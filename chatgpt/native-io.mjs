@@ -62,8 +62,13 @@ export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-
   let connection = null, opening = null, closed = false, sequence = 0, initialized = false
   const pending = new Map()
   const fail = () => { for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(new Error('metadata connection unavailable')) }; pending.clear(); initialized = false }
+  async function dispose(ws) {
+    if (!ws || ws.readyState === WebSocket.CLOSED) return
+    await new Promise(resolve => { const timer = setTimeout(() => { ws.terminate() }, 1000); ws.once('close', () => { clearTimeout(timer); resolve() }); ws.close() })
+  }
   async function wire(method, params) {
     if (closed) throw new Error('metadata client closed')
+    if (connection?.readyState !== WebSocket.OPEN) throw new Error('metadata connection unavailable')
     return await new Promise((resolve, reject) => {
       const id = ++sequence
       const timer = setTimeout(() => { pending.delete(id); reject(new Error('metadata request timed out')) }, 5000)
@@ -89,9 +94,16 @@ export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-
         if (message.error) entry.reject(new Error('metadata request failed'))
         else entry.resolve(message.result)
       })
-      await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', () => reject(new Error('metadata service unavailable'))) })
-      await wire('initialize', { clientInfo: { name: 'ghost_sentinel_chatgpt', version: '0.1.0-dev.0' }, capabilities: { experimentalApi: true } })
-      ws.send(JSON.stringify({ method: 'initialized' })); initialized = true
+      try {
+        await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', () => reject(new Error('metadata service unavailable'))) })
+        await wire('initialize', { clientInfo: { name: 'ghost_sentinel_chatgpt', version: '0.1.0-dev.0' }, capabilities: { experimentalApi: true } })
+        if (closed || connection !== ws) throw new Error('metadata connection superseded')
+        ws.send(JSON.stringify({ method: 'initialized' })); initialized = true
+      } catch (error) {
+        if (connection === ws) { fail(); connection = null }
+        await dispose(ws)
+        throw error
+      }
     })().finally(() => { opening = null })
     return opening
   }
@@ -102,8 +114,7 @@ export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-
       if (closed) return
       closed = true; fail()
       const ws = connection; connection = null
-      if (!ws || ws.readyState === WebSocket.CLOSED) return
-      await new Promise(resolve => { const timer = setTimeout(() => { ws.terminate(); resolve() }, 1000); ws.once('close', () => { clearTimeout(timer); resolve() }); ws.close() })
+      await dispose(ws)
     },
   }
 }

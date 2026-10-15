@@ -108,9 +108,9 @@ export class BoundedReader {
 
   view(reason = null) {
     reason ??= this.closed ? 'reader-closed' : this.gap ?? (this.available === false ? 'source-unavailable' : null);
-    const coverage = reason || this.gap ? 'gap' : this.stat && this.offset < this.stat.size ? 'catching-up' : this.pendingBytes ? 'partial-record' : this.stat ? 'caught-up' : 'catching-up';
     // ps lstart is precise to one second. Recompute this for restored cursors too.
     const startGap = this.state.phase === 'started' && this.state.at < this.source.hostStartedAt + 1000 ? this.state.at < this.source.hostStartedAt ? 'start-predates-host' : 'host-start-time-overlap' : null;
+    const coverage = reason || this.gap || startGap ? 'gap' : this.stat && this.offset < this.stat.size ? 'catching-up' : this.pendingBytes ? 'partial-record' : this.stat ? 'caught-up' : 'catching-up';
     const gap = reason ?? this.gap ?? (!this.state.header ? 'main-header-unverified' : !this.state.anchored ? 'current-turn-not-observed' : startGap);
     return { coverage, gap, observed: { ...this.state }, effectivePhase: coverage === 'caught-up' && !gap ? this.state.phase : 'unknown', offset: this.offset, committedOffset: this.committed, pendingBytes: this.pendingBytes, excluded: this.excluded, recentLifecycle: this.recentLifecycle.map(e => ({ ...e })), metrics: { ...this.metrics } };
   }
@@ -226,6 +226,10 @@ export class BoundedReader {
       if (`${after.dev}:${after.ino}` !== this.fileId) this.gap = 'record-file-replaced';
       else if (after.size < this.offset) this.gap = 'record-file-truncated';
       else if (after.size === stat.size && after.mtimeMs !== stat.mtimeMs) this.gap = 'record-rewrite-suspected';
+      else if (after.size > stat.size) {
+        this.stat = { size: after.size, mtimeMs: after.mtimeMs };
+        this.needsGuard = true;
+      }
     } catch { this.gap = 'record-source-unavailable'; }
     finally { this.busy = false; this.metrics.physicalBytes += readBytes; this.metrics.maximumReadBytes = Math.max(this.metrics.maximumReadBytes, readBytes); finishPump(); this.pumpComplete = null; }
     return { ...this.view(), readBytes };

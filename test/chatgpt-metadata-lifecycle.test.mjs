@@ -1,0 +1,54 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
+import { createServer } from 'node:http'
+import { randomUUID } from 'node:crypto'
+import { rm } from 'node:fs/promises'
+import { createMetadataClient } from '../chatgpt/native-io.mjs'
+const { WebSocketServer } = createRequire(new URL('../chatgpt/package.json', import.meta.url))('ws')
+
+async function metadataFixture(t, mode) {
+  const socketPath = '/private/tmp/sentinel-metadata-' + randomUUID() + '.sock'
+  const websocket = new WebSocketServer({ noServer: true }), server = createServer()
+  server.on('upgrade', (req, socket, head) => websocket.handleUpgrade(req, socket, head, ws => websocket.emit('connection', ws, req)))
+  websocket.on('connection', ws => ws.on('message', bytes => {
+    const message = JSON.parse(bytes)
+    if (!message.id) return
+    if (message.method === 'initialize') {
+      if (mode === 'timeout') return
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, ...(mode === 'reject' ? { error: { code: -32603, message: 'controlled initialization rejection' } } : { result: { serverInfo: { name: 'controlled-metadata' } } }) }))
+    } else ws.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { thread: { id: 'confirmed-main' } } }))
+  }))
+  await new Promise(resolve => server.listen(socketPath, resolve))
+  const client = createMetadataClient({ socketPath })
+  t.after(async () => { await client.close(); for (const ws of websocket.clients) ws.terminate(); await new Promise(resolve => websocket.close(resolve)); await new Promise(resolve => server.close(resolve)); await rm(socketPath, { force: true }) })
+  return { client, connections: () => websocket.clients.size }
+}
+
+test('each rejected initialization releases its websocket before a retry', async t => {
+  const f = await metadataFixture(t, 'reject')
+  for (let retry = 0; retry < 3; retry++) {
+    await assert.rejects(f.client.request('thread/read', { threadId: 'confirmed-main', includeTurns: false }), /metadata request failed/)
+    assert.equal(f.connections(), 0)
+    assert.equal(f.client.diagnostics().pendingRequests, 0)
+    assert.equal(f.client.diagnostics().connected, false)
+  }
+})
+
+test('a successful initialized connection is reused and explicitly closes without pending deadlines', async t => {
+  const f = await metadataFixture(t, 'accept')
+  assert.equal((await f.client.request('thread/read', { threadId: 'confirmed-main', includeTurns: false })).thread.id, 'confirmed-main')
+  assert.equal((await f.client.request('thread/read', { threadId: 'confirmed-main', includeTurns: false })).thread.id, 'confirmed-main')
+  assert.equal(f.connections(), 1)
+  await f.client.close()
+  assert.equal(f.connections(), 0)
+  assert.deepEqual(f.client.diagnostics(), { closed: true, pendingRequests: 0, deadlineTimers: 0, connected: false })
+})
+
+test('an initialization timeout releases its websocket before reporting failure', async t => {
+  const f = await metadataFixture(t, 'timeout')
+  await assert.rejects(f.client.request('thread/read', { threadId: 'confirmed-main', includeTurns: false }), /metadata request timed out/)
+  assert.equal(f.connections(), 0)
+  assert.equal(f.client.diagnostics().pendingRequests, 0)
+  assert.equal(f.client.diagnostics().connected, false)
+})

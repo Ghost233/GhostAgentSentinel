@@ -89,6 +89,10 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
       const epoch = sourceEpoch
       const before = await qualify(entry.id, entry.reader?.source)
       if (before.gap) return await fail(entry, before.gap, before.scope)
+      if (entry.blocked) {
+        if (entry.blocked.scope === fingerprint(before.source)) { entry.view = gapView(entry.blocked.reason); return entry.view }
+        entry.blocked = null
+      }
       const generation = entry.generation
       if (closed) return gapView('adapter-closed')
       if (!entry.reader) {
@@ -102,7 +106,10 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
       const observed = await entry.reader.pump()
       const after = await qualify(entry.id, before.source)
       if (closed || epoch !== sourceEpoch || generation !== entry.generation) return gapView('observation-superseded')
-      if (after.gap || observed.coverage === 'gap') return await fail(entry, after.gap ?? observed.gap, after.scope)
+      if (after.gap || observed.coverage === 'gap') {
+        if (!after.gap && ['start-predates-host', 'host-start-time-overlap'].includes(observed.gap)) entry.blocked = { scope: fingerprint(before.source), reason: observed.gap }
+        return await fail(entry, after.gap ?? observed.gap, after.scope)
+      }
       const connection = await sourceFor(before.source, epoch)
       if (!connection) return await fail(entry, 'source-generation-changed', 'source')
       const phase = observed.effectivePhase, lifecycleId = observed.observed.turnId ?? 'unobserved:' + before.source.hostRunId
@@ -120,10 +127,13 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
       // Persist first-capture identities before sending. A lost response replays
       // from the previous position with the same timestamps after recovery.
       await saveCursor(target, { ...previousCheckpoint, fileId: previousCheckpoint.fileId ?? checkpoint.fileId, attachSize: previousCheckpoint.attachSize ?? checkpoint.attachSize }, entry.captured, entry.captureThroughOffset)
-      await core.ingest(connection.key, { tasks: [...(previousLifecycle && previousLifecycle !== lifecycleId ? [{ id: entry.id, sessionId: entry.id, lifecycleId: previousLifecycle, title: 'ChatGPT 主会话', status: ['completed', 'aborted'].includes(previousPhase) ? 'idle' : 'unknown', gaps: ['completed', 'aborted'].includes(previousPhase) ? [] : ['execution-superseded'] }] : []), { id: entry.id, sessionId: entry.id, lifecycleId, title: 'ChatGPT 主会话', status, gaps }], events: lifecycleEvents.map(event => ({ id: 'lifecycle:' + event.recordStart, taskId: entry.id, taskLifecycleId: event.turnId, kind: 'status', capturedAt: entry.captured.get(event.recordStart), occurredAt: event.at, text: event.type, evidence: 'chatgpt-record:' + entry.cursorKey + ':' + event.recordStart, data: { status: phaseStatus(event.type === 'task_started' ? 'started' : event.type === 'task_complete' ? 'completed' : 'aborted'), nativeType: event.type, runId: event.turnId } })) })
+      await core.ingest(connection.key, { tasks: [...(previousLifecycle && previousLifecycle !== lifecycleId ? [{ id: entry.id, sessionId: entry.id, lifecycleId: previousLifecycle, title: 'ChatGPT 主会话', status: ['completed', 'aborted'].includes(previousPhase) ? 'idle' : 'unknown', gaps: ['completed', 'aborted'].includes(previousPhase) ? [] : ['execution-superseded'] }] : []), { id: entry.id, sessionId: entry.id, lifecycleId, title: 'ChatGPT 主会话', status, gaps }], events: lifecycleEvents.map(event => ({ id: 'lifecycle:' + event.recordStart, taskId: entry.id, taskLifecycleId: event.turnId, kind: 'status', capturedAt: entry.captured.get(event.recordStart), occurredAt: event.at, text: event.type, evidence: 'chatgpt-record:' + entry.cursorKey + ':' + event.recordStart, data: { status: phase === 'unknown' ? 'unknown' : phaseStatus(event.type === 'task_started' ? 'started' : event.type === 'task_complete' ? 'completed' : 'aborted'), nativeType: event.type, runId: event.turnId } })) })
       if (closed || epoch !== sourceEpoch || generation !== entry.generation) { await stop(entry, 'observation-superseded'); return entry.view }
       await saveCursor(target, checkpoint, entry.captured, entry.captureThroughOffset)
-      const snapshot = await core.snapshot(), task = snapshot.tasks.find(task => task.sourceKey === connection.key && task.id === entry.id && task.lifecycleId === lifecycleId)
+      const snapshot = await core.snapshot()
+      if (closed) return gapView('adapter-closed')
+      if (epoch !== sourceEpoch || generation !== entry.generation || source?.key !== connection.key) return entry.view
+      const task = snapshot.tasks.find(task => task.sourceKey === connection.key && task.id === entry.id && task.lifecycleId === lifecycleId)
       if (!task || task.analysis.state !== 'observation-only') { await stop(entry, 'core-capability-unconfirmed'); return entry.view }
       entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, gap: observed.gap, readBytes: observed.readBytes, observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
       return entry.view
@@ -140,7 +150,7 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
     if (!entry && threads.size >= 256) return gapView('observation-capacity-reached')
     if (!entry) { entry = { id, cursorKey: fingerprint([installationId, id]), generation: 0, captured: new Map(), captureThroughOffset: -1, view: gapView('not-observed', id) }; threads.set(id, entry) }
     const view = await run(entry)
-    if (!view.identity.threadId && !entry.reader && !entry.lifecycleId) threads.delete(id)
+    if (!view.identity.threadId && !entry.reader && !entry.lifecycleId && !entry.blocked) threads.delete(id)
     return view
   }
   async function refresh() { if (closed) return; if (refreshPending) return refreshPending; refreshPending = (async () => { for (const entry of threads.values()) if (!closed) await run(entry) })().finally(() => { refreshPending = null }); return refreshPending }
