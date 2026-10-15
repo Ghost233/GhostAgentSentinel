@@ -85,6 +85,7 @@ test('oversized, malformed and unverified cursor files fail closed through the p
     ['symbolic link', 'cursor-file-unverified', async () => { const target = join(dir, 'foreign-cursor.json'); await writeFile(target, saved, { mode: 0o600 }); await symlink(target, cursorPath) }],
     ['group-readable', 'cursor-file-unverified', async () => { await writeFile(cursorPath, saved, { mode: 0o600 }); await chmod(cursorPath, 0o644) }],
     ['capture metadata missing', 'cursor-format-invalid', async () => { const broken = JSON.parse(saved); delete broken.captures; await writeFile(cursorPath, JSON.stringify(broken), { mode: 0o600 }) }],
+    ['legacy size history missing', 'cursor-invalid', async () => { const legacy = JSON.parse(saved); legacy.reader.format = 1; delete legacy.reader.knownSize; await writeFile(cursorPath, JSON.stringify(legacy), { mode: 0o600 }) }],
   ]
   for (const [name, gap, arrange] of cases) {
     await t.test(name, async () => {

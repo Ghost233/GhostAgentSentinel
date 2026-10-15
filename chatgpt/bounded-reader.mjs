@@ -88,7 +88,7 @@ export class BoundedReader {
     this.rolling = Buffer.alloc(0); this.committedTail = Buffer.alloc(0);
     this.guardHash = digest(Buffer.alloc(0)); this.needsGuard = Boolean(cursor);
     this.handle = null; this.fileId = null; this.stat = null; this.projection = null;
-    this.gap = null; this.attachSize = null; this.excluded = 0;
+    this.gap = null; this.attachSize = null; this.knownSize = null; this.excluded = 0;
     this.metrics = { physicalBytes: 0, records: 0, peakProjectionBytes: 0, maximumReadBytes: 0 };
     this.recentLifecycle = [];
     if (typeof source.threadId !== 'string' || !source.threadId || source.threadId.length > 128 || source.parentId !== null || !source.hostRunId || !Number.isFinite(source.hostStartedAt) || !['vscode', 'cli', 'appServer'].includes(source.sourceKind) || source.originator !== 'Codex Desktop') this.gap = 'main-identity-unverified';
@@ -96,10 +96,10 @@ export class BoundedReader {
     else if (profileKey(source.profile) !== profileKey(supportedProfile)) this.gap = 'unsupported-host-version';
     if (cursor && !this.gap) {
       const s = cursor.state;
-      if (cursor.format !== 1 || cursor.scope !== this.scope || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || !Number.isSafeInteger(cursor.attachSize) || cursor.attachSize < 0 || !/^[0-9a-f]{64}$/.test(cursor.guardHash ?? '') || typeof cursor.fileId !== 'string' || cursor.fileId.length > 100 || typeof s?.header !== 'boolean' || typeof s?.anchored !== 'boolean' || !['unknown', 'started', 'completed', 'aborted'].includes(s?.phase) || s.turnId !== null && (typeof s.turnId !== 'string' || s.turnId.length > 128) || s.at !== null && !Number.isSafeInteger(s.at)) {
+      if (cursor.format !== 2 || cursor.scope !== this.scope || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || !Number.isSafeInteger(cursor.attachSize) || cursor.attachSize < 0 || !Number.isSafeInteger(cursor.knownSize) || cursor.knownSize < cursor.offset || cursor.knownSize < cursor.attachSize || !/^[0-9a-f]{64}$/.test(cursor.guardHash ?? '') || typeof cursor.fileId !== 'string' || cursor.fileId.length > 100 || typeof s?.header !== 'boolean' || typeof s?.anchored !== 'boolean' || !['unknown', 'started', 'completed', 'aborted'].includes(s?.phase) || s.turnId !== null && (typeof s.turnId !== 'string' || s.turnId.length > 128) || s.at !== null && !Number.isSafeInteger(s.at)) {
         this.gap = 'cursor-invalid';
       } else {
-        this.offset = this.committed = cursor.offset; this.fileId = cursor.fileId; this.guardHash = cursor.guardHash; this.attachSize = cursor.attachSize;
+        this.offset = this.committed = cursor.offset; this.fileId = cursor.fileId; this.guardHash = cursor.guardHash; this.attachSize = cursor.attachSize; this.knownSize = cursor.knownSize;
         this.state = { header: s.header, anchored: s.anchored, phase: s.phase, turnId: s.turnId, at: s.at, orphan: s.orphan === true };
         this.gap = cursor.gap === null ? null : 'cursor-retains-gap';
       }
@@ -198,7 +198,8 @@ export class BoundedReader {
       const id = `${stat.dev}:${stat.ino}`;
       if (!stat.isFile() || id !== `${opened.dev}:${opened.ino}` || this.fileId && this.fileId !== id) { this.gap = 'record-file-replaced'; return { ...this.view(), readBytes }; }
       this.fileId = id; this.attachSize ??= stat.size;
-      if (stat.size < this.offset) { this.gap = 'record-file-truncated'; return { ...this.view(), readBytes }; }
+      if (stat.size < Math.max(this.offset, this.knownSize ?? this.attachSize)) { this.gap = 'record-file-truncated'; return { ...this.view(), readBytes }; }
+      this.knownSize = stat.size;
       if (this.stat && stat.size === this.stat.size && stat.mtimeMs !== this.stat.mtimeMs) { this.gap = 'record-rewrite-suspected'; return { ...this.view(), readBytes }; }
       const unchanged = this.stat && stat.size === this.stat.size && stat.mtimeMs === this.stat.mtimeMs;
       if (!unchanged || this.needsGuard) {
@@ -224,10 +225,11 @@ export class BoundedReader {
       }
       const after = await fs.stat(this.source.path);
       if (`${after.dev}:${after.ino}` !== this.fileId) this.gap = 'record-file-replaced';
-      else if (after.size < this.offset) this.gap = 'record-file-truncated';
+      else if (after.size < Math.max(this.offset, this.knownSize)) this.gap = 'record-file-truncated';
       else if (after.size === stat.size && after.mtimeMs !== stat.mtimeMs) this.gap = 'record-rewrite-suspected';
       else if (after.size > stat.size) {
         this.stat = { size: after.size, mtimeMs: after.mtimeMs };
+        this.knownSize = after.size;
         this.needsGuard = true;
       }
     } catch { this.gap = 'record-source-unavailable'; }
@@ -236,7 +238,7 @@ export class BoundedReader {
   }
 
   checkpoint() {
-    return { format: 1, scope: this.scope, offset: this.committed, attachSize: this.attachSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap };
+    return { format: 2, scope: this.scope, offset: this.committed, attachSize: this.attachSize, knownSize: this.knownSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap };
   }
 
   async close() {

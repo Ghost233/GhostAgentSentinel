@@ -124,3 +124,73 @@ test('an append observed after the bounded read keeps completion unknown until t
   assert.equal(caughtUp.observation.status, 'running')
   assert.ok(caughtUp.observation.readBytes <= 262144)
 })
+
+test('removing an unread terminal tail is truncation even when the file remains beyond the current cursor', async t => {
+  let terminal
+  const f = await setup(t, { records: ({ started }) => {
+    terminal = row('event_msg', { type: 'task_complete', turn_id: 'review-turn' }, started + 1)
+    return row('event_msg', { type: 'task_started', turn_id: 'review-turn' }, started) + row('response_item', { text: 'x'.repeat(400000) }, started) + terminal
+  } })
+  const first = await f.read()
+  assert.equal(first.observation.coverage, 'catching-up')
+  assert.equal(first.observation.readBytes, 262144)
+  const knownSize = (await fs.stat(f.path)).size, remaining = knownSize - Buffer.byteLength(terminal)
+  assert.ok(remaining > 262144)
+  await fs.truncate(f.path, remaining)
+  const truncated = await f.read()
+  assert.equal(truncated.observation.gap, 'record-file-truncated')
+  assert.equal(truncated.observation.status, 'unknown')
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
+  assert.equal((await f.core.snapshot()).tasks[0].status, 'unknown')
+})
+
+test('an unread tail shrink during the read closes observation despite staying beyond the byte budget', async t => {
+  let terminal
+  const f = await setup(t, { records: ({ started }) => {
+    terminal = row('event_msg', { type: 'task_complete', turn_id: 'review-turn' }, started + 1)
+    return row('event_msg', { type: 'task_started', turn_id: 'review-turn' }, started) + row('response_item', { text: 'x'.repeat(400000) }, started) + terminal
+  } })
+  const originalStat = fs.stat
+  let recordStats = 0
+  t.mock.method(fs, 'stat', async (...args) => {
+    if (args[0] === f.path && ++recordStats === 2) {
+      const current = await originalStat(...args)
+      const reduced = current.size - Buffer.byteLength(terminal)
+      assert.ok(reduced > 262144)
+      await fs.truncate(f.path, reduced)
+    }
+    return originalStat(...args)
+  })
+  const truncated = await f.read()
+  assert.equal(truncated.observation.gap, 'record-file-truncated')
+  assert.equal(truncated.observation.status, 'unknown')
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
+})
+
+test('a restored reader retains a larger observed size and rejects loss beyond its unread cursor', async t => {
+  const f = await setup(t, { records: ({ started }) => row('event_msg', { type: 'task_started', turn_id: 'review-turn' }, started) + row('response_item', { text: 'x'.repeat(400000) }, started) })
+  const originalStat = fs.stat
+  let recordStats = 0, terminal
+  t.mock.method(fs, 'stat', async (...args) => {
+    if (args[0] === f.path && ++recordStats === 2) {
+      terminal = row('event_msg', { type: 'task_complete', turn_id: 'review-turn' }, Date.now())
+      await fs.appendFile(f.path, row('response_item', { text: 'y'.repeat(100000) }, Date.now()) + terminal)
+    }
+    return originalStat(...args)
+  })
+  const baseline = await f.read()
+  assert.equal(baseline.observation.coverage, 'catching-up')
+  const cursor = JSON.parse(await fs.readFile(join(f.dir, 'adapter/cursors', baseline.identity.cursorKey + '.json'), 'utf8'))
+  assert.ok(cursor.reader.knownSize > cursor.reader.attachSize)
+  const reduced = (await originalStat(f.path)).size - Buffer.byteLength(terminal)
+  assert.ok(reduced > cursor.reader.attachSize && reduced > cursor.reader.offset)
+  await f.adapter.close()
+  await fs.truncate(f.path, reduced)
+  const restored = await startChatGPTAdapter({ core: f.core, native: f.native, sessionsRoot: f.dir, dataDir: join(f.dir, 'adapter'), installationId: 'review-installation', token: 'b'.repeat(64), pollMs: 0 })
+  try {
+    const result = await restored.read({ thread_id: 'review-main' })
+    assert.equal(result.observation.gap, 'record-file-truncated')
+    assert.equal(result.observation.status, 'unknown')
+    assert.equal(restored.diagnostics().openReaders, 0)
+  } finally { await restored.close() }
+})

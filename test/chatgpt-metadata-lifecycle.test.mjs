@@ -4,11 +4,13 @@ import { createRequire } from 'node:module'
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { createMetadataClient } from '../chatgpt/native-io.mjs'
 const { WebSocketServer } = createRequire(new URL('../chatgpt/package.json', import.meta.url))('ws')
 
 async function metadataFixture(t, mode) {
-  const socketPath = '/private/tmp/sentinel-metadata-' + randomUUID() + '.sock'
+  const socketPath = join(tmpdir(), 'gs-m-' + randomUUID().slice(0, 12) + '.sock')
   const websocket = new WebSocketServer({ noServer: true }), server = createServer()
   server.on('upgrade', (req, socket, head) => websocket.handleUpgrade(req, socket, head, ws => websocket.emit('connection', ws, req)))
   websocket.on('connection', ws => ws.on('message', bytes => {
@@ -22,6 +24,8 @@ async function metadataFixture(t, mode) {
   await new Promise(resolve => server.listen(socketPath, resolve))
   const client = createMetadataClient({ socketPath })
   t.after(async () => { await client.close(); for (const ws of websocket.clients) ws.terminate(); await new Promise(resolve => websocket.close(resolve)); await new Promise(resolve => server.close(resolve)); await rm(socketPath, { force: true }) })
+  assert.equal(dirname(server.address()), tmpdir(), 'metadata sockets must use the platform temporary directory')
+  assert.ok(Buffer.byteLength(server.address()) < 104, 'Unix socket endpoint must fit the supported macOS path limit')
   return { client, connections: () => websocket.clients.size }
 }
 

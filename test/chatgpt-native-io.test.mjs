@@ -4,7 +4,7 @@ import { createRequire } from 'node:module'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
@@ -17,7 +17,7 @@ const nativePath = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/Codex
 
 test('production native IO qualifies actual app-server facts and readonly metadata before core and MCP publication', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-native-'))
-  const socketPath = '/private/tmp/sentinel-native-' + randomUUID() + '.sock'
+  const socketPath = join(tmpdir(), 'gs-n-' + randomUUID().slice(0, 12) + '.sock')
   const recordPath = join(dir, 'main.jsonl'), born = Date.now() - 10_000
   const started = new Date(born).toUTCString().replace(',', '').replace(/ GMT$/, '')
   await writeFile(recordPath, JSON.stringify({ type: 'session_meta', payload: { id: 'native-main' } }) + '\n' + JSON.stringify({ timestamp: new Date(born + 3000).toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'native-turn' } }) + '\n')
@@ -45,6 +45,8 @@ test('production native IO qualifies actual app-server facts and readonly metada
   const core = await connectCore({ dataDir: join(dir, 'core') })
   const adapter = await startChatGPTAdapter({ core, native, sessionsRoot: dir, dataDir: join(dir, 'adapter'), installationId: 'native-io-test', token: 'd'.repeat(64), pollMs: 0 })
   t.after(async () => { await adapter.close(); await core.close(); await server.close(); for (const ws of metadata.clients) ws.terminate(); await new Promise(resolve => metadata.close(resolve)); await new Promise(resolve => unix.close(resolve)); await rm(socketPath, { force: true }); await rm(dir, { force: true, recursive: true }) })
+  assert.equal(dirname(unix.address()), tmpdir(), 'native IO sockets must use the platform temporary directory')
+  assert.ok(Buffer.byteLength(unix.address()) < 104, 'Unix socket endpoint must fit the supported macOS path limit')
   const result = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'd'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'native-main' } } }) }).then(response => response.json())
   assert.equal(result.result.structuredContent.observation.phase, 'started', 'saved notLoaded/interrupted metadata is not runtime truth')
   assert.equal((await core.snapshot()).tasks[0].status, 'running')
