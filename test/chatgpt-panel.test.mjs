@@ -173,3 +173,16 @@ test('an unbound source failure keeps only its new diagnostic gaps after clearin
   assert.equal(page.element('#gaps').textContent, '')
   assert.match(page.element('#identity').textContent, /main-b/)
 })
+
+test('the actual panel DOM omits excluded child-agent counts while retaining current-chat coverage and evidence', async t => {
+  const page = await harness(t), view = material()
+  view.discovery.counts.child = 987
+  await page.deliver(view)
+  page.element('#diagnostics').open = true
+  const visible = ['summary', 'coverage', 'technical', 'gaps'].map(id => page.element('#' + id).textContent).join('\n')
+  assert.doesNotMatch(visible, /子代理|child|987/)
+  assert.match(page.element('#coverage').textContent, /本聊天：已接入/)
+  assert.match(page.element('#coverage').textContent, /主聊天 3/)
+  assert.match(page.element('#technical').textContent, /private-evidence-id/)
+  assert.equal(page.element('#issues').children.length, 1)
+})

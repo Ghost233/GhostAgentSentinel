@@ -6,9 +6,8 @@ const counters = () => ({ main: 0, fork: 0, child: 0, remote: 0, cloud: 0, unkno
 export function classifyThread(thread, sessionsRoot) {
   if (!thread || typeof thread.id !== 'string' || !thread.id || thread.id.length > 128) return 'unknown'
   if (thread.parentThreadId || typeof thread.source === 'object' && thread.source?.subAgent) return 'child'
-  const locations = [thread.cwd, thread.path, ...(Array.isArray(thread.environments) ? thread.environments.flatMap(item => [item?.environmentId, item?.cwd]) : [])].filter(value => typeof value === 'string')
-  if (locations.some(value => /^(?:cloud|https?):\/\//.test(value))) return 'cloud'
-  if (locations.some(value => /^(?:ssh|remote):\/\//.test(value))) return 'remote'
+  const locations = [thread.cwd, thread.path, ...(Array.isArray(thread.environments) ? thread.environments.map(item => item?.cwd) : [])].filter(value => typeof value === 'string')
+  if (locations.some(value => !isAbsolute(value))) return 'unknown'
   if (thread.parentThreadId !== null || !['cli', 'vscode', 'appServer'].includes(thread.source) || thread.originator !== 'Codex Desktop' || typeof thread.cwd !== 'string' || !isAbsolute(thread.cwd) || typeof thread.path !== 'string' || !isAbsolute(thread.path)) return 'unknown'
   if (!resolve(thread.path).startsWith(resolve(sessionsRoot) + sep) || !thread.path.endsWith('.jsonl')) return 'unknown'
   // Environment IDs are opaque in the locked native schema. A selected

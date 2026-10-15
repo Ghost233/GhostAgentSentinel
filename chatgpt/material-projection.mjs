@@ -24,6 +24,7 @@ export class MaterialProjection {
     this.stack = []
     this.fields = {}
     this.body = { text: '', truncated: false, redacted: false }
+    this.agentBody = { text: '', truncated: false, redacted: false }
     this.peakProjectionBytes = 0
   }
 
@@ -43,7 +44,7 @@ export class MaterialProjection {
       if (contentType.test(path)) item.contentType = capture.text
       else item.contentText = capture
     } else this.fields[path] = capture
-    const bytes = Buffer.byteLength(JSON.stringify(this.fields)) + Buffer.byteLength(this.body.text) + Buffer.byteLength(this.stack.at(-1)?.contentText?.text ?? '')
+    const bytes = Buffer.byteLength(JSON.stringify(this.fields)) + Buffer.byteLength(this.body.text) + Buffer.byteLength(this.agentBody.text) + Buffer.byteLength(this.stack.at(-1)?.contentText?.text ?? '')
     this.peakProjectionBytes = Math.max(this.peakProjectionBytes, bytes)
     if (bytes > 16384) throw new Error('material projection limit exceeded')
   }
@@ -62,6 +63,8 @@ export class MaterialProjection {
         if (/^payload\.(?:item\.)?content\.\d+$/.test(item.path)) {
           if (['input_text', 'output_text', 'text'].includes(item.contentType) && item.contentText) append(this.body, item.contentText)
           else this.body.truncated = true
+          if (item.contentType === 'Text' && /^payload\.item\./.test(item.path) && item.contentText) append(this.agentBody, item.contentText)
+          else { this.agentBody.truncated = true; this.agentBody.omitted = true }
         }
       } else if (token.name === 'startString' || token.name === 'startNumber') {
         const path = this.path()
@@ -96,7 +99,7 @@ export class MaterialProjection {
     this.tokens(this.parse(none))
     if (this.stack.length) throw new Error('incomplete JSON record')
     const scalar = path => this.fields[path]?.text
-    return { type: scalar('type'), timestamp: scalar('timestamp'), payload: Object.fromEntries(['type', 'id', 'role', 'turn_id', 'root_turn_id', 'thread_id', 'call_id', 'name'].map(key => [key, scalar('payload.' + key)])), material: { fields: this.fields, body: this.body, turnId: scalar('payload.internal_chat_message_metadata_passthrough.turn_id'), turnTrigger: scalar('payload.turn_attribution.turn_trigger') } }
+    return { type: scalar('type'), timestamp: scalar('timestamp'), payload: Object.fromEntries(['type', 'id', 'role', 'turn_id', 'root_turn_id', 'thread_id', 'call_id', 'name'].map(key => [key, scalar('payload.' + key)])), material: { fields: this.fields, body: this.body, agentBody: this.agentBody, turnId: scalar('payload.internal_chat_message_metadata_passthrough.turn_id'), turnTrigger: scalar('payload.turn_attribution.turn_trigger') } }
   }
 }
 
@@ -106,11 +109,21 @@ export function materialRecord(row, turnId, recordStart, recordEnd, turnTrigger)
   const producer = completed && itemType === 'UserMessage'
   const commandResult = completed && itemType === 'CommandExecution'
   const mcpResult = completed && itemType === 'McpToolCall'
-  if (row.type !== 'response_item' && !producer && !commandResult && !mcpResult) return null
+  const agentOutput = completed && itemType === 'AgentMessage'
+  if (row.type !== 'response_item' && !producer && !commandResult && !mcpResult && !agentOutput) return null
   const payload = row.payload
   const data = { nativeType: 'response_item/' + payload.type, sourceKind: 'chatgpt-native', sourceForm: 'response_item/' + payload.type, runId: row.material.turnId ?? turnId }
   let kind, capture
-  if (mcpResult) {
+  if (agentOutput) {
+    if (payload.turn_id !== turnId) return null
+    kind = 'output'
+    capture = row.material.agentBody
+    Object.assign(data, { nativeType: 'item_completed/AgentMessage', sourceForm: 'event_msg/item_completed', runId: payload.turn_id, messageId: row.material.fields['payload.item.id']?.text })
+    if (capture.omitted || !capture.text.trim()) {
+      kind = 'gap'
+      capture = { text: '原生代理输出含未识别或缺失的文字内容，当前材料不完整', truncated: true }
+    }
+  } else if (mcpResult) {
     if (payload.turn_id !== turnId) return null
     kind = 'gap'
     capture = { text: '原生 MCP 结果正文的固定字段尚未核实，当前材料已省略', truncated: true }

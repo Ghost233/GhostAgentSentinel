@@ -77,14 +77,14 @@ test('directory exclusions remain visible without reading fork, child, foreign o
   await f.add('ordinary')
   await f.add('fork', { forkedFromId: 'ordinary' })
   await f.add('child', { parentThreadId: 'ordinary', source: { subAgent: { thread_spawn: {} } } })
-  await f.add('remote', { environments: [{ environmentId: 'ssh://test-host' }] })
-  await f.add('cloud', { environments: [{ environmentId: 'cloud://test-work' }] })
+  await f.add('remote', { cwd: 'ssh://test-host/project' })
+  await f.add('cloud', { path: 'https://test-work/main.jsonl' })
   await f.add('unknown', { environments: [{ environmentId: 'opaque-environment-id' }] })
   await f.adapter.refresh()
   assert.deepEqual((await f.core.snapshot()).tasks.map(task => task.id), ['ordinary'])
   assert.ok(f.facts.reads.every(id => id === 'ordinary'))
   const coverage = f.adapter.discovery()
-  assert.deepEqual(coverage.counts, { main: 1, fork: 1, child: 1, remote: 1, cloud: 1, unknown: 1 })
+  assert.deepEqual(coverage.counts, { main: 1, fork: 1, child: 1, remote: 0, cloud: 0, unknown: 3 })
   assert.ok(coverage.gaps.includes('fork-coverage-pending'))
   assert.ok(coverage.gaps.includes('unclassified-directory-entries'))
   assert.equal(coverage.complete, false)
@@ -227,4 +227,45 @@ test('expired absent directory identities release cached observations and reader
   assert.equal(f.adapter.diagnostics().directoryEntries, 0)
   assert.equal(f.adapter.diagnostics().trackedThreads, 0)
   assert.equal(f.adapter.diagnostics().openReaders, 0)
+})
+
+test('opaque selected environment IDs never classify a host from ssh, cloud or URL-shaped labels', async t => {
+  const f = await fixture(t)
+  await f.add('known-local')
+  for (const [index, environmentId] of ['ssh://opaque', 'cloud://opaque', 'remote://opaque', 'https://opaque'].entries()) await f.add('opaque-' + index, { environments: [{ environmentId, cwd: join(f.dir, 'project-a') }] })
+  await f.adapter.refresh()
+  assert.deepEqual((await f.core.snapshot()).tasks.map(task => task.id), ['known-local'])
+  assert.deepEqual(f.adapter.discovery().counts, { main: 1, fork: 0, child: 0, remote: 0, cloud: 0, unknown: 4 })
+  assert.ok(f.adapter.discovery().gaps.includes('unclassified-directory-entries'))
+  assert.ok(f.facts.reads.every(id => id === 'known-local'))
+})
+
+test('unconfirmed panel visits during global qualification failures cannot exhaust the registry or erase confirmed chat history', async t => {
+  for (const mode of ['host-unavailable', 'disabled', 'user-unknown', 'effective-unknown']) await t.test(mode, async t => {
+    const f = await fixture(t)
+    await f.add('retained-main')
+    assert.equal((await f.read('retained-main')).identity.threadId, 'retained-main')
+    const original = (await f.core.snapshot()).tasks.find(task => task.id === 'retained-main').events[0]
+    const readEnablement = f.native.readEnablement
+    if (mode === 'host-unavailable') f.facts.host = false
+    else f.native.readEnablement = async () => mode === 'disabled' ? { user: 'disabled', effective: 'disabled' } : mode === 'user-unknown' ? { user: 'unknown', effective: 'unknown' } : { user: 'enabled', effective: 'unknown' }
+    for (let index = 0; index < 256; index++) {
+      const invalid = await f.adapter.read({ thread_id: 'unconfirmed-' + index })
+      assert.notEqual(invalid.observation.gap, 'observation-capacity-reached')
+    }
+    assert.equal(f.adapter.diagnostics().trackedThreads, 1, 'only the previously confirmed observation may retain a registry entry')
+    assert.equal(f.adapter.diagnostics().openReaders, 0)
+    assert.equal((await f.core.snapshot()).tasks.length, 1)
+    f.facts.host = true; f.native.readEnablement = readEnablement
+    await f.add('new-main')
+    const recovered = await f.read('new-main')
+    assert.equal(recovered.identity.threadId, 'new-main')
+    assert.equal(recovered.observation.status, 'running')
+    assert.equal((await f.read('retained-main')).identity.threadId, 'retained-main')
+    const retained = (await f.core.snapshot()).tasks.find(task => task.id === 'retained-main').events.find(event => event.id === original.id)
+    assert.equal(retained.capturedAt, original.capturedAt)
+    assert.equal(f.adapter.diagnostics().trackedThreads, 2)
+    await f.adapter.close()
+    for (const field of ['trackedThreads', 'openReaders', 'pendingOperations', 'queuedBatches', 'refreshTimers', 'directoryEntries', 'directoryPending']) assert.equal(f.adapter.diagnostics()[field], 0, field)
+  })
 })

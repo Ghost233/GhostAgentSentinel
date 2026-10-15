@@ -84,6 +84,7 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
     const previous = source
     source = null
     await Promise.all([...threads.values()].map(entry => stop(entry, reason, false)))
+    for (const [id, entry] of threads) if (!entry.lifecycleId && !entry.blocked) threads.delete(id)
     if (previous) await core.unregisterSource(previous.key, reason)
   }
 
@@ -182,6 +183,16 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
         batch.events.sort((a, b) => Number(a.id.split(':')[1]) - Number(b.id.split(':')[1]))
         const before = await core.snapshot()
         if (closed || epoch !== sourceEpoch || generation !== entry.generation) return entry.view
+        const outputs = new Map(before.tasks.filter(task => task.sourceKey === connection.key).flatMap(task => task.events).filter(event => event.kind === 'output' && event.data?.messageId).map(event => [JSON.stringify([event.taskId, event.taskLifecycleId, event.data.messageId]), event]))
+        batch.events = batch.events.filter(event => {
+          if (event.kind !== 'output' || !event.data?.messageId) return true
+          const key = JSON.stringify([event.taskId, event.taskLifecycleId, event.data.messageId]), original = outputs.get(key)
+          if (!original) { outputs.set(key, event); return true }
+          if (original.id === event.id) return true
+          if (original.text === event.text && Boolean(original.data?.truncated) === Boolean(event.data.truncated) && Boolean(original.data?.redacted) === Boolean(event.data.redacted)) return false
+          event.kind = 'gap'; event.text = '同一原生输出身份的正文不一致，采集覆盖未确认'; event.data = { ...event.data, truncated: true }
+          return true
+        })
         const descriptions = new Map(batch.tasks.map(task => [task.lifecycleId, task]))
         const known = before.tasks.filter(task => task.sourceKey === connection.key && task.id === entry.id)
         for (const turnId of new Set(batch.events.map(event => event.taskLifecycleId))) if (!descriptions.has(turnId)) descriptions.set(turnId, { id: entry.id, sessionId: entry.id, lifecycleId: turnId, title: 'ChatGPT 主会话', status: 'unknown' })

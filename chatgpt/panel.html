@@ -75,7 +75,7 @@ function render(view){
     coverage.push('本聊天：'+(discovery.currentIncluded===true?'已接入':'接入未确认'));
     coverage.push('已接入聊天 '+count(discovery.tracked)+' · 来源 '+count(discovery.connected));
     const counts=discovery.counts;
-    if(counts)coverage.push('目录：主聊天 '+count(counts.main)+' · 分叉 '+count(counts.fork)+' · 子代理 '+count(counts.child)+' · 远程 '+count(counts.remote)+' · 云端 '+count(counts.cloud)+' · 未分类 '+count(counts.unknown));
+    if(counts)coverage.push('目录：主聊天 '+count(counts.main)+' · 分叉 '+count(counts.fork)+' · 远程 '+count(counts.remote)+' · 云端 '+count(counts.cloud)+' · 未分类 '+count(counts.unknown));
     coverage.push('发现覆盖：'+(discovery.complete===true?'已确认':'完整性尚未确认'));
   }
   if(analysis.coverage)coverage.push('分析材料覆盖：'+(analysis.coverage.complete===true?'已确认':'存在缺口'));
