@@ -89,6 +89,7 @@ export async function createCore({
   const findTask = (sourceKey, id, lifecycleId) => Array.from(tasks.values()).find(task => identity(task.sourceKey, task.id, task.lifecycleId) === identity(sourceKey, id, lifecycleId));
   const liveIdentity = task => task.status === 'running' && task.baselineConfirmed && connected(sources.get(task.sourceKey));
   const usable = task => liveIdentity(task) && (!sources.get(task.sourceKey)?.hierarchyContext || task.requestId != null);
+  const observationOnly = task => sources.get(task.sourceKey)?.descriptor.mode === 'observation-only';
   const contextFor = (task, read) => {
     const context = sources.get(task.sourceKey)?.hierarchyContext;
     if (!context) return null;
@@ -156,7 +157,7 @@ export async function createCore({
   function cleanQueue() {
     for (let index = queue.length - 1; index >= 0; index--) {
       const task = tasks.get(queue[index]);
-      if (!paused && !closed && task && usable(task)) continue;
+      if (!paused && !closed && task && usable(task) && !observationOnly(task)) continue;
       queued.delete(queue[index]);
       queue.splice(index, 1);
       if (task && task.analysis.queuedAt !== null) {
@@ -673,7 +674,7 @@ export async function createCore({
     if (closed || active !== round || round.cancelled) return;
     active = null;
     const task = tasks.get(round.taskKey);
-    if (!task || !usable(task) || task.requestId !== round.requestId) return;
+    if (!task || !usable(task) || observationOnly(task) || task.requestId !== round.requestId) return;
     if ([...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])].some(event => event.capturedAt <= now() - DAY)) {
       error = Object.assign(new Error('Analysis inputs expired before the response completed'), { code: 'evidence_expired' });
     }
@@ -719,7 +720,7 @@ export async function createCore({
       const key = queue.shift();
       queued.delete(key);
       const task = tasks.get(key);
-      if (!task || !usable(task)) continue;
+      if (!task || !usable(task) || observationOnly(task)) continue;
       if (now() < (task.analysis.nextEligibleAt ?? 0)) continue;
       const capturedEvents = publicEvents(task);
       const instruction = contextFor(task);
@@ -774,6 +775,16 @@ export async function createCore({
     prune();
     cleanQueue();
     for (const task of tasks.values()) {
+      if (observationOnly(task)) {
+        if (task.analysis.state !== 'observation-only') {
+          task.analysis.state = 'observation-only';
+          task.analysis.queuedAt = null;
+          task.analysis.nextEligibleAt = null;
+          task.analysis.error = null;
+          save('tasks', task);
+        }
+        continue;
+      }
       if (!usable(task) || paused || active?.taskKey === task.key) continue;
       if (!analyzer) {
         task.analysis.state = 'unavailable';
@@ -804,12 +815,12 @@ export async function createCore({
         save('notifications', notification);
       }
     }
-    for (const task of tasks.values()) if (usable(task) && !paused && !['unknown', 'failed', 'stale', 'interrupted'].includes(task.analysis.state) && !task.analysis.checks.some(check => check.judgmentState === 'failed')) makeNotification(task, task.alerts.filter(alert => alert.status === 'attention'));
+    for (const task of tasks.values()) if (usable(task) && !observationOnly(task) && !paused && !['unknown', 'failed', 'stale', 'interrupted'].includes(task.analysis.state) && !task.analysis.checks.some(check => check.judgmentState === 'failed')) makeNotification(task, task.alerts.filter(alert => alert.status === 'attention'));
     scheduleIdle();
     startNext();
     if (wakeTimer) clearTimeout(wakeTimer);
     wakeTimer = null;
-    const times = Array.from(tasks.values()).filter(task => usable(task) && task.analysis.nextEligibleAt > current).map(task => task.analysis.nextEligibleAt);
+    const times = Array.from(tasks.values()).filter(task => usable(task) && !observationOnly(task) && task.analysis.nextEligibleAt > current).map(task => task.analysis.nextEligibleAt);
     times.push(...Array.from(notifications.values()).filter(notification => notification.status === 'pending' && notification.readyAt > current).map(notification => notification.readyAt));
     if (times.length > 0) {
       wakeTimer = setTimeout(tick, Math.max(1, Math.min(...times) - current));
@@ -882,7 +893,19 @@ export async function createCore({
         sources.set(source.key, source);
       } else {
         if (now() - source.lastSeenAt >= leaseMs) resetSource(source, 'Source lease expired before re-registration');
+        const modeChanged = source.descriptor.mode !== descriptor.mode;
         Object.assign(source, { descriptor: copy(descriptor), status: 'connected', lastSeenAt: now(), disconnectReason: null });
+        if (modeChanged) for (const task of tasks.values()) if (task.sourceKey === source.key) {
+          cancelRound('Source observation mode changed', task);
+          invalidateAlerts(task, 'unknown');
+          task.resultKey = null;
+          task.resultScope = null;
+          Object.assign(task.analysis, { state: observationOnly(task) ? 'observation-only' : 'unknown',
+            summary: null, summaryAt: null, completedAt: null, startedAt: null, through: null, throughRevision: 0,
+            queuedAt: null, nextEligibleAt: null, error: null, inputEventIds: [], contextEvidenceRefs: [],
+            checks: unknownChecks('Source observation mode changed; prior judgments are not current') });
+          save('tasks', task);
+        }
       }
       hadConnection = true;
       save('sources', source);
@@ -959,7 +982,7 @@ export async function createCore({
         }
         task.gaps = [...new Set([...(task.gaps ?? []), ...(descriptor.gaps ?? [])])].filter(reason => reason !== 'Task baseline is not yet available');
         task.gapRecords = (task.gapRecords ?? []).filter(gap => gap.reason !== 'Task baseline is not yet available');
-        task.baselineConfirmed = true;
+        task.baselineConfirmed = !observationOnly(task) || descriptor.status !== 'unknown';
         const changed = before !== JSON.stringify([task.title, task.status, task.sessionId, task.parentId, task.gaps, task.baselineConfirmed]);
         if (changed) {
           task.updatedAt = now();

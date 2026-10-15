@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel 会话检查</title>
+<style>:root{font:13px/1.5 system-ui;color-scheme:light dark}body{margin:0;padding:14px}h1{font-size:15px;margin:0 0 10px}p{margin:6px 0}.muted{color:GrayText;font-size:12px}#summary{font-weight:600}details{margin-top:12px}#error{color:#d86e55}</style>
+<h1>Sentinel · 当前会话</h1>
+<p id="summary" role="status">⚪ 正在核对当前会话</p>
+<p id="analysis" class="muted">六项分析尚未接入</p>
+<details><summary>观察详情</summary><p id="identity" class="muted"></p><p id="coverage" class="muted"></p></details>
+<p id="error" role="status"></p>
+<script>
+let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false;
+const pending=new Map();
+function clearView(message){document.querySelector('#summary').textContent='⚪ '+message;document.querySelector('#identity').textContent='';document.querySelector('#coverage').textContent='';document.querySelector('#error').textContent='';}
+function request(method,params){return new Promise((resolve,reject)=>{const n=++id;const timeout=setTimeout(()=>{pending.delete(n);reject(new Error('宿主响应超时'));},5000);pending.set(n,{resolve,reject,timeout});parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
+function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/notifications/host-context-changed'){generation++;clearView('会话已变化，重新核对中');clearTimeout(timer);timer=null;if(ready&&!busy)void refresh();}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
+addEventListener('message',onMessage);
+async function refresh(){if(stopped||document.hidden||busy||!ready)return;busy=true;const g=generation;try{const response=await request('tools/call',{name:'sentinel_current_chat',arguments:{}});if(stopped||g!==generation)return;const view=response.structuredContent;if(response.isError||view?.signal!=='gray'||view.analysis?.state!=='not-connected')throw new Error('未收到兼容的观察结果');document.querySelector('#summary').textContent='⚪ '+view.summary;document.querySelector('#identity').textContent=view.identity?.threadId?'本机主会话：'+view.identity.threadId:'当前会话未确认';document.querySelector('#coverage').textContent=view.observation?.gap?'观察缺口：'+view.observation.gap:'采集覆盖：'+view.observation.coverage;document.querySelector('#analysis').textContent=view.analysis.summary;document.querySelector('#error').textContent='';}catch(error){if(!stopped&&g===generation){clearView('本次读取失败，当前状态不可判断');document.querySelector('#error').textContent=error.message;}}finally{busy=false;if(!stopped&&!document.hidden)timer=setTimeout(refresh,1500);}}
+function visibility(){clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void refresh();}
+function teardown(){stopped=true;generation++;clearTimeout(timer);timer=null;for(const p of pending.values()){clearTimeout(p.timeout);p.reject(new Error('页面已销毁'));}pending.clear();removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
+addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
+(async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.0'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');await refresh();}catch(error){clearView('宿主初始化未完成');document.querySelector('#error').textContent=error.message;}})();
+</script>
+</html>
