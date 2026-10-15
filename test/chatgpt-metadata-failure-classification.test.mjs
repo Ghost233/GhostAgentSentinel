@@ -13,7 +13,7 @@ import { startChatGPTAdapter } from '../chatgpt/adapter.mjs';
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs';
 const { WebSocketServer } = createRequire(new URL('../chatgpt/package.json', import.meta.url))('ws');
 
-async function fixture(t, initialMode) {
+async function fixture(t, initialMode, invalidPage) {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-metadata-classification-'));
   const socketPath = join(tmpdir(), 'gs-mf-' + randomUUID().slice(0, 8) + '.sock');
   const metadata = createServer(), websocket = new WebSocketServer({ noServer: true });
@@ -30,6 +30,7 @@ async function fixture(t, initialMode) {
       if (mode === 'disconnect') { ws.close(1011); return; }
       if (mode === 'rpc') { ws.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'PRIVATE_RPC_MESSAGE', data: { path: dir } } })); return; }
       if (mode === 'invalid-json') { ws.send('PRIVATE_INVALID_JSON'); return; }
+      if (mode === 'invalid-page') { ws.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: invalidPage })); return; }
       ws.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { data: [], nextCursor: null } })); return;
     }
     const enabled = { plugins: { 'sentinel@test': { enabled: true } } };
@@ -75,4 +76,39 @@ test('closing a real pending metadata request cancels it without publishing an e
   await f.adapter.close(); await refreshing;
   assert.deepEqual((await f.page()).receipts, []);
   assert.deepEqual(f.native.diagnostics(), { closed: true, pendingRequests: 0, deadlineTimers: 0, connected: false });
+});
+
+const invalidPages = [
+  ['missing result', undefined], ['null result', null], ['string result', 'PRIVATE_RESULT'], ['array result', []],
+  ['missing data', { nextCursor: null }], ['null data', { data: null }],
+  ['string data', { data: 'invalid-directory-page', nextCursor: null }], ['object data', { data: {} }],
+  ['number data', { data: 0 }], ['boolean data', { data: false }],
+  ['oversized data', { data: Array.from({ length: 51 }, () => ({ id: 'PRIVATE_THREAD' })) }],
+  ['number cursor', { data: [], nextCursor: 0 }], ['boolean cursor', { data: [], nextCursor: false }],
+  ['object cursor', { data: [], nextCursor: {} }], ['array cursor', { data: [], nextCursor: [] }],
+  ['empty cursor', { data: [], nextCursor: '' }], ['oversized cursor', { data: [], nextCursor: 'x'.repeat(4097) }],
+];
+test('real directory page schema failures retain protocol classification without response bodies', async t => {
+  for (const [name, pageResult] of invalidPages) await t.test(name, async t => {
+    const f = await fixture(t, 'invalid-page', pageResult);
+    await f.adapter.refresh();
+    const page = await f.page();
+    assert.equal(page.receipts.length, 1);
+    assert.deepEqual(page.receipts[0].error, { code: 'metadata-invalid-response', stage: 'metadata', category: 'protocol' });
+    assert.deepEqual(f.adapter.discovery().error, page.receipts[0].error);
+    assert.equal(JSON.stringify(page).includes('PRIVATE_'), false);
+    assert.equal(JSON.stringify(page).includes('invalid-directory-page'), false);
+    f.setMode('success'); await f.adapter.refresh();
+    assert.equal((await f.page()).receipts[0].state, 'recovered');
+  });
+});
+
+test('valid terminal directory pages keep their optional cursor contract', async t => {
+  for (const pageResult of [{ data: [] }, { data: [], nextCursor: null }]) await t.test(Object.hasOwn(pageResult, 'nextCursor') ? 'null cursor' : 'omitted cursor', async t => {
+    const f = await fixture(t, 'invalid-page', pageResult);
+    await f.adapter.refresh();
+    assert.equal(f.adapter.discovery().state, 'ready');
+    assert.equal(f.adapter.discovery().error, undefined);
+    assert.deepEqual((await f.page()).receipts, []);
+  });
 });

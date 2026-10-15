@@ -43,7 +43,7 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
           const response = await native.listThreads({ cursor: next, limit: PAGE_SIZE, archived: scope })
           pages++; pagesRead++
           if (closed) break
-          if (!response || !Array.isArray(response.data) || response.data.length > PAGE_SIZE || response.nextCursor != null && (typeof response.nextCursor !== 'string' || !response.nextCursor || response.nextCursor.length > 4096)) throw new Error('invalid directory page')
+          if (!response || !Array.isArray(response.data) || response.data.length > PAGE_SIZE || response.nextCursor != null && (typeof response.nextCursor !== 'string' || !response.nextCursor || response.nextCursor.length > 4096)) throw Object.assign(new Error('invalid directory page'), { code: 'metadata-invalid-response', stage: 'metadata' })
           for (const thread of response.data) {
             if (typeof thread?.id !== 'string' || !thread.id || thread.id.length > 128) { gaps.push('directory-identity-invalid'); continue }
             const kind = classifyThread(thread, sessionsRoot)
