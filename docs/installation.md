@@ -1,10 +1,10 @@
 # 安装与逐后台接入
 
-v0.1.0 面向本机 DSH。每份独立 DSH 配置启用一次 Sentinel；同一配置的多个窗口共用 Host 时无需重复安装。使用同一监控数据目录的后台共用一个核心。
+v0.1.1 面向本机 DSH。每份独立 DSH 配置启用一次 Sentinel；同一配置的多个窗口共用 Host 时无需重复安装。使用同一监控数据目录的后台共用一个核心。
 
 ## 安装发布包
 
-1. 从 [GitHub 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases/tag/v0.1.0) 下载 `ghost-agent-sentinel-0.1.0.tgz` 和 `SHA256SUMS`。
+1. 从 [GitHub 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases/tag/v0.1.1) 下载 `ghost-agent-sentinel-0.1.1.tgz` 和 `SHA256SUMS`。
 2. 校验下载文件，在长期保留的空目录中解压。
 3. 在已有 DSH 实例的“插件 → 安装第三方插件”中选择解压后的 `package` 目录，安装并启用 `ghost-agent-sentinel`。
 4. 在右侧“新标签页 → Sentinel”打开全局总览，核对来源清单。聊天输入框下方的 `GS` 打开当前会话检查；只读会话使用顶部备用入口。
@@ -13,11 +13,11 @@ macOS 解压示例：
 
 ```sh
 shasum -a 256 -c SHA256SUMS
-mkdir sentinel-0.1.0
-tar -xzf ghost-agent-sentinel-0.1.0.tgz -C sentinel-0.1.0
+mkdir sentinel-0.1.1
+tar -xzf ghost-agent-sentinel-0.1.1.tgz -C sentinel-0.1.1
 ```
 
-选择 `sentinel-0.1.0/package`，不要选择 `.tgz` 文件。目录安装可能使用 link，安装后需要保留目录。本包没有 npm 运行依赖或安装脚本，普通用户无需运行 `npm install`。
+选择 `sentinel-0.1.1/package`，不要选择 `.tgz` 文件。目录安装可能使用 link，安装后需要保留目录。本包没有 npm 运行依赖或安装脚本，普通用户无需运行 `npm install`。
 
 升级时保留旧目录，在另一空目录解压新版本，再通过 DSH 安装入口升级。安装器要求重开或已确认模块缓存仍旧时，先核对运行任务和未保存输入，再正常关闭并重开同一配置；仅看到版本号改变不能证明新模块已加载。
 

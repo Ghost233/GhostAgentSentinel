@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, resolve, dirname, delimiter } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = resolve(fileURLToPath(new URL('../', import.meta.url)))
@@ -11,13 +11,14 @@ const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 const expected = JSON.parse(await readFile(join(root, '.github/release-manifest.json'), 'utf8'))
 assert.equal(process.env.RELEASE_TAG || `v${manifest.version}`, `v${manifest.version}`, 'tag and package version must agree')
 assert.equal(expected.version, manifest.version)
+assert.equal(process.version, expected.build.node, 'release build requires the pinned Node.js runtime')
 const destination = resolve(process.argv[2] || 'release-assets')
 assert.notEqual(destination, root, 'release assets require a separate directory')
 await mkdir(destination, { recursive: true })
 const temporary = await mkdtemp(join(tmpdir(), 'sentinel-release-check-'))
 const sha = value => createHash('sha256').update(value).digest('hex')
 try {
-  const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--offline', '--no-audit', '--no-fund', '--cache', join(temporary, 'cache'), '--pack-destination', destination], { cwd: root, encoding: 'utf8' }))
+  const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--offline', '--no-audit', '--no-fund', '--cache', join(temporary, 'cache'), '--pack-destination', destination], { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH || ''}` } }))
   assert.equal(pack.filename, `${manifest.name}-${manifest.version}.tgz`)
   assert.deepEqual(pack.files.map(file => file.path).sort(), Object.keys(expected.files).sort(), 'packed file list must match the release manifest')
   const archive = await readFile(join(destination, pack.filename))

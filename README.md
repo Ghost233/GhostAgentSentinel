@@ -1,10 +1,10 @@
 # GhostAgentSentinel
 
-面向 AI agent 的本机只读执行监控工具。v0.1.0 提供共享核心与 DSH 适配器，观察已接入后台中的主代理及多级子代理；Codex 适配器留待后续版本。
+面向 AI agent 的本机只读执行监控工具。v0.1.1 提供共享核心与 DSH 适配器，观察已接入后台中的主代理及多级子代理；Codex 适配器留待后续版本。
 
 ## 安装
 
-从 [v0.1.0 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases/tag/v0.1.0) 下载 `ghost-agent-sentinel-0.1.0.tgz`，解压到长期保留的目录。在 DSH 的“插件 → 安装第三方插件”中选择解压后的 `package` 目录，安装并启用 `ghost-agent-sentinel`。
+从 [v0.1.1 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases/tag/v0.1.1) 下载 `ghost-agent-sentinel-0.1.1.tgz`，解压到长期保留的目录。在 DSH 的“插件 → 安装第三方插件”中选择解压后的 `package` 目录，安装并启用 `ghost-agent-sentinel`。
 
 运行需要支持 Node.js 22.13 或更新版本及 `node:sqlite` 的 DSH Host。插件使用宿主提供的 DSH SDK 和 React，没有 npm 运行依赖或安装脚本。完整多级历史补采和父代理等待识别依赖宿主能力，见 [安装说明与兼容性](docs/installation.md)。
 
