@@ -1,0 +1,10 @@
+{
+  "purpose": "Frozen pre-multilevel Sentinel core used only by the legacy compatibility regression test. Runtime package does not contain this fixture.",
+  "files": {
+    "core/index.mjs": "aeaf4be208d03f72f3af7356e0d0358ffa6d3a444d2683c31fc48eb0ca650dfc",
+    "analysis/index.mjs": "28f2ebd8ee922bddb8c02c1d1fae49220190d2b16c354f56858e7b9e6dffe590",
+    "analysis/http.mjs": "1f7fd0228211023298bc87866fea44aa4fc5e9a543da13d8e25a09717fe28848",
+    "enrollment-config.mjs": "9b7c7836e9eb3905c0ef97365fbe1d30537682ad0806a876ced3547c175ceeb3",
+    "privacy.mjs": "82bb8e6c661414e02d68f608d4c78915c365c02ad87add4d5dec2ba137b69972"
+  }
+}

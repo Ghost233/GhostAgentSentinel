@@ -1,0 +1,4 @@
+- insert:
+    - id: ghost-agent-sentinel
+      name: ghost-agent-sentinel
+      config: {}

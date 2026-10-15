@@ -1,0 +1,29 @@
+name: Release validation
+on:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: read
+jobs:
+  package:
+    name: Build and verify release package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.9.0'
+          cache: npm
+      - name: Match the release build toolchain
+        run: npm install --global npm@11.19.1 --ignore-scripts --no-audit --no-fund
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build and validate tagged package
+        run: npm run release:check -- release-assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: release-assets/
+          if-no-files-found: error

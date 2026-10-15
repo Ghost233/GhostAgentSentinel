@@ -1,0 +1,23 @@
+{
+  "name": "ghost-agent-sentinel",
+  "version": "0.1.0",
+  "description": "Local read-only DSH task monitoring with an independent shared core",
+  "private": true,
+  "type": "module",
+  "main": "dsh/host.mjs",
+  "exports": { ".": "./dsh/host.mjs", "./client": "./dsh/client.js", "./package.json": "./package.json" },
+  "bin": { "ghost-agent-sentinel": "src/daemon.mjs" },
+  "files": ["src", "dsh", "docs/installation.md", "docs/development-contract.md", "docs/release-status.md", "docs/release-notes.md", "README.md", "GLOSSARY.md"],
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "release:check": "node scripts/check-release.mjs",
+    "check": "node scripts/check.mjs && node scripts/check-dsh-package.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:resources": "node --expose-gc --test test/resource-pressure.test.mjs test/process-resources.test.mjs test/core-resources.test.mjs test/core-physical-admission.test.mjs test/core-bounded-retention.test.mjs test/core-transport-process-resources.test.mjs test/server-resources.test.mjs test/transport-resources.test.mjs test/dsh-resource-collector.test.mjs test/dsh-resource-adapter.test.mjs test/dsh-client.test.mjs"
+  },
+  "dsh": {
+    "bundle": { "patch": "./dsh/cordis.patch.yml" },
+    "client": { "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right", "@deepseek-ai/dsh-client-ui-conversation"], "platform": "web", "immediately": true }
+  },
+  "license": "UNLICENSED"
+}

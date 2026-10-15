@@ -1,0 +1,14 @@
+node_modules/
+.runtime/
+coverage/
+*.tgz
+
+/.scratch/
+/.pnpm-store/
+/.codex/config.toml
+/probes/*
+!/probes/modeldeck/
+/probes/modeldeck/*
+!/probes/modeldeck/quality-cases.mjs
+
+/release-assets/
