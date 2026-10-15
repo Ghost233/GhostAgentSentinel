@@ -1,5 +1,6 @@
 export const PROTOCOL = 1
 export const GS_SUMMARY_FEATURE = 'gs-summary/1'
+export const SOURCE_OBSERVATION_FEATURE = 'source-observation/1'
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000
 const kinds = new Set(['input', 'output', 'tool-start', 'tool-result', 'status', 'gap'])
 const statuses = new Set(['running', 'idle', 'disposed', 'unknown'])
@@ -25,6 +26,10 @@ function time(value, field) {
 export function normalizeSource(value) {
   const input = object(value, 'source')
   const result = { registrationId: string(input.registrationId, 'registrationId'), hostRunId: string(input.hostRunId, 'hostRunId'), name: string(input.name, 'name') }
+  if (input.mode !== undefined) {
+    if (input.mode !== 'observation-only') throw new Error('unsupported source observation mode')
+    result.mode = input.mode
+  }
   if (input.profile !== undefined) result.profile = string(input.profile, 'profile', 2000)
   if (input.enroll !== undefined) {
     if (typeof input.enroll !== 'boolean') throw new Error('enroll must be boolean')

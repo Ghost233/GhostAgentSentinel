@@ -90,6 +90,7 @@ export function gsStatus(task, source, current, descendantWait = null) {
   const base = { silence: { ...silence, exempt: Boolean(waiting) }, waiting, coverage }
   if (!active) return { light: null, label: task.status === 'unknown' ? '状态未知' : '已结束', reason: '不计入活动执行节点', ...base }
   if (source.status !== 'connected') return { light: 'gray', label: '不可判断', reason: '来源失联；不能把缺失消息当作原代理静默', ...base }
+  if (source.descriptor?.mode === 'observation-only') return { light: 'gray', label: '只读观察', reason: '仅提供执行观察；语义分析尚未接入', ...base, waiting: null }
   const alerts = task.alerts.filter(alert => alert.status === 'attention' && !waitExempts(alert, waiting, scope))
   if (alerts.length) return { light: 'red', label: '需要关注', reason: alerts.map(alert => alert.reason).join('；'), ...base }
   const activation = source.hierarchyContext?.activations.find(item => item.taskId === task.id && item.lifecycleId === task.lifecycleId)
