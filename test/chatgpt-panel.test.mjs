@@ -60,6 +60,69 @@ test('the real panel script accepts grounded material issues and places small li
   assert.match(page.element('#coverage').textContent, /分叉.*1/)
 })
 
+test('the current-chat pause button uses its displayed identity and revision and keeps collection visible', async t => {
+  const page = await harness(t)
+  const view = material('main-a')
+  view.monitoring = { registrationId: 'chatgpt:installation', taskId: 'main-a', paused: false, revision: 'revision-a' }
+  await page.deliver(view)
+  const button = page.element('#pause')
+  assert.equal(button.hidden, false)
+  assert.equal(button.textContent, '暂停本聊天分析')
+  const operation = button.onclick()
+  await page.flush()
+  assert.equal(button.disabled, true)
+  const sent = page.sent.findLast(row => row.method === 'tools/call')
+  assert.equal(sent.params.name, 'sentinel_set_chat_analysis')
+  assert.equal(sent.params.arguments.expectedThreadId, 'main-a')
+  assert.equal(sent.params.arguments.revision, 'revision-a')
+  assert.equal(sent.params.arguments.paused, true)
+  const paused = { ...view, monitoring: { ...view.monitoring, paused: true, revision: 'revision-b' }, analysis: { ...view.analysis, state: 'paused' } }
+  page.reply(sent.id, { structuredContent: paused })
+  await operation
+  assert.equal(button.textContent, '恢复本聊天分析')
+  assert.equal(button.disabled, false)
+  assert.match(page.element('#summary').textContent, /本聊天分析已暂停/)
+  assert.match(page.element('#analysis').textContent, /继续采集/)
+  assert.match(page.element('#identity').textContent, /main-a/)
+  assert.equal([...page.timers.values()].filter(value => value.delay === 1500).length, 1)
+})
+
+test('a pause response from the previous chat cannot overwrite the new chat or leave a control exposed', async t => {
+  const page = await harness(t), view = material('main-a')
+  view.monitoring = { registrationId: 'chatgpt:installation', taskId: 'main-a', paused: false, revision: 'revision-a' }
+  await page.deliver(view)
+  const operation = page.element('#pause').onclick()
+  await page.flush()
+  const sent = page.sent.findLast(row => row.method === 'tools/call')
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed', params: {} } })
+  assert.equal(page.element('#pause').hidden, true)
+  page.reply(sent.id, { structuredContent: { ...view, monitoring: { ...view.monitoring, paused: true } } })
+  await operation
+  assert.equal(page.element('#identity').textContent, '')
+  assert.equal(page.element('#pause').hidden, true)
+  await page.refresh(); await page.deliver(result('main-b'))
+  assert.match(page.element('#identity').textContent, /main-b/)
+  assert.equal(page.element('#pause').hidden, true, 'a legacy observation-only view cannot write monitoring state')
+})
+
+test('the first settled monitoring failure is distinct from task findings and clears on chat switches', async t => {
+  const page = await harness(t), view = material('main-a', 'gray')
+  view.health = { state: 'failed', failures: [{ id: 'failure-a', domain: 'analysis', error: { code: 'invalid_json', stage: 'llm' } }] }
+  await page.deliver(view)
+  assert.match(page.element('#health').textContent, /监控故障.*分析.*invalid_json/)
+  assert.match(page.element('#issues').textContent, /用户只要求/)
+  assert.doesNotMatch(page.element('#health').textContent, /卡死|任务疑点/)
+  await page.refresh()
+  const priorGreen = { ...view, signal: 'green', analysis: { ...view.analysis, issues: [], checks: ids.map(id => ({ id, status: 'clear', reason: 'Previous result' })) } }
+  await page.deliver(priorGreen)
+  assert.match(page.element('#summary').textContent, /^⚪.*监控故障/)
+  await page.refresh()
+  await page.deliver({ ...view, health: { state: 'recovered', failures: [] } })
+  assert.match(page.element('#health').textContent, /监控已恢复/)
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed', params: {} } })
+  assert.equal(page.element('#health').textContent, '')
+})
+
 test('unknown or unconfigured results never masquerade as green while legitimate prior green can remain queued', async t => {
   const page = await harness(t)
   const unavailable = material('main-a', 'green')

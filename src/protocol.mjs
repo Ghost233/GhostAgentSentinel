@@ -2,10 +2,12 @@ export const PROTOCOL = 1
 export const GS_SUMMARY_FEATURE = 'gs-summary/1'
 export const SOURCE_OBSERVATION_FEATURE = 'source-observation/1'
 export const CHATGPT_MAIN_FEATURE = 'chatgpt-main/1'
+export const CONVERSATION_MONITORING_FEATURE = 'conversation-monitoring/1'
+export const MONITORING_FAILURES_FEATURE = 'monitoring-failures/1'
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000
 const kinds = new Set(['input', 'output', 'tool-start', 'tool-result', 'status', 'gap'])
 const statuses = new Set(['running', 'idle', 'disposed', 'unknown'])
-const dataStrings = ['callId', 'rootCallId', 'parentCallId', 'toolName', 'command', 'errorCode', 'sourceVersion', 'validationScope', 'status', 'cwd', 'resultSource', 'signal', 'refinesEventId', 'nativeType', 'childSessionId', 'runId', 'turnTrigger', 'inputOrigin', 'messageId', 'inputPhase', 'sourceKind', 'sourceForm', 'senderSessionId', 'approvalId', 'waitId']
+const dataStrings = ['callId', 'rootCallId', 'parentCallId', 'toolName', 'command', 'errorCode', 'sourceVersion', 'validationScope', 'status', 'cwd', 'resultSource', 'signal', 'refinesEventId', 'nativeType', 'childSessionId', 'runId', 'turnTrigger', 'inputOrigin', 'messageId', 'inputPhase', 'sourceKind', 'sourceForm', 'senderSessionId', 'approvalId', 'waitId', 'evidenceKind', 'forkThreadId', 'sourceThreadId', 'originRunId']
 
 function object(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${field} must be an object`)
@@ -22,6 +24,48 @@ function strings(value, field) {
 function time(value, field) {
   if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${field} must be an epoch millisecond integer`)
   return value
+}
+
+export function normalizeConversationMonitoring(value, control = false) {
+  const input = object(value, 'conversation monitoring')
+  const allowed = control ? ['registrationId', 'taskId', 'paused', 'revision'] : ['registrationId', 'taskId']
+  if (Object.keys(input).some(key => !allowed.includes(key))) throw new Error('unsupported conversation monitoring field')
+  const result = { registrationId: string(input.registrationId, 'registrationId'), taskId: string(input.taskId, 'taskId') }
+  if (control) {
+    if (typeof input.paused !== 'boolean') throw new Error('paused must be boolean')
+    result.paused = input.paused
+    result.revision = string(input.revision, 'revision', 100)
+  }
+  return result
+}
+
+export function normalizeFailureScope(value) {
+  const input = object(value, 'failure receipt scope')
+  if (Object.keys(input).some(key => !['sourceKey', 'mainId', 'lifecycleId', 'afterSequence', 'limit'].includes(key))) throw new Error('unsupported failure receipt scope field')
+  const result = { sourceKey: string(input.sourceKey, 'sourceKey', 256) }
+  for (const key of ['mainId', 'lifecycleId']) if (input[key] !== undefined) result[key] = input[key] === null ? null : string(input[key], key, 256)
+  if (input.afterSequence !== undefined) result.afterSequence = time(input.afterSequence, 'afterSequence')
+  if (input.limit !== undefined) {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100) throw new Error('failure receipt limit must be between 1 and 100')
+    result.limit = input.limit
+  }
+  return result
+}
+
+export function normalizeCollectionOutcome(value) {
+  const input = object(value, 'collection outcome')
+  if (Object.keys(input).some(key => !['sourceKey', 'mainId', 'lifecycleId', 'roundId', 'channel', 'outcome', 'settledAt', 'error'].includes(key))) throw new Error('unsupported collection outcome field')
+  if (!['failed', 'succeeded'].includes(input.outcome)) throw new Error('invalid collection outcome')
+  const result = { sourceKey: string(input.sourceKey, 'sourceKey', 256), roundId: string(input.roundId, 'roundId', 256), outcome: input.outcome, settledAt: time(input.settledAt, 'settledAt') }
+  for (const key of ['mainId', 'lifecycleId']) result[key] = input[key] === null ? null : string(input[key], key, 256)
+  if (result.mainId === null && result.lifecycleId !== null) throw new Error('collection lifecycle requires a main identity')
+  if (input.channel !== undefined) {
+    const channel = string(input.channel, 'channel', 200)
+    if (!/^(default|directory|main:[a-f0-9]{64})$/.test(channel)) throw new Error('invalid collection channel')
+    result.channel = channel
+  }
+  if (input.outcome === 'failed') result.error = input.error === undefined ? { code: 'collection_failed' } : object(input.error, 'collection error')
+  return result
 }
 
 export function normalizeSource(value) {
@@ -90,7 +134,7 @@ export function normalizeBatch(value) {
             event.data[key] = item.data[key]
           }
         }
-        if (item.data.inputSequence !== undefined) event.data.inputSequence = time(item.data.inputSequence, 'inputSequence')
+        for (const key of ['inputSequence', 'recordOrdinal', 'endOrdinalExclusive', 'endByteOffset']) if (item.data[key] !== undefined) event.data[key] = time(item.data[key], key)
         if (item.data.exitCode !== undefined && item.data.exitCode !== null) {
           if (!Number.isSafeInteger(item.data.exitCode)) throw new Error('exitCode must be integer')
           event.data.exitCode = item.data.exitCode

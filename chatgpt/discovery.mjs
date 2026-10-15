@@ -1,6 +1,7 @@
 import { isAbsolute, resolve, sep } from 'node:path'
 
 const LIMIT = 256, PAGE_SIZE = 50, PAGES_PER_REFRESH = 4, TTL = 86400000
+const metadataIoCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'EIO', 'ENOTDIR', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'])
 const counters = () => ({ main: 0, fork: 0, child: 0, remote: 0, cloud: 0, unknown: 0 })
 
 export function classifyThread(thread, sessionsRoot) {
@@ -19,11 +20,11 @@ export function classifyThread(thread, sessionsRoot) {
 
 export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
   const catalog = new Map()
-  let cursor = null, archived = false, closed = false, pending = null, directoryComplete = false, updatedAt = null, state = 'pending', gaps = [], pagesRead = 0
+  let cursor = null, archived = false, closed = false, pending = null, directoryComplete = false, updatedAt = null, state = 'pending', gaps = [], pagesRead = 0, error = null
   const coverage = () => {
     const counts = counters()
     for (const item of catalog.values()) counts[item.kind]++
-    return { state, complete: false, directoryComplete, updatedAt, counts, gaps: [...new Set([...gaps, 'all-local-execution-coverage-unverified', ...(counts.fork ? ['fork-coverage-pending'] : []), ...(counts.unknown ? ['unclassified-directory-entries'] : [])])] }
+    return { state, complete: false, directoryComplete, updatedAt, counts, gaps: [...new Set([...gaps, 'all-local-execution-coverage-unverified', ...(counts.fork ? ['fork-coverage-pending'] : []), ...(counts.unknown ? ['unclassified-directory-entries'] : [])])], ...(state === 'unavailable' && error ? { error: { ...error } } : {}) }
   }
   async function refresh() {
     if (closed) return coverage()
@@ -64,9 +65,9 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
           if (seenCursors.has(key)) { gaps.push('directory-cursor-repeated'); cursor = null; archived = false; break }
           seenCursors.add(key); cursor = next; archived = scope
         }
-        state = 'ready'; updatedAt = at
+        state = 'ready'; updatedAt = at; error = null
         if (cursor || archived) gaps.push('directory-page-budget')
-      } catch { state = 'unavailable'; gaps.push('directory-page-failed'); cursor = null; archived = false }
+      } catch (cause) { state = 'unavailable'; error = { code: metadataIoCodes.has(cause?.code) ? cause.code : 'metadata-unavailable' }; gaps.push('directory-page-failed'); cursor = null; archived = false }
       return coverage()
     })().finally(() => { pending = null })
     return pending
@@ -77,6 +78,6 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
     has: id => catalog.has(id),
     kind: id => catalog.get(id)?.kind ?? null,
     diagnostics: () => ({ directoryEntries: catalog.size, directoryPending: pending ? 1 : 0, directoryPages: pagesRead, directoryCursor: cursor || archived ? 1 : 0 }),
-    async close() { closed = true; await pending; catalog.clear(); cursor = null; archived = false; pagesRead = 0; gaps = []; state = 'closed' },
+    async close() { closed = true; await pending; catalog.clear(); cursor = null; archived = false; pagesRead = 0; gaps = []; error = null; state = 'closed' },
   }
 }

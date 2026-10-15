@@ -32,12 +32,42 @@ export function createInstructionLookup(context, sourceTasks, sourceEvents, now,
   return { tasks, events, parents, validUntil, sourcePolicy }
 }
 
+// Extra originRefs preserve fork user context only. They never participate in
+// verifiedUserEntry: the current request still needs its own non-history run.
+export function verifiedForkContext(binding, { tasks, events, sourcePolicy }) {
+  const inheritedEvents = [], gaps = []
+  if (sourcePolicy !== 'chatgpt-main/1' || !binding) return { inheritedEvents, gaps, valid: true }
+  const owner = tasks.get(key(binding.taskId, binding.lifecycleId))
+  const originals = binding.originRefs.map(reference => events.get(referenceKey(reference))).filter(Boolean)
+  const history = originals.filter(event => event.data?.history === true || event.data?.inherited === true)
+  const boundaries = history.filter(event => event.data?.evidenceKind === 'fork-boundary')
+  // Retained history may belong to an earlier observation container of this
+  // same fork. Its native origin run remains independent of both containers.
+  const own = event => event.taskId === binding.taskId && tasks.has(key(event.taskId, event.taskLifecycleId)) && event.data?.runId === event.taskLifecycleId && event.data?.forkThreadId === owner?.id && event.data?.history === true && event.data?.inherited === true
+  const native = event => own(event) && event.data?.sourceKind === 'chatgpt-native'
+  const ordinal = value => Number.isSafeInteger(value) && value >= 0
+  if (boundaries.some(event => !native(event) || event.kind !== 'status' || event.data.nativeType !== 'session_meta' || event.data.sourceForm !== 'session_meta/history_base' || !event.data.sourceThreadId || event.data.sourceThreadId === owner?.id || !ordinal(event.data.endOrdinalExclusive) || !ordinal(event.data.endByteOffset) || event.data.endByteOffset === 0)) return { inheritedEvents, gaps: ['fork_boundary_origin_missing'], valid: false }
+  for (const input of history.filter(event => event.kind === 'input')) {
+    const data = input.data
+    const boundary = boundaries.find(event => event.data.sourceThreadId === data.sourceThreadId && ordinal(data.recordOrdinal) && data.recordOrdinal < event.data.endOrdinalExclusive)
+    const start = history.find(event => native(event) && event.kind === 'status' && event.data?.nativeType === 'task_started' && event.data.sourceForm === 'event_msg' && ['composer', 'edit_user_message'].includes(event.data.turnTrigger) && event.data.sourceThreadId === data.sourceThreadId && event.data.originRunId === data.originRunId && ordinal(event.data.recordOrdinal) && event.data.recordOrdinal < data.recordOrdinal)
+    if (!native(input) || data.nativeType !== 'item_completed/UserMessage' || data.sourceForm !== 'event_msg/item_completed' || data.inputOrigin !== 'user-entry' || data.inputPhase !== 'consumed' || !data.messageId || !data.originRunId || data.originRunId === binding.lifecycleId || data.senderSessionId || !boundary || !start) return { inheritedEvents: [], gaps: ['fork_user_origin_missing'], valid: false }
+    if (!input.text?.trim() || data.truncated || data.redacted) { gaps.push('fork_user_context_excerpt_missing'); continue }
+    inheritedEvents.push({ ...input, authorizationEligible: true, contextRole: 'user-limit', sourceRef: eventRef(input) })
+  }
+  if (boundaries.length && !inheritedEvents.length) gaps.push('fork_user_context_unconfirmed')
+  return { inheritedEvents, gaps: [...new Set(gaps)], valid: true }
+}
+
 export function instructionContext(task, context, sourceTasks, sourceEvents, now, lookup = createInstructionLookup(context, sourceTasks, sourceEvents, now)) {
   const { tasks, events, parents, sourcePolicy } = lookup
   const bindings = context.instructionBindings.filter(item => item.taskId === task.id && item.lifecycleId === task.lifecycleId)
   const eligible = event => bindings.some(binding => binding.inputRef.eventId === event.id && verifiedUserEntry(binding, event, { tasks, events, parents, sourcePolicy }))
   const binding = bindings.find(item => item.phase === 'consumed' && item.inputRef.eventId === task.requestId)
   const gaps = [], inheritedEvents = []
+  const forkContext = verifiedForkContext(binding, lookup)
+  inheritedEvents.push(...forkContext.inheritedEvents)
+  gaps.push(...forkContext.gaps)
   if (parents.has(task.sessionId) && !binding) gaps.push('delegated_instruction_missing')
   const ancestors = new Set()
   for (let ancestor = parents.get(task.sessionId); ancestor; ancestor = parents.get(ancestor)) ancestors.add(ancestor)

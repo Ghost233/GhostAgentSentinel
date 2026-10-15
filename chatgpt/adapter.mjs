@@ -1,14 +1,22 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BoundedReader, supportedProfile } from './bounded-reader.mjs'
 import { startPanelServer } from './panel-server.mjs'
 import { loadCursor, saveCursor } from './cursor-store.mjs'
 import { classifyThread, createDiscovery } from './discovery.mjs'
+import { openHealthOutbox } from './health-outbox.mjs'
+import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const profileKey = value => JSON.stringify([value?.appVersion, value?.appBuild, value?.cliVersion])
 const phaseStatus = phase => phase === 'started' ? 'running' : ['completed', 'aborted'].includes(phase) ? 'idle' : 'unknown'
+const collectionFailures = new Set(['record-source-unavailable', 'record-identity-changed', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'cursor-anchor-changed', 'record-malformed-or-over-limit', 'invalid-lifecycle-record', 'cursor-invalid', 'cursor-retains-gap', 'unsupported-record-type', 'unsupported-event-type'])
+const combineHealth = (...values) => {
+  const failed = values.filter(value => value?.state === 'failed')
+  const failures = new Map(failed.flatMap(value => value.failures ?? []).map(failure => [failure.id ?? JSON.stringify([failure.domain, failure.channel, failure.roundId, failure.error]), failure]))
+  return { state: failed.length ? 'failed' : values.some(value => value?.state === 'recovered') ? 'recovered' : 'unknown', failures: [...failures.values()].slice(0, 6) }
+}
 const lifecycleGapView = (reason, threadId = null) => ({ identity: { threadId }, signal: 'gray', summary: '无法确认当前观察', observation: { phase: 'unknown', status: 'unknown', gap: reason }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
 
 function requestIdentity(meta) {
@@ -48,7 +56,9 @@ function materialContext(snapshot, sourceKey, batch) {
 function materialView(view, task) {
   const states = { queued: '检查排队中', analyzing: '正在检查', unavailable: '本地摘取模型或 JEV 未配置', failed: '本轮分析失败', unknown: '当前请求或分析证据不足', cooldown: '本轮六项检查已更新', idle: '最近检查结果' }
   const issues = task.alerts.filter(alert => alert.status === 'attention').map(alert => ({ checkId: alert.checkId, reason: alert.reason.slice(0, 240), evidence: (alert.evidenceIds ?? []).map(id => task.events.find(event => event.id === id)).filter(Boolean).slice(0, 2).map(event => ({ text: event.text.slice(0, 120), reference: event.evidence ?? event.id })) }))
-  return { ...view, signal: task.gs?.light ?? 'gray', summary: (task.currentRequest ? task.gs?.reason ?? view.summary : '当前用户请求尚未核实，检查结论不可判断').slice(0, 240),
+  return { ...view, signal: task.conversationMonitoring?.paused ? 'gray' : task.gs?.light ?? 'gray', summary: (task.conversationMonitoring?.paused ? '本聊天分析已暂停，继续只读采集' : task.currentRequest ? task.gs?.reason ?? view.summary : '当前用户请求尚未核实，检查结论不可判断').slice(0, 240),
+    ...(task.conversationMonitoring ? { monitoring: task.conversationMonitoring } : {}),
+    health: task.monitoringHealth,
     observation: { ...view.observation, gap: view.observation.gap ?? (!task.currentRequest ? 'current-user-request-unverified' : null) },
     analysis: { connected: true, state: task.analysis.state, summary: states[task.analysis.state] ?? '本轮尚无有效检查结论', checks: task.analysis.checks, issues,
       resultDisposition: task.analysis.resultDisposition, waitMs: task.analysis.waitMs, lagMs: task.analysis.lagMs, error: task.analysis.error, coverage: task.analysis.coverage ?? task.coverage } }
@@ -62,17 +72,43 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
   if (typeof collectMaterials !== 'boolean') throw new Error('invalid material collection mode')
   const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
   await mkdir(join(dataDir, 'cursors'), { recursive: true, mode: 0o700 })
+  const healthOutbox = collectMaterials ? await openHealthOutbox({ dataDir, now }) : null
   let closed = false, timer = null, refreshPending = null, source = null, sourceEpoch = 0, registration = null
+  let sourceHealth = null, outboxError = null
   const threads = new Map(), operations = new Set()
   const discovery = createDiscovery({ native, sessionsRoot, now })
   let queue = Promise.resolve(), queuedBatches = 0, rotation = 0
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
   const capability = async () => { const features = (await core.health()).features ?? []; return features.includes('source-observation/1') && (!collectMaterials || features.includes('chatgpt-main/1') && features.includes('hierarchy-context/1')) }
 
+  async function collectionOutcome(entry, outcome, error, roundId, channel = entry ? 'main:' + fingerprint(entry.id) : 'directory') {
+    if (!healthOutbox || !source || closed) return
+    const scope = entry?.lifecycleVerified && entry.hostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: entry.lifecycleId } : { mainId: null, lifecycleId: null }
+    const value = { sourceKey: source.key, ...scope, channel, roundId, outcome, settledAt: now(), ...(error ? { error: failureErrorInfo({ code: error.code ?? 'collection_failed', stage: error.stage ?? 'collection', status: error.status, details: error.details }) } : {}) }
+    try {
+      healthOutbox.push(value)
+      if (entry && outcome === 'succeeded' && scope.mainId !== null) healthOutbox.push({ ...value, mainId: null, lifecycleId: null })
+      if (healthOutbox.diagnostics().pending < 256) outboxError = null
+    } catch (failure) { outboxError = { state: 'failed', failures: [{ domain: 'collection', error: failureErrorInfo(failure) }] } }
+    if (typeof core.recordCollectionOutcome === 'function') await healthOutbox.flush(value => core.recordCollectionOutcome(value))
+  }
+  async function updateHealth(entry = null) {
+    if (!healthOutbox || !source || closed) return
+    const owner = source, epoch = sourceEpoch, key = owner.key
+    const snapshot = await core.snapshot().catch(() => null)
+    if (closed || epoch !== sourceEpoch || source !== owner) return
+    sourceHealth = combineHealth(snapshot?.sources.find(value => value.key === key)?.monitoringHealth, healthOutbox.health({ sourceKey: key, mainId: null, lifecycleId: null }), outboxError)
+    if (entry) {
+      const task = snapshot?.tasks.find(task => task.sourceKey === key && task.id === entry.id && task.lifecycleId === entry.lifecycleId)
+      entry.health = combineHealth(task?.monitoringHealth, entry.lifecycleId ? healthOutbox.health({ sourceKey: key, mainId: entry.id, lifecycleId: entry.lifecycleId }) : null)
+      entry.view.health = combineHealth(entry.health, sourceHealth)
+    }
+  }
+
   async function stop(entry, reason, revokeTask = true) {
     entry.generation++
     const reader = entry.reader
-    entry.reader = null; entry.view = gapView(reason)
+    entry.reader = null; entry.view = { ...gapView(reason), ...(entry.health ? { health: entry.health } : {}) }
     await reader?.close()
     if (revokeTask && source && entry.lifecycleId && entry.hostRunId === source.hostRunId) {
       await core.ingest(source.key, { tasks: [{ id: entry.id, sessionId: entry.id, lifecycleId: entry.lifecycleId, title: 'ChatGPT 主会话', status: 'unknown', gaps: [reason] }] })
@@ -83,6 +119,7 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
     sourceEpoch++
     const previous = source
     source = null
+    if (reason !== 'observation-unavailable') { sourceHealth = null; outboxError = null; for (const entry of threads.values()) entry.health = null }
     await Promise.all([...threads.values()].map(entry => stop(entry, reason, false)))
     for (const [id, entry] of threads) if (!entry.lifecycleId && !entry.blocked) threads.delete(id)
     if (previous) await core.unregisterSource(previous.key, reason)
@@ -132,6 +169,7 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
   }
 
   async function prepare(entry, context, epoch) {
+    const roundId = randomUUID()
     try {
       const before = await qualify(entry.id, entry.reader?.source, context)
       if (before.gap) { await fail(entry, before.gap, before.scope); return null }
@@ -143,18 +181,20 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
       if (closed || epoch !== sourceEpoch) return null
       if (!entry.reader) {
         let cursor = null
-        try { cursor = await loadCursor(join(dataDir, 'cursors', entry.cursorKey + '.json')) } catch (error) { await stop(entry, error.code ?? 'cursor-unavailable'); return null }
+        try { cursor = await loadCursor(join(dataDir, 'cursors', entry.cursorKey + '.json')) } catch (error) { await collectionOutcome(entry, 'failed', error, roundId); await stop(entry, error.code ?? 'cursor-unavailable'); await updateHealth(entry); return null }
         if (cursor) { entry.captured = new Map(cursor.captures.map(item => [item.offset, item.capturedAt])); entry.captureThroughOffset = cursor.captureThroughOffset }
         entry.reader = new BoundedReader(before.source, cursor?.reader, { mode: collectMaterials ? 'material' : 'metadata' })
       }
       if (closed) return null
       const previousCheckpoint = entry.reader.checkpoint(), observed = await entry.reader.pump()
       if (observed.coverage === 'gap') {
+        const code = observed.gap?.split(':')[0]
+        if (observed.error || collectionFailures.has(code)) await collectionOutcome(entry, 'failed', observed.error ?? { code }, roundId)
         if (['start-predates-host', 'host-start-time-overlap'].includes(observed.gap)) entry.blocked = { scope: fingerprint(before.source), reason: observed.gap }
-        await fail(entry, observed.gap); return null
+        await fail(entry, observed.gap); await updateHealth(entry); return null
       }
-      return { source: before.source, previousCheckpoint, observed, epoch, generation }
-    } catch { await stop(entry, 'observation-unavailable').catch(() => {}); return null }
+      return { source: before.source, previousCheckpoint, observed, epoch, generation, roundId }
+    } catch (error) { await collectionOutcome(entry, 'failed', error, roundId); await stop(entry, 'observation-unavailable').catch(() => {}); await updateHealth(entry); return null }
   }
 
   async function publish(entry, prepared) {
@@ -165,7 +205,8 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
       const phase = observed.effectivePhase, lifecycleId = observed.observed.turnId ?? 'unobserved:' + prepared.source.hostRunId
       const status = phaseStatus(phase)
       const previousLifecycle = entry.lifecycleId, previousPhase = entry.view.observation.phase
-      entry.lifecycleId = lifecycleId; entry.hostRunId = prepared.source.hostRunId
+      entry.lifecycleId = lifecycleId; entry.lifecycleVerified = observed.observed.anchored === true; entry.hostRunId = prepared.source.hostRunId; entry.sourceKey = connection.key
+      if (previousLifecycle !== lifecycleId) entry.health = null
       const lifecycleEvents = collectMaterials ? observed.recentLifecycle : observed.recentLifecycle.filter(event => event.turnId === lifecycleId)
       const materials = collectMaterials ? observed.materials : []
       for (const event of [...lifecycleEvents, ...materials].sort((a, b) => a.recordStart - b.recordStart)) if (!entry.captured.has(event.recordStart)) {
@@ -203,6 +244,7 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
       await core.ingest(connection.key, batch)
       if (closed || epoch !== sourceEpoch || generation !== entry.generation) { await stop(entry, 'observation-superseded'); return entry.view }
       await saveCursor(target, checkpoint, entry.captured, entry.captureThroughOffset)
+      await collectionOutcome(entry, 'succeeded', null, prepared.roundId)
       const snapshot = await core.snapshot()
       if (closed) return gapView('adapter-closed')
       if (epoch !== sourceEpoch || generation !== entry.generation || source?.key !== connection.key) return entry.view
@@ -210,8 +252,13 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
       if (!task || !collectMaterials && task.analysis.state !== 'observation-only') { await stop(entry, 'core-capability-unconfirmed'); return entry.view }
       entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, gap: observed.gap, readBytes: observed.readBytes, observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
       if (collectMaterials) entry.view = materialView(entry.view, task)
+      if (healthOutbox) {
+        sourceHealth = combineHealth(snapshot.sources.find(value => value.key === connection.key)?.monitoringHealth, healthOutbox.health({ sourceKey: connection.key, mainId: null, lifecycleId: null }), outboxError)
+        entry.health = combineHealth(task.monitoringHealth, healthOutbox.health({ sourceKey: connection.key, mainId: entry.id, lifecycleId }))
+        entry.view.health = combineHealth(entry.health, sourceHealth)
+      }
       return entry.view
-    } catch { await stop(entry, 'observation-unavailable').catch(() => {}); return entry.view }
+    } catch (error) { await collectionOutcome(entry, 'failed', error, prepared.roundId); await stop(entry, 'observation-unavailable').catch(() => {}); await updateHealth(entry); return entry.view }
   }
 
   function rememberCapture(entry, offset) { const at = now(); if (!Number.isSafeInteger(at) || at < 0) throw new Error('invalid capture clock'); entry.captured.set(offset, at); if (entry.captured.size > 16) entry.captured.delete(entry.captured.keys().next().value); return at }
@@ -222,7 +269,10 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
     queue = pending.catch(() => {})
     return track(pending.finally(() => { queuedBatches-- }))
   }
-  function decorate(view) { return { ...view, discovery: { ...discovery.snapshot(), tracked: threads.size, connected: source ? 1 : 0, currentIncluded: Boolean(view.identity.threadId && threads.has(view.identity.threadId)) } } }
+  function decorate(view) {
+    const retained = healthOutbox?.diagnostics()
+    return { ...view, ...(healthOutbox ? { health: { ...combineHealth(view.health, sourceHealth, outboxError), historyGap: retained.rejected > 0 || retained.expired > 0 } } : {}), discovery: { ...discovery.snapshot(), tracked: threads.size, connected: source ? 1 : 0, currentIncluded: Boolean(view.identity.threadId && threads.has(view.identity.threadId)) } }
+  }
 
   async function collect(requested = [], discover = false) {
     const epoch = sourceEpoch
@@ -231,7 +281,13 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
       const host = await native.sampleHost(), user = await native.readEnablement(null)
       const gap = hostGap(host) ?? (user?.user !== 'enabled' || user?.effective !== 'enabled' ? user?.user === 'disabled' || user?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed' : null)
       if (gap) { await stopSource(gap); return }
-      if (discover) await discovery.refresh()
+      if (collectMaterials) await sourceFor(host, epoch)
+      if (discover) {
+        const roundId = randomUUID(), result = await discovery.refresh()
+        if (result.state === 'unavailable') await collectionOutcome(null, 'failed', result.error ?? { code: 'metadata-unavailable', stage: 'metadata' }, roundId)
+        else if (result.state === 'ready') await collectionOutcome(null, 'succeeded', null, roundId)
+        await updateHealth()
+      }
       if (closed || epoch !== sourceEpoch) return
       for (const [id, entry] of threads) {
         const kind = discovery.kind(id)
@@ -272,7 +328,7 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
         await publish(entry, value)
       }
       if (source && !closed && epoch === sourceEpoch) await core.heartbeat(source.key)
-    } catch { await stopSource('observation-unavailable').catch(() => {}) }
+    } catch (error) { await collectionOutcome(null, 'failed', error, randomUUID()); await updateHealth(); await stopSource('observation-unavailable').catch(() => {}) }
   }
   async function read(meta) {
     const id = requestIdentity(meta)
@@ -291,10 +347,27 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
     await pending
     return decorate(closed ? gapView('adapter-closed') : entry.view)
   }
+  async function control(meta, change) {
+    const id = requestIdentity(meta)
+    if (!id || id !== change.expectedThreadId) throw new Error('当前聊天身份已变化，请重新核对')
+    const pending = enqueue(async () => {
+      await collect([id])
+      const entry = threads.get(id)
+      if (closed || !source || !entry?.reader || entry.hostRunId !== source.hostRunId || entry.view.identity.threadId !== id) throw new Error('当前聊天的监控资格尚未确认')
+      if (!(await core.health()).features?.includes('conversation-monitoring/1')) throw new Error('共享核心尚不支持本聊天暂停')
+      await core.setConversationMonitoring({ registrationId: 'chatgpt:' + installationId, taskId: id, paused: change.paused, revision: change.revision })
+      await collect([id])
+      return decorate(closed ? gapView('adapter-closed') : entry.view)
+    })
+    if (!pending) throw new Error('会话检查正在收尾或队列已满')
+    return pending
+  }
   async function refresh() { if (closed) return; if (refreshPending) return refreshPending; const pending = enqueue(() => collect([], true)); if (!pending) return; refreshPending = pending.finally(() => { refreshPending = null }); return refreshPending }
-  const panel = await startPanelServer({ read, token, port })
+  let panel
+  try { panel = await startPanelServer({ read, ...(collectMaterials ? { control } : {}), token, port }) }
+  catch (error) { await healthOutbox?.close(); throw error }
   const schedule = () => { if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(); schedule() }, pollMs) }
   if (pollMs && typeof native.listThreads === 'function') void refresh()
   schedule()
-  return { url: panel.url, read, refresh, discovery: () => decorate(gapView('not-observed')).discovery, diagnostics: () => ({ closed, trackedThreads: threads.size, openReaders: [...threads.values()].filter(entry => entry.reader?.handle).length, pendingOperations: operations.size, refreshTimers: timer === null ? 0 : 1, queuedBatches, ...discovery.diagnostics(), ...panel.diagnostics() }), async close() { if (closed) return; closed = true; clearTimeout(timer); timer = null; const directoryClosing = discovery.close(); await native.close?.(); await panel.close(); await Promise.allSettled([...operations]); await directoryClosing; await stopSource('adapter-closed').catch(() => {}); threads.clear() } }
+  return { url: panel.url, read, refresh, discovery: () => decorate(gapView('not-observed')).discovery, diagnostics: () => ({ closed, trackedThreads: threads.size, openReaders: [...threads.values()].filter(entry => entry.reader?.handle).length, pendingOperations: operations.size, refreshTimers: timer === null ? 0 : 1, queuedBatches, ...(healthOutbox ? { healthOutbox: healthOutbox.diagnostics() } : {}), ...discovery.diagnostics(), ...panel.diagnostics() }), async close() { if (closed) return; closed = true; clearTimeout(timer); timer = null; const directoryClosing = discovery.close(); await native.close?.(); await panel.close(); await Promise.allSettled([...operations]); await directoryClosing; await stopSource('adapter-closed').catch(() => {}); threads.clear(); await healthOutbox?.close() } }
 }

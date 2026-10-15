@@ -79,4 +79,12 @@ chatgpt-main/1 健康能力及来源 policy 启用本机主聊天检查。未知
 
 ChatGPT 的纯静默和未结束工具只显示“等待原因未确认”及观察时长，不生成对应红色停滞告警。核心接收分析结果时也执行此限制，其它有独立依据的告警保留。DSH 的原等待规则不变。
 
-自动发现和原生材料的覆盖边界见 [开发候选说明](chatgpt-observation.md)。会话级持久暂停、分叉材料、可靠失败回执、历史面板和正式后台仍须后续实现及实机验收。
+conversation-monitoring/1 提供独立聊天控制。GET /v1/conversation/monitoring 查询 registrationId、taskId；POST 同路径接收 registrationId、taskId、paused、revision。设置按 registrationId 与原生 task.id 持久保存，最多 1000 个已控制范围；观察保留期不会解除手动暂停。相同目标状态幂等，过期的相反写入返回 409 conversation_monitoring_conflict。面板写控制只向 app 暴露，宿主会话身份与预期身份须一致，不新增查看入口。
+
+monitoring-failures/1 提供 GET /v1/monitoring/failures 补读及 POST /v1/monitoring/collection-outcome 采集结算。回执带 sourceKey、mainId、lifecycleId、channel、首次轮次、原时间和安全错误分类；初次身份未确认的采集使用显式 null 范围。目录与聊天读取的 channel 分开恢复。分析结算由核心持有，取消或未执行调用不制造失败。已断连但仍保留的 ChatGPT 来源可补报原时间的历史结算，不恢复来源或任务运行状态。
+
+任务的 monitoringHealth 按自身范围投影，来源的同名字段只包含身份未确认的来源级故障。当前状态从故障状态索引取得，不能用第一页历史回执推断是否仍失败。回执和状态各最多 1024 条，固定保留 24 小时；查询支持 afterSequence 与最多 100 条分页，裁剪通过 historyGap 表达。适配器最多 256 条结算 FIFO 只保存安全元数据，失败和恢复按原顺序补报。面板单独显示监控故障，原生通知由后续切片实现。
+
+history 或 inherited 材料保留为上下文，但不更新当前请求、任务状态、执行活动，也不作新验证。分叉历史的额外来源引用不放宽当前真人输入校验；完整物理读取接入仍待后续阶段。
+
+自动发现和原生材料的覆盖边界见 [开发候选说明](chatgpt-observation.md)。完整分叉、原生通知、历史面板和正式后台仍须后续实现及实机验收。
