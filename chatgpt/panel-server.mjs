@@ -4,8 +4,9 @@ import { readFile } from 'node:fs/promises'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
+import { z } from 'zod'
 
-export async function startPanelServer({ read, token, port = 0 }) {
+export async function startPanelServer({ read, control, token, port = 0 }) {
   if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) throw new Error('installation authentication is required')
   const html = await readFile(new URL('./panel.html', import.meta.url), 'utf8'), sockets = new Set(), cleanups = new Set()
   let closed = false, activeRequests = 0, transports = 0
@@ -27,6 +28,15 @@ export async function startPanelServer({ read, token, port = 0 }) {
       _meta: { ui: { resourceUri: uri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'thread' }] } },
     }, async (_args, extra) => {
       const view = await read(extra._meta)
+      return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
+    })
+    if (typeof control === 'function') registerAppTool(mcp, 'sentinel_set_chat_analysis', {
+      title: '设置本聊天分析', description: '仅暂停或恢复当前聊天的监控分析，继续只读采集。',
+      inputSchema: { paused: z.boolean(), expectedThreadId: z.string().min(1).max(128), revision: z.string().min(1).max(2000) },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+      _meta: { ui: { visibility: ['app'] } },
+    }, async (change, extra) => {
+      const view = await control(extra._meta, change)
       return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
     })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })

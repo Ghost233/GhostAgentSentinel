@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile, rename, chmod, rm, stat } from 'node:fs/pro
 import { join } from 'node:path'
 import { createCore } from './core/index.mjs'
 import { createAnalyzer } from './analysis/index.mjs'
-import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig } from './protocol.mjs'
+import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig } from './protocol.mjs'
 import { normalizeEnrollment } from './enrollment-config.mjs'
 import { HIERARCHY_FEATURE } from './hierarchy.mjs'
 import { GS_FEATURE } from './gs-status.mjs'
@@ -133,7 +133,25 @@ export async function startServer({ dataDir, onIdle, ...options }) {
     if (request.headers.host !== expectedHost || !authorized(request, token)) return send(401, { error: 'private connection required' })
     if (stopping) return send(503, { error: 'core shutting down' })
     try {
-      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: [HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE] })
+      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: [HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE] })
+      if (request.method === 'GET' && request.url.startsWith('/v1/monitoring/failures')) {
+        const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
+        if (url.pathname !== '/v1/monitoring/failures') return send(404, { error: 'unknown endpoint' })
+        if ([...params.keys()].some(key => params.getAll(key).length !== 1)) throw new Error('duplicate failure receipt query field')
+        const scope = Object.fromEntries(params)
+        for (const key of ['mainId', 'lifecycleId']) if (scope[key] === '') scope[key] = null
+        for (const key of ['afterSequence', 'limit']) if (scope[key] !== undefined) {
+          if (!/^\d+$/.test(scope[key])) throw new Error('invalid failure receipt query integer')
+          scope[key] = Number(scope[key])
+        }
+        return send(200, await core.failureReceipts(scope))
+      }
+      if (request.method === 'GET' && request.url.startsWith('/v1/conversation/monitoring')) {
+        const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
+        if (url.pathname !== '/v1/conversation/monitoring') return send(404, { error: 'unknown endpoint' })
+        if ([...params.keys()].length !== 2 || params.getAll('registrationId').length !== 1 || params.getAll('taskId').length !== 1) throw new Error('invalid conversation monitoring query')
+        return send(200, await core.conversationMonitoring(Object.fromEntries(params)))
+      }
       if (request.method === 'GET' && request.url.startsWith('/v1/gs/summary')) {
         const url = new URL(request.url, `http://${expectedHost}`)
         if (url.pathname !== '/v1/gs/summary') return send(404, { error: 'unknown endpoint' })
@@ -156,6 +174,8 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         case '/v1/source/unregister': result = await core.unregisterSource(identifier(body.sourceKey), typeof body.reason === 'string' ? body.reason.slice(0, 500) : 'adapter stopped'); break
         case '/v1/monitoring/pause': result = await core.pause(); break
         case '/v1/monitoring/resume': result = await core.resume(); break
+        case '/v1/monitoring/collection-outcome': result = await core.recordCollectionOutcome(body); break
+        case '/v1/conversation/monitoring': result = await core.setConversationMonitoring(body); break
         case '/v1/notifications/claim': counts.notificationClaims++; result = await core.claimNotifications(identifier(body.sourceKey)); break
         case '/v1/sources': result = await core.configureSources(normalizeEnrollment(body)); break
         case '/v1/notifications/ack': {
@@ -171,7 +191,7 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         default: return send(404, { error: 'unknown endpoint' })
       }
       send(200, result ?? null)
-    } catch (error) { send(['analysis_config_conflict', 'hierarchy_version_unsupported'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : error.code === 'analysis_config_unconfirmed' ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
+    } catch (error) { send(['analysis_config_conflict', 'hierarchy_version_unsupported', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : error.code === 'analysis_config_unconfirmed' ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
     } finally { counts.activeRequests--; await flushIdle() }
   })
   server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)) })

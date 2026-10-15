@@ -8,6 +8,8 @@
 <h1>Sentinel · 当前会话</h1>
 <p id="summary" role="status">⚪ 正在核对当前会话</p>
 <p id="analysis">当前分析不可判断</p>
+<p id="health" class="muted" role="status"></p>
+<button id="pause" type="button" hidden>暂停本聊天分析</button>
 <section id="issues" aria-label="需要关注的问题"></section>
 <details id="checks"><summary>六项检查</summary><div id="check-list"></div></details>
 <details id="diagnostics"><summary id="diagnostics-title">观察与覆盖</summary><p id="identity" class="muted"></p><p id="coverage" class="muted"></p><p id="observation" class="muted"></p><div id="gaps" class="muted"></div><p id="technical" class="muted"></p></details>
@@ -20,16 +22,23 @@ const element=id=>document.querySelector('#'+id);
 const text=(value,max=240)=>typeof value==='string'?value.trim().slice(0,max):'';
 const list=value=>Array.isArray(value)?value:[];
 const count=value=>Number.isSafeInteger(value)&&value>=0?String(value):'—';
-let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false,lastIdentity=null;
+let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false,lastIdentity=null,controlState=null;
 const pending=new Map();
 function reset(collapse=true){
-  for(const name of ['identity','coverage','observation','technical','error'])element(name).textContent='';
+  controlState=null;element('pause').hidden=true;element('pause').disabled=false;
+  for(const name of ['identity','coverage','observation','technical','error','health'])element(name).textContent='';
   for(const name of ['issues','check-list','gaps'])element(name).replaceChildren();
   element('analysis').textContent='当前分析不可判断';element('diagnostics-title').textContent='观察与覆盖';
   if(collapse){element('checks').open=false;element('diagnostics').open=false;}
 }
 function clearView(message){reset();lastIdentity=null;element('summary').textContent='⚪ '+message;element('summary').setAttribute('data-signal','gray');}
 function node(tag,value,className){const child=document.createElement(tag);if(value)child.textContent=value;if(className)child.className=className;return child;}
+function renderHealth(health){
+  if(health?.state==='failed'){
+    const reasons=list(health.failures).slice(0,3).map(failure=>(failure.domain==='collection'?'采集':'分析')+'失败'+(text(failure.error?.code,80)?'（'+text(failure.error.code,80)+'）':''));
+    element('health').textContent=(health.orderingGap?'监控曾有失败 · 恢复状态未确认 · ':'监控故障 · ')+(reasons.join('；')||'本轮监控不可用');
+  }else if(health?.state==='recovered')element('health').textContent='监控已恢复';
+}
 function stateLine(analysis){
   const parts=[states[analysis.state]??'分析状态未确认'];
   if(Number.isFinite(analysis.waitMs)&&analysis.waitMs>=1000)parts.push('排队 '+Math.floor(analysis.waitMs/1000)+' 秒');
@@ -41,19 +50,27 @@ function render(view){
   const identity=text(view.identity?.threadId,128);
   if(!identity){
     clearView('当前会话未确认');
-    const gaps=[...list(view.discovery?.gaps),view.observation?.gap].filter(value=>text(value));
+    const gaps=[...list(view.discovery?.gaps),view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
     for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
     if(gaps.length)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
+    renderHealth(view.health);
     return;
   }
   reset(identity!==lastIdentity);lastIdentity=identity;
   const analysis=view.analysis,byId=new Map(list(analysis.checks).filter(check=>check&&Object.hasOwn(labels,check.id)).map(check=>[check.id,check]));
   let signal=view.signal,summary=text(view.summary)||'当前状态不可判断';
-  const green=analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted'].includes(analysis.state)&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>{const check=byId.get(id);return check&&(check.status==='clear'||check.applicability?.state==='not-triggered');});
-  if(signal==='green'&&!green){signal='gray';summary=states[analysis.state]??'当前分析不可判断';}
+  const green=view.health?.state!=='failed'&&analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted'].includes(analysis.state)&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>{const check=byId.get(id);return check&&(check.status==='clear'||check.applicability?.state==='not-triggered');});
+  if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?(view.health.orderingGap?'监控恢复状态未确认':'监控故障，当前状态不可判断'):states[analysis.state]??'当前分析不可判断';}
   if(signal==='green'&&analysis.resultDisposition==='pending')summary='上轮正常 · 待分析';
   element('summary').textContent=lights[signal]+' '+summary;element('summary').setAttribute('data-signal',signal);
   element('analysis').textContent=stateLine(analysis);
+  renderHealth(view.health);
+  const monitoring=view.monitoring;
+  if(monitoring?.taskId===identity&&typeof monitoring.paused==='boolean'&&text(monitoring.revision,2000)){
+    controlState={taskId:identity,paused:monitoring.paused,revision:monitoring.revision};
+    element('pause').hidden=false;element('pause').textContent=monitoring.paused?'恢复本聊天分析':'暂停本聊天分析';
+    if(monitoring.paused){element('summary').textContent='⚪ 本聊天分析已暂停';element('summary').setAttribute('data-signal','gray');element('analysis').textContent='继续采集 · 仅手动恢复分析';}
+  }
   const references=[];
   for(const issue of list(analysis.issues).slice(0,6)){
     if(!issue||!text(issue.reason))continue;
@@ -82,7 +99,7 @@ function render(view){
   element('coverage').textContent=coverage.join('\n');
   const recordStates={'caught-up':'已追平','catching-up':'正在补读','partial-record':'等待记录写完',gap:'存在缺口'};
   element('observation').textContent='执行记录：'+(recordStates[view.observation?.coverage]??'尚未确认');
-  const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),view.observation?.gap].filter(value=>text(value));
+  const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
   for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
   if(gaps.length||discovery?.complete===false||analysis.coverage?.complete===false)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
   const technical=['分析状态：'+text(analysis.state,80)];
@@ -95,6 +112,19 @@ function request(method,params){return new Promise((resolve,reject)=>{const n=++
 function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/notifications/host-context-changed'){generation++;clearView('会话已变化，重新核对中');clearTimeout(timer);timer=null;if(ready&&!busy)void refresh();}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
 addEventListener('message',onMessage);
 async function refresh(){if(stopped||document.hidden||busy||!ready)return;busy=true;const g=generation;try{const response=await request('tools/call',{name:'sentinel_current_chat',arguments:{}});if(stopped||g!==generation)return;if(response.isError)throw new Error('当前检查读取失败');render(response.structuredContent);}catch(error){if(!stopped&&g===generation){clearView('本次读取失败，当前状态不可判断');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}}finally{busy=false;if(!stopped&&!document.hidden)timer=setTimeout(refresh,1500);}}
+async function setPaused(){
+  if(stopped||busy||!ready||!controlState)return;
+  const state=controlState,g=generation;clearTimeout(timer);timer=null;busy=true;element('pause').disabled=true;
+  try{
+    const response=await request('tools/call',{name:'sentinel_set_chat_analysis',arguments:{paused:!state.paused,expectedThreadId:state.taskId,revision:state.revision}});
+    if(stopped||g!==generation)return;
+    if(response.isError)throw new Error('本聊天暂停状态未确认');
+    if(response.structuredContent?.identity?.threadId!==state.taskId)throw new Error('当前聊天身份已变化');
+    render(response.structuredContent);
+  }catch(error){if(!stopped&&g===generation){clearView('本聊天暂停状态未确认');element('error').textContent='刷新后可重试';element('technical').textContent=text(error.message);}}
+  finally{busy=false;if(!stopped&&!document.hidden)timer=setTimeout(refresh,1500);}
+}
+element('pause').onclick=setPaused;
 function visibility(){clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void refresh();}
 function teardown(){stopped=true;generation++;clearTimeout(timer);timer=null;for(const p of pending.values()){clearTimeout(p.timeout);p.reject(new Error('页面已销毁'));}pending.clear();removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});

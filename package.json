@@ -13,7 +13,7 @@
     "release:check": "node scripts/check-release.mjs",
     "check": "node scripts/check.mjs && node scripts/check-dsh-package.mjs",
     "test": "node --test test/*.test.mjs",
-    "test:chatgpt": "node --test test/chatgpt-*.test.mjs test/core-chatgpt-*.test.mjs test/core-observation-mode.test.mjs",
+    "test:chatgpt": "node --test test/chatgpt-*.test.mjs test/core-chatgpt-*.test.mjs test/core-observation-mode.test.mjs test/core-projection-cost.test.mjs",
     "test:resources": "node --expose-gc --test test/resource-pressure.test.mjs test/process-resources.test.mjs test/core-resources.test.mjs test/core-physical-admission.test.mjs test/core-bounded-retention.test.mjs test/core-transport-process-resources.test.mjs test/server-resources.test.mjs test/transport-resources.test.mjs test/dsh-resource-collector.test.mjs test/dsh-resource-adapter.test.mjs test/dsh-client.test.mjs"
   },
   "dsh": {

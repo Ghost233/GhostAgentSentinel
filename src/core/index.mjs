@@ -9,16 +9,20 @@ import { createInstructionLookup, instructionContext, eventRef, referenceKey } f
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
 import { analysisTimeConditions } from '../analysis/index.mjs';
 import { inferenceFailureInfo } from '../analysis/failure-info.mjs';
+import { normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope } from '../protocol.mjs';
+import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
 
 const DAY = 24 * 60 * 60 * 1000;
 const CLAIM_MS = 60_000;
 const GROUP_MS = 3_000;
 const HIERARCHY_CAPTURE_LIMIT = 10_000;
+const CONVERSATION_MONITORING_LIMIT = 1_000;
 const HIERARCHY_CAPTURE_GAP = 'Hierarchy evidence identity retention budget exceeded';
 const CHECK_IDS = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait'];
 const copy = value => structuredClone(value);
 const identity = (...parts) => JSON.stringify(parts);
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const historical = event => event.data?.history === true || event.data?.inherited === true;
 const unknownChecks = (reason, judgmentState = 'insufficient') => CHECK_IDS.map(id => ({ id, status: 'unknown', judgmentState, applicability: { state: 'unknown', reason, evidenceIds: [] }, reason, evidenceIds: [] }));
 
 // This module owns monitoring state only. It never controls a source task or a model process.
@@ -37,12 +41,15 @@ export async function createCore({
   }
   const write = db.prepare('INSERT INTO records(collection,key,value) VALUES(?,?,?) ON CONFLICT(collection,key) DO UPDATE SET value=excluded.value');
   const remove = db.prepare('DELETE FROM records WHERE collection=? AND key=?');
+  const failureStore = createFailureReceipts({ db, now });
   const rows = db.prepare('SELECT collection,key,value FROM records').all();
   const sources = new Map();
   const tasks = new Map();
   const events = new Map();
   const notifications = new Map();
-  const collections = { sources, tasks, events, notifications };
+  const conversationSettings = new Map();
+  const conversationRevision = randomUUID();
+  const collections = { sources, tasks, events, notifications, conversationSettings };
   let paused = false;
   let enrollment = { entries: [], configuredAt: null, managed: false };
   for (const row of rows) {
@@ -90,6 +97,21 @@ export async function createCore({
   const liveIdentity = task => task.status === 'running' && task.baselineConfirmed && connected(sources.get(task.sourceKey));
   const usable = task => liveIdentity(task) && (!(sources.get(task.sourceKey)?.hierarchyContext || sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1') || task.requestId != null);
   const observationOnly = task => sources.get(task.sourceKey)?.descriptor.mode === 'observation-only';
+  const conversationFor = task => {
+    const source = sources.get(task.sourceKey);
+    if (source?.descriptor.policy !== 'chatgpt-main/1') return null;
+    const registrationId = source.descriptor.registrationId, taskId = task.id;
+    const setting = conversationSettings.get(identity(registrationId, taskId));
+    return { registrationId, taskId, paused: setting?.paused ?? false, revision: setting?.revision ?? fingerprint([conversationRevision, registrationId, taskId]) };
+  };
+  const conversationPaused = task => conversationFor(task)?.paused === true;
+  const conversationScope = value => {
+    const stored = conversationSettings.get(identity(value.registrationId, value.taskId));
+    if (stored) return { registrationId: stored.registrationId, taskId: stored.taskId, paused: stored.paused, revision: stored.revision };
+    const scoped = [...tasks.values()].find(task => task.id === value.taskId && sources.get(task.sourceKey)?.descriptor.registrationId === value.registrationId && sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1');
+    if (!scoped) throw new Error('Unknown ChatGPT conversation scope');
+    return conversationFor(scoped);
+  };
   const contextFor = (task, read) => {
     const owner = sources.get(task.sourceKey), context = owner?.hierarchyContext;
     if (!context) return null;
@@ -109,7 +131,7 @@ export async function createCore({
     });
   };
   const resultKeyFor = (task, context, read) => {
-    const coverage = coverageFor(task, read), input = { task: { id: task.id, lifecycleId: task.lifecycleId, status: task.status, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt }, source: sources.get(task.sourceKey)?.descriptor, events: publicEvents(task, context, read), coverage };
+    const coverage = coverageFor(task, read), input = { task: { id: task.id, lifecycleId: task.lifecycleId, status: task.status, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt }, source: sources.get(task.sourceKey)?.descriptor, events: publicEvents(task, context, read).filter(event => !historical(event)), coverage };
     return fingerprint([task.revision, resultScopeFor(task, read), typeof analyzer?.timeConditions === 'function' ? analyzer.timeConditions(input, now()) : analysisTimeConditions(input, now())]);
   };
   const resultScopeFor = (task, read) => {
@@ -157,7 +179,7 @@ export async function createCore({
   function cleanQueue() {
     for (let index = queue.length - 1; index >= 0; index--) {
       const task = tasks.get(queue[index]);
-      if (!paused && !closed && task && usable(task) && !observationOnly(task)) continue;
+      if (!paused && !closed && task && usable(task) && !observationOnly(task) && !conversationPaused(task)) continue;
       queued.delete(queue[index]);
       queue.splice(index, 1);
       if (task && task.analysis.queuedAt !== null) {
@@ -322,7 +344,7 @@ export async function createCore({
     const request = retained.findIndex(event => event.id === task.requestId && event.kind === 'input');
     const boundary = !connected(sources.get(task.sourceKey)) ? '来源失联，以下仅为历史观察：' : !task.baselineConfirmed ? '任务基线未知，以下仅为历史观察：' : task.status !== 'running' ? '任务当前不在运行或状态未知，以下仅为历史观察：' : !coverage.complete ? '观察覆盖不足，无法确认当前活动；最近观察：' : '';
     if (request < 0 || !task.currentRequest.trim()) return { summary: `${boundary}当前请求未知，无法确认当前活动`, observedAt: null, evidenceIds: [] };
-    const scope = retained.slice(request).filter(event => !event.data?.history), byId = new Map(scope.map(event => [event.id, event]));
+    const scope = retained.slice(request).filter(event => !historical(event)), byId = new Map(scope.map(event => [event.id, event]));
     const replacements = new Map(), refinements = new Set();
     const interrupted = event => event.data?.interrupted === true || event.data?.aborted === true || event.data?.timedOut === true || Boolean(event.data?.signal);
     for (const event of scope) {
@@ -355,7 +377,9 @@ export async function createCore({
   }
 
   function prune() {
-    const cutoff = now() - DAY;
+    const current = now();
+    failureStore.prune(current);
+    const cutoff = current - DAY;
     const expiredByTask = new Map();
     for (const event of events.values()) {
       if (event.capturedAt > cutoff) continue;
@@ -491,7 +515,7 @@ export async function createCore({
         save('sources', source);
         pendingPrunedSources.delete(source.key);
       }
-      if (!connected(source) && source.lastSeenAt <= cutoff && !Array.from(tasks.values()).some(task => task.sourceKey === source.key)) erase('sources', source.key);
+      if (!connected(source) && source.lastSeenAt <= cutoff && !Array.from(tasks.values()).some(task => task.sourceKey === source.key)) { failureStore.clearSource(source.key, current); erase('sources', source.key); }
     }
     if (expiredByTask.size > 0) db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   }
@@ -540,7 +564,7 @@ export async function createCore({
 
   function memberAlerts(member) {
     const task = tasks.get(member.taskKey);
-    if (!task || !usable(task) || paused || task.requestId !== member.requestId) return [];
+    if (!task || !usable(task) || paused || conversationPaused(task) || task.requestId !== member.requestId) return [];
     if (['stale', 'failed', 'interrupted', 'unknown'].includes(task.analysis.state) || task.analysis.checks.some(check => check.judgmentState === 'failed')) return [];
     const retained = new Set(taskEvents(task).map(event => event.id));
     const waiting = userWait(task, taskEvents(task), now());
@@ -665,7 +689,7 @@ export async function createCore({
       if (check.applicability && (!['triggered', 'not-triggered', 'unknown'].includes(check.applicability.state) || typeof check.applicability.reason !== 'string' || !Array.isArray(check.applicability.evidenceIds) || check.applicability.evidenceIds.some(id => !eventIds.has(id)) || check.applicability.state !== 'unknown' && check.applicability.evidenceIds.length === 0 || check.status === 'attention' && check.applicability.state !== 'triggered')) throw new Error('Analyzer returned invalid applicability evidence');
       if (check.recoveryFor !== undefined && (!round.input.task.activeAlerts?.some(alert => alert.id === check.recoveryFor && alert.checkId === check.id) || !Array.isArray(check.recoveryEvidenceIds) || !check.recoveryEvidenceIds.length || check.recoveryEvidenceIds.some(id => !check.evidenceIds.includes(id) || !round.input.events.some(event => event.id === id && event.kind === 'tool-result' && !event.data?.history && !event.data?.interrupted && !event.data?.aborted && !event.data?.timedOut && !event.data?.signal)))) throw new Error('Analyzer returned invalid recovery scope or result evidence');
       check.applicability ??= { state: check.status !== 'unknown' ? 'triggered' : 'unknown', reason: 'Legacy analyzer trigger coverage', evidenceIds: check.evidenceIds };
-      check.judgmentState = check.applicability.state === 'not-triggered' ? 'not-triggered' : check.status === 'unknown' ? 'insufficient' : check.status;
+      check.judgmentState = round.input.source.policy === 'chatgpt-main/1' && check.status === 'unknown' && check.judgmentState === 'failed' ? 'failed' : check.applicability.state === 'not-triggered' ? 'not-triggered' : check.status === 'unknown' ? 'insufficient' : check.status;
       if (round.input.source.policy === 'chatgpt-main/1' && check.id === 'long_wait' && check.status === 'attention') {
         check.status = 'unknown';
         check.judgmentState = 'insufficient';
@@ -691,7 +715,7 @@ export async function createCore({
     if (closed || active !== round || round.cancelled) return;
     active = null;
     const task = tasks.get(round.taskKey);
-    if (!task || !usable(task) || observationOnly(task) || task.requestId !== round.requestId) return;
+    if (!task || !usable(task) || observationOnly(task) || conversationPaused(task) || task.requestId !== round.requestId) return;
     if ([...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])].some(event => event.capturedAt <= now() - DAY)) {
       error = Object.assign(new Error('Analysis inputs expired before the response completed'), { code: 'evidence_expired' });
     }
@@ -727,6 +751,18 @@ export async function createCore({
       task.analysis.state = result.coverage?.dependencies?.length > 0 ? 'unavailable' : 'cooldown';
       updateAlerts(task, result, round.observedAt);
     }
+    const failedCheck = !error && sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' ? result.checks.find(check => check.judgmentState === 'failed') : null;
+    const settledError = error ?? failedCheck?.error ?? (failedCheck ? { code: 'analysis_failed' } : null);
+    if (failedCheck) {
+      task.resultKey = null; task.resultScope = null;
+      task.analysis.state = 'failed';
+      task.analysis.error = { ...failureErrorInfo(settledError), message: 'One or more analysis checks failed' };
+    }
+    if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' && (error || !result.coverage?.dependencies?.length)) failureStore.settle({
+      sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId, roundId: round.id,
+      domain: 'analysis', outcome: settledError ? 'failed' : 'succeeded', attempted: true, settled: true,
+      settledAt: completedAt, error: settledError,
+    });
     save('tasks', task);
     tick();
   }
@@ -737,13 +773,14 @@ export async function createCore({
       const key = queue.shift();
       queued.delete(key);
       const task = tasks.get(key);
-      if (!task || !usable(task) || observationOnly(task)) continue;
+      if (!task || !usable(task) || observationOnly(task) || conversationPaused(task)) continue;
       if (now() < (task.analysis.nextEligibleAt ?? 0)) continue;
-      const capturedEvents = publicEvents(task);
+      const capturedEvents = publicEvents(task).filter(event => !historical(event));
       const instruction = contextFor(task);
       const roundContext = instruction && copy({ binding: instruction.binding, inheritedEvents: instruction.inheritedEvents.map(({ key, taskKey, sequence, ...event }) => event), gaps: instruction.gaps });
       const source = sources.get(task.sourceKey);
       const round = {
+        id: randomUUID(),
         taskKey: key, requestId: task.requestId, revision: task.revision, observedAt: now(), resultKey: resultKeyFor(task), resultScope: resultScopeFor(task),
         through: capturedEvents.length ? Math.max(...capturedEvents.map(event => event.capturedAt)) : null,
         controller: new AbortController(), transportController: new AbortController(), cancelled: false,
@@ -792,6 +829,12 @@ export async function createCore({
     prune();
     cleanQueue();
     for (const task of tasks.values()) {
+      if (conversationPaused(task)) {
+        if (task.analysis.state !== 'paused' || task.analysis.queuedAt !== null) {
+          task.analysis.state = 'paused'; task.analysis.queuedAt = null; save('tasks', task);
+        }
+        continue;
+      }
       if (observationOnly(task)) {
         if (task.analysis.state !== 'observation-only') {
           task.analysis.state = 'observation-only';
@@ -832,12 +875,12 @@ export async function createCore({
         save('notifications', notification);
       }
     }
-    for (const task of tasks.values()) if (usable(task) && !observationOnly(task) && !paused && !['unknown', 'failed', 'stale', 'interrupted'].includes(task.analysis.state) && !task.analysis.checks.some(check => check.judgmentState === 'failed')) makeNotification(task, task.alerts.filter(alert => alert.status === 'attention'));
+    for (const task of tasks.values()) if (usable(task) && !observationOnly(task) && !paused && !conversationPaused(task) && !['unknown', 'failed', 'stale', 'interrupted'].includes(task.analysis.state) && !task.analysis.checks.some(check => check.judgmentState === 'failed')) makeNotification(task, task.alerts.filter(alert => alert.status === 'attention'));
     scheduleIdle();
     startNext();
     if (wakeTimer) clearTimeout(wakeTimer);
     wakeTimer = null;
-    const times = Array.from(tasks.values()).filter(task => usable(task) && !observationOnly(task) && task.analysis.nextEligibleAt > current).map(task => task.analysis.nextEligibleAt);
+    const times = Array.from(tasks.values()).filter(task => usable(task) && !observationOnly(task) && !conversationPaused(task) && task.analysis.nextEligibleAt > current).map(task => task.analysis.nextEligibleAt);
     times.push(...Array.from(notifications.values()).filter(notification => notification.status === 'pending' && notification.readyAt > current).map(notification => notification.readyAt));
     if (times.length > 0) {
       wakeTimer = setTimeout(tick, Math.max(1, Math.min(...times) - current));
@@ -852,8 +895,9 @@ export async function createCore({
   function applyGSProjection(publicTasks, current) {
     for (const task of publicTasks) {
       const source = sources.get(task.sourceKey);
-      const scopedTask = { ...task, requestId: tasks.get(task.key).requestId };
+      const scopedTask = { ...task, events: task.events.filter(event => !historical(event)), requestId: tasks.get(task.key).requestId };
       task.gs = gsStatus(scopedTask, source, current, childWait(scopedTask, source, publicTasks, current));
+      if (conversationPaused(task) && source.status === 'connected' && task.gs.light !== null) task.gs = { ...task.gs, light: 'gray', label: '本聊天分析已暂停', reason: '执行观察继续；仅手动恢复本聊天分析，恢复后按当前材料重新排队' };
       task.lastActivity = task.gs.silence.since;
     }
   }
@@ -873,6 +917,7 @@ export async function createCore({
     analysis: { state: 'unknown', through: null, throughRevision: 0, completedAt: null, nextEligibleAt: null, error: null, summary: null, checks: unknownChecks('No completed analysis'), queuedAt: null, startedAt: null }, alerts: [],
   });
   function admitRequest(task, event) {
+    if (historical(event)) return;
     const currentInput = taskEvents(task).find(value => value.id === task.requestId);
     if (event.kind !== 'input' || (currentInput && (event.capturedAt < currentInput.capturedAt || event.capturedAt === currentInput.capturedAt && !(event.data?.inputPhase === 'consumed' && Number.isSafeInteger(event.data?.inputSequence) && event.data.inputSequence > (currentInput.data?.inputSequence ?? Infinity))))) return;
     cancelRound('Current request changed during analysis', task, true);
@@ -1040,13 +1085,13 @@ export async function createCore({
         save('events', event);
         counts.accepted++;
         task.updatedAt = now();
-        task.lastActivity = Math.max(task.lastActivity ?? 0, event.capturedAt);
+        if (!historical(event)) task.lastActivity = Math.max(task.lastActivity ?? 0, event.capturedAt);
         task.revision++;
         if (!incoming && !source.hierarchyContext && source.descriptor.policy !== 'chatgpt-main/1') admitRequest(task, event);
         if (event.kind === 'gap') {
           rememberGap(task, { reason: event.text, at: event.capturedAt });
         }
-        if (event.kind === 'status' && ['running', 'idle', 'disposed', 'unknown'].includes(event.data?.status) && (source.descriptor.policy !== 'chatgpt-main/1' || task.baselineConfirmed)) {
+        if (!historical(event) && event.kind === 'status' && ['running', 'idle', 'disposed', 'unknown'].includes(event.data?.status) && (source.descriptor.policy !== 'chatgpt-main/1' || task.baselineConfirmed)) {
           task.status = event.data.status;
           if (task.status !== 'unknown') task.lastKnownStatus = task.status;
           if (task.status !== 'running') { cancelRound('Source task is no longer running', task); invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended'); }
@@ -1112,6 +1157,9 @@ export async function createCore({
         value.analysis.lagMs = task.lastActivity === null ? null : Math.max(0, task.lastActivity - (task.analysis.through ?? task.lastActivity));
         value.analysis.waitMs = task.analysis.queuedAt === null ? 0 : Math.max(0, current - task.analysis.queuedAt);
         value.analysis.resultDisposition = resultDispositionFor(task, instruction, read);
+        const conversation = conversationFor(task);
+        if (conversation) value.conversationMonitoring = conversation;
+        if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1') value.monitoringHealth = failureStore.health({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId }, current);
         return value;
       });
       applyGSProjection(publicTasks, current);
@@ -1122,7 +1170,7 @@ export async function createCore({
         overview: { runningTasks: publicTasks.filter(task => task.status === 'running').length, knownSources: sources.size, connectedSources: Array.from(sources.values()).filter(connected).length, attentionTasks: publicTasks.filter(task => task.alerts.some(alert => alert.status === 'attention')).length, coverage: { complete: false, gaps: ['Automatic discovery of all local sources has not been verified'] } },
         enrollment: enrollmentSnapshot(),
         hierarchyContext,
-        sources: Array.from(sources.values()).map(source => copy(source)), tasks: publicTasks,
+        sources: Array.from(sources.values()).map(source => ({ ...copy(source), ...(source.descriptor.policy === 'chatgpt-main/1' ? { monitoringHealth: failureStore.health({ sourceKey: source.key, mainId: null, lifecycleId: null }, current) } : {}) })), tasks: publicTasks,
       };
     },
     async gsSummary({ sourceKey, sessionId }) {
@@ -1159,12 +1207,50 @@ export async function createCore({
         nativeRunBindings: [...sources.values()].reduce((count, source) => count + (source.hierarchyRunBindings?.length ?? 0), 0), analysisReuseKeys: [...tasks.values()].reduce((count, task) => count + Number(task.resultKey != null) + Number(task.resultScope != null), 0), taskContextFingerprints: [...tasks.values()].filter(task => task.contextFingerprint != null).length,
         notificationBindings: [...tasks.values()].filter(task => task.notificationBinding).length, notificationBindingEvidenceRefs: [...tasks.values()].reduce((count, task) => count + (task.notificationBinding?.evidenceRefs.length ?? 0), 0), notificationMemberships: [...notifications.values()].reduce((count, notification) => count + notificationMembers(notification).length, 0) };
       return {
-        protocol: 1, pid: process.pid, generatedAt: now(), closed,
+        protocol: 1, pid: process.pid, generatedAt: now(), closed, failureReceipts: failureStore.diagnostics(),
         runtime: { connectedSources: closed ? 0 : Array.from(sources.values()).filter(connected).length, activeAnalyses: active ? 1 : 0, cancelledUnsettledRequests: pendingCancelledRequests, unsettledAnalysisCalls: admission.unsettledCalls, analysisAdmissionLimit: admission.limit, analysisAdmissionBlocked: admission.blocked },
         temporary: { queueKeys: queue.length, queueMemberships: queued.size, timers, pendingNotificationWindows: [...notifications.values()].filter(notification => notification.status === 'pending').length },
         retained: { retentionMs: DAY, sources: sources.size, tasks: tasks.size, events: events.size, alerts: Array.from(tasks.values()).reduce((count, task) => count + task.alerts.length, 0), notifications: notifications.size, sourceGapRecords: Array.from(sources.values()).reduce((count, source) => count + (source.gapRecords?.length ?? 0), 0), taskGapRecords: Array.from(tasks.values()).reduce((count, task) => count + (task.gapRecords?.length ?? 0), 0), hierarchyEvidenceIdentities: Array.from(sources.values()).reduce((count, source) => count + (source.hierarchyEvidenceCaptures?.length ?? 0), 0), hierarchyEvidenceIdentityLimitPerSource: HIERARCHY_CAPTURE_LIMIT, ...metadata },
-        configuration: { sourcePlanEntries: enrollment.entries.length }, memory: process.memoryUsage(),
+        configuration: { sourcePlanEntries: enrollment.entries.length, conversationMonitoringScopes: conversationSettings.size, conversationMonitoringLimit: CONVERSATION_MONITORING_LIMIT, pausedConversations: [...conversationSettings.values()].filter(setting => setting.paused).length }, memory: process.memoryUsage(),
       };
+    },
+    async conversationMonitoring(value) {
+      ensureOpen();
+      return conversationScope(normalizeConversationMonitoring(value));
+    },
+    async failureReceipts(scope) {
+      ensureOpen();
+      scope = normalizeFailureScope(scope);
+      const source = sources.get(scope.sourceKey);
+      if (source?.descriptor.policy !== 'chatgpt-main/1') throw new Error('Failure receipts require a known ChatGPT source');
+      return failureStore.list(scope);
+    },
+    async recordCollectionOutcome(value) {
+      ensureOpen();
+      const outcome = normalizeCollectionOutcome(value), source = sources.get(outcome.sourceKey);
+      if (source?.descriptor.policy !== 'chatgpt-main/1') throw new Error('Collection outcomes require a known ChatGPT source');
+      if (outcome.mainId !== null && ![...tasks.values()].some(task => task.sourceKey === outcome.sourceKey && task.id === outcome.mainId && (outcome.lifecycleId === null || task.lifecycleId === outcome.lifecycleId))) throw new Error('Collection outcome scope is not a verified task');
+      return failureStore.settle({ ...outcome, domain: 'collection', attempted: true, settled: true });
+    },
+    async setConversationMonitoring(value) {
+      ensureOpen();
+      const control = normalizeConversationMonitoring(value, true), current = conversationScope(control);
+      if (current.paused === control.paused) return current;
+      if (current.revision !== control.revision) throw Object.assign(new Error('Conversation monitoring state changed'), { code: 'conversation_monitoring_conflict' });
+      if (!conversationSettings.has(identity(control.registrationId, control.taskId)) && conversationSettings.size >= CONVERSATION_MONITORING_LIMIT) throw Object.assign(new Error('Conversation monitoring preference capacity reached; existing choices remain unchanged'), { code: 'conversation_monitoring_capacity' });
+      const setting = { key: identity(control.registrationId, control.taskId), registrationId: control.registrationId, taskId: control.taskId, paused: control.paused, revision: randomUUID() };
+      save('conversationSettings', setting); conversationSettings.set(setting.key, setting);
+      for (const task of tasks.values()) {
+        if (sources.get(task.sourceKey)?.descriptor.policy !== 'chatgpt-main/1' || sources.get(task.sourceKey)?.descriptor.registrationId !== control.registrationId || task.id !== control.taskId) continue;
+        if (control.paused) cancelRound('Conversation analysis is paused', task, true);
+        task.analysis.queuedAt = null;
+        task.analysis.state = control.paused ? 'paused' : 'unknown';
+        task.analysis.nextEligibleAt = Math.max(now(), task.analysis.nextEligibleAt ?? 0);
+        task.resultKey = null; task.resultScope = null;
+        invalidateAlerts(task, 'paused'); save('tasks', task);
+      }
+      tick();
+      return conversationScope(control);
     },
     async pause() {
       ensureOpen();
@@ -1261,6 +1347,7 @@ export async function createCore({
       if (idleTimer) clearTimeout(idleTimer);
       wakeTimer = null;
       idleTimer = null;
+      failureStore.close();
       db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
       db.close();
     },

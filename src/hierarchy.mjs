@@ -1,4 +1,4 @@
-import { verifiedUserEntry } from './instruction-context.mjs'
+import { verifiedUserEntry, verifiedForkContext } from './instruction-context.mjs'
 export const HIERARCHY_FEATURE = 'hierarchy-context/1'
 const key = (...parts) => JSON.stringify(parts)
 const fail = message => { throw Object.assign(new Error(message), { code: 'hierarchy_context_invalid' }) }
@@ -111,6 +111,7 @@ export function validateHierarchy(context, { tasks, events, now, acceptedRuns = 
     const originEvents = binding.originRefs.map(resolve)
     if (binding.origin === 'delegated' && !parents.has(owner.sessionId)) fail('delegated instruction has no verified relation')
     if (binding.origin === 'user-entry' && !verifiedUserEntry(binding, input, { tasks: byTask, events: byEvent, parents }, sourcePolicy)) fail('user label alone does not establish an original consumed user entry')
+    if (!verifiedForkContext(binding, { tasks: byTask, events: byEvent, sourcePolicy }).valid) fail('fork context lacks its own native history boundary and user provenance')
     if (binding.origin === 'delegated' && originEvents.length === 0) fail('delegated instruction lacks origin evidence')
     const ancestors = new Set(); for (let ancestor = parents.get(owner.sessionId); ancestor; ancestor = parents.get(ancestor)) ancestors.add(ancestor)
     for (const reference of binding.ancestorLimitRefs) { const event = resolve(reference), ancestor = byTask.get(key(event.taskId, event.taskLifecycleId)); if (!ancestors.has(ancestor?.sessionId) || event.kind !== 'input' || ['delegated', 'agent-relay', 'runtime-notice'].includes(event.data?.inputOrigin)) fail('inherited limit must cite a related ancestor input') }
