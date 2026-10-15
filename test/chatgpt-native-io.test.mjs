@@ -23,7 +23,7 @@ test('production native IO qualifies actual app-server facts and readonly metada
   await writeFile(recordPath, JSON.stringify({ type: 'session_meta', payload: { id: 'native-main' } }) + '\n' + JSON.stringify({ timestamp: new Date(born + 3000).toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'native-turn' } }) + '\n')
   let actualCommand = nativePath + ' -c model_provider="opaque provider" --config policy=["opaque", "values"] app-server --analytics-default-enabled -c nested="opaque value" -c final=true'
   let enabled = true
-  const calls = []
+  const calls = [], directoryParams = []
   const metadata = new WebSocketServer({ path: '/', noServer: true })
   const { createServer } = await import('node:http')
   const unix = createServer()
@@ -35,6 +35,7 @@ test('production native IO qualifies actual app-server facts and readonly metada
     let result
     if (message.method === 'initialize') result = { serverInfo: { name: 'controlled-readonly-metadata' } }
     if (message.method === 'thread/read') result = { thread: { id: 'native-main', parentThreadId: null, source: 'vscode', originator: 'Codex Desktop', forkedFromId: null, cwd: dir, path: recordPath, status: { type: 'notLoaded' } } }
+    if (message.method === 'thread/list') { directoryParams.push(message.params); result = { data: [{ id: 'native-main' }], nextCursor: null } }
     if (message.method === 'thread/turns/list') result = { data: [{ id: 'native-turn', status: 'interrupted' }], nextCursor: null }
     if (message.method === 'config/read') result = { config: { plugins: { 'sentinel@test': { enabled } } }, layers: [{ name: { type: 'user' }, config: { plugins: { 'sentinel@test': { enabled } } } }] }
     ws.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }))
@@ -60,7 +61,14 @@ test('production native IO qualifies actual app-server facts and readonly metada
   actualCommand = nativePath + ' app-server'
   enabled = false
   assert.equal((await adapter.read({ thread_id: 'native-main' })).observation.gap, 'plugin-disabled')
-  assert.ok(calls.every(method => ['initialize', 'initialized', 'thread/read', 'thread/turns/list', 'config/read'].includes(method)))
+  assert.deepEqual((await native.listThreads({ archived: true })).data, [{ id: 'native-main' }])
+  assert.equal(directoryParams[0].useStateDbOnly, true)
+  assert.equal(directoryParams[0].sortKey, 'created_at')
+  assert.equal(directoryParams[0].sortDirection, 'desc')
+  assert.equal(directoryParams[0].archived, true)
+  assert.equal(directoryParams[0].limit, 50)
+  await assert.rejects(native.listThreads({ limit: 51 }), /invalid directory budget/)
+  assert.ok(calls.every(method => ['initialize', 'initialized', 'thread/list', 'thread/read', 'thread/turns/list', 'config/read'].includes(method)))
   const isolated = createMetadataClient({ socketPath })
   await assert.rejects(isolated.request('thread/resume', {}), /non-observation method rejected/)
   await isolated.close()

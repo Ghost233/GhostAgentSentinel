@@ -1,10 +1,11 @@
 export const PROTOCOL = 1
 export const GS_SUMMARY_FEATURE = 'gs-summary/1'
 export const SOURCE_OBSERVATION_FEATURE = 'source-observation/1'
+export const CHATGPT_MAIN_FEATURE = 'chatgpt-main/1'
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000
 const kinds = new Set(['input', 'output', 'tool-start', 'tool-result', 'status', 'gap'])
 const statuses = new Set(['running', 'idle', 'disposed', 'unknown'])
-const dataStrings = ['callId', 'rootCallId', 'parentCallId', 'toolName', 'command', 'errorCode', 'sourceVersion', 'validationScope', 'status', 'cwd', 'resultSource', 'signal', 'refinesEventId', 'nativeType', 'childSessionId', 'runId', 'inputOrigin', 'messageId', 'inputPhase', 'sourceKind', 'sourceForm', 'senderSessionId', 'approvalId', 'waitId']
+const dataStrings = ['callId', 'rootCallId', 'parentCallId', 'toolName', 'command', 'errorCode', 'sourceVersion', 'validationScope', 'status', 'cwd', 'resultSource', 'signal', 'refinesEventId', 'nativeType', 'childSessionId', 'runId', 'turnTrigger', 'inputOrigin', 'messageId', 'inputPhase', 'sourceKind', 'sourceForm', 'senderSessionId', 'approvalId', 'waitId']
 
 function object(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${field} must be an object`)
@@ -29,6 +30,10 @@ export function normalizeSource(value) {
   if (input.mode !== undefined) {
     if (input.mode !== 'observation-only') throw new Error('unsupported source observation mode')
     result.mode = input.mode
+  }
+  if (input.policy !== undefined) {
+    if (input.policy !== CHATGPT_MAIN_FEATURE) throw new Error('unsupported source observation policy')
+    result.policy = input.policy
   }
   if (input.profile !== undefined) result.profile = string(input.profile, 'profile', 2000)
   if (input.enroll !== undefined) {

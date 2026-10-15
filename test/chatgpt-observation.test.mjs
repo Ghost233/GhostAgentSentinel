@@ -85,7 +85,7 @@ test('a source disabled while reading never publishes the late running observati
   const f = await fixture(t)
   assert.equal((await f.call({ thread_id: 'main-a' })).data.result.structuredContent.observation.status, 'running')
   let checks = 0
-  f.native.readEnablement = async () => ({ user: ++checks === 1 ? 'enabled' : 'disabled', effective: 'enabled' })
+  f.native.readEnablement = async cwd => ({ user: cwd === null || ++checks === 1 ? 'enabled' : 'disabled', effective: 'enabled' })
   const view = (await f.call({ thread_id: 'main-a' })).data.result.structuredContent
   assert.equal(view.observation.gap, 'plugin-disabled')
   assert.equal(view.observation.status, 'unknown')
@@ -203,7 +203,7 @@ test('closing the adapter releases panel and reader resources without controllin
   const f = await fixture(t)
   await f.call({ thread_id: 'main-a' })
   await f.adapter.close()
-  assert.deepEqual(f.adapter.diagnostics(), { closed: true, trackedThreads: 0, openReaders: 0, pendingOperations: 0, refreshTimers: 0, activeRequests: 0, transports: 0, sockets: 0 })
+  assert.deepEqual(f.adapter.diagnostics(), { closed: true, trackedThreads: 0, openReaders: 0, pendingOperations: 0, refreshTimers: 0, queuedBatches: 0, directoryEntries: 0, directoryPending: 0, directoryPages: 0, directoryCursor: 0, activeRequests: 0, transports: 0, sockets: 0 })
   const snapshot = await f.core.snapshot()
   assert.equal(snapshot.sources[0].status, 'disconnected')
   assert.equal(snapshot.tasks[0].status, 'unknown')

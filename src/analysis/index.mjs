@@ -58,7 +58,7 @@ export function createAnalyzer(config = {}) {
         checks, coverage,
       };
       const longWait = checks.find(check => check.id === 'long_wait');
-      evaluateWait(input.task, ownEvents, coverage, now, config.longWaitMs ?? 300_000, longWait);
+      evaluateWait(input.task, ownEvents, coverage, now, config.longWaitMs ?? 300_000, longWait, input.source);
       longWait.judgmentState = longWait.status === 'unknown' ? 'insufficient' : longWait.status;
       if (hasRequestAnchor && !latestInput) {
         coverage.complete = false;
@@ -183,13 +183,13 @@ export function analysisTimeConditions(input, now, waitMs = 300_000) {
   const anchored = Object.hasOwn(input.task, 'currentRequestId');
   const request = anchored ? retained.find(event => event.kind === 'input' && event.id === input.task.currentRequestId) : retained.findLast(event => event.kind === 'input');
   const scope = (request ? retained.slice(retained.indexOf(request)) : anchored ? [] : retained).filter(event => !event.data?.history && event.data?.inputOrigin !== 'runtime-notice');
-  const waiting = userWait(input.task, scope, now);
+  const waiting = input.source?.policy === 'chatgpt-main/1' ? null : userWait(input.task, scope, now);
   const activity = scope.findLast(event => ['output', 'tool-start', 'tool-result'].includes(event.kind) && !event.data?.refinesEventId);
   const silence = waiting ? 'waiting' : !activity ? 'initial' : now - activity.capturedAt >= 60_000 ? 'silent' : 'active';
   if (!input.coverage.complete || input.task.status !== 'running') return [waitMs, 'unobservable', silence];
   const events = effectiveResults(scope), open = new Map();
   for (const event of events) { if (event.kind === 'tool-start' && event.data?.callId) open.set(event.data.callId, event); if (event.kind === 'tool-result' && event.data?.callId) open.delete(event.data.callId); }
-  const elapsed = event => { const since = event.occurredAt ?? event.capturedAt; return now - since - userWaitDuration(input.task, events, now, since, event.kind === 'tool-start' ? event.data?.callId ?? null : undefined); };
+  const elapsed = event => { const since = event.occurredAt ?? event.capturedAt; return now - since - (input.source?.policy === 'chatgpt-main/1' ? 0 : userWaitDuration(input.task, events, now, since, event.kind === 'tool-start' ? event.data?.callId ?? null : undefined)); };
   const latest = events.findLast(event => ['output', 'tool-start', 'tool-result'].includes(event.kind)) ?? events.findLast(event => event.kind === 'input');
   return [waitMs, silence, [...open.values()].map(event => [event.id, elapsed(event) >= waitMs]), Boolean(latest && elapsed(latest) >= waitMs)];
 }
@@ -371,7 +371,7 @@ function buildCandidates(events, facts, latestInput, coverage, checks) {
   return candidates;
 }
 
-function evaluateWait(task, events, coverage, now, waitMs, check) {
+function evaluateWait(task, events, coverage, now, waitMs, check, source) {
   if (!coverage.complete || task.status !== 'running') { check.reason = '运行状态或采集覆盖不足，不能确认当前等待'; return; }
   const active = new Map();
   for (const event of events) {
@@ -381,8 +381,15 @@ function evaluateWait(task, events, coverage, now, waitMs, check) {
   }
   const open = [...active.values()];
   const latest = events.filter(event => ['output', 'tool-start', 'tool-result'].includes(event.kind) && !event.data?.history).at(-1) ?? events.findLast(event => event.kind === 'input');
-  const elapsed = event => { const since = event.occurredAt ?? event.capturedAt; return Math.max(0, now - since - userWaitDuration(task, events, now, since, event.kind === 'tool-start' ? event.data?.callId ?? null : undefined)); };
+  const conservative = source?.policy === 'chatgpt-main/1';
+  const elapsed = event => { const since = event.occurredAt ?? event.capturedAt; return Math.max(0, now - since - (conservative ? 0 : userWaitDuration(task, events, now, since, event.kind === 'tool-start' ? event.data?.callId ?? null : undefined))); };
   const overdue = open.find(event => elapsed(event) >= waitMs);
+  if (conservative && (overdue || latest && elapsed(latest) >= waitMs)) {
+    const evidence = overdue ?? latest;
+    check.reason = `等待原因未确认；已观察至少 ${Math.floor(elapsed(evidence) / 1000)} 秒，静默或尚无工具结束结果不足以确认停滞`;
+    check.evidenceIds = [evidence.id];
+    return;
+  }
   if (overdue) {
     check.status = 'attention';
     check.conditionAt = userWaitThresholdAt(task, events, now, overdue.occurredAt ?? overdue.capturedAt, waitMs, overdue.data.callId);

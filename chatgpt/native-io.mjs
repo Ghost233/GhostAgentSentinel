@@ -9,7 +9,7 @@ const execute = promisify(execFile)
 const appPath = '/Applications/ChatGPT.app'
 const nativePath = appPath + '/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
 const appExecutable = appPath + '/Contents/MacOS/ChatGPT'
-const readonlyMethods = new Set(['thread/read', 'thread/turns/list', 'config/read'])
+const readonlyMethods = new Set(['thread/read', 'thread/turns/list', 'thread/list', 'config/read'])
 
 // The locked desktop version prefixes its subcommand with global config
 // overrides. ps presents a command string, so keep quoted and nested TOML
@@ -170,6 +170,10 @@ export function createNativeIO({ pluginId, socketPath, processSample, profileSam
         if (!Number.isSafeInteger(hostStartedAt)) return { available: false, reason: 'source-generation-unverified' }
         return { available: true, hostRunId: native.pid + ':' + native.started, hostStartedAt, profile }
       } catch { return { available: false, reason: 'host-verification-unavailable' } }
+    },
+    async listThreads({ cursor = null, limit = 50, archived = false } = {}) {
+      if (cursor !== null && (typeof cursor !== 'string' || cursor.length > 4096) || !Number.isSafeInteger(limit) || limit < 1 || limit > 50 || typeof archived !== 'boolean') throw new Error('invalid directory budget')
+      return rpc.request('thread/list', { cursor, limit, archived, useStateDbOnly: true, sortKey: 'created_at', sortDirection: 'desc', sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'] })
     },
     async readThread(id) {
       const result = await rpc.request('thread/read', { threadId: id, includeTurns: false })

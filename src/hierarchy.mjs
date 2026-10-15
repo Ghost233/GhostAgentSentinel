@@ -52,7 +52,9 @@ export function normalizeHierarchy(value) {
 }
 
 // Validate against the whole prospective batch before the core mutates source/task state.
-export function validateHierarchy(context, { tasks, events, now, acceptedRuns = [] }) {
+export function validateHierarchy(context, { tasks, events, now, acceptedRuns = [], sourcePolicy = null }) {
+  const chatGPT = sourcePolicy === 'chatgpt-main/1'
+  if (chatGPT && (context.relations.length || context.waitBindings?.length || tasks.some(task => task.parentId))) fail('ChatGPT main policy does not include subagents or unverified ancestry')
   const sessions = new Set(context.sessions.map(item => item.sessionId)), byTask = new Map(tasks.map(task => [key(task.id, task.lifecycleId), task]))
   const byEvent = new Map(events.filter(event => event.capturedAt <= now && event.capturedAt > now - 86_400_000).map(event => [key(event.taskId, event.taskLifecycleId, event.id), event]))
   const resolve = reference => { const event = byEvent.get(key(reference.taskId, reference.lifecycleId, reference.eventId)); if (!byTask.has(key(reference.taskId, reference.lifecycleId)) || !event) fail('hierarchy reference is outside source, lifecycle or retention'); return event }
@@ -64,8 +66,9 @@ export function validateHierarchy(context, { tasks, events, now, acceptedRuns = 
     const owner = task(activation)
     if (activation.sessionId !== null && (!sessions.has(activation.sessionId) || owner.sessionId !== activation.sessionId)) fail('activation session does not match its task')
     const evidence = activation.stateRefs.map(resolve)
+    const nativeMain = event => chatGPT && activation.sessionId === owner.sessionId && owner.sessionId === owner.id && activation.runId === activation.lifecycleId && event.taskId === activation.taskId && event.taskLifecycleId === activation.lifecycleId && event.kind === 'status' && event.data?.sourceKind === 'chatgpt-native' && event.data?.sourceForm === 'event_msg' && event.data?.runId === activation.runId
     if (activation.runId !== null) {
-      const proof = evidence.filter(event => ['subagent/start', 'subagent/end'].includes(event.data?.nativeType) && event.data?.childSessionId === (activation.sessionId ?? activation.taskId) && event.data?.runId === activation.runId)
+      const proof = evidence.filter(event => chatGPT ? nativeMain(event) && ['task_started', 'task_complete', 'turn_aborted'].includes(event.data?.nativeType) : ['subagent/start', 'subagent/end'].includes(event.data?.nativeType) && event.data?.childSessionId === (activation.sessionId ?? activation.taskId) && event.data?.runId === activation.runId)
       if (!proof.length) fail('activation run identity lacks its own native evidence')
       const accepted = runs.get(activation.runId)
       if (accepted && key(accepted.taskId, accepted.lifecycleId, accepted.sessionId) !== key(activation.taskId, activation.lifecycleId, activation.sessionId)) fail('native activation run is already bound to another task lifecycle')
@@ -76,7 +79,8 @@ export function validateHierarchy(context, { tasks, events, now, acceptedRuns = 
     const expected = activation.state === 'running' ? 'running' : ['idle', 'disposed']
     const ownState = evidence.some(event => event.taskId === activation.taskId && event.taskLifecycleId === activation.lifecycleId && event.kind === 'status' && (Array.isArray(expected) ? expected.includes(event.data?.status) : event.data?.status === expected) && ['agent/created', 'agent/status', 'agent/disposed', 'native-baseline'].includes(event.data?.nativeType))
     const nativeActivation = activation.runId && evidence.some(event => event.data?.nativeType === (activation.state === 'running' ? 'subagent/start' : 'subagent/end') && event.data?.childSessionId === (activation.sessionId ?? activation.taskId) && event.data?.runId === activation.runId)
-    if (!ownState && !nativeActivation) fail('directory membership is not execution state evidence')
+    const mainState = evidence.some(event => nativeMain(event) && (activation.state === 'running' ? event.data?.nativeType === 'task_started' && event.data?.status === 'running' : ['task_complete', 'turn_aborted'].includes(event.data?.nativeType) && ['idle', 'disposed'].includes(event.data?.status)))
+    if (chatGPT ? !mainState : !ownState && !nativeActivation) fail('directory membership is not execution state evidence')
   }
   const parents = new Map(), externalParents = new Map()
   for (const relation of context.relations) {
@@ -106,7 +110,7 @@ export function validateHierarchy(context, { tasks, events, now, acceptedRuns = 
     if (input.data?.inputPhase && input.data.inputPhase !== binding.phase) fail('instruction phase differs from original native input')
     const originEvents = binding.originRefs.map(resolve)
     if (binding.origin === 'delegated' && !parents.has(owner.sessionId)) fail('delegated instruction has no verified relation')
-    if (binding.origin === 'user-entry' && !verifiedUserEntry(binding, input, { tasks: byTask, events: byEvent, parents })) fail('user label alone does not establish an original consumed user entry')
+    if (binding.origin === 'user-entry' && !verifiedUserEntry(binding, input, { tasks: byTask, events: byEvent, parents }, sourcePolicy)) fail('user label alone does not establish an original consumed user entry')
     if (binding.origin === 'delegated' && originEvents.length === 0) fail('delegated instruction lacks origin evidence')
     const ancestors = new Set(); for (let ancestor = parents.get(owner.sessionId); ancestor; ancestor = parents.get(ancestor)) ancestors.add(ancestor)
     for (const reference of binding.ancestorLimitRefs) { const event = resolve(reference), ancestor = byTask.get(key(event.taskId, event.taskLifecycleId)); if (!ancestors.has(ancestor?.sessionId) || event.kind !== 'input' || ['delegated', 'agent-relay', 'runtime-notice'].includes(event.data?.inputOrigin)) fail('inherited limit must cite a related ancestor input') }
