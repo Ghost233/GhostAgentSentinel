@@ -8,8 +8,9 @@ const publicReceipt = ({ causeKey, ...value }) => copy(value);
 const identifier = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
 const CATEGORIES = new Map([
   ['timeout', ['deadline', 'timeout', 'ETIMEDOUT']],
-  ['transport', ['network', 'http_error', 'metadata-unavailable', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN']],
-  ['protocol', ['invalid_json', 'invalid_response', 'invalid_model', 'unexpected_stream', 'incomplete_response', 'invalid_extraction', 'invalid_decision', 'invalid-lifecycle-record', 'unsupported-record-type', 'unsupported-event-type']],
+  ['transport', ['network', 'http_error', 'metadata-unavailable', 'metadata-send-failed', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN']],
+  ['protocol', ['invalid_json', 'invalid_response', 'invalid_model', 'unexpected_stream', 'incomplete_response', 'invalid_extraction', 'invalid_decision', 'invalid-lifecycle-record', 'unsupported-record-type', 'unsupported-event-type', 'metadata-rpc-error', 'metadata-invalid-response']],
+  ['cancelled', ['cancelled']],
   ['evidence', ['invalid_evidence']], ['expired', ['evidence_expired', 'analysis_expired']],
   ['configuration', ['configuration', 'analysis_config_conflict']],
   ['persistence', ['monitoring_outbox_capacity']],
@@ -39,7 +40,7 @@ export function createFailureReceipts({ db, now = Date.now }) {
   let receipts = load(COLLECTION), states = load(STATES), closed = false;
   const stored = db.prepare('SELECT value FROM records WHERE collection=? AND key=?').get('settings', COLLECTION);
   const metadata = stored ? JSON.parse(stored.value) : {};
-  let sequence = metadata.sequence ?? Math.max(0, ...[...receipts.values()].map(value => value.sequence)), prunedThrough = metadata.prunedThrough ?? 0;
+  let sequence = metadata.sequence ?? Math.max(0, ...[...receipts.values()].map(value => value.sequence)), prunedThrough = metadata.prunedThrough ?? 0, recoveryWatermarkEvictions = metadata.recoveryWatermarkEvictions ?? 0;
   const save = (collection, key, value) => write.run(collection, key, JSON.stringify(value));
   function eraseReceipt(receipt) { remove.run(COLLECTION, receipt.id); receipts.delete(receipt.id); prunedThrough = Math.max(prunedThrough, receipt.sequence); }
   function pruneRows(current) {
@@ -47,24 +48,24 @@ export function createFailureReceipts({ db, now = Date.now }) {
     for (const receipt of receipts.values()) if (receipt.firstFailedAt <= cutoff) eraseReceipt(receipt);
     for (const state of states.values()) if (state.updatedAt <= cutoff) { remove.run(STATES, state.key); states.delete(state.key); }
     for (const receipt of [...receipts.values()].sort((a, b) => a.sequence - b.sequence).slice(0, Math.max(0, receipts.size - LIMIT))) eraseReceipt(receipt);
-    for (const state of [...states.values()].sort((a, b) => Number(a.active) - Number(b.active) || a.updatedAt - b.updatedAt).slice(0, Math.max(0, states.size - LIMIT))) { remove.run(STATES, state.key); states.delete(state.key); }
+    for (const state of [...states.values()].sort((a, b) => Number(a.active) - Number(b.active) || a.updatedAt - b.updatedAt).slice(0, Math.max(0, states.size - LIMIT))) { remove.run(STATES, state.key); states.delete(state.key); if (state.kind === 'recovery') recoveryWatermarkEvictions++; }
   }
   // SQLite and the in-memory index advance together, including on write errors.
   function change(operation, current = now()) {
     if (closed) throw new Error('Failure receipt store is closed');
-    const previous = { receipts, states, sequence, prunedThrough };
+    const previous = { receipts, states, sequence, prunedThrough, recoveryWatermarkEvictions };
     db.exec('SAVEPOINT failure_receipt_change');
     receipts = new Map(receipts); states = new Map(states);
     try {
       pruneRows(current);
       const result = operation();
       pruneRows(current);
-      if (sequence !== previous.sequence || prunedThrough !== previous.prunedThrough) save('settings', COLLECTION, { sequence, prunedThrough });
+      if (sequence !== previous.sequence || prunedThrough !== previous.prunedThrough || recoveryWatermarkEvictions !== previous.recoveryWatermarkEvictions) save('settings', COLLECTION, { sequence, prunedThrough, recoveryWatermarkEvictions });
       db.exec('RELEASE failure_receipt_change');
       return result;
     } catch (error) {
       db.exec('ROLLBACK TO failure_receipt_change'); db.exec('RELEASE failure_receipt_change');
-      ({ receipts, states, sequence, prunedThrough } = previous);
+      ({ receipts, states, sequence, prunedThrough, recoveryWatermarkEvictions } = previous);
       throw error;
     }
   }
@@ -77,7 +78,7 @@ export function createFailureReceipts({ db, now = Date.now }) {
   }
   const matches = (value, scope) => ['sourceKey', 'mainId', 'lifecycleId'].every(field => scope[field] === undefined || value[field] === scope[field]);
   const sameScope = (value, input) => matches(value, input) && value.domain === input.domain && (value.channel ?? 'default') === (input.channel ?? 'default');
-  const stats = () => ({ closed, receipts: receipts.size, states: states.size, activeStates: [...states.values()].filter(value => value.active).length, maximumReceipts: LIMIT, maximumStates: LIMIT, retentionMs: DAY, latestSequence: sequence, prunedThroughSequence: prunedThrough });
+  const stats = () => ({ closed, receipts: receipts.size, states: states.size, activeStates: [...states.values()].filter(value => value.active).length, recoveryWatermarks: [...states.values()].filter(value => value.kind === 'recovery').length, recoveryWatermarkEvictions, orderingGap: recoveryWatermarkEvictions > 0, maximumReceipts: LIMIT, maximumStates: LIMIT, retentionMs: DAY, latestSequence: sequence, prunedThroughSequence: prunedThrough });
   maintain();
   return {
     settle(input) {
@@ -92,7 +93,14 @@ export function createFailureReceipts({ db, now = Date.now }) {
         const { sourceKey, mainId, lifecycleId, roundId, domain } = input;
         const at = input.settledAt ?? current;
         if (at <= current - DAY) return { created: false, receipt: null };
+        // Ordering proof belongs to the channel, not to an individual cause.
+        const scopeKey = JSON.stringify([sourceKey, mainId, lifecycleId, domain, channel]);
         if (input.outcome === 'succeeded') {
+          const watermark = states.get(scopeKey);
+          if (!watermark || at > watermark.updatedAt) {
+            const next = { key: scopeKey, kind: 'recovery', sourceKey, mainId, lifecycleId, domain, channel, updatedAt: at, active: false, lastRoundId: roundId };
+            save(STATES, scopeKey, next); states.set(scopeKey, next);
+          }
           const recovered = [];
           for (const state of states.values()) if (sameScope(state, input) && state.active && at >= state.updatedAt) {
             const next = { ...state, active: false, updatedAt: at, lastRoundId: roundId };
@@ -110,17 +118,24 @@ export function createFailureReceipts({ db, now = Date.now }) {
         const historical = [...receipts.values()].find(value => value.causeKey === causeKey && value.firstRoundId === roundId);
         if (historical) return { created: false, receipt: publicReceipt(historical) };
         const state = states.get(causeKey);
-        if (state && (at < state.updatedAt || !state.active && state.lastRoundId === roundId)) return { created: false, receipt: null };
-        if (state?.active) {
+        const watermark = Math.max(-1, ...[...states.values()].filter(value => sameScope(value, input) && value.active === false).map(value => value.updatedAt));
+        const recoveredAt = at < watermark ? watermark : null;
+        if (state && ((recoveredAt === null && at < state.updatedAt) || !state.active && state.lastRoundId === roundId)) return { created: false, receipt: null };
+        if (recoveredAt !== null) {
+          const previous = receipts.get(state?.episodeId);
+          if (previous && previous.firstFailedAt <= at && previous.recoveredAt !== null && previous.recoveredAt >= at) return { created: false, receipt: publicReceipt(previous) };
+        }
+        if (state?.active && recoveredAt === null) {
           const next = { ...state, updatedAt: at, lastRoundId: roundId };
           save(STATES, causeKey, next); states.set(causeKey, next);
           const receipt = receipts.get(state.episodeId);
           return { created: false, receipt: receipt ? publicReceipt(receipt) : null };
         }
-        const receipt = { id: randomUUID(), sequence: ++sequence, sourceKey, mainId, lifecycleId, domain, channel, firstRoundId: roundId, firstFailedAt: at, recoveredAt: null, state: 'active', error, causeKey };
-        const next = { key: causeKey, sourceKey, mainId, lifecycleId, domain, channel, episodeId: receipt.id, updatedAt: at, active: true, lastRoundId: roundId, error };
-        save(COLLECTION, receipt.id, receipt); save(STATES, causeKey, next);
-        receipts.set(receipt.id, receipt); states.set(causeKey, next);
+        const receipt = { id: randomUUID(), sequence: ++sequence, sourceKey, mainId, lifecycleId, domain, channel, firstRoundId: roundId, firstFailedAt: at, recoveredAt, state: recoveredAt === null ? 'active' : 'recovered', error, causeKey };
+        const next = { key: causeKey, sourceKey, mainId, lifecycleId, domain, channel, episodeId: receipt.id, updatedAt: recoveredAt ?? at, active: recoveredAt === null, lastRoundId: roundId, error };
+        save(COLLECTION, receipt.id, receipt);
+        receipts.set(receipt.id, receipt);
+        if (!state || next.updatedAt >= state.updatedAt) { save(STATES, causeKey, next); states.set(causeKey, next); }
         return { created: true, receipt: publicReceipt(receipt) };
       }, current);
     },
@@ -130,14 +145,14 @@ export function createFailureReceipts({ db, now = Date.now }) {
       maintain();
       const values = [...receipts.values()].filter(value => matches(value, { sourceKey, mainId, lifecycleId }) && value.sequence > afterSequence).sort((a, b) => a.sequence - b.sequence);
       const page = values.slice(0, limit);
-      return { receipts: page.map(publicReceipt), nextSequence: page.at(-1)?.sequence ?? afterSequence, hasMore: values.length > page.length, historyGap: afterSequence < prunedThrough };
+      return { receipts: page.map(publicReceipt), nextSequence: page.at(-1)?.sequence ?? afterSequence, hasMore: values.length > page.length, historyGap: afterSequence < prunedThrough || recoveryWatermarkEvictions > 0, orderingGap: recoveryWatermarkEvictions > 0 };
     },
-    health(scope) {
+    health(scope, at) {
       if (!identifier(scope?.sourceKey) || !identifier(scope.mainId) && scope.mainId !== null || !identifier(scope.lifecycleId) && scope.lifecycleId !== null || scope.mainId === null && scope.lifecycleId !== null) throw new Error('Failure health scope identity is incomplete');
-      maintain();
-      const current = [...states.values()].filter(value => matches(value, scope));
+      maintain(at);
+      const current = [...states.values()].filter(value => matches(value, scope) && value.kind !== 'recovery');
       const active = current.filter(value => value.active).sort((a, b) => b.updatedAt - a.updatedAt);
-      return { state: active.length ? 'failed' : current.length ? 'recovered' : 'unknown', failures: active.slice(0, 6).map(value => {
+      return { state: active.length ? 'failed' : current.length ? 'recovered' : 'unknown', orderingGap: recoveryWatermarkEvictions > 0, failures: active.slice(0, 6).map(value => {
         const receipt = receipts.get(value.episodeId);
         return { id: value.episodeId, sourceKey: value.sourceKey, mainId: value.mainId, lifecycleId: value.lifecycleId, domain: value.domain, channel: value.channel ?? 'default', error: copy(value.error), roundId: value.lastRoundId, firstRoundId: receipt?.firstRoundId ?? null, firstFailedAt: receipt?.firstFailedAt ?? null, updatedAt: value.updatedAt };
       }), hasMore: active.length > 6 };

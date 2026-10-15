@@ -9,8 +9,9 @@ test('directory failures expose only safe classification and a later successful 
   try {
     const failure = await directory.refresh()
     assert.equal(failure.state, 'unavailable')
-    assert.deepEqual(failure.error, { code: 'ECONNREFUSED' })
+    assert.deepEqual(failure.error, { code: 'ECONNREFUSED', stage: 'metadata', category: 'transport' })
     assert.equal(JSON.stringify(failure).includes('private path'), false)
+    assert.equal(JSON.stringify(failure).includes('RPC body'), false)
     failing = false
     const recovered = await directory.refresh()
     assert.equal(recovered.state, 'ready')
@@ -23,7 +24,14 @@ test('unknown metadata error codes are classified without free text, while bound
   let cursor = 0
   const limited = createDiscovery({ native: { async listThreads() { return { data: [], nextCursor: 'page-' + ++cursor } } }, sessionsRoot: '/approved/sessions' })
   try {
-    assert.deepEqual((await unavailable.refresh()).error, { code: 'metadata-unavailable' })
+    const failure = await unavailable.refresh()
+    assert.deepEqual(Object.keys(failure.error).sort(), ['category', 'code', 'codeHash', 'stage'])
+    assert.equal(failure.error.code, 'unrecognized_error')
+    assert.equal(failure.error.stage, 'metadata')
+    assert.equal(failure.error.category, 'other')
+    assert.match(failure.error.codeHash, /^[a-f0-9]{64}$/)
+    assert.equal((await unavailable.refresh()).error.codeHash, failure.error.codeHash)
+    for (const secret of ['untrusted-code', 'untrusted message']) assert.equal(JSON.stringify(failure).includes(secret), false)
     const budget = await limited.refresh()
     assert.ok(budget.gaps.includes('directory-page-budget'))
     assert.equal(budget.error, undefined)

@@ -1,7 +1,7 @@
 import { isAbsolute, resolve, sep } from 'node:path'
+import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 
 const LIMIT = 256, PAGE_SIZE = 50, PAGES_PER_REFRESH = 4, TTL = 86400000
-const metadataIoCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'EIO', 'ENOTDIR', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'])
 const counters = () => ({ main: 0, fork: 0, child: 0, remote: 0, cloud: 0, unknown: 0 })
 
 export function classifyThread(thread, sessionsRoot) {
@@ -67,7 +67,7 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
         }
         state = 'ready'; updatedAt = at; error = null
         if (cursor || archived) gaps.push('directory-page-budget')
-      } catch (cause) { state = 'unavailable'; error = { code: metadataIoCodes.has(cause?.code) ? cause.code : 'metadata-unavailable' }; gaps.push('directory-page-failed'); cursor = null; archived = false }
+      } catch (cause) { state = 'unavailable'; error = failureErrorInfo({ code: typeof cause?.code === 'string' ? cause.code : 'metadata-unavailable', stage: 'metadata' }); gaps.push('directory-page-failed'); cursor = null; archived = false }
       return coverage()
     })().finally(() => { pending = null })
     return pending

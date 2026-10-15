@@ -10,6 +10,15 @@ const appPath = '/Applications/ChatGPT.app'
 const nativePath = appPath + '/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
 const appExecutable = appPath + '/Contents/MacOS/ChatGPT'
 const readonlyMethods = new Set(['thread/read', 'thread/turns/list', 'thread/list', 'config/read'])
+const metadataMessages = {
+  deadline: 'metadata request timed out',
+  'metadata-rpc-error': 'metadata request failed',
+  'metadata-unavailable': 'metadata connection unavailable',
+  'metadata-send-failed': 'metadata send failed',
+  'metadata-invalid-response': 'metadata response invalid',
+  cancelled: 'metadata client closed',
+}
+const metadataError = code => Object.assign(new Error(metadataMessages[code] ?? 'metadata operation failed'), { code, stage: 'metadata' })
 
 // The locked desktop version prefixes its subcommand with global config
 // overrides. ps presents a command string, so keep quoted and nested TOML
@@ -61,23 +70,23 @@ function executionSubcommand(command) {
 export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-server-control/app-server-control.sock') } = {}) {
   let connection = null, opening = null, closed = false, sequence = 0, initialized = false
   const pending = new Map()
-  const fail = () => { for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(new Error('metadata connection unavailable')) }; pending.clear(); initialized = false }
+  const fail = (code = 'metadata-unavailable') => { for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(metadataError(code)) }; pending.clear(); initialized = false }
   async function dispose(ws) {
     if (!ws || ws.readyState === WebSocket.CLOSED) return
     await new Promise(resolve => { const timer = setTimeout(() => { ws.terminate() }, 1000); ws.once('close', () => { clearTimeout(timer); resolve() }); ws.close() })
   }
   async function wire(method, params) {
-    if (closed) throw new Error('metadata client closed')
-    if (connection?.readyState !== WebSocket.OPEN) throw new Error('metadata connection unavailable')
+    if (closed) throw metadataError('cancelled')
+    if (connection?.readyState !== WebSocket.OPEN) throw metadataError('metadata-unavailable')
     return await new Promise((resolve, reject) => {
       const id = ++sequence
-      const timer = setTimeout(() => { pending.delete(id); reject(new Error('metadata request timed out')) }, 5000)
+      const timer = setTimeout(() => { pending.delete(id); reject(metadataError('deadline')) }, 5000)
       pending.set(id, { resolve, reject, timer })
-      connection.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }), error => { if (!error) return; clearTimeout(timer); pending.delete(id); reject(new Error('metadata send failed')) })
+      connection.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }), error => { if (!error) return; clearTimeout(timer); pending.delete(id); reject(metadataError('metadata-send-failed')) })
     })
   }
   async function connect() {
-    if (closed) throw new Error('metadata client closed')
+    if (closed) throw metadataError('cancelled')
     if (connection?.readyState === WebSocket.OPEN && initialized) return
     if (opening) return opening
     opening = (async () => {
@@ -87,17 +96,17 @@ export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-
       ws.on('close', () => { if (connection === ws) { fail(); connection = null } })
       ws.on('message', bytes => {
         let message
-        try { message = JSON.parse(bytes) } catch { if (connection === ws) fail(); ws.terminate(); return }
-        const entry = pending.get(message.id)
+        try { message = JSON.parse(bytes) } catch { if (connection === ws) fail('metadata-invalid-response'); ws.terminate(); return }
+        const entry = pending.get(message?.id)
         if (!entry) return
         pending.delete(message.id); clearTimeout(entry.timer)
-        if (message.error) entry.reject(new Error('metadata request failed'))
+        if (message.error) entry.reject(metadataError('metadata-rpc-error'))
         else entry.resolve(message.result)
       })
       try {
-        await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', () => reject(new Error('metadata service unavailable'))) })
+        await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', () => reject(metadataError('metadata-unavailable'))) })
         await wire('initialize', { clientInfo: { name: 'ghost_sentinel_chatgpt', version: '0.1.0-dev.0' }, capabilities: { experimentalApi: true } })
-        if (closed || connection !== ws) throw new Error('metadata connection superseded')
+        if (closed || connection !== ws) throw metadataError(closed ? 'cancelled' : 'metadata-unavailable')
         ws.send(JSON.stringify({ method: 'initialized' })); initialized = true
       } catch (error) {
         if (connection === ws) { fail(); connection = null }
@@ -112,7 +121,7 @@ export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-
     diagnostics: () => ({ closed, pendingRequests: pending.size, deadlineTimers: pending.size, connected: connection?.readyState === WebSocket.OPEN }),
     async close() {
       if (closed) return
-      closed = true; fail()
+      closed = true; fail('cancelled')
       const ws = connection; connection = null
       await dispose(ws)
     },

@@ -4,9 +4,9 @@
     "node": "v24.21.0",
     "npm": "11.19.1"
   },
-  "sha256": "54c7323e32d9be2cb9c60234a6a2f1caf73a03ee4e5c16b3a10e4dd1b827c0b3",
+  "sha256": "3ebbe262fc846885b13093f7df87b9ee14c59deaeba748509fbe4db07754b4e7",
   "files": {
-    "docs/chatgpt-observation.md": "35b56740b3c3bb7210b782a47a1ea8704d7c6866c75452b293bc0872153c56f0",
+    "docs/chatgpt-observation.md": "ddd66cece37ca79d996d36dea5a176ecc34185e81d229d381f66a41e303e3df4",
     "docs/development-contract.md": "a59c842b24d47bc1a159d4ddc8a49d21a9d65b929efdaaafb373cae818160279",
     "docs/installation.md": "28e0b54d67b276e589a1cea80fa439cfbe498c6adbac64adad83cf8d3023db5f",
     "docs/release-notes.md": "d217b13db88c61f217375770ce4125dd02173906b8c2cf6143758a4e3935abef",
@@ -26,8 +26,8 @@
     "src/analysis/index.mjs": "578630772bca0e3330faa18995bca72df75cd6fe0e47d2ed06b6b73e72b0715d",
     "src/analysis/jev-rendering.mjs": "7f1285fe531cea41627c2ad1aaa9ec197888aa68efb1c3829de71a892fe39991",
     "src/core-client.mjs": "14ea0a1cf00fa21dbcf25251925841009a35a00d67ee9c2b60204733cc62d743",
-    "src/core/failure-receipts.mjs": "d036fc772bc9fada8dbe75a4e8efa351454c6026fac9aacc24b3e70e8d62981d",
-    "src/core/index.mjs": "81a576f65d70c3eb1c960114e992b85f47e6f83c6765c139069ff249d6b2a32a",
+    "src/core/failure-receipts.mjs": "9213c804d69114e5fa9e64c5698639075ae9b804fa3654ce99e425c5674b805c",
+    "src/core/index.mjs": "d6bf5fbb7380ae006073127ba4c65317f42e9a1394bde5affb4191963e30b74e",
     "src/daemon.mjs": "266344416a159c9e54dd01c297f39a8ca1e5ed5648ef0a2607aeb4b74354c4d8",
     "src/enrollment-config.mjs": "9b7c7836e9eb3905c0ef97365fbe1d30537682ad0806a876ced3547c175ceeb3",
     "src/gs-status.mjs": "38a66473eb3f942c4f32a92f6a1921ebbdec9a7f323feeed81935c29431bcba4",

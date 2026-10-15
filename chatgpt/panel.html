@@ -36,7 +36,7 @@ function node(tag,value,className){const child=document.createElement(tag);if(va
 function renderHealth(health){
   if(health?.state==='failed'){
     const reasons=list(health.failures).slice(0,3).map(failure=>(failure.domain==='collection'?'采集':'分析')+'失败'+(text(failure.error?.code,80)?'（'+text(failure.error.code,80)+'）':''));
-    element('health').textContent='监控故障 · '+(reasons.join('；')||'本轮监控不可用');
+    element('health').textContent=(health.orderingGap?'监控曾有失败 · 恢复状态未确认 · ':'监控故障 · ')+(reasons.join('；')||'本轮监控不可用');
   }else if(health?.state==='recovered')element('health').textContent='监控已恢复';
 }
 function stateLine(analysis){
@@ -50,7 +50,7 @@ function render(view){
   const identity=text(view.identity?.threadId,128);
   if(!identity){
     clearView('当前会话未确认');
-    const gaps=[...list(view.discovery?.gaps),view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[])].filter(value=>text(value));
+    const gaps=[...list(view.discovery?.gaps),view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
     for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
     if(gaps.length)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
     renderHealth(view.health);
@@ -60,7 +60,7 @@ function render(view){
   const analysis=view.analysis,byId=new Map(list(analysis.checks).filter(check=>check&&Object.hasOwn(labels,check.id)).map(check=>[check.id,check]));
   let signal=view.signal,summary=text(view.summary)||'当前状态不可判断';
   const green=view.health?.state!=='failed'&&analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted'].includes(analysis.state)&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>{const check=byId.get(id);return check&&(check.status==='clear'||check.applicability?.state==='not-triggered');});
-  if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?'监控故障，当前状态不可判断':states[analysis.state]??'当前分析不可判断';}
+  if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?(view.health.orderingGap?'监控恢复状态未确认':'监控故障，当前状态不可判断'):states[analysis.state]??'当前分析不可判断';}
   if(signal==='green'&&analysis.resultDisposition==='pending')summary='上轮正常 · 待分析';
   element('summary').textContent=lights[signal]+' '+summary;element('summary').setAttribute('data-signal',signal);
   element('analysis').textContent=stateLine(analysis);
@@ -99,7 +99,7 @@ function render(view){
   element('coverage').textContent=coverage.join('\n');
   const recordStates={'caught-up':'已追平','catching-up':'正在补读','partial-record':'等待记录写完',gap:'存在缺口'};
   element('observation').textContent='执行记录：'+(recordStates[view.observation?.coverage]??'尚未确认');
-  const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[])].filter(value=>text(value));
+  const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
   for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
   if(gaps.length||discovery?.complete===false||analysis.coverage?.complete===false)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
   const technical=['分析状态：'+text(analysis.state,80)];

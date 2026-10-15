@@ -6,18 +6,21 @@ import { join } from 'node:path';
 import { createCore } from '../src/core/index.mjs';
 
 const ref = (taskId, eventId) => ({ taskId, lifecycleId: 'life', eventId });
-for (const populated of [false, true]) for (const [kind, expected] of [
+for (const populated of [false, true, 'success']) for (const [kind, expected] of [
   ['future-entry', [false, false, true, true]],
   ['expiry-exit', [true, true, false, false]],
   ['rollback', [true, false, false, false]],
-]) test(`legacy projection keeps ${kind} eligibility with ${populated ? 'retained' : 'empty'} ChatGPT failure indexes`, async t => {
+]) test(`legacy projection keeps ${kind} eligibility with ${populated === 'success' ? 'successful ChatGPT task' : populated ? 'retained' : 'empty'} failure indexes`, async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'failure-projection-clock-'));
   let clock = 1_000_000, armed = false, calls = 0;
   const now = () => { if (!armed) return clock; calls++; return kind === 'rollback' ? calls < 6 ? 1_000_002 : 999_998 : clock++; };
   const core = await createCore({ dataDir, now, leaseMs: 172_800_000 });
   t.after(async () => { await core.close(); await rm(dataDir, { recursive: true, force: true }); });
   const chatgpt = await core.registerSource({ registrationId: 'chatgpt-clock', hostRunId: 'host', name: 'ChatGPT', policy: 'chatgpt-main/1' });
-  if (populated) await core.recordCollectionOutcome({ sourceKey: chatgpt, mainId: null, lifecycleId: null, roundId: 'capture', outcome: 'failed', settledAt: clock, error: { code: 'EACCES', stage: 'collection' } });
+  if (populated === 'success') {
+    await core.ingest(chatgpt, { tasks: [{ id: 'chatgpt-main', lifecycleId: 'run', title: 'ChatGPT', status: 'running' }] });
+    await core.recordCollectionOutcome({ sourceKey: chatgpt, mainId: 'chatgpt-main', lifecycleId: 'run', roundId: 'capture-success', outcome: 'succeeded', settledAt: clock });
+  } else if (populated) await core.recordCollectionOutcome({ sourceKey: chatgpt, mainId: null, lifecycleId: null, roundId: 'capture', outcome: 'failed', settledAt: clock, error: { code: 'EACCES', stage: 'collection' } });
   const source = await core.registerSource({ registrationId: kind, hostRunId: 'host', name: 'DSH' }), ids = ['one', 'two', 'three', 'four'];
   await core.ingest(source, { tasks: ids.map(id => ({ id, lifecycleId: 'life', sessionId: id, status: 'running', title: id })), events: ids.flatMap(taskId => [
     { id: 'state', taskId, taskLifecycleId: 'life', kind: 'status', text: '', capturedAt: clock, data: { nativeType: 'agent/status', status: 'running' } },

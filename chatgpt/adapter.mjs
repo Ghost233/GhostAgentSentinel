@@ -15,7 +15,7 @@ const collectionFailures = new Set(['record-source-unavailable', 'record-identit
 const combineHealth = (...values) => {
   const failed = values.filter(value => value?.state === 'failed')
   const failures = new Map(failed.flatMap(value => value.failures ?? []).map(failure => [failure.id ?? JSON.stringify([failure.domain, failure.channel, failure.roundId, failure.error]), failure]))
-  return { state: failed.length ? 'failed' : values.some(value => value?.state === 'recovered') ? 'recovered' : 'unknown', failures: [...failures.values()].slice(0, 6) }
+  return { state: failed.length ? 'failed' : values.some(value => value?.state === 'recovered') ? 'recovered' : 'unknown', failures: [...failures.values()].slice(0, 6), orderingGap: values.some(value => value?.orderingGap === true) }
 }
 const lifecycleGapView = (reason, threadId = null) => ({ identity: { threadId }, signal: 'gray', summary: '无法确认当前观察', observation: { phase: 'unknown', status: 'unknown', gap: reason }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
 
@@ -79,12 +79,16 @@ export async function startChatGPTAdapter({ core, native, sessionsRoot, dataDir,
   const discovery = createDiscovery({ native, sessionsRoot, now })
   let queue = Promise.resolve(), queuedBatches = 0, rotation = 0
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
-  const capability = async () => { const features = (await core.health()).features ?? []; return features.includes('source-observation/1') && (!collectMaterials || features.includes('chatgpt-main/1') && features.includes('hierarchy-context/1')) }
+  const capability = async () => {
+    const features = (await core.health()).features
+    const required = collectMaterials ? ['source-observation/1', 'chatgpt-main/1', 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
+    return Array.isArray(features) && required.every(feature => features.includes(feature))
+  }
 
   async function collectionOutcome(entry, outcome, error, roundId, channel = entry ? 'main:' + fingerprint(entry.id) : 'directory') {
     if (!healthOutbox || !source || closed) return
     const scope = entry?.lifecycleVerified && entry.hostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: entry.lifecycleId } : { mainId: null, lifecycleId: null }
-    const value = { sourceKey: source.key, ...scope, channel, roundId, outcome, settledAt: now(), ...(error ? { error: failureErrorInfo({ code: error.code ?? 'collection_failed', stage: error.stage ?? 'collection', status: error.status, details: error.details }) } : {}) }
+    const value = { sourceKey: source.key, ...scope, channel, roundId, outcome, settledAt: now(), ...(error ? { error: failureErrorInfo({ code: error.code ?? 'collection_failed', codeHash: error.codeHash, stage: error.stage ?? 'collection', status: error.status, details: error.details }) } : {}) }
     try {
       healthOutbox.push(value)
       if (entry && outcome === 'succeeded' && scope.mainId !== null) healthOutbox.push({ ...value, mainId: null, lifecycleId: null })

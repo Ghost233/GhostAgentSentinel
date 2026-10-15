@@ -1159,7 +1159,7 @@ export async function createCore({
         value.analysis.resultDisposition = resultDispositionFor(task, instruction, read);
         const conversation = conversationFor(task);
         if (conversation) value.conversationMonitoring = conversation;
-        if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1') value.monitoringHealth = failureStore.health({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId });
+        if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1') value.monitoringHealth = failureStore.health({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId }, current);
         return value;
       });
       applyGSProjection(publicTasks, current);
@@ -1170,7 +1170,7 @@ export async function createCore({
         overview: { runningTasks: publicTasks.filter(task => task.status === 'running').length, knownSources: sources.size, connectedSources: Array.from(sources.values()).filter(connected).length, attentionTasks: publicTasks.filter(task => task.alerts.some(alert => alert.status === 'attention')).length, coverage: { complete: false, gaps: ['Automatic discovery of all local sources has not been verified'] } },
         enrollment: enrollmentSnapshot(),
         hierarchyContext,
-        sources: Array.from(sources.values()).map(source => ({ ...copy(source), ...(source.descriptor.policy === 'chatgpt-main/1' ? { monitoringHealth: failureStore.health({ sourceKey: source.key, mainId: null, lifecycleId: null }) } : {}) })), tasks: publicTasks,
+        sources: Array.from(sources.values()).map(source => ({ ...copy(source), ...(source.descriptor.policy === 'chatgpt-main/1' ? { monitoringHealth: failureStore.health({ sourceKey: source.key, mainId: null, lifecycleId: null }, current) } : {}) })), tasks: publicTasks,
       };
     },
     async gsSummary({ sourceKey, sessionId }) {
