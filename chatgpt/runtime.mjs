@@ -52,10 +52,10 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native 
   try {
     core = await connectCore({ dataDir: config.coreDataDir })
     const hostIO = native ?? createNativeIO({ pluginId: config.pluginId, socketPath: config.metadataSocket })
-    adapter = await startChatGPTAdapter({ core, native: hostIO, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, pollMs })
+    adapter = await startChatGPTAdapter({ core, native: hostIO, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, pollMs, collectMaterials: true })
     const pluginDir = join(config.dataDir, 'plugin')
     await mkdir(join(pluginDir, '.codex-plugin'), { recursive: true, mode: 0o700 })
-    await writePrivateJson(join(pluginDir, '.codex-plugin/plugin.json'), { name: 'ghost-sentinel', version: '0.1.0-dev.0', description: 'ChatGPT.app 本机主会话只读观察；当前候选仅接入真实生命周期。', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查', shortDescription: '本机主会话 · 只读观察' } })
+    await writePrivateJson(join(pluginDir, '.codex-plugin/plugin.json'), { name: 'ghost-sentinel', version: '0.1.0-dev.0', description: 'ChatGPT.app 本机主会话只读检查；当前开发候选不含正式常驻安装。', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查', shortDescription: '本机主会话 · 只读检查' } })
     await writePrivateJson(join(pluginDir, '.mcp.json'), { mcpServers: { sentinel: { url: adapter.url + '/mcp', http_headers: { Authorization: 'Bearer ' + config.token } } } })
     await writePrivateJson(join(config.dataDir, 'runtime.json'), { format: 1, pid: process.pid, runId, installationId: config.installationId, url: adapter.url, startedAt: Date.now() })
     return { url: adapter.url, pluginDir, refresh: adapter.refresh, diagnostics: adapter.diagnostics, close }

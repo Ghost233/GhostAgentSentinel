@@ -46,7 +46,7 @@ test('the internal helper entry runs as a separate process and exits with its ow
   const deadline = Date.now() + 5000
   while (!output.includes('\n')) { assert.ok(child.exitCode === null, errors); assert.ok(Date.now() < deadline, 'helper must announce its own endpoint'); await new Promise(resolve => setTimeout(resolve, 10)) }
   const ready = JSON.parse(output.trim())
-  assert.equal(ready.mode, 'observation-only')
+  assert.equal(ready.policy, 'chatgpt-main/1')
   assert.equal(ready.pid, child.pid)
   const config = JSON.parse(await readFile(prepared.configPath, 'utf8'))
   assert.equal(output.includes(config.token), false)

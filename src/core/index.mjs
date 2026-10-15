@@ -88,16 +88,16 @@ export async function createCore({
   const connected = source => source?.status === 'connected';
   const findTask = (sourceKey, id, lifecycleId) => Array.from(tasks.values()).find(task => identity(task.sourceKey, task.id, task.lifecycleId) === identity(sourceKey, id, lifecycleId));
   const liveIdentity = task => task.status === 'running' && task.baselineConfirmed && connected(sources.get(task.sourceKey));
-  const usable = task => liveIdentity(task) && (!sources.get(task.sourceKey)?.hierarchyContext || task.requestId != null);
+  const usable = task => liveIdentity(task) && (!(sources.get(task.sourceKey)?.hierarchyContext || sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1') || task.requestId != null);
   const observationOnly = task => sources.get(task.sourceKey)?.descriptor.mode === 'observation-only';
   const contextFor = (task, read) => {
-    const context = sources.get(task.sourceKey)?.hierarchyContext;
+    const owner = sources.get(task.sourceKey), context = owner?.hierarchyContext;
     if (!context) return null;
     const current = now();
-    const source = read?.bySource.get(task.sourceKey);
-    if (source && (!source.instruction || current < source.instructionAt || current >= source.instruction.validUntil)) source.instruction = createInstructionLookup(context, source.tasks, source.events, current);
-    if (source) source.instructionAt = current;
-    const value = source ? instructionContext(task, context, source.tasks, source.events, current, source.instruction) : instructionContext(task, context, [...tasks.values()].filter(item => item.sourceKey === task.sourceKey), [...events.values()].filter(event => tasks.get(event.taskKey)?.sourceKey === task.sourceKey), current);
+    const source = read?.bySource.get(task.sourceKey) ?? { tasks: [...tasks.values()].filter(item => item.sourceKey === task.sourceKey), events: [...events.values()].filter(event => tasks.get(event.taskKey)?.sourceKey === task.sourceKey) };
+    if (!source.instruction || current < source.instructionAt || current >= source.instruction.validUntil) source.instruction = createInstructionLookup(context, source.tasks, source.events, current, owner.descriptor.policy);
+    source.instructionAt = current;
+    const value = instructionContext(task, context, source.tasks, source.events, current, source.instruction);
     value.gaps = [...new Set([...value.gaps, ...(value.binding?.retentionGaps ?? [])])];
     return value;
   };
@@ -109,7 +109,7 @@ export async function createCore({
     });
   };
   const resultKeyFor = (task, context, read) => {
-    const coverage = coverageFor(task, read), input = { task: { id: task.id, lifecycleId: task.lifecycleId, status: task.status, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt }, events: publicEvents(task, context, read), coverage };
+    const coverage = coverageFor(task, read), input = { task: { id: task.id, lifecycleId: task.lifecycleId, status: task.status, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt }, source: sources.get(task.sourceKey)?.descriptor, events: publicEvents(task, context, read), coverage };
     return fingerprint([task.revision, resultScopeFor(task, read), typeof analyzer?.timeConditions === 'function' ? analyzer.timeConditions(input, now()) : analysisTimeConditions(input, now())]);
   };
   const resultScopeFor = (task, read) => {
@@ -298,6 +298,11 @@ export async function createCore({
 
   function coverageFor(task, read) {
     const source = sources.get(task.sourceKey);
+    let scopedEvents = taskEvents(task, read);
+    if (source?.descriptor.policy === 'chatgpt-main/1' && task.requestId != null) {
+      const request = scopedEvents.findIndex(event => event.kind === 'input' && event.id === task.requestId);
+      if (request >= 0) scopedEvents = scopedEvents.slice(request);
+    }
     const inCurrentScope = gap => task.requestStartedAt == null || (gap.endAt ?? gap.at) >= task.requestStartedAt;
     const gaps = [
       ...(source?.descriptor.gaps ?? []),
@@ -306,9 +311,10 @@ export async function createCore({
     ];
     if (source?.hierarchyCaptureBudgetExceeded) gaps.push(HIERARCHY_CAPTURE_GAP);
     if (!task.baselineConfirmed) gaps.push('Task baseline is unconfirmed');
+    if (source?.descriptor.policy === 'chatgpt-main/1' && task.requestId == null) gaps.push('Current user request is unverified');
     if (!connected(source)) gaps.push('Source is disconnected');
-    if (taskEvents(task, read).some(event => event.data?.truncated && event.data?.inputOrigin !== 'runtime-notice' && (task.requestStartedAt == null || event.capturedAt >= task.requestStartedAt))) gaps.push('Some observed excerpts are truncated');
-    if (taskEvents(task, read).some(event => event.data?.redacted && (task.requestStartedAt == null || event.capturedAt >= task.requestStartedAt))) gaps.push('Some observed content was omitted for privacy');
+    if (scopedEvents.some(event => event.data?.truncated && event.data?.inputOrigin !== 'runtime-notice' && (task.requestStartedAt == null || event.capturedAt >= task.requestStartedAt))) gaps.push('Some observed excerpts are truncated');
+    if (scopedEvents.some(event => event.data?.redacted && (task.requestStartedAt == null || event.capturedAt >= task.requestStartedAt))) gaps.push('Some observed content was omitted for privacy');
     return { complete: gaps.length === 0, gaps: [...new Set(gaps)] };
   }
 
@@ -660,9 +666,20 @@ export async function createCore({
       if (check.recoveryFor !== undefined && (!round.input.task.activeAlerts?.some(alert => alert.id === check.recoveryFor && alert.checkId === check.id) || !Array.isArray(check.recoveryEvidenceIds) || !check.recoveryEvidenceIds.length || check.recoveryEvidenceIds.some(id => !check.evidenceIds.includes(id) || !round.input.events.some(event => event.id === id && event.kind === 'tool-result' && !event.data?.history && !event.data?.interrupted && !event.data?.aborted && !event.data?.timedOut && !event.data?.signal)))) throw new Error('Analyzer returned invalid recovery scope or result evidence');
       check.applicability ??= { state: check.status !== 'unknown' ? 'triggered' : 'unknown', reason: 'Legacy analyzer trigger coverage', evidenceIds: check.evidenceIds };
       check.judgmentState = check.applicability.state === 'not-triggered' ? 'not-triggered' : check.status === 'unknown' ? 'insufficient' : check.status;
+      if (round.input.source.policy === 'chatgpt-main/1' && check.id === 'long_wait' && check.status === 'attention') {
+        check.status = 'unknown';
+        check.judgmentState = 'insufficient';
+        check.reason = '等待原因未确认；观察时长本身不能确认停滞';
+        check.applicability = { state: 'unknown', reason: check.reason, evidenceIds: check.evidenceIds };
+        delete check.conditionAt;
+        delete check.recoveryFor;
+        delete check.recoveryEvidenceIds;
+      }
       checks.set(check.id, check);
     }
-    return { ...copy(result), checks: CHECK_IDS.map(id => checks.get(id)) };
+    const value = { ...copy(result), checks: CHECK_IDS.map(id => checks.get(id)) };
+    if (round.input.source.policy === 'chatgpt-main/1') value.summary.attention = value.checks.filter(check => check.status === 'attention').map(check => check.reason).join('；') || '本轮未形成有足够依据的提醒；不可判断项目仍显示未知';
+    return value;
   }
 
   function completeRound(round, result, error) {
@@ -894,16 +911,22 @@ export async function createCore({
       } else {
         if (now() - source.lastSeenAt >= leaseMs) resetSource(source, 'Source lease expired before re-registration');
         const modeChanged = source.descriptor.mode !== descriptor.mode;
+        const policyChanged = source.descriptor.policy !== descriptor.policy;
         Object.assign(source, { descriptor: copy(descriptor), status: 'connected', lastSeenAt: now(), disconnectReason: null });
-        if (modeChanged) for (const task of tasks.values()) if (task.sourceKey === source.key) {
-          cancelRound('Source observation mode changed', task);
+        if (policyChanged) {
+          delete source.hierarchyContext;
+          delete source.hierarchyMaterialKey;
+        }
+        if (modeChanged || policyChanged) for (const task of tasks.values()) if (task.sourceKey === source.key) {
+          cancelRound('Source observation mode or policy changed', task);
           invalidateAlerts(task, 'unknown');
+          if (policyChanged) { task.currentRequest = ''; task.requestId = null; task.requestStartedAt = null; task.contextFingerprint = null; }
           task.resultKey = null;
           task.resultScope = null;
           Object.assign(task.analysis, { state: observationOnly(task) ? 'observation-only' : 'unknown',
             summary: null, summaryAt: null, completedAt: null, startedAt: null, through: null, throughRevision: 0,
             queuedAt: null, nextEligibleAt: null, error: null, inputEventIds: [], contextEvidenceRefs: [],
-            checks: unknownChecks('Source observation mode changed; prior judgments are not current') });
+            checks: unknownChecks('Source observation mode or policy changed; prior judgments are not current') });
           save('tasks', task);
         }
       }
@@ -939,7 +962,7 @@ export async function createCore({
         for (const task of batch.tasks ?? []) prospectiveTasks.set(identity(task.id, task.lifecycleId), task);
         const prospectiveEvents = new Map(Array.from(events.values()).filter(event => tasks.get(event.taskKey)?.sourceKey === sourceKey).map(event => [identity(event.taskId, event.taskLifecycleId, event.id), event]));
         for (const event of batch.events ?? []) if (!prospectiveEvents.has(identity(event.taskId, event.taskLifecycleId, event.id))) prospectiveEvents.set(identity(event.taskId, event.taskLifecycleId, event.id), event);
-        acceptedRuns = validateHierarchy(incoming, { tasks: [...prospectiveTasks.values()], events: [...prospectiveEvents.values()], now: now(), acceptedRuns: source.hierarchyRunBindings ?? [] });
+        acceptedRuns = validateHierarchy(incoming, { tasks: [...prospectiveTasks.values()], events: [...prospectiveEvents.values()], now: now(), acceptedRuns: source.hierarchyRunBindings ?? [], sourcePolicy: source.descriptor.policy });
         const references = [...incoming.activations.flatMap(item => item.stateRefs), ...incoming.relations.flatMap(item => item.evidenceRefs), ...incoming.instructionBindings.flatMap(item => [item.inputRef, ...item.originRefs, ...item.ancestorLimitRefs]), ...(incoming.waitBindings ?? []).flatMap(item => item.evidenceRefs)];
         for (const reference of references) {
           const capture = captures.get(referenceKey(reference));
@@ -982,7 +1005,7 @@ export async function createCore({
         }
         task.gaps = [...new Set([...(task.gaps ?? []), ...(descriptor.gaps ?? [])])].filter(reason => reason !== 'Task baseline is not yet available');
         task.gapRecords = (task.gapRecords ?? []).filter(gap => gap.reason !== 'Task baseline is not yet available');
-        task.baselineConfirmed = !observationOnly(task) || descriptor.status !== 'unknown';
+        task.baselineConfirmed = !(observationOnly(task) || source.descriptor.policy === 'chatgpt-main/1') || descriptor.status !== 'unknown';
         const changed = before !== JSON.stringify([task.title, task.status, task.sessionId, task.parentId, task.gaps, task.baselineConfirmed]);
         if (changed) {
           task.updatedAt = now();
@@ -1019,11 +1042,11 @@ export async function createCore({
         task.updatedAt = now();
         task.lastActivity = Math.max(task.lastActivity ?? 0, event.capturedAt);
         task.revision++;
-        if (!incoming && !source.hierarchyContext) admitRequest(task, event);
+        if (!incoming && !source.hierarchyContext && source.descriptor.policy !== 'chatgpt-main/1') admitRequest(task, event);
         if (event.kind === 'gap') {
           rememberGap(task, { reason: event.text, at: event.capturedAt });
         }
-        if (event.kind === 'status' && ['running', 'idle', 'disposed', 'unknown'].includes(event.data?.status)) {
+        if (event.kind === 'status' && ['running', 'idle', 'disposed', 'unknown'].includes(event.data?.status) && (source.descriptor.policy !== 'chatgpt-main/1' || task.baselineConfirmed)) {
           task.status = event.data.status;
           if (task.status !== 'unknown') task.lastKnownStatus = task.status;
           if (task.status !== 'running') { cancelRound('Source task is no longer running', task); invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended'); }
@@ -1048,7 +1071,7 @@ export async function createCore({
           }
         }
         for (const task of tasks.values()) if (task.sourceKey === sourceKey) bindNotificationRoot(task, incoming);
-        for (const binding of incoming.instructionBindings) if (binding.phase === 'consumed' && binding.origin !== 'runtime-notice') {
+        for (const binding of incoming.instructionBindings) if (binding.phase === 'consumed' && binding.origin !== 'runtime-notice' && (source.descriptor.policy !== 'chatgpt-main/1' || binding.origin === 'user-entry')) {
           const task = findTask(sourceKey, binding.taskId, binding.lifecycleId), event = events.get(identity(sourceKey, binding.inputRef.taskId, binding.inputRef.lifecycleId, binding.inputRef.eventId));
           if (task && event && !task.excludedInstructionIds?.includes(event.id)) { admitRequest(task, event); save('tasks', task); }
         }

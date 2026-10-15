@@ -1,4 +1,5 @@
-// Project only lifecycle metadata; response bodies and reasoning never enter this reader.
+// Metadata-only is the default; material mode shares the same bounded physical read.
+import { MaterialProjection, materialRecord } from './material-projection.mjs';
 import { jsonParser } from 'stream-json/core/parser.js';
 import filter from 'stream-json/core/filters/filter.js';
 import stringer from 'stream-json/core/stringer.js';
@@ -80,7 +81,9 @@ const otherEvents = new Set(['item_started', 'item_completed', 'token_count', 'a
 const lifecycle = new Set(['task_started', 'task_complete', 'turn_aborted']);
 
 export class BoundedReader {
-  constructor(source, cursor = null) {
+  constructor(source, cursor = null, { mode = 'metadata' } = {}) {
+    if (!['metadata', 'material'].includes(mode)) throw new Error('unsupported reader mode');
+    this.mode = mode;
     this.source = source;
     this.scope = digest(JSON.stringify([typeof source.path === 'string' ? resolve(source.path) : '', source.threadId, source.hostRunId, profileKey(source.profile)]));
     this.state = emptyState();
@@ -91,9 +94,12 @@ export class BoundedReader {
     this.gap = null; this.attachSize = null; this.knownSize = null; this.excluded = 0;
     this.metrics = { physicalBytes: 0, records: 0, peakProjectionBytes: 0, maximumReadBytes: 0 };
     this.recentLifecycle = [];
+    this.materials = [];
+    this.turnTrigger = this.mode === 'material' && typeof cursor?.turnTrigger === 'string' && cursor.turnTrigger.length <= 256 ? cursor.turnTrigger : null;
     if (typeof source.threadId !== 'string' || !source.threadId || source.threadId.length > 128 || source.parentId !== null || !source.hostRunId || !Number.isFinite(source.hostStartedAt) || !['vscode', 'cli', 'appServer'].includes(source.sourceKind) || source.originator !== 'Codex Desktop') this.gap = 'main-identity-unverified';
     else if (source.forkedFromId) this.gap = 'fork-provenance-unverified';
     else if (profileKey(source.profile) !== profileKey(supportedProfile)) this.gap = 'unsupported-host-version';
+    else if (cursor && this.mode === 'material' && cursor.projectionMode !== 'material') this.gap = 'material-cursor-baseline-missing';
     if (cursor && !this.gap) {
       const s = cursor.state;
       if (cursor.format !== 2 || cursor.scope !== this.scope || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || !Number.isSafeInteger(cursor.attachSize) || cursor.attachSize < 0 || !Number.isSafeInteger(cursor.knownSize) || cursor.knownSize < cursor.offset || cursor.knownSize < cursor.attachSize || !/^[0-9a-f]{64}$/.test(cursor.guardHash ?? '') || typeof cursor.fileId !== 'string' || cursor.fileId.length > 100 || typeof s?.header !== 'boolean' || typeof s?.anchored !== 'boolean' || !['unknown', 'started', 'completed', 'aborted'].includes(s?.phase) || s.turnId !== null && (typeof s.turnId !== 'string' || s.turnId.length > 128) || s.at !== null && !Number.isSafeInteger(s.at)) {
@@ -112,7 +118,7 @@ export class BoundedReader {
     const startGap = this.state.phase === 'started' && this.state.at < this.source.hostStartedAt + 1000 ? this.state.at < this.source.hostStartedAt ? 'start-predates-host' : 'host-start-time-overlap' : null;
     const coverage = reason || this.gap || startGap ? 'gap' : this.stat && this.offset < this.stat.size ? 'catching-up' : this.pendingBytes ? 'partial-record' : this.stat ? 'caught-up' : 'catching-up';
     const gap = reason ?? this.gap ?? (!this.state.header ? 'main-header-unverified' : !this.state.anchored ? 'current-turn-not-observed' : startGap);
-    return { coverage, gap, observed: { ...this.state }, effectivePhase: coverage === 'caught-up' && !gap ? this.state.phase : 'unknown', offset: this.offset, committedOffset: this.committed, pendingBytes: this.pendingBytes, excluded: this.excluded, recentLifecycle: this.recentLifecycle.map(e => ({ ...e })), metrics: { ...this.metrics } };
+    return { coverage, gap, observed: { ...this.state }, effectivePhase: coverage === 'caught-up' && !gap ? this.state.phase : 'unknown', offset: this.offset, committedOffset: this.committed, pendingBytes: this.pendingBytes, excluded: this.excluded, recentLifecycle: this.recentLifecycle.map(e => ({ ...e })), ...(this.mode === 'material' ? { materials: this.materials.map(e => ({ ...e, data: { ...e.data } })) } : {}), metrics: { ...this.metrics } };
   }
 
   apply(row, recordStart) {
@@ -125,6 +131,12 @@ export class BoundedReader {
     }
     if (!this.state.header) return;
     if (row.payload?.thread_id && row.payload.thread_id !== this.source.threadId) { this.excluded++; return; }
+    if (this.mode === 'material' && row.type === 'event_msg' && row.payload?.type === 'item_completed' && row.payload.thread_id !== this.source.threadId) { this.excluded++; return; }
+    if (this.mode === 'material' && this.state.anchored && this.state.turnId) {
+      const material = materialRecord(row, this.state.turnId, recordStart, this.offset + 1, this.turnTrigger);
+      if (material && material.turnId === this.state.turnId) this.materials.push(material);
+      else if (material) this.excluded++;
+    }
     if (row.type !== 'event_msg') {
       if (this.state.anchored && !otherRecords.has(row.type)) this.gap = 'unsupported-record-type:' + String(row.type).slice(0, 80);
       return;
@@ -138,9 +150,11 @@ export class BoundedReader {
     if (!this.state.anchored && id !== this.source.anchorTurnId && !(type === 'task_started' && recordStart >= this.attachSize)) return;
     if (typeof id !== 'string' || !id || id.length > 128 || !Number.isFinite(Date.parse(row.timestamp))) { this.gap = 'invalid-lifecycle-record'; return; }
     this.state.anchored = true;
-    this.recentLifecycle.push({ type, turnId: id, at: Date.parse(row.timestamp), recordStart });
-    if (this.recentLifecycle.length > 8) this.recentLifecycle.shift();
+    const turnTrigger = this.mode === 'material' && row.material.fields['payload.turn_attribution.turn_id']?.text === id ? row.material.turnTrigger ?? null : null;
+    this.recentLifecycle.push({ type, turnId: id, at: Date.parse(row.timestamp), recordStart, ...(this.mode === 'material' ? { recordEnd: this.offset + 1, turnTrigger } : {}) });
+    if (this.mode === 'metadata' && this.recentLifecycle.length > 8) this.recentLifecycle.shift();
     if (type === 'task_started') {
+      if (this.mode === 'material') this.turnTrigger = turnTrigger;
       this.state = { header: true, anchored: true, phase: 'started', turnId: id, at: Date.parse(row.timestamp), orphan: Date.parse(row.timestamp) < this.source.hostStartedAt };
     } else if (!this.state.turnId || this.state.turnId === id) {
       this.state = { header: true, anchored: true, phase: type === 'task_complete' ? 'completed' : 'aborted', turnId: id, at: Date.parse(row.timestamp), orphan: false };
@@ -149,12 +163,12 @@ export class BoundedReader {
 
   consume(bytes) {
     let at = 0;
-    while (at < bytes.length && !this.gap) {
+    while (at < bytes.length && !this.gap && (this.mode !== 'material' || this.recentLifecycle.length + this.materials.length < 16)) {
       const newline = bytes.indexOf(10, at);
       const end = newline < 0 ? bytes.length : newline;
       const part = bytes.subarray(at, end);
       const recordStart = this.offset - this.pendingBytes;
-      this.projection ??= new Projection();
+      this.projection ??= this.mode === 'material' ? new MaterialProjection() : new Projection();
       try {
         this.projection.write(part);
         this.metrics.peakProjectionBytes = Math.max(this.metrics.peakProjectionBytes, this.projection.peakProjectionBytes);
@@ -175,13 +189,14 @@ export class BoundedReader {
 
   async pump({ budgetBytes = 262144, available = this.available ?? true, profile = this.source.profile, hostRunId = this.source.hostRunId } = {}) {
     if (!Number.isSafeInteger(budgetBytes) || budgetBytes < 1 || budgetBytes > 262144) throw new Error('invalid read budget');
+    if (this.mode === 'material' && !this.busy) { this.recentLifecycle = []; this.materials = []; }
     if (this.closed) return { ...this.view('reader-closed'), readBytes: 0 };
     if (this.gap) return { ...this.view(), readBytes: 0 };
     if (profileKey(profile) !== profileKey(supportedProfile)) { this.gap = 'unsupported-host-version'; return { ...this.view(), readBytes: 0 }; }
     if (hostRunId !== this.source.hostRunId) { this.gap = 'source-generation-changed'; return { ...this.view(), readBytes: 0 }; }
     this.available = available;
     if (!available) { this.needsGuard = true; return { ...this.view('source-unavailable'), readBytes: 0 }; }
-    if (this.busy) return { ...this.view('reader-busy'), readBytes: 0 };
+    if (this.busy) return { ...this.view('reader-busy'), ...(this.mode === 'material' ? { materials: [], recentLifecycle: [] } : {}), readBytes: 0 };
     this.busy = true;
     let finishPump;
     this.pumpComplete = new Promise(resolve => { finishPump = resolve; });
@@ -238,7 +253,7 @@ export class BoundedReader {
   }
 
   checkpoint() {
-    return { format: 2, scope: this.scope, offset: this.committed, attachSize: this.attachSize, knownSize: this.knownSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap };
+    return { format: 2, scope: this.scope, offset: this.committed, attachSize: this.attachSize, knownSize: this.knownSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap, ...(this.mode === 'material' ? { projectionMode: 'material', turnTrigger: this.turnTrigger } : {}) };
   }
 
   async close() {

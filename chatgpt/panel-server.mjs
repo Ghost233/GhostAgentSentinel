@@ -22,7 +22,7 @@ export async function startPanelServer({ read, token, port = 0 }) {
     const uri = 'ui://ghost-sentinel/current-chat.html'
     registerAppResource(mcp, 'sentinel-current-chat', uri, {}, async () => ({ contents: [{ uri, mimeType: RESOURCE_MIME_TYPE, text: html }] }))
     registerAppTool(mcp, 'sentinel_current_chat', {
-      title: 'Sentinel 会话检查', description: '只读查看当前本机主会话的真实观察状态。六项分析尚未接入。', inputSchema: {},
+      title: 'Sentinel 会话检查', description: '只读查看当前本机主会话的观察、检查结果及证据缺口。', inputSchema: {},
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       _meta: { ui: { resourceUri: uri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'thread' }] } },
     }, async (_args, extra) => {
