@@ -269,3 +269,68 @@ test('unconfirmed panel visits during global qualification failures cannot exhau
     for (const field of ['trackedThreads', 'openReaders', 'pendingOperations', 'queuedBatches', 'refreshTimers', 'directoryEntries', 'directoryPending']) assert.equal(f.adapter.diagnostics()[field], 0, field)
   })
 })
+
+function pagedDirectory(f) {
+  f.native.listThreads = async ({ cursor, limit, archived }) => {
+    f.facts.pages++; assert.ok(limit <= 50)
+    const rows = [...f.rows.values()].filter(thread => Boolean(thread.archived) === archived).sort((a, b) => b.createdAt - a.createdAt)
+    const start = cursor === null ? 0 : Number(cursor), data = rows.slice(start, start + limit)
+    return { data, nextCursor: start + data.length < rows.length ? String(start + data.length) : null }
+  }
+}
+function excludedDirectoryEntry(f, kind, index) {
+  const id = kind + '-' + index
+  return { id, createdAt: index, parentThreadId: kind === 'child' ? 'parent' : null, originator: kind === 'non-desktop' ? 'Other Client' : 'Codex Desktop', source: 'vscode', path: join(f.dir, id + '.jsonl'), cwd: join(f.dir, 'project-a'), ...(kind === 'unknown' ? { environments: [{ environmentId: 'opaque-selection' }] } : {}) }
+}
+async function boundedRefresh(f) {
+  const pages = f.facts.pages, reads = f.facts.reads.length
+  await f.adapter.refresh()
+  assert.ok(f.facts.pages - pages <= 4)
+  assert.ok(f.facts.reads.length - reads <= 40, 'at most twenty selected mains receive before/after qualification reads')
+  assert.ok(f.adapter.diagnostics().directoryEntries <= 256)
+}
+
+test('a full directory of excluded identities cannot starve the only eligible main from background observation', async t => {
+  for (const kind of ['child', 'unknown', 'non-desktop']) await t.test(kind, async t => {
+    const f = await fixture(t); pagedDirectory(f)
+    for (let index = 0; index < 256; index++) { const thread = excludedDirectoryEntry(f, kind, index); f.rows.set(thread.id, thread) }
+    await boundedRefresh(f); await boundedRefresh(f)
+    assert.equal(f.adapter.discovery().directoryComplete, true)
+    assert.equal(f.adapter.diagnostics().directoryEntries, 256)
+    assert.equal(f.adapter.diagnostics().trackedThreads, 0)
+    assert.deepEqual((await f.core.snapshot()).tasks, [])
+    await f.add('only-main', { createdAt: 1000, environments: [{ environmentId: 'local', cwd: join(f.dir, 'project-a') }] })
+    for (let refresh = 0; refresh < 4; refresh++) await boundedRefresh(f)
+    const snapshot = await f.core.snapshot(), coverage = f.adapter.discovery()
+    assert.deepEqual(snapshot.tasks.map(task => task.id), ['only-main'])
+    assert.equal(snapshot.tasks[0].status, 'running')
+    assert.equal(coverage.counts.main, 1)
+    assert.equal(coverage.complete, false)
+    assert.ok(coverage.gaps.includes('directory-diagnostic-entries-omitted'))
+    assert.ok(f.facts.reads.every(id => id === 'only-main'))
+    assert.equal(f.adapter.diagnostics().trackedThreads, 1)
+    assert.equal(f.adapter.diagnostics().directoryEntries, 256)
+  })
+})
+
+test('admitting a main into a full diagnostic directory preserves already confirmed mains and their first capture time', async t => {
+  const f = await fixture(t); pagedDirectory(f)
+  await f.add('retained-main', { createdAt: -1 })
+  await boundedRefresh(f)
+  const original = (await f.core.snapshot()).tasks[0].events[0]
+  for (let index = 0; index < 256; index++) { const thread = excludedDirectoryEntry(f, 'child', index); f.rows.set(thread.id, thread) }
+  await boundedRefresh(f); await boundedRefresh(f)
+  assert.equal(f.adapter.diagnostics().directoryEntries, 256)
+  await f.add('new-main', { createdAt: 1000 })
+  for (let refresh = 0; refresh < 4; refresh++) await boundedRefresh(f)
+  const snapshot = await f.core.snapshot()
+  assert.deepEqual(snapshot.tasks.map(task => task.id).sort(), ['new-main', 'retained-main'])
+  const retained = snapshot.tasks.find(task => task.id === 'retained-main')
+  assert.equal(retained.status, 'running')
+  assert.equal(retained.events.find(event => event.id === original.id).capturedAt, original.capturedAt)
+  assert.equal(f.adapter.discovery().counts.main, 2)
+  assert.ok(f.adapter.discovery().gaps.includes('directory-diagnostic-entries-omitted'))
+  assert.ok(f.facts.reads.every(id => ['retained-main', 'new-main'].includes(id)))
+  await f.adapter.close()
+  for (const field of ['trackedThreads', 'openReaders', 'pendingOperations', 'directoryEntries', 'directoryPending', 'directoryCursor']) assert.equal(f.adapter.diagnostics()[field], 0, field)
+})

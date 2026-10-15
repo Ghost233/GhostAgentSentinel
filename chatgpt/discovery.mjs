@@ -46,7 +46,13 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
           for (const thread of response.data) {
             if (typeof thread?.id !== 'string' || !thread.id || thread.id.length > 128) { gaps.push('directory-identity-invalid'); continue }
             const kind = classifyThread(thread, sessionsRoot)
-            if (!catalog.has(thread.id) && catalog.size >= LIMIT) { gaps.push('directory-capacity-reached'); continue }
+            if (!catalog.has(thread.id) && catalog.size >= LIMIT) {
+              gaps.push('directory-capacity-reached')
+              const diagnostic = kind === 'main' ? [...catalog.values()].find(item => item.kind !== 'main') : null
+              if (kind !== 'main' || diagnostic) gaps.push('directory-diagnostic-entries-omitted')
+              if (!diagnostic) continue
+              catalog.delete(diagnostic.id)
+            }
             catalog.set(thread.id, { id: thread.id, kind, seenAt: at })
           }
           if (closed) break
