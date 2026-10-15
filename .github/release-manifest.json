@@ -4,10 +4,10 @@
     "node": "v24.21.0",
     "npm": "11.19.1"
   },
-  "sha256": "2b08d6254017b60d507ddf55663835972f79093cc41b0c51e22d987a5423fdbf",
+  "sha256": "23727a69201f78ee634b377393f1730d6d9717770051b25b0a603ab96eff5008",
   "files": {
-    "docs/chatgpt-observation.md": "faf4fb2fa1e6ff5d69637621344eb96cea719726d4adce29f519a292432fe3af",
-    "docs/development-contract.md": "b2dac506209dae7c6ddd4f67f31a66a3a5cb4d8731998e27400cd4e820297215",
+    "docs/chatgpt-observation.md": "cf0fbd59b64c18b8463f98555f040b850c0b3884a90eaafda955c1a2bbcb0a70",
+    "docs/development-contract.md": "b063605c0424590d1bee61fe50c59f9819696d5b76827367bc6dee191a4635ba",
     "docs/installation.md": "28e0b54d67b276e589a1cea80fa439cfbe498c6adbac64adad83cf8d3023db5f",
     "docs/release-notes.md": "d217b13db88c61f217375770ce4125dd02173906b8c2cf6143758a4e3935abef",
     "docs/release-status.md": "c9c91731695bb66c27ab6963f4007223b9a9ff04103860db8a7fc26d6c640be7",
@@ -26,7 +26,7 @@
     "src/analysis/index.mjs": "16388b185a67811d06e3927f1d9e530fdfcc508698098690226b32ea56336547",
     "src/analysis/jev-rendering.mjs": "7f1285fe531cea41627c2ad1aaa9ec197888aa68efb1c3829de71a892fe39991",
     "src/core-client.mjs": "afbd3aa288c440dba370a4a62259a1e6c35c0199f507f4028b08c1512ab9e81d",
-    "src/core/index.mjs": "a8c671b1ca93716d95b16de4bac7ee1c37b836ae4a264953493f24fe3492f732",
+    "src/core/index.mjs": "e352b196588ed902b92732a7eccfc479479c39d66b617833a6424966eadd5322",
     "src/daemon.mjs": "266344416a159c9e54dd01c297f39a8ca1e5ed5648ef0a2607aeb4b74354c4d8",
     "src/enrollment-config.mjs": "9b7c7836e9eb3905c0ef97365fbe1d30537682ad0806a876ced3547c175ceeb3",
     "src/gs-status.mjs": "edabac1adc118e1d1599c72f20def56b71e34b26fc59a83ed76c1de2fa7fdbe6",

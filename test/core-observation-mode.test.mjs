@@ -140,3 +140,29 @@ test('invalid modes are atomic and default sources still analyze independently t
   assert.equal(state.tasks.find(value => value.sourceKey === observed && value.id === 'second').status, 'running');
   assert.equal(state.sources.find(value => value.key === observed).status, 'connected');
 });
+
+test('only observation-only unknown descriptors leave the task baseline unconfirmed through HTTP', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-observation-progress-'));
+  const server = await startServer({ dataDir });
+  const client = await connectCore({ dataDir });
+  t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const observed = await client.registerSource(descriptor);
+  const { mode, ...normal } = descriptor;
+  const legacy = await client.registerSource({ ...normal, registrationId: 'legacy-progress' });
+  await client.ingest(observed, { tasks: [{ ...task, status: 'unknown' }] });
+  await client.ingest(legacy, { tasks: [{ ...task, status: 'unknown' }] });
+  let snapshot = await client.snapshot();
+  assert.deepEqual(snapshot.tasks.find(value => value.sourceKey === observed).coverage, { complete: false, gaps: ['Task baseline is unconfirmed'] });
+  assert.deepEqual(snapshot.tasks.find(value => value.sourceKey === legacy).coverage, { complete: true, gaps: [] });
+  for (const status of ['running', 'idle']) {
+    await client.ingest(observed, { tasks: [{ ...task, status }] });
+    snapshot = await client.snapshot();
+    assert.deepEqual(snapshot.tasks.find(value => value.sourceKey === observed).coverage, { complete: true, gaps: [] });
+    assert.equal(snapshot.tasks.find(value => value.sourceKey === observed).analysis.state, 'observation-only');
+  }
+  await client.ingest(observed, { tasks: [{ ...task, status: 'unknown', gaps: ['Fixed genuine capture loss'] }] });
+  await client.ingest(observed, { tasks: [{ ...task, status: 'running', gaps: [] }] });
+  snapshot = await client.snapshot();
+  assert.deepEqual(snapshot.tasks.find(value => value.sourceKey === observed).coverage, { complete: false, gaps: ['Fixed genuine capture loss'] });
+  assert.deepEqual(snapshot.tasks.find(value => value.sourceKey === legacy).coverage, { complete: true, gaps: [] });
+});

@@ -982,7 +982,7 @@ export async function createCore({
         }
         task.gaps = [...new Set([...(task.gaps ?? []), ...(descriptor.gaps ?? [])])].filter(reason => reason !== 'Task baseline is not yet available');
         task.gapRecords = (task.gapRecords ?? []).filter(gap => gap.reason !== 'Task baseline is not yet available');
-        task.baselineConfirmed = true;
+        task.baselineConfirmed = !observationOnly(task) || descriptor.status !== 'unknown';
         const changed = before !== JSON.stringify([task.title, task.status, task.sessionId, task.parentId, task.gaps, task.baselineConfirmed]);
         if (changed) {
           task.updatedAt = now();
