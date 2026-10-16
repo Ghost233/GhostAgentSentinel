@@ -280,9 +280,16 @@ async function managementCore(config, io) {
   finally { clearTimeout(timer) }
 }
 async function disconnected(config, core, io) {
-  const sources = await io.request(core.target, '/v1/sources')
-  if (!Array.isArray(sources.entries) || sources.entries.length > 5000) fail('existing-core-source-plan-unconfirmed')
-  return !sources.entries.some(entry => entry.registrationId === 'chatgpt:' + config.installationId && ['connecting', 'connected'].includes(entry.status))
+  const plan = await io.request(core.target, '/v1/sources'), registrationId = 'chatgpt:' + config.installationId
+  const id = value => typeof value === 'string' && value.trim().length > 0
+  const liveStatuses = ['connecting', 'connected', 'disconnected']
+  if (!Array.isArray(plan?.entries) || !Array.isArray(plan.unlisted) || plan.entries.length + plan.unlisted.length > 5000 || plan.entries.some(entry => !id(entry?.registrationId) || ![...liveStatuses, 'disabled', 'pending'].includes(entry.status) || !Number.isSafeInteger(entry.connectedSources) || entry.connectedSources < 0 || entry.connectedSources > 5000) || plan.unlisted.some(source => !id(source?.sourceKey) || !id(source.registrationId) || !liveStatuses.includes(source.status))) fail('existing-core-source-plan-unconfirmed')
+  // Enrollment can hide a live disabled entry, and unlisted rows have no policy.
+  const ambiguous = plan.entries.some(entry => entry.registrationId === registrationId && (entry.connectedSources > 0 || ['connecting', 'connected'].includes(entry.status))) || plan.unlisted.some(source => source.registrationId === registrationId && source.status !== 'disconnected')
+  if (!ambiguous) return true
+  const snapshot = await io.request(core.target, '/v1/snapshot')
+  if (!Array.isArray(snapshot?.sources) || snapshot.sources.length > 5000 || snapshot.sources.some(source => !id(source?.key) || !id(source.descriptor?.registrationId) || source.descriptor.policy !== undefined && !id(source.descriptor.policy) || !liveStatuses.includes(source.status))) fail('existing-core-source-snapshot-unconfirmed')
+  return !snapshot.sources.some(source => source.descriptor.registrationId === registrationId && source.descriptor.policy === 'chatgpt-main/1' && source.status !== 'disconnected')
 }
 async function stopNode(state, transaction, io) {
   const owned = await runtimeIdentity(state, io)

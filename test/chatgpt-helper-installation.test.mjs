@@ -238,7 +238,7 @@ async function lifecycleIO(f, live) {
     if (target.url === core.url) {
       assert.equal(target.token, core.token)
       if (path === '/v1/health') return { protocol: 1, instanceId: core.instanceId, features: ['chatgpt-installation-purge/1', 'chatgpt-retention-maintenance/1'] }
-      if (path === '/v1/sources') return { entries: [{ registrationId: 'chatgpt:' + f.config.installationId, status: nodeAlive ? 'connected' : 'disconnected' }] }
+      if (path === '/v1/sources') return { entries: [{ registrationId: 'chatgpt:' + f.config.installationId, status: nodeAlive ? 'connected' : 'disconnected', connectedSources: nodeAlive ? 1 : 0 }], unlisted: [] }
       if (path === '/v1/chatgpt/installation/purge') { assert.deepEqual(body, { installationId: f.config.installationId }); steps.push('core-purge'); return { installationId: f.config.installationId, registrationId: 'chatgpt:' + f.config.installationId, status: 'complete', logical: { status: 'purged' }, physical: { status: 'checkpointed', secureDelete: true } } }
     }
     if (!nodeAlive) throw Object.assign(new Error('isolated endpoint closed'), { code: 'ECONNREFUSED' })
@@ -252,6 +252,84 @@ async function lifecycleIO(f, live) {
   } }
   return { io, steps, core }
 }
+
+async function realDisconnectScenario(t, mode) {
+  const f = await fixture(t), live = await managed(f); let server, client
+  try {
+    server = await startServer({ dataDir: f.config.coreDataDir }); client = await connectCore({ dataDir: f.config.coreDataDir })
+    const target = JSON.parse(await readFile(join(f.config.coreDataDir, 'runtime.json'))), registrationId = 'chatgpt:' + f.config.installationId
+    const sourceKey = await client.registerSource({ registrationId, hostRunId: randomUUID(), name: 'isolated ChatGPT source', policy: 'chatgpt-main/1', nativeOriginVersion: 2, enroll: mode === 'disabled-own' })
+    if (['closed-own', 'same-reg-peer'].includes(mode)) await client.unregisterSource(sourceKey, 'controlled public disconnect')
+    if (mode === 'same-reg-peer') await client.registerSource({ registrationId, hostRunId: randomUUID(), name: 'DSH same registration', mode: 'observation-only', enroll: false })
+    if (mode === 'disabled-own') await client.configureSources([{ registrationId, name: 'disabled enrollment', enabled: false }])
+    const before = await client.sourcePlan(), observed = { snapshots: 0, connectedSnapshotBeforeRelease: false }; let nodeAlive = true
+    const io = { ...live.io, async signal(pid, signal) {
+      assert.equal(pid, live.identity.pid); assert.equal(signal, 'SIGTERM'); nodeAlive = false
+      await rm(join(f.dataDir, 'runtime.json')); await rm(join(f.dataDir, 'runtime.lock'), { recursive: true })
+    }, async request(value, path, body) {
+      if (value.url === target.url) {
+        if (path === '/v1/snapshot') {
+          observed.snapshots++
+          if (mode === 'closed-own') throw Object.assign(new Error('unrelated snapshot materials exceed the unchanged 1 MiB cap'), { code: 'management-response-limit' })
+        }
+        const response = await fetch(value.url + path, { method: body === undefined ? 'GET' : 'POST', redirect: 'error', signal: AbortSignal.timeout(2000), headers: { authorization: 'Bearer ' + value.token, 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
+        const result = await response.json(); assert.equal(response.status, 200)
+        if (path === '/v1/snapshot' && ['live-own', 'disabled-own'].includes(mode)) {
+          assert.equal(result.sources.find(source => source.key === sourceKey).status, 'connected'); observed.connectedSnapshotBeforeRelease = true
+          // Return the still-connected snapshot, then let the next public poll observe real disconnect.
+          await client.unregisterSource(sourceKey, 'controlled release after connected snapshot')
+        }
+        return result
+      }
+      if (!nodeAlive) throw Object.assign(new Error('controlled helper endpoint closed'), { code: 'ECONNREFUSED' })
+      return live.io.request(value, path, body)
+    }, async execute(file, args, input) {
+      if (file.endsWith('/GhostSentinelHelper') && args[0] === '--unregister') {
+        observed.beforeUnregister = await client.snapshot()
+        return { stdout: JSON.stringify({ ok: true, bundleId: 'com.ghostsentinel.helper', command: '--unregister', serviceStatus: 'notRegistered', unregisterCompleted: true }) }
+      }
+      if (file.endsWith('/GhostSentinelHelper') && args[0] === '--register') return { stdout: JSON.stringify({ ok: true, bundleId: 'com.ghostsentinel.helper', command: '--register', serviceStatus: 'requiresApproval', unregisterCompleted: false }) }
+      if (file === '/bin/ps' && args[0] === '-axo' && !nodeAlive) return { stdout: '' }
+      if (file === '/bin/ps' && args[0] === '-p' && !nodeAlive) throw Object.assign(new Error('controlled owned process absent'), { code: 1 })
+      return live.io.execute(file, args, input)
+    } }
+    const result = await applyHelperChange({ operation: 'upgrade', destinationBundle: f.destinationBundle, candidateBundle: f.candidateBundle, configPath: f.configPath }, io)
+    return { result, observed, before, sourceKey, registrationId }
+  } finally { await client?.close(); await server?.close() }
+}
+
+for (const mode of ['live-own', 'disabled-own', 'same-reg-peer', 'closed-own']) test(`disconnect guard uses real public Core receipts for ${mode}`, async t => {
+  const { result, observed, before, sourceKey, registrationId } = await realDisconnectScenario(t, mode)
+  assert.equal(result.status, 'pending-approval', JSON.stringify(result)); assert.ok(result.completed.includes('owned-source-disconnected'))
+  assert.equal(observed.beforeUnregister.sources.find(source => source.key === sourceKey).status, 'disconnected')
+  if (mode === 'closed-own') assert.equal(observed.snapshots, 0, 'ordinary compact disconnect must not request potentially oversized materials')
+  else assert.equal(observed.snapshots, 1)
+  if (mode === 'live-own') { assert.deepEqual(before.entries, []); assert.equal(observed.connectedSnapshotBeforeRelease, true) }
+  if (mode === 'disabled-own') { assert.equal(before.entries[0].status, 'disabled'); assert.equal(before.entries[0].connectedSources, 1); assert.equal(observed.connectedSnapshotBeforeRelease, true) }
+  if (mode === 'same-reg-peer') assert.ok(observed.beforeUnregister.sources.some(source => source.descriptor.registrationId === registrationId && source.descriptor.policy !== 'chatgpt-main/1' && source.status === 'connected'))
+})
+
+test('disconnect guard keeps malformed or over-budget public receipts protected', async t => {
+  for (const mode of ['missing-unlisted', 'missing-count', 'unknown-status', 'missing-descriptor', 'unknown-snapshot-status', 'snapshot-limit']) {
+    const f = await fixture(t), live = await managed(f), controlled = await lifecycleIO(f, live), registrationId = 'chatgpt:' + f.config.installationId
+    const io = { ...controlled.io, async request(target, path, body) {
+      if (path === '/v1/sources') {
+        if (mode === 'missing-unlisted') return { entries: [] }
+        if (mode === 'missing-count') return { entries: [{ registrationId, status: 'disconnected' }], unlisted: [] }
+        return { entries: [], unlisted: [{ sourceKey: 'own', registrationId, status: mode === 'unknown-status' ? 'unknown' : 'connected' }] }
+      }
+      if (path === '/v1/snapshot') {
+        if (mode === 'snapshot-limit') throw Object.assign(new Error('bounded snapshot'), { code: 'management-response-limit' })
+        return { sources: mode === 'missing-descriptor' ? [{ status: 'disconnected' }] : [{ descriptor: { registrationId, policy: 'chatgpt-main/1' }, status: 'unknown' }] }
+      }
+      return controlled.io.request(target, path, body)
+    } }
+    const result = await applyHelperChange({ operation: 'upgrade', destinationBundle: f.destinationBundle, candidateBundle: f.candidateBundle, configPath: f.configPath }, io)
+    assert.equal(result.status, 'failed', mode)
+    assert.equal(result.error.code, mode === 'snapshot-limit' ? 'management-response-limit' : ['missing-descriptor', 'unknown-snapshot-status'].includes(mode) ? 'existing-core-source-snapshot-unconfirmed' : 'existing-core-source-plan-unconfirmed', mode)
+    assert.equal(result.completed.includes('owned-source-disconnected'), false); assert.deepEqual(controlled.steps, ['TERM']); assert.ok(await lstat(join(f.dataDir, 'maintenance.json')))
+  }
+})
 
 for (const form of ['declared', 'absolute']) test(`exact ${form} wrapper display resumes and stops only the owned Node`, async t => {
   const f = await fixture(t), pending = await pendingInstall(f), live = await readyRuntime(f)
