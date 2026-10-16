@@ -62,6 +62,114 @@ async function pendingInstall(f) {
   const io = { ...f.io, async request() { throw Object.assign(new Error('closed fixture endpoint'), { code: 'ECONNREFUSED' }) }, async execute(file, args) { if (file.endsWith('/GhostSentinelHelper')) return { stdout: JSON.stringify({ ok: true, bundleId: 'com.ghostsentinel.helper', command: args[0], serviceStatus: args[0] === '--status' ? 'notRegistered' : 'requiresApproval', unregisterCompleted: false }) }; return f.io.execute(file, args) } }
   return applyHelperChange({ operation: 'install', candidateBundle: f.candidateBundle, destinationBundle: f.destinationBundle, configPath: f.configPath }, io)
 }
+function lookupUnknownIO(f) {
+  const observed = { labels: [], controls: [], labelOutcome: 'missing', race: false, registerStatus: 'requiresApproval', registerError: null, currentStatus: 'requiresApproval' }
+  const io = { ...f.io, async request() { throw Object.assign(new Error('closed fixture endpoint'), { code: 'ECONNREFUSED' }) }, async execute(file, args) {
+    if (file === '/usr/bin/env') {
+      assert.deepEqual(args.slice(0, 4), ['LC_ALL=C', 'LANG=C', '/bin/launchctl', 'print'])
+      const target = args[4], domain = target.split('/')[0]
+      assert.equal(args.length, 5); assert.ok(['gui', 'user'].includes(domain)); assert.equal(target, domain + '/' + process.getuid() + '/com.ghostsentinel.helper.agent')
+      observed.labels.push(target)
+      if (observed.labelOutcome === 'present' || observed.race && observed.labels.length > 2) return { stdout: 'existing service', stderr: '' }
+      const stderr = 'Bad request.\nCould not find service "com.ghostsentinel.helper.agent" in domain for ' + (domain === 'gui' ? 'user gui: ' : 'uid: ') + process.getuid() + '\n'
+      throw Object.assign(new Error('controlled label lookup'), { code: observed.labelOutcome === 'denied' ? 'EPERM' : observed.labelOutcome === 'wrong-code' ? 1 : 113, stdout: observed.labelOutcome === 'stdout' ? 'unexpected' : '', stderr: observed.labelOutcome === 'wrong-uid' ? stderr.replace(String(process.getuid()), String(process.getuid() + 1)) : observed.labelOutcome === 'wrong-label' ? stderr.replace('com.ghostsentinel.helper.agent', 'com.foreign.agent') : observed.labelOutcome === 'changed-text' ? 'unknown format\n' : stderr })
+    }
+    if (file === '/bin/ps') { assert.equal(args[0], '-axo'); return { stdout: '' } }
+    if (file.endsWith('/GhostSentinelHelper')) {
+      observed.controls.push(args[0])
+      if (args[0] === '--register') {
+        const transaction = JSON.parse(await readFile(join(f.dataDir, 'helper-operation.json')))
+        assert.equal(transaction.registrationWasAbsent, false); assert.equal(transaction.registrationAttempted, true); assert.equal(observed.labels.length, 4)
+        if (observed.registerError) throw observed.registerError
+      }
+      return { stdout: JSON.stringify({ ok: true, bundleId: 'com.ghostsentinel.helper', command: args[0], serviceStatus: args[0] === '--status' ? file.startsWith(f.candidateBundle) ? 'notFound' : observed.currentStatus : args[0] === '--unregister' ? 'notRegistered' : observed.registerStatus, unregisterCompleted: args[0] === '--unregister' }) }
+    }
+    return f.io.execute(file, args)
+  } }
+  return { io, observed }
+}
+const initialInstall = f => ({ operation: 'install', candidateBundle: f.candidateBundle, destinationBundle: f.destinationBundle, configPath: f.configPath })
+
+test('notFound first install records two exact label barriers and still requires real runtime identity', async t => {
+  for (const status of ['requiresApproval', 'enabled']) {
+    const f = await fixture(t), { io, observed } = lookupUnknownIO(f); observed.registerStatus = status; observed.currentStatus = status
+    const pending = await applyHelperChange(initialInstall(f), io)
+    assert.equal(pending.status, status === 'requiresApproval' ? 'pending-approval' : 'pending-runtime-verification'); assert.equal(pending.collectionResumed, false)
+    assert.deepEqual(observed.controls, ['--status', '--register']); assert.equal(observed.labels.length, 4)
+    const operation = JSON.parse(await readFile(join(f.dataDir, 'helper-operation.json')))
+    assert.equal(operation.initialServiceStatus, 'notFound'); assert.equal(operation.registrationWasAbsent, false); assert.equal(operation.registrationAttempted, true)
+    assert.equal(operation.labelAbsenceBeforeMutation.length, 2); assert.equal(operation.labelAbsenceBeforeRegister.length, 2)
+    assert.equal(operation.registrationReceipt.serviceStatus, status)
+    const options = { operation: 'install', destinationBundle: f.destinationBundle, configPath: f.configPath, resume: pending.operationId }
+    assert.equal((await applyHelperChange(options, io)).status, status === 'requiresApproval' ? 'pending-approval' : 'pending-runtime-verification')
+    const live = await readyRuntime(f)
+    assert.equal((await applyHelperChange(options, live.io)).status, 'complete')
+  }
+})
+
+test('notFound first install rejects present and every unconfirmed exact-label outcome before mutation', async t => {
+  for (const outcome of ['present', 'denied', 'wrong-code', 'wrong-uid', 'wrong-label', 'changed-text', 'stdout']) {
+    const f = await fixture(t), { io, observed } = lookupUnknownIO(f); observed.labelOutcome = outcome
+    await assert.rejects(applyHelperChange(initialInstall(f), io), { code: outcome === 'present' ? 'existing-helper-service-requires-migration' : 'helper-service-absence-unconfirmed' })
+    assert.deepEqual(observed.controls, ['--status']); await assert.rejects(lstat(f.destinationBundle), { code: 'ENOENT' }); await assert.rejects(lstat(join(f.dataDir, 'maintenance.json')), { code: 'ENOENT' })
+  }
+})
+
+test('notFound label race stays protected and only a never-attempted operation can cancel without unregister', async t => {
+  const f = await fixture(t), { io, observed } = lookupUnknownIO(f); observed.race = true
+  const failed = await applyHelperChange(initialInstall(f), io)
+  assert.equal(failed.status, 'failed'); assert.equal(failed.error.code, 'existing-helper-service-requires-migration'); assert.deepEqual(observed.controls, ['--status'])
+  const record = JSON.parse(await readFile(join(f.dataDir, 'helper-operation.json')))
+  assert.equal(record.registrationWasAbsent, false); assert.equal(record.registrationAttempted, false)
+  const options = { operation: 'uninstall', destinationBundle: f.destinationBundle, configPath: f.configPath, resume: failed.operationId }
+  assert.equal((await applyHelperChange(options, io)).status, 'failed'); assert.ok(await lstat(f.destinationBundle))
+  observed.race = false
+  const cancelled = await applyHelperChange(options, io)
+  assert.equal(cancelled.status, 'cancelled', JSON.stringify(cancelled)); assert.ok(cancelled.completed.includes('registration-not-attempted')); assert.equal(cancelled.completed.includes('SMAppService-unregistered'), false)
+  assert.deepEqual(observed.controls, ['--status']); await assert.rejects(lstat(f.destinationBundle), { code: 'ENOENT' })
+  assert.deepEqual(await applyHelperChange(options, io), cancelled)
+})
+
+test('notFound register conflict or unknown completion cannot authorize cancellation of an unknown registration', async t => {
+  for (const conflict of [true, false]) {
+    const f = await fixture(t), { io, observed } = lookupUnknownIO(f)
+    if (conflict) observed.registerError = Object.assign(new Error('controlled registration conflict'), { code: 'fixture_registration_conflict' })
+    else observed.registerStatus = 'notFound'
+    const pending = await applyHelperChange(initialInstall(f), io)
+    assert.equal(pending.status, conflict ? 'failed' : 'pending-runtime-verification'); if (conflict) assert.equal(pending.error.code, 'fixture_registration_conflict')
+    const operation = JSON.parse(await readFile(join(f.dataDir, 'helper-operation.json'))); assert.equal(operation.registrationAttempted, true); assert.equal(operation.registrationWasAbsent, false)
+    const options = { operation: 'uninstall', destinationBundle: f.destinationBundle, configPath: f.configPath, resume: pending.operationId }
+    const result = await applyHelperChange(options, io)
+    assert.equal(result.status, 'failed'); assert.equal(result.error.code, 'cancellation-registration-ownership-unconfirmed')
+    assert.equal(observed.controls.includes('--unregister'), false); assert.ok(await lstat(f.destinationBundle)); assert.ok(await lstat(join(f.dataDir, 'maintenance.json')))
+    if (conflict) {
+      const live = await readyRuntime(f), controlled = await lifecycleIO(f, live)
+      assert.equal((await applyHelperChange(options, controlled.io)).status, 'cancelled')
+      assert.deepEqual(controlled.steps, ['TERM', 'core-purge', 'unregister'])
+    }
+  }
+})
+
+test('notFound cancellation uses only same-operation successful own registration and a current registered status', async t => {
+  const f = await fixture(t), { io, observed } = lookupUnknownIO(f), pending = await applyHelperChange(initialInstall(f), io)
+  const options = { operation: 'uninstall', destinationBundle: f.destinationBundle, configPath: f.configPath, resume: pending.operationId }
+  observed.currentStatus = 'notFound'
+  const unknown = await applyHelperChange(options, io)
+  assert.equal(unknown.status, 'failed'); assert.equal(unknown.error.code, 'cancellation-registration-ownership-unconfirmed'); assert.equal(observed.controls.includes('--unregister'), false)
+  assert.ok(await lstat(f.destinationBundle)); assert.ok(await lstat(join(f.dataDir, 'maintenance.json')))
+  observed.currentStatus = 'requiresApproval'
+  assert.equal((await applyHelperChange(options, io)).status, 'cancelled')
+  assert.equal(observed.controls.filter(value => value === '--register').length, 1); assert.equal(observed.controls.filter(value => value === '--unregister').length, 1)
+})
+
+test('notFound branch retains the existing unknown runtime and live endpoint exclusions', async t => {
+  const f = await fixture(t), { io, observed } = lookupUnknownIO(f)
+  await writeFile(join(f.dataDir, 'runtime.json'), '{}', { mode: 0o600 })
+  await assert.rejects(applyHelperChange(initialInstall(f), io), { code: 'unmanaged-runtime-or-plugin-requires-migration' }); assert.deepEqual(observed.controls, [])
+  await rm(join(f.dataDir, 'runtime.json'))
+  await assert.rejects(applyHelperChange(initialInstall(f), { ...io, async request() { return {} } }), { code: 'unmanaged-endpoint-requires-migration' }); assert.deepEqual(observed.controls, [])
+})
+
 async function readyRuntime(f) {
   const identity = { protocol: 'ghost-sentinel-chatgpt-helper/1', installationId: f.config.installationId, runId: randomUUID(), pid: 12345, version: '0.1.0-dev.1' }, wrapper = 12344
   const url = 'http://127.0.0.1:' + f.config.port

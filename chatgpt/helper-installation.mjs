@@ -175,6 +175,21 @@ async function control(destination, command, io) {
   if (response.ok !== true || response.bundleId !== bundleId || response.command !== command || !['notRegistered', 'enabled', 'requiresApproval', 'notFound'].includes(response.serviceStatus) || typeof response.unregisterCompleted !== 'boolean') fail('helper-control-protocol-invalid')
   return response
 }
+async function missingAgentLabels(io) {
+  const observations = []
+  for (const domain of ['gui', 'user']) {
+    const target = domain + '/' + uid() + '/' + bundleId + '.agent'
+    let failure
+    try { await io.execute('/usr/bin/env', ['LC_ALL=C', 'LANG=C', '/bin/launchctl', 'print', target]) }
+    catch (error) { failure = error }
+    if (!failure) fail('existing-helper-service-requires-migration')
+    // Narrow host calibration only: every other output, including IPC errors, is unknown.
+    const stderr = 'Bad request.\nCould not find service "' + bundleId + '.agent" in domain for ' + (domain === 'gui' ? 'user gui: ' : 'uid: ') + uid() + '\n'
+    if (failure.code !== 113 || failure.stdout !== '' || failure.stderr !== stderr) fail('helper-service-absence-unconfirmed')
+    observations.push({ target, observedAt: Date.now(), exitCode: failure.code, stdout: failure.stdout, stderr: failure.stderr })
+  }
+  return observations
+}
 async function processRecord(pid, expectedForms, io) {
   const record = (await io.execute('/bin/ps', ['-p', String(pid), '-o', 'uid=,ppid=,lstart=', '-ww'])).stdout.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)
   const command = (await io.execute('/bin/ps', ['-p', String(pid), '-o', 'comm=', '-ww'])).stdout.trim()
@@ -513,7 +528,8 @@ async function cancelInstall(options, io, previewOnly = false) {
     if (await optional(options.destinationBundle, lstat) || await optional(staging, lstat)) fail('cancelled-installation-residual-changed')
     return previewOnly ? { mode: 'preview', operation: 'uninstall', activation: 'not-requested', cancellation: 'already-cancelled' } : transaction.cancellationResult
   }
-  if (!['preparing', 'pending-approval', 'pending-runtime-verification', 'failed'].includes(transaction.status) || !transaction.registrationWasAbsent || transaction.completed.includes('maintenance-released')) fail('cancellation-phase-unconfirmed')
+  const lookupUnknown = transaction.initialServiceStatus === 'notFound' && transaction.registrationWasAbsent === false
+  if (!['preparing', 'pending-approval', 'pending-runtime-verification', 'failed'].includes(transaction.status) || !transaction.registrationWasAbsent && !lookupUnknown || transaction.completed.includes('maintenance-released')) fail('cancellation-phase-unconfirmed')
   const receipt = await optional(join(config.dataDir, 'helper-installation.json'), json)
   if (receipt && (receipt.operationId !== options.resume || receipt.installationId !== config.installationId || receipt.configIdentity !== transaction.configIdentity || receipt.destinationBundle !== options.destinationBundle || receipt.manifestSHA256 !== transaction.manifestSHA256)) fail('cancellation-managed-receipt-mismatch')
   const ownedBundles = []
@@ -523,14 +539,21 @@ async function cancelInstall(options, io, previewOnly = false) {
   }
   if (previewOnly) return { mode: 'preview', operation: 'uninstall', activation: 'not-requested', cancellation: 'own-never-ready-install', destinationBundle: options.destinationBundle, pending: ['owned-runtime-and-service-stop', 'available-core-and-native-cleanup', 'first-party-plugin-unregistration'] }
   const state = { config, options }, originalFailure = transaction.error
+  const neverAttempted = lookupUnknown && transaction.registrationAttempted === false, registered = transaction.registrationReceipt
+  const ownRegistration = lookupUnknown && transaction.registrationAttempted === true && receipt && ownedBundles.includes(options.destinationBundle) && registered && Object.keys(registered).length === 5 && registered.ok === true && registered.bundleId === bundleId && registered.command === '--register' && ['enabled', 'requiresApproval'].includes(registered.serviceStatus) && registered.unregisterCompleted === false
   try {
     const owner = await optional(join(config.dataDir, 'runtime.lock'), lstat), runtime = await optional(join(config.dataDir, 'runtime.json'), lstat)
     let owned
     if (owner || runtime) {
+      if (neverAttempted) fail('cancellation-registration-ownership-unconfirmed')
       if (!owner || !runtime || !ownedBundles.includes(options.destinationBundle)) fail('cancellation-runtime-partial-unconfirmed')
       owned = await stopNode(state, transaction, io)
       transaction.confirmedPort = config.port
     } else {
+      if (lookupUnknown) {
+        if (neverAttempted && ownedBundles.length) transaction.labelAbsenceBeforeCancellation = await missingAgentLabels(io)
+        else if (!ownRegistration) fail('cancellation-registration-ownership-unconfirmed')
+      }
       if (transaction.knownPort === null && config.port !== undefined && transaction.confirmedPort !== config.port) fail('cancellation-first-port-unconfirmed')
       const processes = (await io.execute('/bin/ps', ['-axo', 'uid=,pid=,args=', '-ww'])).stdout
       if (hasManagedProcess(processes, options) || config.port !== undefined && !await endpointClosed(config, io)) fail('cancellation-absent-runtime-unconfirmed')
@@ -548,16 +571,20 @@ async function cancelInstall(options, io, previewOnly = false) {
     if (notifications.status === 'incomplete') fail('native-notification-purge-incomplete')
     const controlRoot = ownedBundles.includes(options.destinationBundle) ? options.destinationBundle : ownedBundles[0]
     if (controlRoot) {
-      const status = await control(controlRoot, '--status', io)
-      if (status.serviceStatus !== 'notRegistered') {
-        const unregistered = await control(controlRoot, '--unregister', io)
-        if (!unregistered.unregisterCompleted || unregistered.serviceStatus !== 'notRegistered') fail('helper-unregister-unconfirmed')
+      if (!neverAttempted) {
+        const status = await control(controlRoot, '--status', io)
+        if (lookupUnknown && !['enabled', 'requiresApproval'].includes(status.serviceStatus)) fail('cancellation-registration-ownership-unconfirmed')
+        if (status.serviceStatus !== 'notRegistered') {
+          const unregistered = await control(controlRoot, '--unregister', io)
+          if (!unregistered.unregisterCompleted || unregistered.serviceStatus !== 'notRegistered') fail('helper-unregister-unconfirmed')
+        }
       }
     } else if (transaction.completed.includes('candidate-installed')) fail('cancellation-installed-bundle-missing')
     if (owned) await waitFor(() => gone(owned.wrapper.pid, io), 'owned-wrapper-stop-unconfirmed')
     const remaining = (await io.execute('/bin/ps', ['-axo', 'uid=,pid=,args=', '-ww'])).stdout
     if (hasManagedProcess(remaining, options) || config.port !== undefined && !await endpointClosed(config, io) || await optional(join(config.dataDir, 'runtime.json'), lstat) || await optional(join(config.dataDir, 'runtime.lock'), lstat)) fail('cancellation-process-stop-unconfirmed')
-    transaction.completed.push('SMAppService-unregistered', 'owned-processes-stopped')
+    if (neverAttempted) transaction.labelAbsenceBeforeCancellationRemoval = await missingAgentLabels(io)
+    transaction.completed.push(neverAttempted ? 'registration-not-attempted' : 'SMAppService-unregistered', 'owned-processes-stopped')
     const privateRecords = await removePrivateRecords(config), plugin = await removePlugin(config, true)
     for (const path of ownedBundles) { if ((await bundle(path, options.configPath, io)).manifestSHA256 !== transaction.manifestSHA256) fail('cancellation-bundle-changed'); await rm(path, { recursive: true }) }
     if (receipt) await rm(join(config.dataDir, 'helper-installation.json'))
@@ -574,14 +601,17 @@ export async function applyHelperChange(options, io = defaultIO) {
   if (options.operation === 'uninstall' && options.resume) return resumeUninstall(options, io)
   const state = await inspect(options, io), { config } = state
   if (options.resume) return resumeChange(state, io)
+  let labelAbsenceBeforeMutation
   if (options.operation === 'install') {
     if (config.port !== undefined && !await endpointClosed(config, io)) fail('unmanaged-endpoint-requires-migration')
-    if ((await control(options.candidateBundle, '--status', io)).serviceStatus !== 'notRegistered') fail('existing-helper-service-requires-migration')
+    const status = (await control(options.candidateBundle, '--status', io)).serviceStatus
+    if (status === 'notFound') labelAbsenceBeforeMutation = await missingAgentLabels(io)
+    else if (status !== 'notRegistered') fail('existing-helper-service-requires-migration')
   }
   const operationId = randomUUID(), completed = [], markerPath = join(config.dataDir, 'maintenance.json'), operationPath = join(config.dataDir, 'helper-operation.json')
   const staging = join(dirname(options.destinationBundle), '.GhostSentinel-' + operationId + '.app')
   const backupBundle = options.operation === 'upgrade' ? join(dirname(options.destinationBundle), '.GhostSentinel-backup-' + operationId + '.app') : null
-  const transaction = { format: 1, operationId, operation: options.operation, installationId: config.installationId, configPath: options.configPath, configIdentity: configIdentity(config), knownPort: config.port ?? null, destinationBundle: options.destinationBundle, manifestSHA256: state.candidate?.manifestSHA256 ?? state.installed?.manifestSHA256, previousManifestSHA256: state.installed?.manifestSHA256, staging, backupBundle, registrationWasAbsent: options.operation === 'install', completed, status: 'preparing' }
+  const transaction = { format: 1, operationId, operation: options.operation, installationId: config.installationId, configPath: options.configPath, configIdentity: configIdentity(config), knownPort: config.port ?? null, destinationBundle: options.destinationBundle, manifestSHA256: state.candidate?.manifestSHA256 ?? state.installed?.manifestSHA256, previousManifestSHA256: state.installed?.manifestSHA256, staging, backupBundle, registrationWasAbsent: options.operation === 'install' && !labelAbsenceBeforeMutation, ...(labelAbsenceBeforeMutation ? { initialServiceStatus: 'notFound', labelAbsenceBeforeMutation, registrationAttempted: false } : {}), completed, status: 'preparing' }
   if (await optional(markerPath, lstat) || await optional(operationPath, lstat)) fail('existing-maintenance-operation-requires-review')
   await save(markerPath, { format: 1, installationId: config.installationId, operationId }, true)
   await save(operationPath, transaction, true)
@@ -610,7 +640,12 @@ export async function applyHelperChange(options, io = defaultIO) {
     const receipt = { format: 1, bundleId, installationId: config.installationId, configPath: options.configPath, configIdentity: configIdentity(config), knownPort: config.port ?? null, destinationBundle: options.destinationBundle, manifestSHA256: state.candidate.manifestSHA256, runtimeVersion: version, operationId }
     await save(join(config.dataDir, 'helper-installation.json'), receipt)
     transaction.phase = 'registering-candidate'; await save(operationPath, transaction)
+    if (labelAbsenceBeforeMutation) {
+      transaction.labelAbsenceBeforeRegister = await missingAgentLabels(io)
+      transaction.registrationAttempted = true; await save(operationPath, transaction)
+    }
     const registered = await control(options.destinationBundle, '--register', io)
+    if (labelAbsenceBeforeMutation) transaction.registrationReceipt = registered
     completed.push('register-returned-' + registered.serviceStatus)
     transaction.phase = 'awaiting-runtime'
     transaction.status = registered.serviceStatus === 'requiresApproval' ? 'pending-approval' : 'pending-runtime-verification'
