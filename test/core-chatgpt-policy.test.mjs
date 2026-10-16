@@ -76,3 +76,14 @@ test('a typed native user message binds its own main execution and exposes autho
   await client.ingest(sourceKey, { events: [native('later-output', 'output', { truncated: true }, 'Incomplete current output')] });
   assert.ok((await client.snapshot()).tasks[0].coverage.gaps.includes('Some observed excerpts are truncated'));
 });
+
+test('pending fork input is rejected outside ChatGPT main policy before task admission through HTTP', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-pending-fork-policy-'));
+  const server = await startServer({ dataDir }), client = await connectCore({ dataDir });
+  t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const sourceKey = await client.registerSource({ registrationId: 'dsh-pending-counterexample', hostRunId: 'host', name: 'DSH' });
+  const event = { id: 'pending-user', taskId: 'main', taskLifecycleId: 'turn', kind: 'input', capturedAt: Date.now(), occurredAt: null, text: 'Inspect current execution',
+    data: { nativeType: 'item_completed/UserMessage', sourceKind: 'chatgpt-native', sourceForm: 'event_msg/item_completed', runId: 'turn', messageId: 'current-user', inputOrigin: 'user-entry', inputPhase: 'consumed', inherited: false, forkHistoryPending: true, forkGeneration: 'a'.repeat(64) } };
+  await assert.rejects(client.ingest(sourceKey, { tasks: [{ id: 'main', sessionId: 'main', lifecycleId: 'turn', title: 'Main', status: 'running' }], events: [event] }), error => error.code === 'hierarchy_context_invalid');
+  assert.deepEqual((await client.snapshot()).tasks, []);
+});

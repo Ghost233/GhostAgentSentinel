@@ -37,6 +37,41 @@ async function harness(t) {
   return { html, parent, document, handlers, timers, sent, element, deliver, refresh, reply, flush, destroy }
 }
 
+test('current facts stay visible while inherited requirements remain pending and cannot appear fully green', async t => {
+  const page = await harness(t), view = material('main-a', 'green')
+  view.summary = '正常'
+  view.analysis.issues = []
+  view.analysis.checks = ids.map(id => ({ id, status: 'clear', reason: '当前片段未见问题' }))
+  view.currentFacts = { request: { text: '只改 <button> 的文字', evidenceIds: ['input-current'] }, activity: { summary: '工具结果：文案已更新', evidenceIds: ['result-current'], observedAt: 1000 } }
+  view.inheritance = { state: 'pending', gaps: ['fork_context_pending'] }
+  await page.deliver(view)
+  assert.match(page.element('#summary').textContent, /^⚪/)
+  assert.doesNotMatch(page.element('#summary').textContent, /正常/)
+  assert.match(page.element('#inheritance').textContent, /继承要求待补齐/)
+  assert.equal(page.element('#current-facts').hidden, false)
+  assert.match(page.element('#current-request').textContent, /只改 <button> 的文字/)
+  assert.match(page.element('#current-activity').textContent, /文案已更新/)
+  assert.equal(page.element('#current-request').children.length, 0, 'current facts remain literal text')
+  assert.match(page.element('#diagnostics-title').textContent, /有缺口/)
+})
+
+test('pending inheritance preserves grounded findings and current facts clear when the displayed scope changes', async t => {
+  const page = await harness(t), view = material()
+  view.currentFacts = { request: { text: '只改文案', evidenceIds: ['input-current'] }, activity: { summary: '工具返回明确失败', evidenceIds: ['result-current'], observedAt: 1000 } }
+  view.inheritance = { state: 'pending', gaps: ['fork_context_pending'] }
+  await page.deliver(view)
+  assert.match(page.element('#summary').textContent, /^🔴/)
+  assert.match(page.element('#inheritance').textContent, /待补齐/)
+  assert.equal(page.element('#issues').children.length, 1)
+  await page.refresh()
+  await page.deliver({ ...view, execution: { historical: true, key: 'older-execution', status: 'idle' } })
+  assert.equal(page.element('#current-facts').hidden, true, 'a history container cannot present live current facts')
+  assert.equal(page.element('#current-request').textContent, '')
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed', params: {} } })
+  assert.equal(page.element('#inheritance').textContent, '')
+  assert.equal(page.element('#current-activity').textContent, '')
+})
+
 test('the real panel script accepts grounded material issues and places small literal evidence directly beneath each issue', async t => {
   const page = await harness(t)
   await page.deliver(material())

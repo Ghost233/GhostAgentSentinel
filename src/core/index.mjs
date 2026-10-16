@@ -1040,6 +1040,7 @@ export async function createCore({
       ensureOpen();
       const source = getSource(sourceKey);
       if (source.hierarchyCaptureMigrationBlocked) throw Object.assign(new Error(HIERARCHY_CAPTURE_GAP), { code: 'hierarchy_context_invalid' });
+      if (source.descriptor.policy !== 'chatgpt-main/1' && batch.events?.some(event => event.data?.forkHistoryPending === true)) throw Object.assign(new Error('pending fork input requires ChatGPT main policy'), { code: 'hierarchy_context_invalid' });
       const originPlan = source.descriptor.policy === 'chatgpt-main/1' ? nativeOrigins.project(source.descriptor.registrationId, source.descriptor.nativeOriginVersion ?? 1, batch.nativeOrigins, batch.events) : null;
       const nativeCaptureTime = source.descriptor.policy === 'chatgpt-main/1' && batch.events?.some(event => event.data?.nativeRecordId) ? now() : null;
       let nativePlan;

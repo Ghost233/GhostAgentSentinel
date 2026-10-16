@@ -29,7 +29,7 @@ function requestIdentity(meta) {
   return new Set(values).size === 1 ? values[0] : null
 }
 
-function materialContext(snapshot, sourceKey, batch) {
+function materialContext(snapshot, sourceKey, batch, inheritance = null) {
   const key = task => JSON.stringify([task.id, task.lifecycleId])
   const tasks = new Map(snapshot.tasks.filter(task => task.sourceKey === sourceKey).map(task => [key(task), task]))
   for (const task of batch.tasks) tasks.set(key(task), { ...tasks.get(key(task)), ...task })
@@ -50,7 +50,8 @@ function materialContext(snapshot, sourceKey, batch) {
     activations.push({ taskId: task.id, lifecycleId: task.lifecycleId, sessionId: task.id, runId: proof ? task.lifecycleId : null, state, stateRefs: proof ? [reference(proof)] : [] })
     if (!start || !['composer', 'edit_user_message'].includes(start.data.turnTrigger)) continue
     for (const input of own.filter(event => event.kind === 'input' && event.data?.nativeType === 'item_completed/UserMessage' && event.data.runId === task.lifecycleId && event.data.inputOrigin === 'user-entry' && event.data.inherited === false && !event.data.history)) {
-      instructionBindings.push({ taskId: task.id, lifecycleId: task.lifecycleId, inputRef: reference(input), phase: 'consumed', origin: 'user-entry', originRefs: [reference(start), reference(input)], ancestorLimitRefs: [] })
+      const receipt = input.data.forkHistoryPending === true && (inheritance?.taskId !== task.id || inheritance.complete) ? [...events.values()].find(event => event.taskId === task.id && event.data?.historyOwnerThreadId === task.id && event.data?.forkReceipt?.ownerGeneration === input.data.forkGeneration) : null
+      instructionBindings.push({ taskId: task.id, lifecycleId: task.lifecycleId, inputRef: reference(input), phase: 'consumed', origin: 'user-entry', originRefs: [reference(start), reference(input)], ancestorLimitRefs: [], ...(input.data.forkHistoryPending === true ? { forkContext: { generation: input.data.forkGeneration, ...((receipt || inheritance?.taskId === task.id && inheritance.complete && inheritance.generation === input.data.forkGeneration && inheritance.receiptId) ? { receiptId: receipt?.data.forkReceipt.id ?? inheritance.receiptId } : {}) } } : {}) })
     }
   }
   const previous = snapshot.sources.find(source => source.key === sourceKey)?.hierarchyContext
@@ -61,7 +62,13 @@ function materialView(view, task, { historical = false } = {}) {
   const states = { queued: '检查排队中', analyzing: '正在检查', unavailable: '本地摘取模型或 JEV 未配置', failed: '本轮分析失败', unknown: '当前请求或分析证据不足', cooldown: '本轮六项检查已更新', idle: '最近检查结果' }
   const findings = historical ? task.analysis.checks.filter(check => check.status === 'attention').map(check => ({ ...check, checkId: check.id })) : task.alerts.filter(alert => alert.status === 'attention')
   const issues = findings.map(alert => ({ checkId: alert.checkId, reason: alert.reason.slice(0, 240), evidence: (alert.evidenceIds ?? []).map(id => task.events.find(event => event.id === id)).filter(Boolean).slice(0, 2).map(event => ({ text: event.text.slice(0, 120), reference: event.evidence ?? event.id })) }))
-  return { ...view, signal: task.conversationMonitoring?.paused ? 'gray' : task.gs?.light ?? 'gray', summary: (task.conversationMonitoring?.paused ? '本聊天分析已暂停，继续只读采集' : task.currentRequest ? task.gs?.reason ?? view.summary : '当前用户请求尚未核实，检查结论不可判断').slice(0, 240),
+  const own = task.events.filter(event => event.taskLifecycleId === task.lifecycleId && !event.data?.history && !event.data?.inherited)
+  const inputRef = task.instructionContext?.binding?.inputRef
+  const request = own.find(event => event.kind === 'input' && event.id === inputRef?.eventId && event.taskId === inputRef.taskId && event.taskLifecycleId === inputRef.lifecycleId && event.authorizationEligible)
+  const currentFacts = !historical && request ? { request: { text: task.currentRequest, evidenceIds: [request.id] }, activity: { ...task.activity, evidenceIds: (task.activity?.evidenceIds ?? []).filter(id => own.some(event => event.id === id)) } } : null
+  const forkBinding = task.instructionContext?.binding?.forkContext
+  const inheritance = forkBinding ? { state: forkBinding.receiptId ? 'complete' : 'pending', gaps: [...new Set([...(task.instructionContext.gaps ?? []), ...(!historical ? view.inheritance?.gaps ?? [] : [])])] } : null
+  return { ...view, ...(currentFacts ? { currentFacts } : {}), ...(!historical && inheritance ? { inheritance } : {}), signal: task.conversationMonitoring?.paused ? 'gray' : task.gs?.light ?? 'gray', summary: (task.conversationMonitoring?.paused ? '本聊天分析已暂停，继续只读采集' : task.currentRequest ? task.gs?.reason ?? view.summary : '当前用户请求尚未核实，检查结论不可判断').slice(0, 240),
     ...(task.conversationMonitoring ? { monitoring: task.conversationMonitoring } : {}),
     health: task.monitoringHealth,
     observation: { ...view.observation, gap: view.observation.gap ?? (!task.currentRequest ? 'current-user-request-unverified' : null) },
@@ -193,7 +200,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
   }
   function entryFor(id) {
     let entry = threads.get(id)
-    if (!entry && threads.size < 256) { entry = { id, cursorKey: fingerprint(collectMaterials ? [installationId, id, 'material/1'] : [installationId, id]), generation: 0, captured: new Map(), captureThroughOffset: -1, lastViewedAt: now(), view: gapView('not-observed', id) }; threads.set(id, entry) }
+    if (!entry && threads.size < 256) { entry = { id, cursorKey: fingerprint(collectMaterials ? [installationId, id, 'material/1'] : [installationId, id]), generation: 0, captured: new Map(), captureThroughOffset: -1, deliveryThrough: { current: -1, history: -1 }, lastViewedAt: now(), view: gapView('not-observed', id) }; threads.set(id, entry) }
     return entry
   }
   async function qualify(id, expected = null, context) {
@@ -227,14 +234,14 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
       if (closed || epoch !== sourceEpoch) return null
       if (!entry.reader) {
         const cursorKey = fingerprint(collectMaterials ? [installationId, entry.id, before.source.forkedFromId ? 'fork-material/' + nativeOriginVersion : 'material/' + nativeOriginVersion] : [installationId, entry.id])
-        if (entry.cursorKey !== cursorKey) { entry.cursorKey = cursorKey; entry.captured.clear(); entry.captureThroughOffset = -1 }
+        if (entry.cursorKey !== cursorKey) { entry.cursorKey = cursorKey; entry.captured.clear(); entry.captureThroughOffset = -1; entry.deliveryThrough = { current: -1, history: -1 } }
         let cursor = null
         try { cursor = await loadCursor(join(dataDir, 'cursors', entry.cursorKey + '.json'), { fork: Boolean(before.source.forkedFromId) }) } catch (error) { await collectionOutcome(entry, 'failed', error, roundId); await stop(entry, error.code ?? 'cursor-unavailable'); await updateHealth(entry); return null }
         if (!cursor && collectMaterials && nativeOriginVersion === 2) {
           const oldKey = fingerprint([installationId, entry.id, before.source.forkedFromId ? 'fork-material/1' : 'material/1'])
           if (await loadCursor(join(dataDir, 'cursors', oldKey + '.json'), { fork: Boolean(before.source.forkedFromId) })) { await stop(entry, 'origin-upgrade-unverified'); return null }
         }
-        if (cursor) { entry.captured = new Map(cursor.captures.map(item => [item.offset, item.capturedAt])); entry.captureThroughOffset = cursor.captureThroughOffset }
+        if (cursor) { entry.captured = new Map(cursor.captures.map(item => [item.offset, item.capturedAt])); entry.captureThroughOffset = cursor.captureThroughOffset; entry.deliveryThrough = cursor.deliveryThrough ?? { current: cursor.captureThroughOffset, history: cursor.captureThroughOffset } }
         entry.reader = before.source.forkedFromId ? new ForkHistoryReader(before.source, cursor?.reader, { native, sessionsRoot, mode: 'material', origins }) : new BoundedReader(before.source, cursor?.reader, { mode: collectMaterials ? 'material' : 'metadata', origins })
       }
       if (closed) return null
@@ -265,14 +272,16 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
       const materials = collectMaterials ? observed.materials : []
       const historyLifecycle = observed.historyLifecycle ?? [], historyMaterials = observed.historyMaterials ?? [], boundaries = observed.historyBoundaries ?? []
       for (const event of [...lifecycleEvents, ...materials, ...historyLifecycle, ...historyMaterials, ...boundaries].sort((a, b) => offset(a) - offset(b))) if (!entry.captured.has(offset(event))) {
-        if (offset(event) <= entry.captureThroughOffset) return await fail(entry, 'cursor-capture-history-unavailable')
+        const channel = event.history === true || event.data?.history === true ? 'history' : 'current'
+        if (offset(event) <= (fork ? entry.deliveryThrough[channel] : entry.captureThroughOffset)) return await fail(entry, 'cursor-capture-history-unavailable')
         rememberCapture(entry, offset(event))
       }
       entry.captureThroughOffset = Math.max(entry.captureThroughOffset, fork ? observed.captureThroughOffset : observed.committedOffset - 1)
+      if (fork) entry.deliveryThrough = observed.deliveryThrough
       const checkpoint = entry.reader.checkpoint(), target = join(dataDir, 'cursors', entry.cursorKey + '.json')
       // Persist first-capture identities before sending. A lost response replays
       // from the previous position with the same timestamps after recovery.
-      await saveCursor(target, fork ? entry.reader.replayCheckpoint(prepared.previousCheckpoint) : { ...prepared.previousCheckpoint, fileId: prepared.previousCheckpoint.fileId ?? checkpoint.fileId, attachSize: prepared.previousCheckpoint.attachSize ?? checkpoint.attachSize, knownSize: checkpoint.knownSize }, entry.captured, entry.captureThroughOffset, { fork })
+      await saveCursor(target, fork ? entry.reader.replayCheckpoint(prepared.previousCheckpoint) : { ...prepared.previousCheckpoint, fileId: prepared.previousCheckpoint.fileId ?? checkpoint.fileId, attachSize: prepared.previousCheckpoint.attachSize ?? checkpoint.attachSize, knownSize: checkpoint.knownSize }, entry.captured, entry.captureThroughOffset, { fork, deliveryThrough: entry.deliveryThrough })
       const batch = { ...(collectMaterials && nativeOriginVersion === 2 ? { nativeOrigins: observed.nativeOrigins ?? [] } : {}), tasks: [...(previousLifecycle && previousLifecycle !== lifecycleId ? [{ id: entry.id, sessionId: entry.id, lifecycleId: previousLifecycle, title: 'ChatGPT 主会话', status: ['completed', 'aborted'].includes(previousPhase) ? 'idle' : 'unknown', gaps: ['completed', 'aborted'].includes(previousPhase) ? [] : ['execution-superseded'] }] : []), { id: entry.id, sessionId: entry.id, lifecycleId, title: 'ChatGPT 主会话', status }], events: lifecycleEvents.map(event => ({ id: (collectMaterials ? 'material-lifecycle:' : 'lifecycle:') + offset(event), taskId: entry.id, taskLifecycleId: event.turnId, kind: 'status', capturedAt: entry.captured.get(offset(event)), occurredAt: event.at, text: event.type, evidence: nativeEvidence(entry, event, offset(event)), data: { status: event.type === 'task_started' && observed.unconfirmedStarts?.includes(event.turnId) ? 'unknown' : observed.historicalTerminal?.turnId === event.turnId ? 'idle' : !collectMaterials && phase === 'unknown' ? 'unknown' : phaseStatus(event.type === 'task_started' ? 'started' : event.type === 'task_complete' ? 'completed' : 'aborted'), nativeType: event.type, runId: event.turnId, ...(collectMaterials ? { sourceKind: 'chatgpt-native', sourceForm: 'event_msg', nativeRecordId: event.nativeRecordId, ...(nativeOriginVersion === 2 ? { nativeGenerationKey: event.nativeGenerationKey, nativeRecordStart: event.nativeRecordStart, nativeRecordEnd: event.nativeRecordEnd } : {}), ...(event.turnTrigger ? { turnTrigger: event.turnTrigger } : {}) } : {}) } })) }
       if (collectMaterials) {
         batch.events.push(...materials.map(event => ({ id: 'material:' + offset(event), taskId: entry.id, taskLifecycleId: event.turnId, kind: event.kind, capturedAt: entry.captured.get(offset(event)), occurredAt: event.at, text: event.text, data: event.data, evidence: nativeEvidence(entry, event, offset(event)) })))
@@ -297,21 +306,25 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
         for (const turnId of observed.unconfirmedStarts ?? []) descriptions.set(turnId, { ...descriptions.get(turnId), id: entry.id, sessionId: entry.id, lifecycleId: turnId, title: 'ChatGPT 主会话', status: 'unknown', gaps: [...new Set([...(descriptions.get(turnId)?.gaps ?? []), 'historical-execution-unconfirmed'])] })
         for (const event of [...known.flatMap(task => task.events), ...batch.events]) if (event.taskLifecycleId !== lifecycleId && !event.data?.history && !event.data?.inherited && event.data?.sourceKind === 'chatgpt-native' && ['task_complete', 'turn_aborted'].includes(event.data?.nativeType)) descriptions.set(event.taskLifecycleId, { id: entry.id, sessionId: entry.id, lifecycleId: event.taskLifecycleId, title: 'ChatGPT 主会话', status: 'idle' })
         batch.tasks = [...descriptions.values()]
-        batch.hierarchyContext = materialContext(before, connection.key, batch)
+        batch.hierarchyContext = materialContext(before, connection.key, batch, fork ? { taskId: entry.id, complete: observed.forkProvenance.complete, receiptId: observed.forkProvenance.receiptId, generation: observed.forkProvenance.generation } : null)
       }
       const accepted = await core.ingest(connection.key, batch)
       entry.reader?.acknowledgeOrigins?.(accepted.nativeOrigins)
       if (closed || epoch !== sourceEpoch || generation !== entry.generation) { await stop(entry, 'observation-superseded'); return entry.view }
-      await saveCursor(target, checkpoint, entry.captured, entry.captureThroughOffset, { fork })
-      await collectionOutcome(entry, 'succeeded', null, prepared.roundId)
+      await saveCursor(target, checkpoint, entry.captured, entry.captureThroughOffset, { fork, deliveryThrough: entry.deliveryThrough })
+      await collectionOutcome(entry, observed.forkProvenance?.error ? 'failed' : 'succeeded', observed.forkProvenance?.error ?? null, prepared.roundId)
       const snapshot = await core.snapshot()
       if (closed) return gapView('adapter-closed')
       if (epoch !== sourceEpoch || generation !== entry.generation || source?.key !== connection.key) return entry.view
       const task = snapshot.tasks.find(task => task.sourceKey === connection.key && task.id === entry.id && task.lifecycleId === lifecycleId)
       if (!task || !collectMaterials && task.analysis.state !== 'observation-only') { await stop(entry, 'core-capability-unconfirmed'); return entry.view }
-      entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, gap: observed.gap, readBytes: observed.readBytes, ...(nativeOriginVersion === 2 ? { decodedBytes: observed.decodedBytes } : {}), observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
+      entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, ...(fork ? { currentCoverage: observed.currentCoverage } : {}), gap: observed.gap, readBytes: observed.readBytes, ...(nativeOriginVersion === 2 ? { decodedBytes: observed.decodedBytes } : {}), observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
       if (collectMaterials) entry.view = materialView(entry.view, task)
-      if (fork) entry.view.forkProvenance = observed.forkProvenance
+      if (fork) {
+        entry.view.forkProvenance = observed.forkProvenance
+        entry.view.inheritance = { state: observed.forkProvenance.complete ? 'complete' : 'pending', gaps: [...new Set([...(task.instructionContext?.gaps ?? []), ...(observed.forkProvenance.gap ? [observed.forkProvenance.gap] : [])])] }
+        if (entry.view.inheritance.state === 'pending' && !['red', 'yellow'].includes(entry.view.signal)) { entry.view.signal = 'gray'; entry.view.summary = task.currentRequest ? '当前执行已接入，继承要求待补齐' : entry.view.summary }
+      }
       await updateHealth(entry, snapshot)
       return entry.view
     } catch (error) { if (error.code === 'native_origin_revision_conflict') { await stop(entry, 'native-origin-revalidating', false); return entry.view } await collectionOutcome(entry, 'failed', error, prepared.roundId); await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {}); await updateHealth(entry); return entry.view }
@@ -426,9 +439,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
     const cursorIndex = selection.historyCursor ? records.findIndex(value => value.task.key === selection.historyCursor) : -1
     const page = records.slice(cursorIndex + 1, cursorIndex + 21), hasMore = records.length > cursorIndex + 21
     const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null, hasMore, cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0), currentGap: retainedOnly ? entry.view.observation?.gap ?? 'current-turn-not-observed' : null, retentionMs: 86400000 }
-    if (!selected) return { ...(entry.view.observation?.coldReadStage ? entry.view : gapView(selection.executionKey ? 'history-unavailable' : 'current-turn-not-observed', entry.id)), health: entry.health, history }
+    if (!selected) return { ...(entry.view.observation?.coldReadStage ? entry.view : gapView(selection.executionKey ? 'history-unavailable' : entry.view.observation?.gap ?? 'current-turn-not-observed', entry.id)), health: entry.health, history }
     const historical = retainedOnly || selected !== current || ['ended', 'aborted'].includes(selected.item.status)
-    const view = materialView({ ...entry.view, identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical })
+    const view = materialView({ ...entry.view, ...(historical ? { currentFacts: undefined, inheritance: undefined } : {}), identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical })
     if (selected === current) view.health = combineHealth(view.health, entry.health)
     if (historical) {
       view.signal = 'gray'; view.summary = retainedOnly ? '当前执行尚未确认 · 显示最近检查记录' : '历史执行 · 仅表示当时的检查记录'

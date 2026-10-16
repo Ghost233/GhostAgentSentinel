@@ -8,6 +8,8 @@
 <h1>Sentinel · 当前会话</h1>
 <p id="summary" role="status">⚪ 正在核对当前会话</p>
 <p id="execution" class="muted"></p>
+<section id="current-facts" hidden><p id="current-request" class="muted"></p><p id="current-activity" class="muted"></p></section>
+<p id="inheritance" class="muted" role="status"></p>
 <p id="analysis">当前分析不可判断</p>
 <p id="health" class="muted" role="status"></p>
 <button id="pause" type="button" hidden>暂停本聊天分析</button>
@@ -32,7 +34,8 @@ let notificationScope=null,notificationScopeKey=null,notificationVersion=0,notif
 const pending=new Map();
 function reset(collapse=true){
   controlState=null;element('pause').hidden=true;element('pause').disabled=false;
-  for(const name of ['identity','coverage','observation','technical','error','health','execution','history-gap','notification-status'])element(name).textContent='';
+  for(const name of ['identity','coverage','observation','technical','error','health','execution','current-request','current-activity','inheritance','history-gap','notification-status'])element(name).textContent='';
+  element('current-facts').hidden=true;
   for(const name of ['issues','check-list','gaps','history-list'])element(name).replaceChildren();
   element('history').hidden=true;element('history-more').hidden=true;
   element('notification-permission').hidden=true;element('notification-permission').disabled=false;
@@ -142,12 +145,19 @@ function render(view){
   if(scopeThreadId&&scopeThreadId!==identity){selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;}
   reset(identity!==lastIdentity);lastIdentity=identity;scopeThreadId=identity;
   const analysis=view.analysis,byId=new Map(list(analysis.checks).filter(check=>check&&Object.hasOwn(labels,check.id)).map(check=>[check.id,check]));
+  const inheritanceGap=view.inheritance&&(view.inheritance.state!=='complete'||list(view.inheritance.gaps).length>0);
   let signal=view.signal,summary=text(view.summary)||'当前状态不可判断';
-  const green=view.health?.state!=='failed'&&analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted','stale'].includes(analysis.state)&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>{const check=byId.get(id);return check&&(check.status==='clear'||check.applicability?.state==='not-triggered');});
-  if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?(view.health.orderingGap?'监控恢复状态未确认':'监控故障，当前状态不可判断'):states[analysis.state]??'当前分析不可判断';}
+  const green=!inheritanceGap&&!list(analysis.coverage?.contextGaps).length&&view.health?.state!=='failed'&&analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted','stale'].includes(analysis.state)&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>{const check=byId.get(id);return check&&(check.status==='clear'||check.applicability?.state==='not-triggered');});
+  if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?(view.health.orderingGap?'监控恢复状态未确认':'监控故障，当前状态不可判断'):inheritanceGap?'当前执行已接入，继承要求待补齐':states[analysis.state]??'当前分析不可判断';}
   if(signal==='green'&&analysis.resultDisposition==='pending')summary='上轮正常 · 待分析';
   if(view.execution?.historical){signal='gray';summary=view.history?.currentGap?'当前执行尚未确认 · 显示最近检查记录':'历史执行 · 仅表示当时的检查记录';}
   element('summary').textContent=lights[signal]+' '+summary;element('summary').setAttribute('data-signal',signal);
+  if(!view.execution?.historical&&text(view.currentFacts?.request?.text,120)){
+    element('current-facts').hidden=false;
+    element('current-request').textContent='当前请求：'+text(view.currentFacts.request.text,120);
+    if(text(view.currentFacts.activity?.summary,160))element('current-activity').textContent='最近活动：'+text(view.currentFacts.activity.summary,160);
+  }
+  if(inheritanceGap)element('inheritance').textContent=view.inheritance.state==='pending'?'继承要求待补齐 · 相关检查不可判断':'继承要求存在缺口 · 相关检查不可判断';
   element('analysis').textContent=(view.execution?.historical?'历史检查 · ':'')+stateLine(analysis);
   renderHealth(view.health);
   renderNotifications(view.notifications);
@@ -183,13 +193,14 @@ function render(view){
     if(counts)coverage.push('目录：主聊天 '+count(counts.main)+' · 分叉 '+count(counts.fork)+' · 远程 '+count(counts.remote)+' · 云端 '+count(counts.cloud)+' · 未分类 '+count(counts.unknown));
     coverage.push('发现覆盖：'+(discovery.complete===true?'已确认':'完整性尚未确认'));
   }
-  if(analysis.coverage)coverage.push('分析材料覆盖：'+(analysis.coverage.complete===true?'已确认':'存在缺口'));
+  if(analysis.coverage)coverage.push((view.inheritance?'当前执行材料覆盖：':'分析材料覆盖：')+(analysis.coverage.complete===true?'已确认':'存在缺口'));
+  if(view.inheritance)coverage.push('继承要求：'+(inheritanceGap?'待补齐或存在缺口':'已核实'));
   element('coverage').textContent=coverage.join('\n');
   const recordStates={'caught-up':'已追平','catching-up':'正在补读','partial-record':'等待记录写完','retained-history':'保留的历史记录',gap:'存在缺口'};
   element('observation').textContent='执行记录：'+(recordStates[view.observation?.coverage]??'尚未确认');
-  const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),view.observation?.gap,view.history?.currentGap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
+  const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),...list(analysis.coverage?.contextGaps),...list(view.inheritance?.gaps),view.observation?.gap,view.history?.currentGap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
   for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
-  if(gaps.length||discovery?.complete===false||analysis.coverage?.complete===false)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
+  if(gaps.length||inheritanceGap||discovery?.complete===false||analysis.coverage?.complete===false)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
   const technical=['分析状态：'+text(analysis.state,80)];
   if(text(analysis.error?.code,120))technical.push('错误代码：'+text(analysis.error.code,120));
   if(text(analysis.error?.message))technical.push(text(analysis.error.message));

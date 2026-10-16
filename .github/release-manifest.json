@@ -4,10 +4,10 @@
     "node": "v24.21.0",
     "npm": "11.19.1"
   },
-  "sha256": "c4269326054a0544e15bad219d2db35af32cc651cd021c61e8cd505dfd6d6c77",
+  "sha256": "d4d10946180f4ab41f9e3bdd8ea133537561a38be614e26ade68939c9060cfd5",
   "files": {
-    "docs/chatgpt-observation.md": "256ab87040f738f30d3b7d1b6ff89a2760db392fcb7c172c6131082d272895ca",
-    "docs/development-contract.md": "b93e642baedb741755445c3ea9fb59efdc0b7f001993b47037955368068b45b0",
+    "docs/chatgpt-observation.md": "97b6ab3bf400e8480aa3702c5ebbf9fe773de00ce3b6b0cbc719bc2ab6dae607",
+    "docs/development-contract.md": "0fd13858deab5a3c56679fd42f5ef91078bcea964364d7bec7a5e42247abbbf4",
     "docs/installation.md": "28e0b54d67b276e589a1cea80fa439cfbe498c6adbac64adad83cf8d3023db5f",
     "docs/release-notes.md": "d217b13db88c61f217375770ce4125dd02173906b8c2cf6143758a4e3935abef",
     "docs/release-status.md": "c9c91731695bb66c27ab6963f4007223b9a9ff04103860db8a7fc26d6c640be7",
@@ -27,7 +27,7 @@
     "src/analysis/jev-rendering.mjs": "7f1285fe531cea41627c2ad1aaa9ec197888aa68efb1c3829de71a892fe39991",
     "src/core-client.mjs": "1cb1252cf0a0a89099b4175ae297b040495d624b9f8e0899e1fbb0761bee9afb",
     "src/core/failure-receipts.mjs": "07b8c7fc7a8ca545d30dfca0a6f33f110426d08f118cf144af79b086b8407d26",
-    "src/core/index.mjs": "b3b5350a5fd0280d875e922ea0e05e605a46b41469e47ee194883de695b39c78",
+    "src/core/index.mjs": "934a0be6960d27bc737e689bf9fea25be7717c8203b44357cb2019b3cf5c078a",
     "src/core/native-capture-progress.mjs": "0fedfd24d2c7f2eb382f67ae55a627efd0aea9ada6854943608ab8129e72dd50",
     "src/core/native-notifications.mjs": "405cd287b05dd77f9bdfc39a6b1ab11842ff8116d4e4a2a72bc94381eb404765",
     "src/core/native-origin-fences.mjs": "8d42897cca50cabdcb580e31c1126e9c0ddd7573f2e21de1f68e895975696205",
@@ -36,11 +36,11 @@
     "src/fork-proof.mjs": "e64f329d6b888ab2d8267890e3bd35f69d2311db365ae14a434249eb0c7f65f9",
     "src/gs-status.mjs": "38a66473eb3f942c4f32a92f6a1921ebbdec9a7f323feeed81935c29431bcba4",
     "src/hierarchy-projection.mjs": "ff825a86f6d235c8f4a244ad28336cced290c3a63d23fdc9a892b8e441cd0879",
-    "src/hierarchy.mjs": "e8d8ed65bb53a9ef6777588fdf4e4ae3ccd6a758ca80dbf599f9c2645fcf4bde",
-    "src/instruction-context.mjs": "7c022b93bb62fcf8da866ac715687b565e044ec9c4a93793a72f15545bd3d636",
+    "src/hierarchy.mjs": "66edc4dd22c83e8ef78ec6bce2526179384e33af5a82157c24fdd7992cf0f73f",
+    "src/instruction-context.mjs": "19c2b2f1071acd89e2bc05029aba0d0697087bb3701e84a92089f9c1515e0f45",
     "src/native-origin.mjs": "0afc126bfa484df8a5fa4d8559d2ad3b2cbda9b4b7c3928d316c05a1a990310c",
     "src/privacy.mjs": "82bb8e6c661414e02d68f608d4c78915c365c02ad87add4d5dec2ba137b69972",
-    "src/protocol.mjs": "84e958a51e0facf70bfd4a4e1cef391f1c12f97e9b2ec58b2e1b55d3ebc4814b",
+    "src/protocol.mjs": "09815877b3d6af783b22dc0f21b6cf6204f4d524f8fc1b5f7b62256f1fb1a81e",
     "src/server.mjs": "cfb3a3f6cd35948c7ea5c0a0a64add7b959ee61ee6c56d3106cccf793d2507c2"
   }
 }

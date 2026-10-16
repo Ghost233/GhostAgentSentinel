@@ -187,7 +187,10 @@ export function normalizeBatch(value) {
         event.data = { ...event.data }
         for (const field of ['forkReceiptId', 'forkGeneration', 'historyGeneration', 'nativeRecordId', 'nativeGenerationKey']) if (item.data[field] !== undefined) event.data[field] = item.data[field]
         if (item.data.forkReceipt !== undefined) event.data.forkReceipt = normalizeForkReceipt(item.data.forkReceipt)
-        if (Boolean(item.data.forkReceiptId) !== Boolean(item.data.forkGeneration)) throw new Error('incomplete fork proof marker')
+        if (item.data.forkHistoryPending !== undefined) {
+          if (item.data.forkHistoryPending !== true || !item.data.forkGeneration || item.data.forkReceiptId || item.kind !== 'input' || item.data.nativeType !== 'item_completed/UserMessage' || item.data.sourceKind !== 'chatgpt-native' || item.data.sourceForm !== 'event_msg/item_completed' || item.data.inputOrigin !== 'user-entry' || item.data.inputPhase !== 'consumed' || item.data.inherited !== false || item.data.history === true || item.data.senderSessionId) throw new Error('invalid pending fork input')
+          event.data.forkHistoryPending = true
+        } else if (Boolean(item.data.forkReceiptId) !== Boolean(item.data.forkGeneration)) throw new Error('incomplete fork proof marker')
         for (const key of dataStrings) if (item.data[key] !== undefined && item.data[key] !== null) {
           const field = sanitizeObservation(string(item.data[key], key, 2000))
           event.data[key] = field.text

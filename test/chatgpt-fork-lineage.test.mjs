@@ -19,7 +19,7 @@ const id = number => '00000000-0000-4000-8000-' + number.toString(16).padStart(1
 const B = id(1), C = id(2), F = id(3), keys = [16, 17, 18, 19].map(id)
 const app = '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT', binary = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
 
-async function fixture(t, mutation = null, { generations = keys.length, sharedOwner = true, original = true, lostAck = false, legacyLineage = false, cwdBytes = 8, historyPaddingBytes = 0, failBootstrap = null, bootstrapError = null, onBootstrap = null, nativeOriginVersion = 1, compressedOriginal = false, compressedGenerations = false, duplicateOriginal = null, originalProducer = null, compressionCapability = true, disabledProducer = false, archivedMains = false, compressedCurrent = false, oldCurrentStart = false, currentPaddingBytes = 0, currentTerminal = null, exactHistoryBytes = 0 } = {}) {
+async function fixture(t, mutation = null, { generations = keys.length, sharedOwner = true, original = true, lostAck = false, legacyLineage = false, cwdBytes = 8, historyPaddingBytes = 0, failBootstrap = null, bootstrapError = null, onBootstrap = null, nativeOriginVersion = 1, compressedOriginal = false, compressedGenerations = false, duplicateOriginal = null, originalProducer = null, compressionCapability = true, disabledProducer = false, archivedMains = false, compressedCurrent = false, oldCurrentStart = false, currentPaddingBytes = 0, currentTerminal = null, exactHistoryBytes = 0, currentTool = false, lostCurrentAck = false } = {}) {
   const records = Array.from({ length: generations }, (_, index) => id(16 + index)), owners = records.map((record, index) => sharedOwner || index === generations - 1 ? B : record), project = '/' + 'p'.repeat(cwdBytes - 1)
   let clock = Date.now(), changed = false, pumpBytes = 0, maximumPumpBytes = 0, maximumReaders = 0, metadataCalls = 0, maximumMetadataCalls = 0, ownerTurn = 'B-' + (generations - 1), growOnForkRead = false, originalGrewAfterRead = false
   let dir, socketPath, unix, ws, server, core, adapter, cleanupPromise
@@ -81,8 +81,10 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
   const forkBytes = currentRow(ordinal, 'session_meta', { ...header(F), forked_from_id: B, history_base: { thread_id: parentKey, end_ordinal_exclusive: ordinal, end_byte_offset: Buffer.byteLength(bytes) } })
     + currentRow(ordinal + 1, 'event_msg', start('F')) + currentRow(ordinal + 2, 'event_msg', user(F, 'F', 'Check this independent fork request'))
     + currentRow(ordinal + 3, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'AgentMessage', id: 'F-output', content: [{ type: 'Text', text: 'New fork activity' + 'p'.repeat(currentPaddingBytes) }] } })
-    + (ending ? currentRow(ordinal + 4, 'event_msg', { type: ending === 'completed' ? 'task_complete' : 'turn_aborted', turn_id: 'F' }) : '')
+    + (currentTool ? currentRow(ordinal + 4, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'CommandExecution', id: 'F-tool', aggregated_output: 'Current tool failed with exit 2', exit_code: 2 } }) : '')
+    + (ending ? currentRow(ordinal + 4 + Number(currentTool), 'event_msg', { type: ending === 'completed' ? 'task_complete' : 'turn_aborted', turn_id: 'F' }) : '')
   await fs.writeFile(currentPath, compressedCurrent ? zstdCompressSync(Buffer.from(forkBytes)) : forkBytes)
+  let nextCurrentOrdinal = ordinal + 4 + Number(currentTool) + Number(Boolean(ending))
   const sourcePaths = new Map(await Promise.all([...paths, ...(original ? [originalPath] : []), ...(duplicateOriginal ? [originalPath + '.zst'] : []), currentPath].map(async path => [await fs.realpath(path), path])))
   const originalOpen = fs.open
   t.mock.method(fs, 'open', async (path, ...args) => {
@@ -131,7 +133,7 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
     const connection = { ...core, async ingest(sourceKey, batch) {
       maxIngest = Math.max(maxIngest, batch.events?.length ?? 0)
       const value = await core.ingest(sourceKey, batch)
-      if (lostAck && !deliveryLost && batch.events?.some(event => event.data?.forkReceipt)) { deliveryLost = true; throw new Error('controlled lineage HTTP acknowledgement loss') }
+      if (!deliveryLost && batch.events?.some(event => lostCurrentAck ? event.data?.forkHistoryPending : lostAck && event.data?.forkReceipt)) { deliveryLost = true; throw new Error('controlled lineage HTTP acknowledgement loss') }
       return value
     } }
     if (!compressionCapability) connection.health = async () => { const health = await core.health(); return { ...health, features: health.features.filter(feature => feature !== 'chatgpt-fork-compression/1') } }
@@ -153,7 +155,7 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
   }
   const growOriginal = async rewrite => { const bytes = await fs.readFile(originalPath, 'utf8'); await fs.writeFile(originalPath, (rewrite ? bytes.replace('Keep the original project restriction', 'Swap the original project restriction') : bytes) + row(4, 'event_msg', { type: 'task_complete', turn_id: 'C' })) }
   const appendForkOutput = () => fs.appendFile(currentPath, row(ordinal + 4, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'AgentMessage', id: 'F-later', content: [{ type: 'Text', text: 'New tail after ancestor growth' }] } }))
-  return { close: cleanup, get native() { return [...natives].at(-1) }, get core() { return core }, get adapter() { return adapter }, dir, read, archiveMains, growOriginal, appendForkOutput, armOriginalGrowth() { growOnForkRead = true }, get originalGrewAfterRead() { return originalGrewAfterRead }, async catchUp(thread) { let view; for (let pump = 0; pump < 32; pump++) { view = await read(thread); if (['caught-up', 'retained-history'].includes(view.observation.coverage)) break } return view }, advance(ms = 500) { clock += ms }, get clock() { return clock }, get maxIngest() { return maxIngest }, get maximumPumpBytes() { return maximumPumpBytes }, get maximumReaders() { return maximumReaders }, get maximumMetadataCalls() { return maximumMetadataCalls }, get liveReaders() { return opened.size }, async compressOriginal() { const prior = originalPath; originalPath += '.zst'; await fs.writeFile(originalPath, zstdCompressSync(await fs.readFile(prior))); sourcePaths.set(await fs.realpath(originalPath), originalPath); await fs.rm(prior) }, async restart() { await adapter.close(); await core.close(); await server.close(); assert.equal(opened.size, 0); server = await startServer({ dataDir: join(dir, 'core'), now: () => clock }); core = await connectCore({ dataDir: join(dir, 'core') }); await openAdapter() }, async appendOwnerRequest() { ownerTurn = 'B-next'; const next = generations * 4 + Number(original) * 4; await fs.appendFile(paths.at(-1), row(next, 'event_msg', start(ownerTurn)) + row(next + 1, 'event_msg', user(B, ownerTurn, 'Inspect one new native owner request'))); return read(B) } }
+  return { async appendCurrentActivity() { const number = nextCurrentOrdinal++; await fs.appendFile(currentPath, row(number, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'AgentMessage', id: 'F-ongoing-' + number, content: [{ type: 'Text', text: 'Fresh activity ' + number }] } })) }, async replaceCurrent() { const bytes = await fs.readFile(currentPath); const next = currentPath + '.replacement'; await fs.writeFile(next, bytes); await fs.rename(next, currentPath) }, close: cleanup, get native() { return [...natives].at(-1) }, get core() { return core }, get adapter() { return adapter }, dir, read, archiveMains, growOriginal, appendForkOutput, armOriginalGrowth() { growOnForkRead = true }, get originalGrewAfterRead() { return originalGrewAfterRead }, async catchUp(thread) { let view; for (let pump = 0; pump < 32; pump++) { view = await read(thread); if (['caught-up', 'retained-history'].includes(view.observation.coverage) && (!view.forkProvenance || view.forkProvenance.complete)) break } return view }, advance(ms = 500) { clock += ms }, get clock() { return clock }, get maxIngest() { return maxIngest }, get maximumPumpBytes() { return maximumPumpBytes }, get maximumReaders() { return maximumReaders }, get maximumMetadataCalls() { return maximumMetadataCalls }, get liveReaders() { return opened.size }, async compressOriginal() { const prior = originalPath; originalPath += '.zst'; await fs.writeFile(originalPath, zstdCompressSync(await fs.readFile(prior))); sourcePaths.set(await fs.realpath(originalPath), originalPath); await fs.rm(prior) }, async restart() { await adapter.close(); await core.close(); await server.close(); assert.equal(opened.size, 0); server = await startServer({ dataDir: join(dir, 'core'), now: () => clock }); core = await connectCore({ dataDir: join(dir, 'core') }); await openAdapter() }, async appendOwnerRequest() { ownerTurn = 'B-next'; const next = generations * 4 + Number(original) * 4; await fs.appendFile(paths.at(-1), row(next, 'event_msg', start(ownerTurn)) + row(next + 1, 'event_msg', user(B, ownerTurn, 'Inspect one new native owner request'))); return read(B) } }
   } catch (error) {
     try { await cleanup() } catch (cleanupError) { throw new AggregateError([error, cleanupError], 'lineage fixture bootstrap and cleanup failed', { cause: error }) }
     throw error
@@ -218,7 +220,7 @@ test('completed main and fork records in the fixed sibling archive reach their o
   assert.equal(base.status, 'idle'); assert.equal(fork.status, 'idle')
   assert.equal(base.currentRequest, 'Retain native requirement 0')
   assert.equal(fork.currentRequest, 'Check this independent fork request')
-  assert.equal(fork.instructionContext.userLimitRefs.length, 1)
+  assert.equal(fork.instructionContext.userLimitRefs.length, 1, JSON.stringify(fork.instructionContext))
   assert.deepEqual(fork.instructionContext.gaps, [])
   assert.ok(fork.events.some(event => event.text === base.currentRequest && event.data.history && event.data.inherited && !event.authorizationEligible))
   assert.equal(fork.events.filter(event => event.data?.forkReceipt).length, 1)
@@ -393,10 +395,12 @@ test('an unfinished seventeenth frame is a visible gap and never becomes an ordi
   assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumPumpBytes <= 262144)
 })
 
-test('an in-progress prefix checkpoint resumes its qualified candidate without losing ancestry or publishing buffered current material', async t => {
+test('an in-progress inherited prefix resumes while already verified current material remains delivered', async t => {
   const f = await fixture(t, null, { generations: 1, historyPaddingBytes: 300000 })
   await f.read(F)
-  assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).some(event => event.kind === 'input'), false)
+  const current = (await f.core.snapshot()).tasks.find(task => task.id === F)
+  assert.equal(current.currentRequest, 'Check this independent fork request')
+  assert.ok(current.instructionContext.gaps.includes('fork_context_pending'))
   const directory = join(f.dir, 'adapter/cursors'), files = await fs.readdir(directory)
   assert.equal(files.length, 1)
   const saved = JSON.parse(await fs.readFile(join(directory, files[0]), 'utf8'))
@@ -465,7 +469,13 @@ test('v2 simultaneous plain and compressed candidates require independently veri
     const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, duplicateOriginal: variant })
     const view = await f.catchUp(F)
     if (variant === 'same') { assert.equal(view.observation.coverage, 'caught-up'); assert.equal(view.forkProvenance.complete, true) }
-    else { assert.notEqual(view.observation.coverage, 'caught-up'); assert.notEqual(view.forkProvenance?.complete, true); assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).length, 0) }
+    else {
+      assert.notEqual(view.observation.coverage, 'caught-up'); assert.notEqual(view.forkProvenance?.complete, true)
+      const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+      assert.equal(task.currentRequest, 'Check this independent fork request')
+      assert.equal(task.events.filter(event => event.data.history).length, 0)
+      assert.deepEqual(task.instructionContext.userLimitRefs, []); assert.ok(task.instructionContext.gaps.length > 0)
+    }
   })
 })
 
@@ -489,10 +499,14 @@ test('v2 compressed qualification precedes body decoding and the whole tree shar
   })
   await t.test('producer project disabled after header', async t => {
     const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, compressedOriginal: true, disabledProducer: true, historyPaddingBytes: 1000000 }), view = await f.read(F)
-    assert.notEqual(view.forkProvenance?.complete, true); assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).length, 0)
+    assert.notEqual(view.forkProvenance?.complete, true)
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    assert.equal(task.currentRequest, 'Check this independent fork request')
+    assert.equal(task.events.filter(event => event.data.history).length, 0)
+    assert.deepEqual(task.instructionContext.userLimitRefs, []); assert.ok(task.instructionContext.gaps.length > 0)
     assert.ok(f.maximumPumpBytes < 65536, 'only the bounded header and preceding qualification can be read')
-    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 0)
-    assert.equal((await f.core.diagnostics()).retained.nativeOriginFences.generations, 0)
+    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, task.events.length)
+    assert.equal((await f.core.diagnostics()).retained.nativeOriginFences.generations, 1)
   })
   await t.test('one decoded budget for all readers and validation passes', async t => {
     const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, compressedOriginal: true, historyPaddingBytes: 1200000 })
@@ -518,7 +532,7 @@ test('completed compressed histories release guards across pumps and cursor rest
   assert.deepEqual(next, first); assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumPumpBytes <= 262144)
 })
 
-test('completed plain history growth is revalidated before newly appended current material can be released', async t => {
+test('completed plain history growth is revalidated independently of newly appended current facts', async t => {
   for (const rewrite of [false, true]) await t.test(rewrite ? 'rewritten-prefix' : 'unchanged-prefix', async t => {
     const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, historyPaddingBytes: 600000 })
     assert.equal((await f.catchUp(F)).forkProvenance.complete, true)
@@ -533,7 +547,11 @@ test('completed plain history growth is revalidated before newly appended curren
     if (rewrite) {
       assert.equal(view.health.state, 'failed')
       assert.ok(view.health.failures.some(failure => failure.error.code === 'native_origin_prefix_changed'))
-      assert.deepEqual(task.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text]), first)
+      assert.deepEqual(task.events.filter(event => event.text !== 'New tail after ancestor growth').map(event => [event.data.nativeRecordId, event.capturedAt, event.text]), first)
+      assert.equal(task.events.filter(event => event.text === 'New tail after ancestor growth').length, 1)
+      assert.equal(view.inheritance.state, 'pending')
+      assert.ok(view.inheritance.gaps.includes('native_origin_prefix_changed'))
+      assert.deepEqual(task.instructionContext.userLimitRefs, []); assert.ok(task.instructionContext.gaps.includes('fork_context_pending'))
     } else {
       assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation))
       assert.equal(task.events.filter(event => event.text === 'New tail after ancestor growth').length, 1)
@@ -557,7 +575,7 @@ test('old fork completion and interruption found across pumps preserve current a
     assert.equal(view.observation.coverage, 'retained-history', JSON.stringify(view.observation)); assert.equal(view.forkProvenance.complete, true)
     const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
     assert.equal(task.status, 'idle'); assert.equal(task.currentRequest, 'Check this independent fork request')
-    assert.equal(task.instructionContext.userLimitRefs.length, 1); assert.deepEqual(task.instructionContext.gaps, [])
+    assert.equal(task.instructionContext.userLimitRefs.length, 1, JSON.stringify({ context: task.instructionContext, data: task.events.filter(event => event.kind === 'input' || event.data?.forkReceipt).map(event => event.data) })); assert.deepEqual(task.instructionContext.gaps, [])
     const start = task.events.find(event => event.data.nativeType === 'task_started' && !event.data.history), input = task.events.find(event => event.kind === 'input' && !event.data.history)
     assert.ok(task.instructionContext.binding.originRefs.some(ref => ref.eventId === start.id)); assert.ok(task.instructionContext.binding.originRefs.some(ref => ref.eventId === input.id))
     const original = task.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text])
@@ -611,7 +629,7 @@ test('simultaneous current and completed ancestor revalidation never calls a rea
   } finally { await reader.close() }
 })
 
-test('an end-guard deferred output keeps its public capture watermark and recovery checkpoint behind delivery', async t => {
+test('an ancestor end-guard defers inherited coverage while current delivery and its first capture survive recovery', async t => {
   for (const restart of [false, true]) await t.test(restart ? 'restart-before-delivery' : 'same-reader-delivery', async t => {
     const { ForkHistoryReader } = await import('../chatgpt/fork-history.mjs'), pump = ForkHistoryReader.prototype.pump
     let latest
@@ -622,15 +640,19 @@ test('an end-guard deferred output keeps its public capture watermark and recove
     await f.appendForkOutput(); f.armOriginalGrowth(); f.advance()
     for (let pump = 0; pump < 8; pump++) { await f.read(F); if (f.originalGrewAfterRead) break }
     assert.equal(f.originalGrewAfterRead, true)
-    assert.deepEqual(latest.materials, []); assert.deepEqual(latest.nativeOrigins, [])
-    assert.equal(latest.captureThroughOffset, through, 'private deferred material is not a published capture watermark')
+    assert.ok(latest.materials.some(event => event.text === 'New tail after ancestor growth'))
+    assert.ok(latest.nativeOrigins.length > 0, 'current facts keep their own verified prefix')
+    assert.ok(latest.captureThroughOffset > through, 'current delivery advances only its own watermark')
     const cursor = JSON.parse(await fs.readFile(join(f.dir, 'adapter/cursors', initial.identity.cursorKey + '.json'), 'utf8'))
-    assert.equal(cursor.captureThroughOffset, through); assert.equal(cursor.reader.captureThroughOffset, through)
+    assert.equal(cursor.captureThroughOffset, latest.captureThroughOffset); assert.equal(cursor.reader.captureThroughOffset, latest.captureThroughOffset)
+    assert.equal(cursor.deliveryThrough.current, latest.deliveryThrough.current)
+    const delivered = (await f.core.snapshot()).tasks.find(task => task.id === F).events.find(event => event.text === 'New tail after ancestor growth')
     if (restart) { await f.restart(); f.advance() }
     const complete = await f.catchUp(F)
     assert.equal(complete.observation.coverage, 'caught-up', JSON.stringify(complete.observation))
     const task = (await f.core.snapshot()).tasks.find(task => task.id === F), events = task.events
     assert.equal(events.filter(event => event.text === 'New tail after ancestor growth').length, 1)
+    assert.deepEqual(events.find(event => event.text === 'New tail after ancestor growth'), delivered)
     assert.deepEqual(events.filter(event => event.text !== 'New tail after ancestor growth').map(event => [event.id, event.data.nativeRecordId, event.evidence, event.capturedAt, event.text]), before)
     assert.deepEqual(task.instructionContext, initialTask.instructionContext)
   })
@@ -671,4 +693,156 @@ test('unfinished compressed history keeps its decoder progress through verificat
   assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation)); assert.equal(view.forkProvenance.complete, true)
   assert.ok(validationPumps > 3); assert.equal(activeCloses, 0, 'only completed guards may discard their decoder, never unfinished validation')
   assert.equal(f.liveReaders, 1); assert.ok(f.maximumReaders <= 4)
+})
+
+
+test('current fork facts reach the production panel before inherited history completes', async t => {
+  for (const nativeOriginVersion of [1, 2]) await t.test('native-origin/' + nativeOriginVersion, async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion, historyPaddingBytes: 600000, currentTool: true })
+    const view = await f.read(F)
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F && task.lifecycleId === 'F')
+    assert.equal(task?.currentRequest, 'Check this independent fork request', JSON.stringify({ view, task }))
+    assert.equal(task.status, 'running')
+    assert.equal(view.observation.currentCoverage, 'caught-up')
+    assert.equal(view.forkProvenance.complete, false)
+    assert.equal(view.inheritance.state, 'pending')
+    assert.ok(task.instructionContext.gaps.includes('fork_context_pending'))
+    assert.equal(view.currentFacts.request.text, task.currentRequest)
+    assert.deepEqual(view.currentFacts.request.evidenceIds, [task.instructionContext.binding.inputRef.eventId])
+    assert.match(view.currentFacts.activity.summary, /Current tool failed with exit 2/)
+    assert.ok(task.events.some(event => event.kind === 'tool-result' && event.data.exitCode === 2 && !event.data.history))
+    assert.notEqual(view.signal, 'green')
+    const original = task.events.filter(event => !event.data.history).map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId])
+    const completed = await f.catchUp(F)
+    assert.equal(completed.forkProvenance.complete, true, JSON.stringify(completed.observation))
+    const retained = (await f.core.snapshot()).tasks.find(task => task.id === F && task.lifecycleId === 'F')
+    assert.deepEqual(retained.instructionContext.gaps, [])
+    assert.equal(retained.instructionContext.userLimitRefs.length, 2)
+    assert.deepEqual(retained.events.filter(event => !event.data.history).map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), original)
+    assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maxIngest <= 16)
+  })
+})
+
+
+test('current-first delivery recovers a lost HTTP acknowledgement without swallowing lower inherited ordinals', async t => {
+  for (const nativeOriginVersion of [1, 2]) await t.test('native-origin/' + nativeOriginVersion, async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion, historyPaddingBytes: 600000, currentTool: true, lostCurrentAck: true })
+    await f.read(F)
+    const first = (await f.core.snapshot()).tasks.find(task => task.id === F && task.lifecycleId === 'F')
+    assert.equal(first.currentRequest, 'Check this independent fork request')
+    assert.ok(first.instructionContext.gaps.includes('fork_context_pending'))
+    const identities = first.events.map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId])
+    f.advance(3000); await f.restart()
+    let pending = await f.read(F)
+    assert.equal(pending.currentFacts.request.text, first.currentRequest)
+    const recovered = (await f.core.snapshot()).tasks.find(task => task.id === F && task.lifecycleId === 'F')
+    assert.deepEqual(recovered.events.filter(event => !event.data.history).map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), identities)
+    const complete = await f.catchUp(F)
+    assert.equal(complete.forkProvenance.complete, true, JSON.stringify(complete.observation))
+    const final = (await f.core.snapshot()).tasks.find(task => task.id === F && task.lifecycleId === 'F')
+    assert.deepEqual(final.instructionContext.gaps, [])
+    assert.equal(final.instructionContext.userLimitRefs.length, 2)
+    assert.deepEqual(final.events.filter(event => !event.data.history).map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), identities)
+    assert.ok(final.events.some(event => event.data.history && event.data.recordOrdinal < 4))
+    assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumPumpBytes <= 262144)
+  })
+})
+
+test('a temporary ancestor metadata failure recovers while current facts remain observable', async t => {
+  const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, historyPaddingBytes: 600000, currentTool: true })
+  const readThread = f.native.readThread
+  let unavailable = true
+  t.mock.method(f.native, 'readThread', async function (threadId) {
+    if (threadId === C && unavailable) throw Object.assign(new Error('controlled ancestor disconnect'), { code: 'EPIPE' })
+    return readThread.call(this, threadId)
+  })
+  let view
+  for (let pump = 0; pump < 8; pump++) { view = await f.read(F); if (view.inheritance?.gaps.includes('history-source-unavailable')) break }
+  assert.equal(view.currentFacts.request.text, 'Check this independent fork request')
+  assert.equal(view.observation.currentCoverage, 'caught-up')
+  assert.ok(view.inheritance.gaps.includes('history-source-unavailable'))
+  const before = (await f.core.snapshot()).tasks.find(task => task.id === F).events.filter(event => !event.data.history).map(event => [event.id, event.text, event.capturedAt])
+  unavailable = false
+  const complete = await f.catchUp(F)
+  assert.equal(complete.forkProvenance.complete, true, JSON.stringify({ view: complete, diagnostics: f.adapter.diagnostics() }))
+  const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+  assert.deepEqual(task.instructionContext.gaps, [])
+  assert.equal(task.instructionContext.userLimitRefs.length, 2)
+  assert.deepEqual(task.events.filter(event => !event.data.history).map(event => [event.id, event.text, event.capturedAt]), before)
+  assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumPumpBytes <= 262144)
+})
+
+
+test('small ongoing current activity shares the original pump grant with incremental inherited history', async t => {
+  const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, historyPaddingBytes: 300000 })
+  let view = await f.read(F), inherited = 0
+  for (let pump = 0; pump < 12; pump++) {
+    await f.appendCurrentActivity(); f.advance(10); view = await f.read(F)
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    assert.equal(task.currentRequest, 'Check this independent fork request')
+    inherited = Math.max(inherited, task.events.filter(event => event.data.history).length)
+  }
+  assert.ok(inherited > 0, 'continuous small current appends must not starve inherited delivery')
+  const complete = await f.catchUp(F)
+  assert.equal(complete.forkProvenance.complete, true, JSON.stringify(complete.inheritance))
+  const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+  assert.equal(task.events.filter(event => event.text.startsWith('Fresh activity ') && !event.data.history).length, 12)
+  assert.deepEqual(task.instructionContext.gaps, [])
+  assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4); assert.ok(f.maxIngest <= 16)
+})
+
+test('a current file replacement discovered during historical work stops the current observation', async t => {
+  const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, compressedOriginal: true, historyPaddingBytes: 1200000 })
+  const pump = NativeJsonlSource.prototype.pump
+  let replaced = false
+  t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) {
+    const value = await pump.apply(this, args)
+    if (!replaced && this.source.historyRange && this.source.path.endsWith('rollout-' + C + '.jsonl.zst')) { replaced = true; await f.replaceCurrent() }
+    return value
+  })
+  let view = await f.read(F)
+  assert.equal(view.currentFacts, undefined, 'an unguarded current packet cannot escape when the historical phase exhausts its grant')
+  assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).length, 0)
+  for (let attempt = 0; attempt < 12; attempt++) { if (view.observation.gap === 'record-file-replaced') break; view = await f.read(F) }
+  assert.equal(replaced, true)
+  assert.equal(view.observation.gap, 'record-file-replaced', JSON.stringify(view))
+  assert.equal(view.observation.phase, 'unknown')
+  assert.equal(view.currentFacts, undefined)
+  assert.equal(view.forkProvenance?.complete, undefined)
+  assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+})
+
+test('legacy fork cursor migration preserves verified history and accepts later current facts', async t => {
+  for (const nativeOriginVersion of [1, 2]) await t.test('native-origin/' + nativeOriginVersion, async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion }), ready = await f.catchUp(F)
+    const before = (await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.id, event.text, event.capturedAt, event.data.nativeRecordId])
+    const path = join(f.dir, 'adapter/cursors', ready.identity.cursorKey + '.json'), cursor = JSON.parse(await fs.readFile(path, 'utf8'))
+    assert.equal(cursor.format, 3); assert.equal(cursor.reader.format, 4)
+    cursor.format = 2; cursor.reader.format = nativeOriginVersion === 2 ? 3 : 2
+    delete cursor.deliveryThrough; delete cursor.reader.deliveryThrough
+    await fs.writeFile(path, JSON.stringify(cursor)); await f.restart(); f.advance(1000); await f.appendCurrentActivity()
+    const migrated = await f.catchUp(F)
+    assert.equal(migrated.forkProvenance.complete, true, JSON.stringify(migrated.observation))
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    assert.deepEqual(task.instructionContext.gaps, [])
+    assert.deepEqual(task.events.filter(event => !event.text.startsWith('Fresh activity ')).map(event => [event.id, event.text, event.capturedAt, event.data.nativeRecordId]), before)
+    assert.equal(task.events.filter(event => event.text.startsWith('Fresh activity ')).length, 1)
+    const saved = JSON.parse(await fs.readFile(path, 'utf8'))
+    assert.equal(saved.format, 3); assert.equal(saved.reader.format, 4)
+    assert.ok(saved.deliveryThrough.current > saved.deliveryThrough.history)
+  })
+})
+
+test('current-first fork cursor formats reject missing independent delivery watermarks', async t => {
+  for (const layer of ['outer', 'reader']) await t.test(layer, async t => {
+    const f = await fixture(t, null, { generations: 1 }), ready = await f.catchUp(F)
+    const path = join(f.dir, 'adapter/cursors', ready.identity.cursorKey + '.json'), cursor = JSON.parse(await fs.readFile(path, 'utf8'))
+    if (layer === 'outer') delete cursor.deliveryThrough
+    else delete cursor.reader.deliveryThrough
+    await fs.writeFile(path, JSON.stringify(cursor)); await f.restart()
+    const view = await f.read(F)
+    assert.notEqual(view.forkProvenance?.complete, true)
+    assert.equal(view.history.currentGap, layer === 'outer' ? 'cursor-format-invalid' : 'cursor-invalid')
+    assert.equal(view.currentFacts, undefined)
+  })
 })

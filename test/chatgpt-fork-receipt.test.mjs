@@ -173,7 +173,7 @@ test('replayed native proofs never acquire a new observation container or first 
   // retains its original physical identity and must not receive a fresh clock.
   for (const event of events.filter(event => !event.data.history)) event.data.nativeRecordId = (event.data.nativeType === 'task_started' ? '1' : '2').repeat(64)
   const own = events.filter(event => !event.data.history), ref = event => ({ taskId: 'f', lifecycleId: 'next', eventId: event.id })
-  await f.core.ingest(copy.source, { tasks: [{ id: 'f', sessionId: 'f', lifecycleId: 'next', title: 'Fork', status: 'running' }], events, hierarchyContext: { schemaVersion: 1, revision: copy.batch.hierarchyContext.revision + 1, sessions: [{ sessionId: 'f' }], relations: [], activations: [{ taskId: 'f', lifecycleId: 'next', sessionId: 'f', runId: 'next', state: 'running', stateRefs: [ref(own[0])] }], instructionBindings: [{ taskId: 'f', lifecycleId: 'next', inputRef: ref(own[1]), phase: 'consumed', origin: 'user-entry', originRefs: own.map(ref), ancestorLimitRefs: [] }], coverage: { complete: true, branchGaps: [] } } })
+  await f.core.ingest(copy.source, { tasks: [{ id: 'f', sessionId: 'f', lifecycleId: 'next', title: 'Fork', status: 'running' }], events, hierarchyContext: { schemaVersion: 1, revision: copy.batch.hierarchyContext.revision + 1, sessions: [{ sessionId: 'f' }], relations: [], activations: [{ taskId: 'f', lifecycleId: 'next', sessionId: 'f', runId: 'next', state: 'running', stateRefs: [ref(own[0])] }], instructionBindings: [{ taskId: 'f', lifecycleId: 'next', inputRef: ref(own[1]), phase: 'consumed', origin: 'user-entry', originRefs: own.map(ref), ancestorLimitRefs: [], forkContext: structuredClone(copy.batch.hierarchyContext.instructionBindings[0].forkContext) }], coverage: { complete: true, branchGaps: [] } } })
   const next = (await f.core.snapshot()).tasks.find(task => task.sourceKey === copy.source && task.lifecycleId === 'next')
   assert.equal(next.events.some(event => event.data?.history), false)
   assert.equal(next.instructionContext.userLimitRefs.length, 0)
@@ -231,7 +231,7 @@ test('compact receipt DTO rejects unbounded or malformed fields through public H
     const receipt = batch.events.find(event => event.data?.forkReceipt).data.forkReceipt
     if (mutation === 'extra') receipt.refs = new Array(200).fill('unbounded')
     if (mutation === 'number') receipt.users = 'one'
-    if (mutation === 'marker') delete batch.events.find(event => event.data?.forkReceiptId).data.forkGeneration
+    if (mutation === 'marker') delete batch.events.find(event => event.data?.forkHistoryPending).data.forkGeneration
   }), error => error.status === 400)
 })
 

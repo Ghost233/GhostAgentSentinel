@@ -38,6 +38,11 @@ export function createInstructionLookup(context, sourceTasks, sourceEvents, now,
 export function verifiedForkContext(binding, lookup) {
   const { tasks, events, sourcePolicy } = lookup
   const current = binding && events.get(referenceKey(binding.inputRef))
+  if (sourcePolicy === 'chatgpt-main/1' && current?.data?.forkHistoryPending === true) {
+    if (!binding?.forkContext || binding.forkContext.generation !== current.data.forkGeneration) return { inheritedEvents: [], gaps: ['fork_current_origin_missing'], valid: true }
+    if (!binding.forkContext.receiptId) return { inheritedEvents: [], gaps: ['fork_context_pending'], valid: true }
+    return compactForkContext(binding, current, lookup)
+  }
   if (sourcePolicy === 'chatgpt-main/1' && current?.data?.forkReceiptId) return compactForkContext(binding, current, lookup)
   const inheritedEvents = [], gaps = []
   if (sourcePolicy !== 'chatgpt-main/1' || !binding) return { inheritedEvents, gaps, valid: true }
@@ -94,7 +99,7 @@ function compactForkContext(binding, current, lookup) {
     lookup.forkIndex = { receipts, generations }
   }
   const { receipts, generations } = lookup.forkIndex, inheritedEvents = []
-  let id = current.data.forkReceiptId, generation = current.data.forkGeneration, owner = binding.taskId, parentCutoff = Infinity, headerOrdinal = null, users = 0, legacyUnverified = false
+  let id = binding.forkContext?.receiptId ?? current.data.forkReceiptId, generation = binding.forkContext?.generation ?? current.data.forkGeneration, owner = binding.taskId, parentCutoff = Infinity, headerOrdinal = null, users = 0, legacyUnverified = false
   const seen = new Set()
   while (id) {
     if (seen.size >= FORK_LINEAGE_FRAMES - 1 || seen.has(id)) return gap('fork_boundary_chain_missing')
@@ -145,7 +150,7 @@ export function instructionContext(task, context, sourceTasks, sourceEvents, now
   const binding = bindings.find(item => item.phase === 'consumed' && item.inputRef.eventId === task.requestId)
   const gaps = [], inheritedEvents = []
   const request = events.get(key(task.id, task.lifecycleId, task.requestId))
-  const forkContext = !binding && request?.data?.forkReceiptId ? { inheritedEvents: [], gaps: ['fork_current_origin_missing'] } : verifiedForkContext(binding, lookup)
+  const forkContext = !binding && (request?.data?.forkReceiptId || request?.data?.forkHistoryPending) ? { inheritedEvents: [], gaps: ['fork_current_origin_missing'] } : verifiedForkContext(binding, lookup)
   inheritedEvents.push(...forkContext.inheritedEvents)
   gaps.push(...forkContext.gaps)
   if (parents.has(task.sessionId) && !binding) gaps.push('delegated_instruction_missing')

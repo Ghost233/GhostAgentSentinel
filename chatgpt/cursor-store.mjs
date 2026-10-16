@@ -23,7 +23,8 @@ export async function loadCursor(path, { fork = false } = {}) {
     if (read.bytesRead > limit) throw invalid('cursor-over-limit')
     if (read.bytesRead !== opened.size || identity(after) !== identity(opened) || identity(current) !== identity(opened) || !current.isFile()) throw invalid('cursor-file-changed')
     const value = JSON.parse(bytes.subarray(0, read.bytesRead).toString('utf8'))
-    if (value.format !== 2 || !value.reader || !Array.isArray(value.captures) || value.captures.length > 16 || !Number.isSafeInteger(value.captureThroughOffset) || value.captureThroughOffset < -1) throw invalid('cursor-format-invalid')
+    if (!(value.format === 2 || fork && value.format === 3 && value.deliveryThrough) || !value.reader || !Array.isArray(value.captures) || value.captures.length > 16 || !Number.isSafeInteger(value.captureThroughOffset) || value.captureThroughOffset < -1) throw invalid('cursor-format-invalid')
+    if (value.deliveryThrough !== undefined && (!fork || !['current', 'history'].every(key => Number.isSafeInteger(value.deliveryThrough[key]) && value.deliveryThrough[key] >= -1 && value.deliveryThrough[key] <= value.captureThroughOffset))) throw invalid('cursor-format-invalid')
     const offsets = new Set()
     for (const capture of value.captures) {
       if (!Number.isSafeInteger(capture.offset) || capture.offset < 0 || capture.offset > value.captureThroughOffset || !Number.isSafeInteger(capture.capturedAt) || capture.capturedAt < 0 || offsets.has(capture.offset)) throw invalid('cursor-capture-invalid')
@@ -34,8 +35,8 @@ export async function loadCursor(path, { fork = false } = {}) {
   finally { await file?.close() }
 }
 
-export async function saveCursor(path, reader, captured, captureThroughOffset, { fork = false } = {}) {
-  const value = JSON.stringify({ format: 2, reader, captures: [...captured].map(([offset, capturedAt]) => ({ offset, capturedAt })), captureThroughOffset })
+export async function saveCursor(path, reader, captured, captureThroughOffset, { fork = false, deliveryThrough } = {}) {
+  const value = JSON.stringify({ format: fork ? 3 : 2, reader, ...(fork ? { deliveryThrough: deliveryThrough ?? reader.deliveryThrough ?? { current: captureThroughOffset, history: captureThroughOffset } } : {}), captures: [...captured].map(([offset, capturedAt]) => ({ offset, capturedAt })), captureThroughOffset })
   if (Buffer.byteLength(value) > (fork === true ? FORK_LIMIT : LIMIT)) throw invalid('cursor-over-limit')
   const temporary = path + '.' + randomUUID() + '.tmp'
   let file

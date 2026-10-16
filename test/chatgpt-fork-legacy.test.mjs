@@ -122,7 +122,14 @@ test('legacy ACK replay and core-adapter recovery preserve the semantic gap and 
 test('v2 compressed legacy admission is exact and retains unverified user provenance for both observed legacy producers', async t => {
   for (const [producer, form, trigger] of [[supportedProfile.cliVersion, 'typed', 'composer'], [ALPHA2, 'typed', null], ['0.160.1', 'typed', null], ['0.160.1', 'typed', 'composer'], ['0.160.1', 'role-user', null], ['0.160.1', 'user-message', null], ['0.160.2', 'typed', null]]) await t.test([producer, form, trigger].join(' / '), async t => {
     const f = await fixture(t, { producer, form, trigger, nativeOriginVersion: 2, compressed: true }), view = await f.caughtUp()
-    if (producer === '0.160.2') { assert.notEqual(view.forkProvenance?.complete, true); assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).length, 0); return }
+    if (producer === '0.160.2') {
+      assert.notEqual(view.forkProvenance?.complete, true)
+      const task = (await f.core.snapshot()).tasks.find(task => task.lifecycleId === 'current')
+      assert.equal(task.currentRequest, 'Inspect independent current request')
+      assert.equal(task.events.filter(event => event.data.history).length, 0)
+      assert.deepEqual(task.instructionContext.userLimitRefs, []); assert.ok(task.instructionContext.gaps.length)
+      return
+    }
     assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation)); assert.equal(view.forkProvenance.complete, true)
     const task = (await f.core.snapshot()).tasks.find(task => task.lifecycleId === 'current'), receipt = task.events.find(event => event.data?.forkReceipt).data.forkReceipt
     assert.equal(task.currentRequest, 'Inspect independent current request')

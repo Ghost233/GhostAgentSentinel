@@ -165,7 +165,7 @@ test('an unacknowledged history start replays from zero with learned file identi
   assert.equal(view.materials.find(item => item.kind === 'input').captureOffset, 2)
 })
 
-test('fork wrapper resolves only explicit main ancestry, combines physical budgets, and emits history before independent current material', async t => {
+test('fork wrapper resolves explicit main ancestry within shared budgets while independent current material can arrive first', async t => {
   const { ForkHistoryReader } = await import('../chatgpt/fork-history.mjs')
   const f = await forkFixture(t), calls = []
   const parent = { id: 'original', path: f.parentPath, cwd: f.dir, parentThreadId: null, originator: 'Codex Desktop', source: 'vscode', forkedFromId: null }
@@ -193,7 +193,8 @@ test('fork wrapper resolves only explicit main ancestry, combines physical budge
   assert.equal(boundary.data.sourceForm, 'session_meta/history_base')
   assert.equal(boundary.data.endOrdinalExclusive, 6)
   assert.equal(boundary.captureOffset, 6)
-  assert.deepEqual(delivered.map(item => item.captureOffset), [1, 2, 3, 4, 5, 6, 8, 9])
+  assert.deepEqual(delivered.map(item => item.captureOffset).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 8, 9])
+  assert.ok(delivered.findIndex(item => item.captureOffset === 9) < delivered.findIndex(item => item.captureOffset === 1))
   const checkpoint = reader.checkpoint()
   assert.ok(Buffer.byteLength(JSON.stringify(checkpoint)) < 16384)
   assert.doesNotMatch(JSON.stringify(checkpoint), /Keep changes|Inspect the new request|Old tests passed/)
@@ -220,12 +221,12 @@ test('self history resolves an older exact-ID generation by native ordinal and b
   for (let i = 0; i < 80; i++) { view = await reader.pump({ budgetBytes: 1024 }); assert.ok(view.readBytes <= 1024); materials.push(...view.historyMaterials, ...view.materials); boundaries.push(...view.historyBoundaries); if (view.coverage === 'caught-up' || view.coverage === 'gap') break }
   assert.equal(view.gap, null)
   assert.equal(view.forkProvenance.complete, true)
-  assert.deepEqual(materials.filter(item => item.kind === 'input').map(item => item.text), ['Keep changes in the requested directory', 'Inspect the new request', 'New generation request'])
+  assert.deepEqual(materials.filter(item => item.kind === 'input').map(item => item.text), ['New generation request', 'Keep changes in the requested directory', 'Inspect the new request'])
   assert.deepEqual(boundaries.map(item => [item.data.historyOwnerThreadId, item.data.sourceThreadId, item.data.endOrdinalExclusive]), [['fork', 'original', 6], ['fork', 'fork', 10]])
   assert.ok(materials.filter(item => item.text !== 'New generation request').every(item => item.data.history === true))
 })
 
-test('completed ancestry remains subject to project eligibility before any newly appended current material is released', async t => {
+test('completed ancestry remains subject to its own project eligibility while independent current material stays observable', async t => {
   const { ForkHistoryReader } = await import('../chatgpt/fork-history.mjs'), { appendFile } = await import('node:fs/promises')
   const f = await forkFixture(t); let enabled = true
   const parent = { id: 'original', path: f.parentPath, cwd: f.dir, parentThreadId: null, originator: 'Codex Desktop', source: 'vscode', forkedFromId: null }
@@ -236,9 +237,11 @@ test('completed ancestry remains subject to project eligibility before any newly
   enabled = false
   await appendFile(f.source.path, row(10, 'response_item', { type: 'message', id: 'fresh', role: 'assistant', content: [{ type: 'output_text', text: 'New current output must stay fenced' }], internal_chat_message_metadata_passthrough: { turn_id: 'new-run' } }, at))
   const disabled = await reader.pump()
-  assert.equal(disabled.gap, 'history-project-disabled')
-  assert.deepEqual(disabled.materials, [])
-  assert.equal(disabled.readBytes, 0)
+  assert.equal(disabled.gap, null)
+  assert.equal(disabled.forkProvenance.gap, 'history-project-disabled')
+  assert.equal(disabled.forkProvenance.complete, false)
+  assert.ok(disabled.materials.some(event => event.text === 'New current output must stay fenced'))
+  assert.deepEqual(disabled.historyMaterials, [])
 })
 
 test('save-before-ingest replay preserves stable logical deliveries after a lost HTTP receipt without storing bodies in cursor', async t => {
@@ -299,7 +302,7 @@ test('the historical header producer project must be enabled independently of th
     const reader = new ForkHistoryReader(f.source, null, { native, sessionsRoot: f.sessionsRoot }); t.after(() => reader.close())
     let view; const history = []; for (let i = 0; i < 20; i++) { view = await reader.pump(); history.push(...view.historyMaterials); if (view.coverage === 'gap' || view.coverage === 'caught-up') break }
     if (enabled) { assert.equal(view.gap, null); assert.ok(history.some(item => item.text === 'Keep changes in the requested directory')) }
-    else { assert.equal(view.gap, 'history-project-disabled'); assert.deepEqual(history, []); assert.deepEqual(view.materials, []) }
+    else { assert.equal(view.forkProvenance.gap, 'history-project-disabled'); assert.equal(view.forkProvenance.complete, false); assert.deepEqual(history, []) }
   })
 })
 
@@ -311,9 +314,10 @@ test('a matching duplicate generation remains ambiguous rather than being chosen
   const native = { async readThread() { return { thread: parent } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } } }
   const reader = new ForkHistoryReader(f.source, null, { native, sessionsRoot: f.sessionsRoot }); t.after(() => reader.close())
   const view = await reader.pump()
-  assert.equal(view.gap, 'history-generation-ambiguous')
+  assert.equal(view.gap, null)
+  assert.equal(view.forkProvenance.gap, 'history-generation-ambiguous')
   assert.deepEqual(view.historyMaterials, [])
-  assert.deepEqual(view.materials, [])
+  assert.ok(view.materials.some(event => event.text === 'Inspect the new request'))
 })
 
 test('closing during delayed ancestry qualification discards the late result and leaves no owned readers or buffers', async t => {
@@ -386,10 +390,12 @@ test('a malformed qualified ancestry record remains a definite safe collection f
   const native = { async readThread() { return { thread: parent } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } } }
   const reader = new ForkHistoryReader(f.source, null, { native, sessionsRoot: f.sessionsRoot }); t.after(() => reader.close())
   const view = await reader.pump()
-  assert.equal(view.gap, 'record-malformed-or-over-limit')
-  assert.equal(view.error.code, 'record-malformed-or-over-limit')
-  assert.equal(view.error.stage, 'collection')
-  assert.equal(Object.hasOwn(view.error, 'message'), false)
+  assert.equal(view.gap, null)
+  assert.equal(view.forkProvenance.gap, 'record-malformed-or-over-limit')
+  assert.equal(view.forkProvenance.error.code, 'record-malformed-or-over-limit')
+  assert.equal(view.forkProvenance.error.stage, 'collection')
+  assert.equal(Object.hasOwn(view.forkProvenance.error, 'message'), false)
+  assert.ok(view.materials.some(event => event.text === 'Inspect the new request'))
   assert.deepEqual(view.historyMaterials, [])
 })
 
@@ -401,9 +407,10 @@ test('fork wrapper refuses ancestry outside roots, child identity or a disabled 
     const native = { async readThread() { return { thread: parent } }, async readEnablement() { return { user: 'enabled', effective: variant === 'disabled' ? 'disabled' : 'enabled' } } }
     const reader = new ForkHistoryReader(f.source, null, { native, sessionsRoot: f.sessionsRoot }); t.after(() => reader.close())
     const view = await reader.pump()
-    assert.equal(view.coverage, 'gap')
-    assert.match(view.gap, variant === 'disabled' ? /history-project-disabled/ : /history-source-unverified/)
-    assert.deepEqual(view.materials, [])
+    assert.equal(view.coverage, 'catching-up')
+    assert.match(view.forkProvenance.gap, variant === 'disabled' ? /history-project-disabled/ : /history-source-unverified/)
+    assert.equal(view.forkProvenance.complete, false)
+    assert.ok(view.materials.some(event => event.text === 'Inspect the new request'))
     assert.deepEqual(view.historyMaterials, [])
   })
 })

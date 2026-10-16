@@ -30,9 +30,15 @@ export function normalizeHierarchy(value) {
     return { parentSessionId: str(item.parentSessionId, 'parentSessionId'), ...child, kind: item.kind, evidenceRefs: refs(item.evidenceRefs) }
   })
   const instructionBindings = list(value.instructionBindings, 'instructionBindings', 1000).map(item => {
-    fields(item, ['taskId', 'lifecycleId', 'inputRef', 'phase', 'origin', 'originRefs', 'ancestorLimitRefs'])
+    fields(item, ['taskId', 'lifecycleId', 'inputRef', 'phase', 'origin', 'originRefs', 'ancestorLimitRefs', 'forkContext'])
     if (!['accepted', 'consumed'].includes(item.phase) || !['user-entry', 'delegated', 'agent-relay', 'runtime-notice', 'unknown'].includes(item.origin)) fail('invalid instruction origin or phase')
-    return { taskId: str(item.taskId, 'taskId'), lifecycleId: str(item.lifecycleId, 'lifecycleId'), inputRef: ref(item.inputRef), phase: item.phase, origin: item.origin, originRefs: refs(item.originRefs), ancestorLimitRefs: refs(item.ancestorLimitRefs) }
+    let forkContext
+    if (item.forkContext !== undefined) {
+      fields(item.forkContext, ['generation', 'receiptId'])
+      if (!/^[a-f0-9]{64}$/.test(item.forkContext.generation ?? '') || item.forkContext.receiptId !== undefined && !/^[a-f0-9]{64}$/.test(item.forkContext.receiptId)) fail('invalid fork context')
+      forkContext = { generation: item.forkContext.generation, ...(item.forkContext.receiptId ? { receiptId: item.forkContext.receiptId } : {}) }
+    }
+    return { ...(forkContext ? { forkContext } : {}), taskId: str(item.taskId, 'taskId'), lifecycleId: str(item.lifecycleId, 'lifecycleId'), inputRef: ref(item.inputRef), phase: item.phase, origin: item.origin, originRefs: refs(item.originRefs), ancestorLimitRefs: refs(item.ancestorLimitRefs) }
   })
   const waitBindings = list(value.waitBindings ?? [], 'waitBindings', 1000).map(item => {
     fields(item, ['taskId', 'lifecycleId', 'waitId', 'phase', 'childRefs', 'evidenceRefs'])
@@ -112,6 +118,7 @@ export function validateHierarchy(context, { tasks, events, now, acceptedRuns = 
     const originEvents = binding.originRefs.map(resolve)
     if (binding.origin === 'delegated' && !parents.has(owner.sessionId)) fail('delegated instruction has no verified relation')
     if (binding.origin === 'user-entry' && !verifiedUserEntry(binding, input, { tasks: byTask, events: byEvent, parents }, sourcePolicy)) fail('user label alone does not establish an original consumed user entry')
+    if (binding.forkContext && (!chatGPT || input.data?.forkHistoryPending !== true || binding.forkContext.generation !== input.data?.forkGeneration)) fail('fork context is not bound to its current native input')
     if (!verifiedForkContext(binding, instructionLookup).valid) fail('fork context lacks its own native history boundary and user provenance')
     if (binding.origin === 'delegated' && originEvents.length === 0) fail('delegated instruction lacks origin evidence')
     const ancestors = new Set(); for (let ancestor = parents.get(owner.sessionId); ancestor; ancestor = parents.get(ancestor)) ancestors.add(ancestor)
