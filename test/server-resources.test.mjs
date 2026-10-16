@@ -4,9 +4,41 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { request } from 'node:http'
+import { channel } from 'node:diagnostics_channel'
 import { setTimeout as delay } from 'node:timers/promises'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
+
+test('sequential core calls reuse loopback connections and explicit close releases their sockets', { timeout: 10000 }, async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-server-keepalive-'))
+  let server, client, closing
+  const connections = new Map(), connected = channel('undici:client:connected')
+  const observe = ({ socket }) => {
+    if (socket?.remotePort !== Number(new URL(server.url).port)) return
+    connections.set(socket, new Promise(resolve => socket.once('close', resolve)))
+  }
+  const close = () => closing ??= (async () => {
+    await client?.close(); await server?.close()
+    let timer
+    try {
+      await Promise.race([Promise.all(connections.values()), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('owned HTTP sockets did not close')), 1000) })])
+      assert.ok([...connections.keys()].every(socket => socket.destroyed))
+      if (client) assert.deepEqual(client.transportDiagnostics(), { closed: true, pendingRequests: 0, deadlineTimers: 0 })
+    } finally { clearTimeout(timer); connected.unsubscribe(observe); await rm(dataDir, { recursive: true, force: true }) }
+  })()
+  t.after(close)
+  server = await startServer({ dataDir })
+  connected.subscribe(observe)
+  client = await connectCore({ dataDir })
+  for (let index = 0; index < 64; index++) assert.equal((await client.health()).instanceId, server.instanceId)
+  assert.equal((await client.diagnostics()).http.activeRequests, 0)
+  const count = connections.size
+  await close()
+  t.diagnostic(`64 sequential core calls used ${count} TCP connections; all owned sockets closed`)
+  assert.ok(count > 0, 'the observer must have captured the owned HTTP connections')
+  assert.ok(count <= 3, `64 sequential core calls opened ${count} TCP connections instead of reusing them`)
+  await assert.rejects(fetch(`${server.url}/v1/health`, { signal: AbortSignal.timeout(1000) }), /fetch failed/)
+})
 
 test('authenticated diagnostics separate retained records from temporary HTTP requests and expose no token or task content', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-server-resources-'))

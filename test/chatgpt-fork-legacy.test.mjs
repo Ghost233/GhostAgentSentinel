@@ -6,15 +6,16 @@ import { tmpdir } from 'node:os'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { startServer } from '../src/server.mjs'
+import { zstdCompressSync } from 'node:zlib'
 import { connectCore } from '../src/core-client.mjs'
 
 const ALPHA2 = '0.162.0-alpha.2'
 
-async function fixture(t, { producer = ALPHA2, trigger = null, form = 'typed', host = supportedProfile, missingCapability = false, lostAck = false } = {}) {
+async function fixture(t, { producer = ALPHA2, trigger = null, form = 'typed', host = supportedProfile, missingCapability = false, lostAck = false, nativeOriginVersion = 1, compressed = false } = {}) {
   let clock = Date.now(), turn = 'current', ordinal = 8, calls = 0, physicalBytes = 0, maximumBytes = 0, maximumEvents = 0, dropped = false
   t.mock.method(Date, 'now', () => clock)
   const hostStartedAt = clock - 20000
-  const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-legacy-fork-')), sessionsRoot = join(dir, 'sessions'), archive = join(dir, 'archived_sessions'), path = join(sessionsRoot, 'fork.jsonl'), original = join(archive, 'original.jsonl')
+  const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-legacy-fork-')), sessionsRoot = join(dir, 'sessions'), archive = join(dir, 'archived_sessions'), path = join(sessionsRoot, 'fork.jsonl'), original = join(archive, 'original.jsonl' + (compressed ? '.zst' : ''))
   await fs.mkdir(sessionsRoot); await fs.mkdir(archive)
   const row = (n, type, payload, at = clock) => JSON.stringify({ ordinal: n, type, payload, timestamp: new Date(at).toISOString() }) + '\n'
   const header = (id, cli = supportedProfile.cliVersion) => ({ id, cwd: '/legacy-project', originator: 'Codex Desktop', source: 'vscode', cli_version: cli, history_mode: 'paginated' })
@@ -22,7 +23,7 @@ async function fixture(t, { producer = ALPHA2, trigger = null, form = 'typed', h
   const typed = (thread, id, text) => ({ type: 'item_completed', thread_id: thread, turn_id: id, item: { type: 'UserMessage', id: id + '-user', content: [{ type: 'text', text }] } })
   const producerRow = form === 'typed' ? row(2, 'event_msg', typed('original', 'old-run', 'Legacy user requirement'), clock - 100000) : form === 'role-user' ? row(2, 'response_item', { type: 'message', role: 'user', id: 'old-mirror', content: [{ type: 'input_text', text: 'Legacy role mirror' }], internal_chat_message_metadata_passthrough: { turn_id: 'old-run' } }, clock - 100000) : row(2, 'event_msg', { type: 'user_message', turn_id: 'old-run', message: 'Legacy event message' }, clock - 100000)
   const prefix = row(0, 'session_meta', header('original', producer), clock - 100000) + row(1, 'event_msg', start('old-run', trigger), clock - 100000) + producerRow + row(3, 'event_msg', { type: 'task_complete', turn_id: 'old-run' }, clock - 100000)
-  await fs.writeFile(original, prefix)
+  await fs.writeFile(original, compressed ? zstdCompressSync(Buffer.from(prefix)) : prefix)
   await fs.writeFile(path, row(4, 'session_meta', { ...header('fork'), forked_from_id: 'original', history_base: { thread_id: 'original', end_ordinal_exclusive: 4, end_byte_offset: Buffer.byteLength(prefix) } }) + row(5, 'event_msg', start(turn, 'composer')) + row(6, 'event_msg', typed('fork', turn, 'Inspect independent current request')) + row(7, 'event_msg', { type: 'item_completed', thread_id: 'fork', turn_id: turn, item: { type: 'AgentMessage', id: 'current-output', content: [{ type: 'Text', text: 'New current activity' }] } }))
   const watched = new Set(await Promise.all([path, original].map(value => fs.realpath(value)))), opened = new Set(), open = fs.open
   t.mock.method(fs, 'open', async (...args) => {
@@ -44,7 +45,7 @@ async function fixture(t, { producer = ALPHA2, trigger = null, form = 'typed', h
       return value
     } }
     if (missingCapability) connection.health = async () => { const health = await core.health(); return { ...health, features: health.features.filter(feature => feature !== 'chatgpt-fork-legacy/1') } }
-    adapter = await startChatGPTAdapter({ core: connection, native, dataDir: join(dir, 'adapter'), sessionsRoot, installationId: 'legacy-install', token: '6'.repeat(64), pollMs: 0, now: () => clock, collectMaterials: true })
+    adapter = await startChatGPTAdapter({ core: connection, native, dataDir: join(dir, 'adapter'), sessionsRoot, installationId: 'legacy-install', token: '6'.repeat(64), pollMs: 0, now: () => clock, collectMaterials: true, nativeOriginVersion })
   }
   await openAdapter()
   t.after(async () => { await adapter.close(); await core.close(); await server.close(); await fs.rm(dir, { recursive: true, force: true }); assert.equal(opened.size, 0) })
@@ -114,5 +115,20 @@ test('legacy ACK replay and core-adapter recovery preserve the semantic gap and 
     assert.ok(fresh.instructionContext.gaps.includes('fork_receipt_missing_or_expired')); assert.deepEqual(fresh.instructionContext.userLimitRefs, [])
     assert.notEqual(expiredView.signal, 'green')
     assert.equal(expired.tasks.flatMap(task => task.events).some(event => original.some(([id]) => event.data?.nativeRecordId === id)), false)
+  })
+})
+
+
+test('v2 compressed legacy admission is exact and retains unverified user provenance for both observed legacy producers', async t => {
+  for (const [producer, form, trigger] of [[supportedProfile.cliVersion, 'typed', 'composer'], [ALPHA2, 'typed', null], ['0.160.1', 'typed', null], ['0.160.1', 'typed', 'composer'], ['0.160.1', 'role-user', null], ['0.160.1', 'user-message', null], ['0.160.2', 'typed', null]]) await t.test([producer, form, trigger].join(' / '), async t => {
+    const f = await fixture(t, { producer, form, trigger, nativeOriginVersion: 2, compressed: true }), view = await f.caughtUp()
+    if (producer === '0.160.2') { assert.notEqual(view.forkProvenance?.complete, true); assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).length, 0); return }
+    assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation)); assert.equal(view.forkProvenance.complete, true)
+    const task = (await f.core.snapshot()).tasks.find(task => task.lifecycleId === 'current'), receipt = task.events.find(event => event.data?.forkReceipt).data.forkReceipt
+    assert.equal(task.currentRequest, 'Inspect independent current request')
+    if (producer === supportedProfile.cliVersion) { assert.equal(receipt.version, 1); assert.equal(task.instructionContext.userLimitRefs.length, 1) }
+    else { assert.equal(receipt.version, 2); assert.equal(receipt.userProofMode, 'legacy-unverified'); assert.equal(receipt.users, form === 'typed' ? 1 : 0); assert.equal(receipt.unconfirmed, form === 'typed' && !trigger ? 1 : 0); assert.ok(task.instructionContext.gaps.includes('fork_user_context_unverified')); assert.equal(task.instructionContext.userLimitRefs.length, 0); assert.notEqual(view.signal, 'green') }
+    assert.ok(task.events.every(event => event.data.nativeGenerationKey))
+    assert.ok(task.events.filter(event => event.data.history).every(event => event.authorizationEligible !== true))
   })
 })

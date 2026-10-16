@@ -160,7 +160,7 @@ async function provider(t, { failFirst = false, attention = false } = {}) {
   return { config: { llm: { baseUrl, model: 'extractor' }, jev: { baseUrl, model: 'judge' } }, calls: () => calls }
 }
 
-test('an actual analysis HTTP failure that recovers before polling still produces its original immediate monitoring notice', async t => {
+for (const transition of ['running', 'idle', 'next-execution']) test(`an actual analysis HTTP failure survives recovery and ${transition} before its first notification poll`, async t => {
   const model = await provider(t, { failFirst: true }), f = await fixture(t, { cooldownMs: 0, leaseMs: 1e9 })
   await f.core.configureAnalysis(model.config)
   await f.core.ingest(f.sourceKey, nativeBatch(f.now()))
@@ -174,8 +174,11 @@ test('an actual analysis HTTP failure that recovers before polling still produce
   assert.deepEqual(page.records[0].firstRoundIds, [receipt.firstRoundId])
   assert.equal(page.records[0].mainId, 'main')
   assert.equal(page.records[0].lifecycleId, 'turn')
+  if (transition !== 'running') await f.core.ingest(f.sourceKey, { tasks: [{ id: 'main', lifecycleId: 'turn', title: 'Original execution', status: 'idle' }, ...(transition === 'next-execution' ? [{ id: 'main', lifecycleId: 'next', title: 'New execution', status: 'running' }] : [])] })
   await f.core.setNativeNotificationEligibility({ sourceKey: f.sourceKey, hostRunId: 'native-host', appRunning: true, pluginEnabled: true })
-  assert.equal((await f.core.claimNotifications(f.sourceKey)).length, 1, 'the first explicit failure has no extra notification delay')
+  const claimed = await f.core.claimNotifications(f.sourceKey)
+  assert.equal(claimed.length, 1, 'the first explicit failure has no extra notification delay')
+  assert.equal(claimed[0].lifecycleId, 'turn'); assert.deepEqual(claimed[0].receiptIds, [receipt.id])
 })
 
 test('ChatGPT task alerts retain the three-second window and ten-minute successful repeat while a late old attempt cannot overwrite the new one', async t => {
@@ -225,7 +228,7 @@ test('native notification and failure-link retention remains capped and exposes 
   assert.equal(JSON.stringify(firstPage).includes('Bearer'), false)
 })
 
-test('an unknown or ended main stops its scoped failure notice while a trusted nullable source failure remains eligible', async t => {
+test('an unknown or ended main preserves its first monitoring failure with the same identity as a source-level failure', async t => {
   for (const status of ['unknown', 'idle']) await t.test(status, async t => {
     const f = await fixture(t)
     await f.core.ingest(f.sourceKey, { tasks: [{ id: 'main', lifecycleId: 'turn', title: 'Main', status: 'running' }] })
@@ -233,8 +236,8 @@ test('an unknown or ended main stops its scoped failure notice while a trusted n
     await f.core.ingest(f.sourceKey, { tasks: [{ id: 'main', lifecycleId: 'turn', title: 'Main', status }] })
     await f.core.setNativeNotificationEligibility({ sourceKey: f.sourceKey, hostRunId: 'native-host', appRunning: true, pluginEnabled: true })
     const claims = await f.core.claimNotifications(f.sourceKey)
-    assert.deepEqual(claims.map(value => value.mainId), [null])
-    assert.equal((await f.core.nativeNotificationRecords({ sourceKey: f.sourceKey })).records.find(value => value.mainId === 'main').status, 'cancelled')
+    assert.deepEqual(claims.map(value => value.mainId), ['main', null])
+    assert.equal((await f.core.nativeNotificationRecords({ sourceKey: f.sourceKey })).records.find(value => value.mainId === 'main').status, 'claimed')
   })
 })
 

@@ -43,11 +43,12 @@ export function createNativeCaptureProgress({ db, seed = [] }) {
 
   return {
     project(registrationId, incoming, current, lookup) {
-      const changes = new Map(), earlier = new Map(), output = []
+      const changes = new Map(), earlier = new Map(), output = []; let existingProgress = false
       for (const event of incoming) {
         const nativeRecordId = event.data?.nativeRecordId
         if (!nativeRecordId || event.capturedAt > current) { output.push(event); continue }
         const key = keyOf(registrationId, nativeRecordId), first = changes.get(key) ?? records.get(key)
+        existingProgress ||= Boolean(first)
         if (first?.expired || first && first.firstCapturedAt <= current - DAY) continue
         if (first) {
           const body = lookup(first.locator)
@@ -71,7 +72,7 @@ export function createNativeCaptureProgress({ db, seed = [] }) {
         const first = changes.get(keyOf(registrationId, event.data?.nativeRecordId))
         return first && !first.expired && event.capturedAt > first.firstCapturedAt ? { ...event, capturedAt: first.firstCapturedAt } : event
       })
-      return { events: projected, earlier, stage(accepted) {
+      return { events: projected, earlier, hasProgress: existingProgress || changes.size > 0, stage(accepted) {
         const actual = new Map([...changes].filter(([, record]) => record.expired))
         for (const value of accepted) {
           const key = keyOf(registrationId, value.event.data?.nativeRecordId), proposed = changes.get(key)

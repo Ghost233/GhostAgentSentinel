@@ -1,3 +1,4 @@
+import { normalizeNativeOrigins } from './native-origin.mjs'
 import { normalizeForkReceipt } from './fork-proof.mjs'
 export const PROTOCOL = 1
 export const GS_SUMMARY_FEATURE = 'gs-summary/1'
@@ -137,6 +138,7 @@ export function normalizeSource(value) {
     if (input.policy !== CHATGPT_MAIN_FEATURE) throw new Error('unsupported source observation policy')
     result.policy = input.policy
   }
+  if (input.nativeOriginVersion !== undefined) { if (input.policy !== CHATGPT_MAIN_FEATURE || input.nativeOriginVersion !== 2) throw new Error('invalid native origin version'); result.nativeOriginVersion = 2 }
   if (input.profile !== undefined) result.profile = string(input.profile, 'profile', 2000)
   if (input.enroll !== undefined) {
     if (typeof input.enroll !== 'boolean') throw new Error('enroll must be boolean')
@@ -149,6 +151,7 @@ export function normalizeSource(value) {
 export function normalizeBatch(value) {
   const input = object(value, 'batch')
   const result = {}
+  if (input.nativeOrigins !== undefined) result.nativeOrigins = normalizeNativeOrigins(input.nativeOrigins)
   if (input.tasks !== undefined) {
     if (!Array.isArray(input.tasks) || input.tasks.length > 2000) throw new Error('tasks must be a bounded list')
     result.tasks = input.tasks.map(item => {
@@ -180,9 +183,9 @@ export function normalizeBatch(value) {
       }
       if (item.data !== undefined) {
         object(item.data, 'event.data')
-        for (const field of ['forkReceiptId', 'forkGeneration', 'historyGeneration', 'nativeRecordId']) if (item.data[field] !== undefined && (typeof item.data[field] !== 'string' || !/^[a-f0-9]{64}$/.test(item.data[field]))) throw new Error('invalid fork proof identity')
+        for (const field of ['forkReceiptId', 'forkGeneration', 'historyGeneration', 'nativeRecordId', 'nativeGenerationKey']) if (item.data[field] !== undefined && (typeof item.data[field] !== 'string' || !/^[a-f0-9]{64}$/.test(item.data[field]))) throw new Error('invalid fork proof identity')
         event.data = { ...event.data }
-        for (const field of ['forkReceiptId', 'forkGeneration', 'historyGeneration', 'nativeRecordId']) if (item.data[field] !== undefined) event.data[field] = item.data[field]
+        for (const field of ['forkReceiptId', 'forkGeneration', 'historyGeneration', 'nativeRecordId', 'nativeGenerationKey']) if (item.data[field] !== undefined) event.data[field] = item.data[field]
         if (item.data.forkReceipt !== undefined) event.data.forkReceipt = normalizeForkReceipt(item.data.forkReceipt)
         if (Boolean(item.data.forkReceiptId) !== Boolean(item.data.forkGeneration)) throw new Error('incomplete fork proof marker')
         for (const key of dataStrings) if (item.data[key] !== undefined && item.data[key] !== null) {
@@ -196,7 +199,7 @@ export function normalizeBatch(value) {
             event.data[key] = item.data[key]
           }
         }
-        for (const key of ['inputSequence', 'recordOrdinal', 'endOrdinalExclusive', 'endByteOffset']) if (item.data[key] !== undefined) event.data[key] = time(item.data[key], key)
+        for (const key of ['inputSequence', 'recordOrdinal', 'endOrdinalExclusive', 'endByteOffset', 'nativeRecordStart', 'nativeRecordEnd']) if (item.data[key] !== undefined) event.data[key] = time(item.data[key], key)
         if (item.data.exitCode !== undefined && item.data.exitCode !== null) {
           if (!Number.isSafeInteger(item.data.exitCode)) throw new Error('exitCode must be integer')
           event.data.exitCode = item.data.exitCode

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile, appendFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, appendFile, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -11,11 +11,13 @@ import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 const profile = { appVersion: '26.1007.71326', appBuild: '20398', cliVersion: '0.162.0-alpha.17.2' }
 const record = (type, payload, at) => JSON.stringify({ type, payload, timestamp: new Date(at).toISOString() }) + '\n'
 
-async function fixture(t, { pollMs = 0 } = {}) {
+async function fixture(t, { pollMs = 0, nativeOriginVersion = 1, fixedStorageRoots = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-discovery-')), born = Date.now() - 10000
+  const sessionsRoot = fixedStorageRoots ? join(dir, 'sessions') : dir, archiveRoot = join(dir, 'archived_sessions')
+  if (fixedStorageRoots) { await mkdir(sessionsRoot); await mkdir(archiveRoot) }
   const rows = new Map(), facts = { enabled: true, host: true, pages: 0, samples: 0, reads: [], configurations: [], projects: new Map(), pageFailure: false }
   async function add(id, extra = {}) {
-    const path = join(dir, id + '.jsonl')
+    const path = join(sessionsRoot, id + '.jsonl')
     await writeFile(path, record('session_meta', { id }, born + 2000) + record('event_msg', { type: 'task_started', turn_id: 'turn-' + id }, born + 2000))
     const thread = { id, path, cwd: join(dir, 'project-a'), originator: 'Codex Desktop', source: 'vscode', parentThreadId: null, forkedFromId: null, sessionId: 'shared-tree-id', updatedAt: Date.now() / 1000 | 0, ...extra }
     rows.set(id, thread); return thread
@@ -28,10 +30,10 @@ async function fixture(t, { pollMs = 0 } = {}) {
     async close() {},
   }
   const server = await startServer({ dataDir: join(dir, 'core') }), core = await connectCore({ dataDir: join(dir, 'core') })
-  const adapter = await startChatGPTAdapter({ core, native, sessionsRoot: dir, dataDir: join(dir, 'adapter'), installationId: 'discovery-installation', token: 'a'.repeat(64), pollMs })
+  const adapter = await startChatGPTAdapter({ core, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'discovery-installation', token: 'a'.repeat(64), pollMs, nativeOriginVersion })
   t.after(async () => { await adapter.close(); await core.close(); await server.close(); await rm(dir, { recursive: true, force: true }) })
   const read = async id => (await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'a'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: id } } }) }).then(value => value.json())).result.structuredContent
-  return { dir, rows, facts, native, core, adapter, add, read }
+  return { dir, sessionsRoot, archiveRoot, rows, facts, native, core, adapter, add, read }
 }
 
 test('background directory pagination discovers existing and new independent local main chats without opening panels', async t => {
@@ -52,6 +54,55 @@ test('background directory pagination discovers existing and new independent loc
   assert.equal(view.discovery.counts.main, 3)
   assert.equal(view.discovery.directoryComplete, true)
   assert.equal(view.discovery.complete, false, 'cached directory completion does not prove all execution domains are discovered')
+})
+
+test('directory observation finds completed plain main records in the fixed sibling archive', async t => {
+  const f = await fixture(t, { fixedStorageRoots: true }), thread = await f.add('archived-main', { archived: true })
+  await appendFile(thread.path, record('event_msg', { type: 'task_complete', turn_id: 'turn-archived-main' }, Date.now() - 1000))
+  const archivedPath = join(f.archiveRoot, 'archived-main.jsonl')
+  await rename(thread.path, archivedPath); thread.path = archivedPath
+  await f.adapter.refresh()
+  const view = await f.read('archived-main')
+  assert.equal(view.identity.threadId, 'archived-main')
+  assert.equal(view.observation.phase, 'completed')
+  assert.equal((await f.core.snapshot()).tasks[0].status, 'idle')
+  assert.equal(f.adapter.discovery().counts.main, 1)
+})
+
+test('fixed archive eligibility rejects lookalike roots, escaped paths and relative storage before opening records', async t => {
+  const f = await fixture(t, { fixedStorageRoots: true })
+  const paths = [join(f.dir, 'archived_sessions-other', 'record.jsonl'), join(f.dir, 'other', 'record.jsonl'), join(f.sessionsRoot, '..', 'other', 'record.jsonl'), 'archived_sessions/record.jsonl', join(f.archiveRoot, 'record.jsonl.backup')]
+  for (const [index, path] of paths.entries()) await f.add('excluded-' + index, { path })
+  await f.adapter.refresh()
+  assert.equal(f.facts.reads.length, 0, 'excluded directory entries must not open their native records')
+  assert.equal(f.adapter.discovery().counts.unknown, paths.length)
+  for (let index = 0; index < paths.length; index++) {
+    const view = await f.read('excluded-' + index)
+    assert.equal(view.identity.threadId, null)
+    assert.equal(view.observation.gap, 'main-identity-unverified')
+  }
+  assert.equal((await f.core.snapshot()).tasks.length, 0)
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
+})
+
+test('a nonstandard configured root does not implicitly authorize an archive sibling', async t => {
+  const f = await fixture(t), path = join(f.dir, '..', 'archived_sessions', 'record.jsonl')
+  await f.add('unapproved-archive', { path })
+  await f.adapter.refresh()
+  assert.equal(f.adapter.discovery().counts.unknown, 1)
+  assert.equal((await f.read('unapproved-archive')).identity.threadId, null)
+  assert.equal((await f.core.snapshot()).tasks.length, 0)
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
+})
+
+test('metadata observation rejects compressed current storage even when passed native origin version two', async t => {
+  const f = await fixture(t, { fixedStorageRoots: true, nativeOriginVersion: 2 })
+  for (const [index, path] of [join(f.sessionsRoot, 'record.jsonl.zst'), join(f.archiveRoot, 'record.jsonl.zst')].entries()) await f.add('compressed-' + index, { path })
+  await f.adapter.refresh()
+  assert.equal(f.adapter.discovery().counts.unknown, 2)
+  for (const id of ['compressed-0', 'compressed-1']) assert.equal((await f.read(id)).identity.threadId, null)
+  assert.equal((await f.core.snapshot()).tasks.length, 0)
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
 })
 
 test('twenty objects share fresh host and project samples and directory heartbeats do not manufacture activity', async t => {

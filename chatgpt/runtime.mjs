@@ -58,7 +58,7 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     core = await connectCore({ dataDir: config.coreDataDir })
     const hostIO = native ?? createNativeIO({ pluginId: config.pluginId, socketPath: config.metadataSocket })
     const notifier = notificationIO ?? (config.notificationBundlePath ? createNativeNotificationIO({ bundlePath: config.notificationBundlePath, installationId: config.installationId }) : undefined)
-    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, pollMs, collectMaterials: true })
+    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, pollMs, collectMaterials: true, nativeOriginVersion: 2 })
     const pluginDir = join(config.dataDir, 'plugin')
     await mkdir(join(pluginDir, '.codex-plugin'), { recursive: true, mode: 0o700 })
     await writePrivateJson(join(pluginDir, '.codex-plugin/plugin.json'), { name: 'ghost-sentinel', version: '0.1.0-dev.0', description: 'ChatGPT.app 本机主会话只读检查；当前开发候选不含正式常驻安装。', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查', shortDescription: '本机主会话 · 只读检查' } })
