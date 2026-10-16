@@ -51,7 +51,7 @@ async function fixture(t, { padding = '', compressed = false, invalidFrame = fal
   const catchUp = async (stopOnFailure = true) => { let view; for (let pump = 0; pump < 100; pump++) { view = await read(); if (stopOnFailure && view.health?.state === 'failed' || view.observation.coverage === 'caught-up' || view.observation.gap && !['main-header-unverified', 'current-turn-not-observed'].includes(view.observation.gap)) break } return view }
   const tail = row(4, 'event_msg', { type: 'item_completed', thread_id: 'main', turn_id: 'run', item: { type: 'AgentMessage', id: 'tail', content: [{ type: 'Text', text: 'New verified tail' }] } })
   const source = async () => (await core.snapshot()).sources[0].key
-  return { dir, path, bytes, tail, encode, core, adapter, read, catchUp, source, ending: phase => row(4, 'event_msg', { type: phase === 'completed' ? 'task_complete' : 'turn_aborted', turn_id: 'run' }), async appendFresh(old = false) { anchorTurnId = old ? 'unconfirmed-old-run' : 'fresh-run'; const at = clock - (old ? 20000 : 0); await fs.appendFile(path, row(5, 'event_msg', { type: 'task_started', turn_id: anchorTurnId, turn_attribution: { turn_id: anchorTurnId, turn_trigger: 'composer' } }, at) + row(6, 'event_msg', { type: 'item_completed', thread_id: 'main', turn_id: anchorTurnId, item: { type: 'UserMessage', id: 'fresh-user', content: [{ type: 'text', text: 'Inspect the new live request' }] } }, at)) }, async restart() { await adapter.close(); adapter = await openAdapter() } }
+  return { dir, path, bytes, tail, encode, core, adapter, read, catchUp, source, ending: (phase, turnId = 'run') => row(turnId === 'run' ? 4 : 7, 'event_msg', { type: phase === 'completed' ? 'task_complete' : 'turn_aborted', turn_id: turnId }, turnId === 'run' ? undefined : clock), confirmFresh() { anchorTurnId = 'fresh-run' }, async appendFresh(old = false, confirmed = true) { const turnId = old ? 'unconfirmed-old-run' : 'fresh-run'; if (confirmed) anchorTurnId = turnId; const at = clock - (old ? 20000 : 0); await fs.appendFile(path, row(5, 'event_msg', { type: 'task_started', turn_id: turnId, turn_attribution: { turn_id: turnId, turn_trigger: 'composer' } }, at) + row(6, 'event_msg', { type: 'item_completed', thread_id: 'main', turn_id: turnId, item: { type: 'UserMessage', id: 'fresh-user', content: [{ type: 'text', text: 'Inspect the new live request' }] } }, at)) }, async restart() { await adapter.close(); adapter = await openAdapter() } }
 }
 
 test('a plain path replaced during its physical read cannot publish old material or a native fence', { timeout: 10000 }, async t => {
@@ -195,6 +195,111 @@ test('an unfinished old main anchor stays unknown at EOF and a later real comple
   assert.equal(task.status, 'idle'); assert.equal(task.currentRequest, 'Inspect this request')
 })
 
+for (const old of [false, true]) test(`an unfinished old anchor independently admits only a verified host-local successor (${old ? 'old-start' : 'fresh-start'})`, async t => {
+  const f = await fixture(t, { oldAnchor: true, padding: 'p'.repeat(600000) })
+  let view
+  for (let pump = 0; pump < 12; pump++) view = await f.read()
+  assert.equal(view.observation.phase, 'unknown')
+  assert.equal(view.observation.metadataOffset, Buffer.byteLength(f.bytes))
+  assert.deepEqual((await f.core.snapshot()).tasks, [])
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 0)
+  await f.appendFresh(old)
+  let snapshot, fresh
+  for (let pump = 0; pump < 100; pump++) {
+    view = await f.read(); snapshot = await f.core.snapshot(); fresh = snapshot.tasks.find(task => task.lifecycleId === 'fresh-run')
+    const prior = snapshot.tasks.find(task => task.lifecycleId === 'run')
+    if (prior) assert.equal(prior.status, 'unknown')
+    if (fresh?.status === 'running' && fresh.currentRequest === 'Inspect the new live request') break
+  }
+  if (old) {
+    assert.equal(snapshot.overview.runningTasks, 0)
+    assert.equal(snapshot.tasks.some(task => task.lifecycleId === 'unconfirmed-old-run'), false)
+    assert.equal(view.observation.phase, 'unknown')
+    return
+  }
+  assert.equal(fresh?.status, 'running', JSON.stringify(view.observation))
+  assert.equal(fresh.currentRequest, 'Inspect the new live request')
+  const start = fresh.events.find(event => event.data.nativeType === 'task_started'), input = fresh.events.find(event => event.kind === 'input')
+  assert.ok(start); assert.ok(input)
+  assert.equal(input.text, 'Inspect the new live request')
+  assert.equal(input.data.inputOrigin, 'user-entry')
+  assert.equal(fresh.coverage.complete, true)
+  assert.deepEqual(fresh.instructionContext.binding.originRefs.map(ref => ref.eventId).sort(), [start.id, input.id].sort())
+  assert.ok(fresh.instructionContext.binding.originRefs.every(ref => ref.lifecycleId === 'fresh-run'))
+  const prior = snapshot.tasks.find(task => task.lifecycleId === 'run')
+  assert.equal(prior?.status, 'unknown')
+  assert.ok(prior.coverage.gaps.includes('historical-execution-unconfirmed'))
+  assert.equal(prior.events.find(event => event.kind === 'input').text, 'Inspect this request')
+  assert.equal(prior.events.some(event => ['task_complete', 'turn_aborted'].includes(event.data.nativeType)), false)
+  assert.equal(snapshot.overview.runningTasks, 1)
+  const captured = snapshot.tasks.map(task => [task.lifecycleId, task.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text])])
+  await f.restart()
+  for (let pump = 0; pump < 24; pump++) view = await f.read()
+  snapshot = await f.core.snapshot()
+  assert.equal(view.observation.phase, 'started')
+  assert.equal(snapshot.tasks.find(task => task.lifecycleId === 'run').status, 'unknown')
+  assert.ok(snapshot.tasks.find(task => task.lifecycleId === 'run').coverage.gaps.includes('historical-execution-unconfirmed'))
+  assert.deepEqual(snapshot.tasks.map(task => [task.lifecycleId, task.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text])]), captured)
+  assert.deepEqual((await f.core.failureReceipts({ sourceKey: await f.source() })).receipts, [])
+})
+
+test('a verified Native anchor arriving after the cold scan reached the fresh start at EOF can still admit that execution', async t => {
+  const f = await fixture(t, { oldAnchor: true, padding: 'p'.repeat(600000) })
+  for (let pump = 0; pump < 12; pump++) await f.read()
+  await f.appendFresh(false, false)
+  let view
+  for (let pump = 0; pump < 12; pump++) view = await f.read()
+  assert.equal(view.observation.coldReadStage, 'scan')
+  assert.equal(view.observation.metadataOffset, (await fs.stat(f.path)).size)
+  assert.deepEqual((await f.core.snapshot()).tasks, [], 'a start with the wrong Native anchor cannot publish or authorize materials')
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 0)
+  f.confirmFresh()
+  let snapshot, fresh
+  for (let pump = 0; pump < 100; pump++) {
+    view = await f.read(); snapshot = await f.core.snapshot(); fresh = snapshot.tasks.find(task => task.lifecycleId === 'fresh-run')
+    if (fresh?.status === 'running' && fresh.currentRequest === 'Inspect the new live request') break
+  }
+  assert.equal(fresh?.status, 'running', JSON.stringify(view.observation))
+  assert.equal(fresh.currentRequest, 'Inspect the new live request')
+  const start = fresh.events.find(event => event.data.nativeType === 'task_started'), input = fresh.events.find(event => event.kind === 'input')
+  assert.equal(fresh.coverage.complete, true)
+  assert.deepEqual(fresh.instructionContext.binding.originRefs.map(ref => ref.eventId).sort(), [start.id, input.id].sort())
+  const prior = snapshot.tasks.find(task => task.lifecycleId === 'run')
+  assert.equal(prior.status, 'unknown')
+  assert.ok(prior.coverage.gaps.includes('historical-execution-unconfirmed'))
+})
+
+test('a verified Native anchor arriving after the cold scan read a completed successor at EOF restores ended history', async t => {
+  const f = await fixture(t, { oldAnchor: true, padding: 'p'.repeat(600000) })
+  for (let pump = 0; pump < 12; pump++) await f.read()
+  await f.appendFresh(false, false)
+  await fs.appendFile(f.path, f.ending('completed', 'fresh-run'))
+  let view
+  for (let pump = 0; pump < 12; pump++) view = await f.read()
+  assert.equal(view.observation.coldReadStage, 'scan')
+  assert.equal(view.observation.metadataOffset, (await fs.stat(f.path)).size)
+  assert.deepEqual((await f.core.snapshot()).tasks, [], 'the wrong Native anchor cannot publish even a completed successor')
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 0)
+  f.confirmFresh()
+  let snapshot, fresh
+  for (let pump = 0; pump < 100; pump++) {
+    view = await f.read(); snapshot = await f.core.snapshot(); fresh = snapshot.tasks.find(task => task.lifecycleId === 'fresh-run')
+    assert.equal(snapshot.overview.runningTasks, 0)
+    assert.ok(snapshot.tasks.every(task => !['queued', 'analyzing'].includes(task.analysis.state)))
+    if (fresh?.status === 'idle' && view.observation.coverage === 'retained-history') break
+  }
+  assert.equal(fresh?.status, 'idle', JSON.stringify(view.observation))
+  assert.equal(fresh.currentRequest, 'Inspect the new live request')
+  const start = fresh.events.find(event => event.data.nativeType === 'task_started'), input = fresh.events.find(event => event.kind === 'input')
+  assert.deepEqual(fresh.instructionContext.binding.originRefs.map(ref => ref.eventId).sort(), [start.id, input.id].sort())
+  assert.equal(fresh.events.filter(event => event.data.nativeType === 'task_complete').length, 1)
+  assert.equal(view.observation.phase, 'completed')
+  assert.equal(view.execution.lifecycleId, 'fresh-run'); assert.equal(view.execution.historical, true)
+  const prior = snapshot.tasks.find(task => task.lifecycleId === 'run')
+  assert.equal(prior.status, 'unknown')
+  assert.ok(prior.coverage.gaps.includes('historical-execution-unconfirmed'))
+})
+
 test('an old terminal proof does not suppress a fresh host-local execution appended after the historical replay', async t => {
   const f = await fixture(t, { oldAnchor: true, terminal: 'completed', padding: 'p'.repeat(600000) })
   let view
@@ -238,6 +343,31 @@ test('an old-anchor pre-scan retains the already checked file identity across it
   assert.ok(view.health.failures.some(failure => failure.error.code === 'record-file-replaced'))
   assert.deepEqual((await f.core.snapshot()).tasks, [])
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 0)
+})
+
+for (const replaced of [false, true]) test(`an old-anchor replay inherits its scan identity before reopening material IO (${replaced ? 'replaced' : 'unchanged'})`, async t => {
+  const f = await fixture(t, { oldAnchor: true, terminal: 'completed', padding: 'p'.repeat(600000) })
+  let view
+  for (let pump = 0; pump < 100; pump++) { view = await f.read(); if (view.observation.coldReadStage === 'verify') break }
+  assert.equal(view.observation.coldReadStage, 'verify')
+  assert.deepEqual((await f.core.snapshot()).tasks, [])
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 0)
+  if (replaced) {
+    const before = await fs.stat(f.path)
+    await fs.rename(f.path, f.path + '.old'); await fs.writeFile(f.path, f.bytes)
+    assert.notEqual((await fs.stat(f.path)).ino, before.ino)
+  }
+  for (let pump = 0; pump < 100; pump++) { view = await f.read(); if (view.health?.state === 'failed' || view.observation.coverage === 'retained-history') break }
+  if (replaced) {
+    assert.equal(view.health.state, 'failed', JSON.stringify(view.observation))
+    assert.ok(view.health.failures.some(failure => failure.error.code === 'record-file-replaced'))
+    assert.deepEqual((await f.core.snapshot()).tasks, [])
+    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 0)
+  } else {
+    assert.equal(view.observation.coverage, 'retained-history')
+    assert.equal((await f.core.snapshot()).tasks.find(task => task.lifecycleId === 'run').status, 'idle')
+    assert.deepEqual((await f.core.failureReceipts({ sourceKey: await f.source() })).receipts, [])
+  }
 })
 
 test('same-size plain rewrites with restored mtime cannot bypass the remaining ctime guard', async t => {

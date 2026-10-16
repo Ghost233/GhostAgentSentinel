@@ -340,11 +340,11 @@ export class ForkHistoryReader {
   }
 
   view(output = {}, reason = null) {
-    const current = this.current.reader.view(), revalidating = this.nodes.some(node => node.reader.io?.revalidation), complete = this.current.resolved && (!this.current.parent || this.current.parent.complete) && !revalidating
+    const current = this.current.reader.view(), revalidating = this.nodes.some(node => node.reader.io?.revalidation), waiting = revalidating || this.budgetWaiting, complete = this.current.resolved && (!this.current.parent || this.current.parent.complete) && !waiting
     const gap = reason ?? (this.closed ? 'reader-closed' : this.gap)
-    return { ...current, ...output, materials: output.materials ?? [], recentLifecycle: output.recentLifecycle ?? [], historyMaterials: output.historyMaterials ?? [], historyLifecycle: output.historyLifecycle ?? [], historyBoundaries: output.historyBoundaries ?? [], readBytes: output.readBytes ?? 0, decodedBytes: output.decodedBytes ?? 0, nativeOrigins: revalidating ? [] : [...new Map(this.nodes.map(node => node.reader.io?.proof() ?? node.originProof).filter(Boolean).map(proof => [proof.key, proof])).values()],
+    return { ...current, ...output, materials: output.materials ?? [], recentLifecycle: output.recentLifecycle ?? [], historyMaterials: output.historyMaterials ?? [], historyLifecycle: output.historyLifecycle ?? [], historyBoundaries: output.historyBoundaries ?? [], readBytes: output.readBytes ?? 0, decodedBytes: output.decodedBytes ?? 0, nativeOrigins: waiting ? [] : [...new Map(this.nodes.map(node => node.reader.io?.proof() ?? node.originProof).filter(Boolean).map(proof => [proof.key, proof])).values()],
       metrics: { ...current.metrics, physicalBytes: this.physicalBytes + (output.readBytes ?? 0), maximumReadBytes: Math.max(this.maximumReadBytes, output.readBytes ?? 0) },
-      coverage: gap ? 'gap' : complete && !this.current.pending.length ? current.coverage : 'catching-up', gap: gap ?? (complete ? current.gap : null), effectivePhase: !gap && complete && !this.current.pending.length ? current.effectivePhase : 'unknown', captureThroughOffset: this.captureThroughOffset,
+      coverage: gap ? 'gap' : complete && !this.current.pending.length ? current.coverage : 'catching-up', gap: gap ?? (complete ? current.gap : null), effectivePhase: !gap && complete && !this.current.pending.length ? current.effectivePhase : 'unknown', captureThroughOffset: this.guardedCheckpoint?.captureThroughOffset ?? this.captureThroughOffset,
       forkProvenance: { ...(current.forkProvenance ?? {}), complete: Boolean(complete && !gap), gap: gap ?? null }, ...(this.error ? { error: this.error } : {}) }
   }
 
@@ -359,6 +359,15 @@ export class ForkHistoryReader {
       const previous = this.checkpoint()
       const output = { materials: [], recentLifecycle: [], historyMaterials: [], historyLifecycle: [], historyBoundaries: [], readBytes: 0, decodedBytes: 0 }
       const budget = { bytes: budgetBytes, decoded: 262144, events: 16, options, qualified: new Map(), projects: new Set(), phase: new Map(), calls: 0, owner: this }
+      this.budgetWaiting = false
+      const holdOutput = () => {
+        this.guardedCheckpoint ??= previous
+        if (CHANNELS.some(channel => output[channel].length)) {
+          this.guardedOutput = Object.fromEntries(CHANNELS.map(channel => [channel, output[channel]]))
+          for (const channel of CHANNELS) output[channel] = []
+        }
+      }
+      const waitForBudget = () => { holdOutput(); this.budgetWaiting = true; return this.view(output) }
       this.budget = budget
       try {
         if (this.temporarilyUnavailable) {
@@ -380,6 +389,7 @@ export class ForkHistoryReader {
             if (checked.coverage === 'gap') { this.error = checked.error; throw failure(checked.gap) }
           }
         }
+        if (readable(budget) < 1 || budget.decoded < 1) return waitForBudget()
         if (this.current.reader.io?.revalidation) {
           const checked = await this.readNode(this.current, { ...options, budgetBytes: readable(budget), decodedBudgetBytes: budget.decoded, verifyOnly: true })
           budget.bytes -= checked.readBytes; output.readBytes += checked.readBytes; budget.decoded -= checked.decodedBytes ?? 0; output.decodedBytes += checked.decodedBytes ?? 0
@@ -393,15 +403,14 @@ export class ForkHistoryReader {
         for (const cwd of budget.projects) await this.producerProject(cwd)
         const guards = this.nodes.filter(node => !node.codecPending && (node.reader.handle || node.history && node.reader.fileId))
         for (const [index, node] of guards.entries()) {
-          if (budget.bytes < 64) throw failure('history-guard-budget')
-          const guarded = await this.readNode(node, { ...options, budgetBytes: Math.max(0, budget.bytes - 64 * (guards.length - index - 1)), decodedBudgetBytes: budget.decoded, verifyOnly: true })
+          const guardBudget = budget.bytes - 64 * (guards.length - index - 1)
+          if (guardBudget < 64 || budget.decoded < 1) return waitForBudget()
+          const guarded = await this.readNode(node, { ...options, budgetBytes: guardBudget, decodedBudgetBytes: budget.decoded, verifyOnly: true })
           budget.bytes -= guarded.readBytes; output.readBytes += guarded.readBytes; budget.decoded -= guarded.decodedBytes ?? 0; output.decodedBytes += guarded.decodedBytes ?? 0
           if (guarded.coverage === 'gap') { this.error = guarded.error; throw failure(guarded.gap) }
         }
-        if (this.nodes.some(node => node.reader.io?.revalidation) && CHANNELS.some(channel => output[channel].length)) {
-          this.guardedOutput = Object.fromEntries(CHANNELS.map(channel => [channel, output[channel]])); this.guardedCheckpoint ??= previous
-          for (const channel of CHANNELS) output[channel] = []
-        } else if (!this.guardedOutput) this.guardedCheckpoint = null
+        if (this.nodes.some(node => node.reader.io?.revalidation)) holdOutput()
+        else if (!this.guardedOutput) this.guardedCheckpoint = null
         if (this.closed) return this.view({ readBytes: output.readBytes })
         return this.view(output)
       } catch (error) {

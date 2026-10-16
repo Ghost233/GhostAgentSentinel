@@ -87,12 +87,12 @@ const sourceIoCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'EIO', 'ENOTDIR', 'E
 const nativeHeader = row => ({ threadId: row.payload.id, ordinal: row.ordinal, originator: row.payload.originator, sourceKind: row.payload.source, cliVersion: row.payload.cli_version, historyMode: row.payload.history_mode, cwd: row.payload.cwd, creationSourceThreadId: row.payload.forked_from_id ?? null, historyBase: row.payload.history_base ? { sourceThreadId: row.payload.history_base.thread_id, endOrdinalExclusive: row.payload.history_base.end_ordinal_exclusive, endByteOffset: row.payload.history_base.end_byte_offset } : null });
 
 export class BoundedReader {
-  constructor(source, cursor = null, { mode = 'metadata', forkSuffix = false, origins = null, scanOnly = false, terminalProof = cursor?.terminalProof ?? null } = {}) {
+  constructor(source, cursor = null, { mode = 'metadata', forkSuffix = false, origins = null, scanOnly = false, terminalProof = cursor?.terminalProof ?? null, successorProof = cursor?.successorProof ?? null } = {}) {
     if (!['metadata', 'material', 'history', 'history-metadata', 'header'].includes(mode)) throw new Error('unsupported reader mode');
     this.origins = origins; this.mode = mode; this.materialMode = ['material', 'history'].includes(mode); this.historyMode = ['history', 'history-metadata'].includes(mode); this.ordinalMode = this.historyMode || forkSuffix;
     this.historyRange = this.historyMode ? source.historyRange : null; this.nextOrdinal = null; this.forkProvenance = null;
     this.source = source; this.nativeOriginVersion = source.nativeOriginVersion ?? 1;
-    this.scanOnly = scanOnly; this.coldScan = null; this.coldCheckpoint = null; this.terminalProof = terminalProof;
+    this.scanOnly = scanOnly; this.scanStart = null; this.coldScan = null; this.coldCheckpoint = null; this.terminalProof = terminalProof; this.successorProof = successorProof;
     this.originIdentity = this.nativeOriginVersion === 2 ? 'native-storage/2:' + nativeStorageKey(source.path) : null;
     this.scope = digest(JSON.stringify([this.nativeOriginVersion === 2 ? this.originIdentity : typeof source.path === 'string' ? resolve(source.path) : '', source.threadId, source.hostRunId, profileKey(source.profile), ...(this.ordinalMode ? [mode, source.forkedFromId ?? null, this.historyRange, this.nativeOriginVersion === 2 ? null : source.expectedFileId ?? null, source.expectedHeader ?? null] : [])]));
     this.state = emptyState();
@@ -131,6 +131,12 @@ export class BoundedReader {
         normalizeNativePrefix(terminalProof.prefix);
       } catch { this.gap = 'cursor-invalid'; }
     }
+    if (successorProof) {
+      try {
+        if (this.nativeOriginVersion !== 2 || Object.keys(successorProof).length !== 7 || successorProof.key !== nativeStorageKey(source.path) || !/^[a-f0-9]{64}$/.test(successorProof.headerHash) || [successorProof.turnId, successorProof.previousTurnId].some(id => typeof id !== 'string' || !id || id.length > 128) || successorProof.turnId === successorProof.previousTurnId || !Number.isSafeInteger(successorProof.at) || successorProof.at < source.hostStartedAt + 1000 || !Number.isSafeInteger(successorProof.recordStart) || successorProof.recordStart < 0 || successorProof.prefix.offset <= successorProof.recordStart) throw new Error('invalid successor proof');
+        normalizeNativePrefix(successorProof.prefix);
+      } catch { this.gap = 'cursor-invalid'; }
+    }
   }
 
   view(reason = null) {
@@ -138,12 +144,13 @@ export class BoundedReader {
     // ps lstart is precise to one second. Recompute this for restored cursors too.
     const terminalVerified = this.io?.terminalVerified && this.io.baseVerified && !this.io.revalidation && (!this.io.compressed || this.io.validated);
     const terminal = terminalVerified && this.terminalProof?.turnId === this.state.turnId ? this.terminalProof : null;
-    const startGap = !this.historyMode && !terminal && this.state.phase === 'started' && this.state.at < this.source.hostStartedAt + 1000 ? this.state.at < this.source.hostStartedAt ? 'start-predates-host' : 'host-start-time-overlap' : null;
+    const unconfirmed = terminalVerified && this.successorProof?.previousTurnId === this.state.turnId && this.state.phase === 'started';
+    const startGap = !this.historyMode && !terminal && !unconfirmed && this.state.phase === 'started' && this.state.at < this.source.hostStartedAt + 1000 ? this.state.at < this.source.hostStartedAt ? 'start-predates-host' : 'host-start-time-overlap' : null;
     const coverage = reason || this.gap || startGap ? 'gap' : this.nativeOriginVersion === 2 && this.ioView && (this.ioView.phase === 'validating' || this.ioView.position < this.offset) ? 'catching-up' : this.stat && this.offset < Math.min(this.stat.size, this.historyRange?.endByteOffset ?? Infinity) ? 'catching-up' : this.pendingBytes ? 'partial-record' : this.stat ? 'caught-up' : 'catching-up';
-    const gap = reason ?? this.gap ?? (!this.state.header ? 'main-header-unverified' : !this.state.anchored ? 'current-turn-not-observed' : startGap);
+    const gap = reason ?? this.gap ?? (!this.state.header ? 'main-header-unverified' : !this.state.anchored ? 'current-turn-not-observed' : unconfirmed ? 'historical-execution-unconfirmed' : startGap);
     if (this.coldScan && !reason) return { coverage: 'catching-up', gap: null, observed: { ...this.state, phase: 'unknown' }, effectivePhase: 'unknown', offset: this.coldCheckpoint.offset, committedOffset: this.coldCheckpoint.offset, pendingBytes: 0, recentLifecycle: [], materials: [], coldRead: { phase: 'scan', offset: this.coldScan.offset, turnId: this.state.turnId }, metrics: { ...this.metrics } };
-    if (this.terminalProof && !terminalVerified && !this.gap && !reason) return { coverage: 'catching-up', gap: null, observed: { ...this.state, phase: 'unknown' }, effectivePhase: 'unknown', offset: this.committed, committedOffset: this.committed, pendingBytes: 0, recentLifecycle: [], materials: [], coldRead: { phase: 'verify', offset: this.io?.revalidation?.prefix.offset ?? this.io?.position ?? 0, turnId: this.terminalProof.turnId }, metrics: { ...this.metrics } };
-    return { coverage, gap, ...(terminal ? { historicalTerminal: { turnId: terminal.turnId, phase: terminal.phase, at: terminal.at } } : {}), observed: { ...this.state, ...(terminal ? { phase: terminal.phase, at: terminal.at, orphan: false } : {}) }, effectivePhase: !this.historyMode && !gap && (coverage === 'caught-up' || terminal) ? terminal?.phase ?? this.state.phase : 'unknown', offset: this.offset, committedOffset: this.committed, pendingBytes: this.pendingBytes, excluded: this.excluded, recentLifecycle: this.recentLifecycle.map(e => ({ ...e })), ...(this.materialMode ? { materials: this.materials.map(e => ({ ...e, data: { ...e.data } })) } : {}), metrics: { ...this.metrics }, ...(this.ordinalMode ? { captureThroughOffset: this.nextOrdinal === null ? -1 : this.nextOrdinal - 1, forkProvenance: this.forkProvenance, header: this.header ?? null } : {}), ...(this.error ? { error: { ...this.error } } : {}) };
+    if ((this.terminalProof || this.successorProof) && !terminalVerified && !this.gap && !reason) return { coverage: 'catching-up', gap: null, observed: { ...this.state, phase: 'unknown' }, effectivePhase: 'unknown', offset: this.committed, committedOffset: this.committed, pendingBytes: 0, recentLifecycle: [], materials: [], coldRead: { phase: 'verify', offset: this.io?.revalidation?.prefix.offset ?? this.io?.position ?? 0, turnId: (this.terminalProof ?? this.successorProof).turnId }, metrics: { ...this.metrics } };
+    return { coverage, gap, ...(terminal ? { historicalTerminal: { turnId: terminal.turnId, phase: terminal.phase, at: terminal.at } } : {}), ...(terminalVerified && this.successorProof ? { unconfirmedStarts: [this.successorProof.previousTurnId] } : {}), observed: { ...this.state, ...(terminal ? { phase: terminal.phase, at: terminal.at, orphan: false } : {}) }, effectivePhase: !this.historyMode && !gap && (coverage === 'caught-up' || terminal) ? terminal?.phase ?? this.state.phase : 'unknown', offset: this.offset, committedOffset: this.committed, pendingBytes: this.pendingBytes, excluded: this.excluded, recentLifecycle: this.recentLifecycle.map(e => ({ ...e })), ...(this.materialMode ? { materials: this.materials.map(e => ({ ...e, data: { ...e.data } })) } : {}), metrics: { ...this.metrics }, ...(this.ordinalMode ? { captureThroughOffset: this.nextOrdinal === null ? -1 : this.nextOrdinal - 1, forkProvenance: this.forkProvenance, header: this.header ?? null } : {}), ...(this.error ? { error: { ...this.error } } : {}) };
   }
 
   apply(row, recordStart) {
@@ -204,6 +211,7 @@ export class BoundedReader {
       if (this.terminalProof && this.terminalProof.turnId !== id) this.terminalProof = null;
       if (this.materialMode) this.turnTrigger = turnTrigger;
       this.state = { header: true, anchored: true, phase: 'started', turnId: id, at: Date.parse(row.timestamp), orphan: Date.parse(row.timestamp) < this.source.hostStartedAt };
+      if (this.scanOnly) this.scanStart = { turnId: id, at: this.state.at, recordStart };
     } else if (!this.state.turnId || this.state.turnId === id) {
       this.state = { header: true, anchored: true, phase: type === 'task_complete' ? 'completed' : 'aborted', turnId: id, at: Date.parse(row.timestamp), orphan: false };
     }
@@ -235,7 +243,7 @@ export class BoundedReader {
     }
   }
 
-  async pump({ budgetBytes = 262144, maxEvents = 16, verifyOnly = false, available = this.available ?? true, profile = this.source.profile, hostRunId = this.source.hostRunId } = {}) {
+  async pump({ budgetBytes = 262144, maxEvents = 16, verifyOnly = false, available = this.available ?? true, profile = this.source.profile, hostRunId = this.source.hostRunId, anchorTurnId = this.source.anchorTurnId } = {}) {
     if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 16) throw new Error('invalid event budget');
     this.maxEvents = maxEvents;
     if (!Number.isSafeInteger(budgetBytes) || budgetBytes < 1 || budgetBytes > 262144) throw new Error('invalid read budget');
@@ -247,7 +255,7 @@ export class BoundedReader {
     this.available = available;
     if (!available) { this.needsGuard = true; return { ...this.view('source-unavailable'), readBytes: 0 }; }
     if (this.busy) return { ...this.view('reader-busy'), ...(this.materialMode ? { materials: [], recentLifecycle: [] } : {}), readBytes: 0 };
-    if (this.nativeOriginVersion === 2) return this.pumpV2({ budgetBytes, maxEvents, verifyOnly, decodedBudgetBytes: arguments[0]?.decodedBudgetBytes ?? 262144 });
+    if (this.nativeOriginVersion === 2) return this.pumpV2({ budgetBytes, maxEvents, verifyOnly, anchorTurnId, decodedBudgetBytes: arguments[0]?.decodedBudgetBytes ?? 262144 });
     this.busy = true;
     let finishPump;
     this.pumpComplete = new Promise(resolve => { finishPump = resolve; });
@@ -305,7 +313,7 @@ export class BoundedReader {
     return { ...this.view(), readBytes };
   }
 
-  async pumpV2({ budgetBytes, maxEvents, verifyOnly, decodedBudgetBytes }) {
+  async pumpV2({ budgetBytes, maxEvents, verifyOnly, decodedBudgetBytes, anchorTurnId }) {
     this.busy = true;
     let finishPump; this.pumpComplete = new Promise(resolve => { finishPump = resolve; });
     let readBytes = 0, decodedBytes = 0;
@@ -316,17 +324,20 @@ export class BoundedReader {
         if (scan.coverage === 'gap' && !['start-predates-host', 'host-start-time-overlap'].includes(scan.gap)) { this.gap = scan.gap; this.error = scan.error; await this.coldScan.close(); this.coldScan = null; }
         else {
           const ending = scan.recentLifecycle.findLast(event => event.turnId === this.state.turnId && ['task_complete', 'turn_aborted'].includes(event.type));
+          const start = this.coldScan.scanStart;
+          const successor = start?.turnId === anchorTurnId && start.turnId !== this.state.turnId && start.at >= this.source.hostStartedAt + 1000 ? start : null;
           const origin = this.coldScan.io?.proof();
-          if (ending && origin?.complete) {
-            const proof = { key: origin.key, headerHash: origin.headerHash, prefix: origin.next, turnId: ending.turnId, phase: ending.type === 'task_complete' ? 'completed' : 'aborted', at: ending.at };
+          if ((ending || successor) && origin?.complete) {
+            const proof = { key: origin.key, headerHash: origin.headerHash, prefix: origin.next, ...(ending ? { turnId: ending.turnId, phase: ending.type === 'task_complete' ? 'completed' : 'aborted', at: ending.at } : { turnId: successor.turnId, at: successor.at, recordStart: successor.recordStart, previousTurnId: this.state.turnId }) };
+            const checkpoint = { ...this.coldCheckpoint, io: this.coldScan.io.checkpoint(this.coldCheckpoint.offset), fileId: this.coldScan.fileId, header: this.coldScan.header, attachSize: this.coldCheckpoint.attachSize ?? this.coldScan.attachSize, knownSize: this.coldScan.knownSize };
             await this.coldScan.close();
-            const restored = new BoundedReader(this.source, this.coldCheckpoint, { mode: this.mode, forkSuffix: this.ordinalMode && !this.historyMode, origins: this.origins, terminalProof: proof });
+            const restored = new BoundedReader(this.source, checkpoint, { mode: this.mode, forkSuffix: this.ordinalMode && !this.historyMode, origins: this.origins, terminalProof: ending ? proof : null, successorProof: ending ? null : proof });
             Object.assign(this, restored, { busy: true, pumpComplete: this.pumpComplete, metrics: this.metrics });
           }
         }
         return { ...this.view(), readBytes, decodedBytes, nativeOrigins: [] };
       }
-      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && this.terminalProof ? { terminalProof: this.terminalProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins: this.origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); return nativeHeader(row); } });
+      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins: this.origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); return nativeHeader(row); } });
       const value = await this.io.pump({ physicalBudget: budgetBytes, decodedBudget: decodedBudgetBytes, limit: this.historyRange?.endByteOffset ?? Infinity, verifyOnly }, bytes => {
         this.attachSize ??= this.io.decodedSize;
         const before = this.offset; this.consume(bytes); return this.offset - before;
@@ -359,7 +370,7 @@ export class BoundedReader {
 
   checkpoint() {
     if (this.coldScan) return structuredClone(this.coldCheckpoint);
-    return { format: this.nativeOriginVersion === 2 ? 3 : 2, ...(this.nativeOriginVersion === 2 ? { io: this.io?.checkpoint(this.committed) ?? this.ioCheckpoint ?? null } : {}), ...(this.terminalProof ? { terminalProof: this.terminalProof } : {}), scope: this.scope, offset: this.committed, attachSize: this.attachSize, knownSize: this.knownSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap, ...(this.ordinalMode ? { nextOrdinal: this.nextOrdinal, forkProvenance: this.forkProvenance, header: this.header ?? null } : {}), ...(this.materialMode ? { header: this.header ?? null, nativeOriginVersion: this.nativeOriginVersion, projectionMode: this.mode, turnTrigger: this.turnTrigger } : {}) };
+    return { format: this.nativeOriginVersion === 2 ? 3 : 2, ...(this.nativeOriginVersion === 2 ? { io: this.io?.checkpoint(this.committed) ?? this.ioCheckpoint ?? null } : {}), ...(this.terminalProof ? { terminalProof: this.terminalProof } : {}), ...(this.successorProof ? { successorProof: this.successorProof } : {}), scope: this.scope, offset: this.committed, attachSize: this.attachSize, knownSize: this.knownSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap, ...(this.ordinalMode ? { nextOrdinal: this.nextOrdinal, forkProvenance: this.forkProvenance, header: this.header ?? null } : {}), ...(this.materialMode ? { header: this.header ?? null, nativeOriginVersion: this.nativeOriginVersion, projectionMode: this.mode, turnTrigger: this.turnTrigger } : {}) };
   }
 
   async close() {
@@ -372,7 +383,7 @@ export class BoundedReader {
       if (coldClosing) await coldClosing; else if (this.io) await ioClosing; else await this.handle?.close(); this.handle = null; this.projection = null;
       this.ioBuffer?.fill(0); this.ioBuffer = null;
       this.rolling.fill(0); this.committedTail.fill(0);
-      this.materials = []; this.recentLifecycle = []; this.turnTrigger = null; this.coldScan = null; this.coldCheckpoint = null; this.terminalProof = null;
+      this.materials = []; this.recentLifecycle = []; this.turnTrigger = null; this.scanStart = null; this.coldScan = null; this.coldCheckpoint = null; this.terminalProof = null; this.successorProof = null;
     })();
     return this.closing;
   }
