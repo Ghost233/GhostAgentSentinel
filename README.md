@@ -1,6 +1,8 @@
 # GhostAgentSentinel
 
-面向 AI agent 的本机只读执行监控工具。v0.1.1 提供共享核心与 DSH 适配器，观察已接入后台中的主代理及多级子代理；Codex 适配器留待后续版本。
+面向 AI agent 的本机只读执行监控工具。已发布的 v0.1.1 提供共享核心与 DSH 适配器，观察已接入后台中的主代理及多级子代理。当前源码为 0.1.2-dev.0 开发候选，开始接入 ChatGPT.app 本机主会话；正式安装与完整框架验收尚未完成。
+
+ChatGPT 适配器只保留会话侧面板，不包含子代理或全局总览。源码已加入主聊天自动发现、原生请求证明、六项检查、单聊天暂停、故障回执及 24 小时已监控历史。紧凑面板把依据放在每条问题下，通知记录区分提交、送达快照和用户动作；正式后台与完整实机验收仍待完成。开发入口与实测边界见 [ChatGPT 只读观察](docs/chatgpt-observation.md)。
 
 ## 安装
 
@@ -51,6 +53,7 @@ node src/daemon.mjs status
 
 ```sh
 npm ci --ignore-scripts
+npm ci --prefix chatgpt --ignore-scripts
 export DSH_WORKFLOW_ROOT=/absolute/path/to/DSH-Workflow
 npm run check
 npm test
@@ -64,4 +67,5 @@ SDK 缺失时检查会明确失败。普通用户安装发布包不需要这套�
 - [发布流程与完成条件](docs/release-status.md#发布流程与完成条件)
 - [版本说明](docs/release-notes.md)
 - [开发接口契约](docs/development-contract.md)
+- [ChatGPT 只读观察开发候选](docs/chatgpt-observation.md)
 - [领域术语](GLOSSARY.md)

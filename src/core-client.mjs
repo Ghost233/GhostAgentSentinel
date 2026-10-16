@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
-import { PROTOCOL } from './protocol.mjs'
+import { PROTOCOL, normalizeFailureScope } from './protocol.mjs'
 
 export const defaultDataDir = join(homedir(), '.ghost-agent-sentinel')
 
@@ -35,7 +35,7 @@ async function request(runtime, path, body, signal, tracking) {
       kind: requestSignal.aborted ? requestSignal.reason === deadline.signal.reason ? 'timeout' : 'cancelled' : kind,
       name: ['Error', 'TypeError', 'SyntaxError', 'AbortError', 'TimeoutError'].includes(error.name) ? error.name : 'Error',
       ...(response ? { status: response.status } : {}),
-      ...(['analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'gs_summary_unsupported', 'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT', 'UND_ERR_SOCKET'].includes(code) ? { code } : {}) })
+      ...(['analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'gs_summary_unsupported', 'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT', 'UND_ERR_SOCKET'].includes(code) ? { code } : {}) })
     throw error
   } finally { clearTimeout(timer); if (tracking) tracking.deadlineTimers-- }
 }
@@ -123,6 +123,7 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
     health: requestSignal => call('/v1/health', undefined, requestSignal),
     registerSource: (descriptor, requestSignal) => call('/v1/source/register', descriptor, requestSignal),
     heartbeat: (sourceKey, requestSignal) => call('/v1/source/heartbeat', { sourceKey }, requestSignal),
+    nativeOriginFence: (sourceKey, key) => call('/v1/source/native-origin', { sourceKey, key }),
     ingest: (sourceKey, batch, requestSignal) => call('/v1/source/ingest', { sourceKey, batch }, requestSignal),
     unregisterSource: (sourceKey, reason, requestSignal) => call('/v1/source/unregister', { sourceKey, reason }, requestSignal),
     snapshot: requestSignal => call('/v1/snapshot', undefined, requestSignal),
@@ -132,11 +133,20 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
     configureSources: (entries, requestSignal) => call('/v1/sources', entries, requestSignal),
     pause: requestSignal => call('/v1/monitoring/pause', {}, requestSignal),
     resume: requestSignal => call('/v1/monitoring/resume', {}, requestSignal),
+    conversationMonitoring: (scope, requestSignal) => call('/v1/conversation/monitoring?' + new URLSearchParams(scope), undefined, requestSignal),
+    setConversationMonitoring: (control, requestSignal) => call('/v1/conversation/monitoring', control, requestSignal),
+    // Identifiers cannot be empty: only an explicit null uses the empty query
+    // value. Literal "null" stays a string, and undefined fields are omitted.
+    failureReceipts: async (scope, requestSignal) => call('/v1/monitoring/failures?' + new URLSearchParams(Object.entries(normalizeFailureScope(scope)).map(([key, value]) => [key, value === null ? '' : String(value)])), undefined, requestSignal),
+    recordCollectionOutcome: (outcome, requestSignal) => call('/v1/monitoring/collection-outcome', outcome, requestSignal),
     configureAnalysis: (config, requestSignal) => call('/v1/analysis/config', config, requestSignal),
     analysisConfig: requestSignal => call('/v1/analysis/config', undefined, requestSignal),
     analysisConfigState: requestSignal => call('/v1/analysis/config/state', undefined, requestSignal),
     configureAnalysisIfCurrent: (config, revision, requestSignal) => call('/v1/analysis/config/compare', { config, revision }, requestSignal),
     claimNotifications: (sourceKey, requestSignal) => call('/v1/notifications/claim', { sourceKey }, requestSignal),
+    setNativeNotificationEligibility: (facts, requestSignal) => call('/v1/notifications/native/eligibility', facts, requestSignal),
+    nativeNotificationRecords: (query, requestSignal) => call('/v1/notifications/native?' + new URLSearchParams(query), undefined, requestSignal),
+    recordNativeNotificationResult: (result, requestSignal) => call('/v1/notifications/native/result', result, requestSignal),
     ackNotification: (id, result, requestSignal) => call('/v1/notifications/ack', { id, result }, requestSignal),
     cancelPending,
     transportDiagnostics: () => ({ closed, pendingRequests: active.size, deadlineTimers: tracking.deadlineTimers }),

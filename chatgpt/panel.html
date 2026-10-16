@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel 会话检查</title>
+<style>
+:root{font:13px/1.5 system-ui;color-scheme:light dark}body{margin:0;padding:14px;overflow-wrap:anywhere}h1{font-size:14px;margin:0 0 8px}p{margin:5px 0}#summary{font-weight:600;font-size:14px}#analysis,.muted{color:GrayText;font-size:12px}.issue{padding:10px 0;border-bottom:1px solid color-mix(in srgb,GrayText 22%,transparent)}h2{font-size:13px;margin:0 0 4px}.evidence{white-space:pre-line;font-size:12px;color:GrayText;line-height:1.45;margin-top:5px}details{margin-top:12px}summary{cursor:pointer;font-size:12px;color:GrayText}.check{padding:8px 0;border-bottom:1px solid color-mix(in srgb,GrayText 15%,transparent)}.check-status{font-size:12px;font-weight:400;margin-left:8px;color:GrayText}#coverage,#technical,#observation,#execution{white-space:pre-line}#error{color:GrayText;font-size:12px}.history-entry{display:block;width:100%;text-align:left;margin:5px 0;padding:6px 8px;font:inherit;border:1px solid GrayText;border-radius:5px;background:transparent;color:inherit;overflow-wrap:anywhere}.history-entry[aria-current=true]{border-width:2px;font-weight:600}
+</style>
+<h1>Sentinel · 当前会话</h1>
+<p id="summary" role="status">⚪ 正在核对当前会话</p>
+<p id="execution" class="muted"></p>
+<p id="record-status" class="muted" role="status"></p>
+<section id="current-facts" hidden><p id="current-request" class="muted"></p><p id="current-activity" class="muted"></p></section>
+<p id="inheritance" class="muted" role="status"></p>
+<p id="analysis">当前分析不可判断</p>
+<p id="health" class="muted" role="status"></p>
+<button id="pause" type="button" hidden>暂停本聊天分析</button>
+<p id="notification-status" class="muted" role="status"></p><button id="notification-permission" type="button" hidden>允许桌面通知</button>
+<section id="issues" aria-label="需要关注的问题"></section>
+<details id="checks"><summary>六项检查</summary><div id="check-list"></div></details>
+<details id="history" hidden><summary>24 小时内的检查记录</summary><button id="history-current" type="button">返回当前／最近一轮</button><div id="history-list"></div><button id="history-more" type="button" hidden>较早记录</button><p id="history-gap" class="muted"></p></details>
+<details id="notification-log" hidden><summary>通知记录</summary><button id="notification-log-refresh" type="button">刷新通知记录</button><p id="notification-log-status" class="muted" role="status"></p><div id="notification-list"></div><button id="notification-log-more" type="button" hidden>较早通知</button><p id="notification-log-gap" class="muted"></p><p class="muted">系统接受、通知中心快照与用户动作分别记录；实际看见仍未确认。</p></details>
+<details id="diagnostics"><summary id="diagnostics-title">观察与覆盖</summary><p id="identity" class="muted"></p><p id="coverage" class="muted"></p><p id="observation" class="muted"></p><div id="gaps" class="muted"></div><p id="technical" class="muted"></p></details>
+<p id="error" role="status"></p>
+<script>
+const labels={stalled_progress:'活跃但推进不足',request_drift:'偏离当前请求',failure_loop:'同类失败反复返工',validation_cost:'完整验证重复成本',validation_gap:'本地验证证据缺口',long_wait:'长等待或活动中断'};
+const lights={red:'🔴',yellow:'🟡',green:'🟢',gray:'⚪'};
+const states={queued:'检查排队中',analyzing:'正在检查',unavailable:'本地模型未配置或不可用',failed:'本轮分析失败',unknown:'当前分析不可判断',cooldown:'本轮检查已更新',idle:'最近检查结果',paused:'分析已暂停',stale:'检查已过期',interrupted:'本轮检查已取消','not-connected':'六项分析尚未接入'};
+const executions={running:'运行中',idle:'已结束',ended:'已结束',aborted:'已中断',unknown:'结束状态未确认'};
+const element=id=>document.querySelector('#'+id);
+const text=(value,max=240)=>typeof value==='string'?value.trim().slice(0,max):'';
+const list=value=>Array.isArray(value)?value:[];
+const count=value=>Number.isSafeInteger(value)&&value>=0?String(value):'—';
+let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false,lastIdentity=null,controlState=null,scopeThreadId=null,selectedExecutionKey=null,historyCursor=null,nextHistoryCursor=null;
+let notificationScope=null,notificationScopeKey=null,notificationVersion=0,notificationRecords=[],notificationBefore=null,notificationWanted=null;
+const pending=new Map();
+function reset(collapse=true){
+  controlState=null;element('pause').hidden=true;element('pause').disabled=false;
+  for(const name of ['identity','coverage','observation','technical','error','health','execution','record-status','current-request','current-activity','inheritance','history-gap','notification-status'])element(name).textContent='';
+  element('current-facts').hidden=true;
+  for(const name of ['issues','check-list','gaps','history-list'])element(name).replaceChildren();
+  element('history').hidden=true;element('history-more').hidden=true;
+  element('notification-permission').hidden=true;element('notification-permission').disabled=false;
+  element('analysis').textContent='当前分析不可判断';element('diagnostics-title').textContent='观察与覆盖';
+  if(collapse){element('checks').open=false;element('diagnostics').open=false;element('history').open=false;}
+}
+function clearView(message){reset();clearNotificationLog();lastIdentity=null;scopeThreadId=null;selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;element('summary').textContent='⚪ '+message;element('summary').setAttribute('data-signal','gray');}
+function node(tag,value,className){const child=document.createElement(tag);if(value)child.textContent=value;if(className)child.className=className;return child;}
+function renderHealth(health){
+  if(health?.state==='failed'){
+    const reasons=list(health.failures).slice(0,3).map(failure=>(failure.domain==='collection'?'采集':'分析')+'失败'+(text(failure.error?.code,80)?'（'+text(failure.error.code,80)+'）':''));
+    element('health').textContent=(health.orderingGap?'监控曾有失败 · 恢复状态未确认 · ':'监控故障 · ')+(reasons.join('；')||'本轮监控不可用');
+  }else if(health?.state==='recovered')element('health').textContent='监控已恢复';
+}
+function renderNotifications(notifications){
+  const permission=notifications?.permission;if(!permission)return;
+  const permitted=['authorized','provisional'].includes(permission.authorization),button=element('notification-permission');
+  button.hidden=permitted;button.disabled=permission.requestInFlight===true;
+  button.textContent=permission.authorization==='denied'?'重新核对通知权限':'允许桌面通知';
+  element('notification-status').textContent=permission.requestInFlight?'等待系统通知授权':notifications.errorCode||permission.errorCode?'桌面通知暂不可用':permitted?'桌面通知已允许':permission.authorization==='denied'?'桌面通知未允许 · 可在系统设置中更改':'桌面通知尚未允许';
+}
+function clearNotificationLog(){
+  notificationVersion++;notificationScope=null;notificationScopeKey=null;notificationRecords=[];notificationBefore=null;notificationWanted=null;
+  element('notification-log').hidden=true;element('notification-log').open=false;element('notification-list').replaceChildren();
+  element('notification-log-status').textContent='';element('notification-log-gap').textContent='';element('notification-log-more').hidden=true;
+  element('notification-log-refresh').disabled=false;element('notification-log-more').disabled=false;
+}
+function renderNotificationScope(view){
+  const scope=view.notifications?.scope,threadId=text(view.identity?.threadId,128),executionKey=view.execution?.key??null,lifecycleId=view.execution?.lifecycleId??null;
+  if(!threadId||!text(scope?.sourceKey,256)||scope.executionKey!==executionKey||scope.lifecycleId!==lifecycleId||selectedExecutionKey&&selectedExecutionKey!==executionKey){clearNotificationLog();return;}
+  const value={threadId,sourceKey:scope.sourceKey,lifecycleId,executionKey},key=JSON.stringify(value);
+  if(key!==notificationScopeKey){clearNotificationLog();notificationScope=value;notificationScopeKey=key;element('notification-log-status').textContent='打开后读取 · 仅按需更新';}
+  element('notification-log').hidden=false;
+}
+function notificationState(record){
+  const submitted=record.native?.submission?.state==='accepted'||record.delivery==='system-accepted';
+  if(record.status==='cancelled')return '已取消'+(submitted?' · 系统曾接受':'');
+  if(submitted)return '系统已接受';
+  if(record.status==='expired')return '提交结果未确认';
+  if(record.status==='failed')return '系统提交失败';
+  if(record.waitReason)return ({'project-unconfirmed':'等待项目资格确认','qualification-unconfirmed':'等待通知资格确认'})[record.waitReason]??'等待投递';
+  return ({submitting:'系统提交中',failed:'系统提交失败',unknown:'提交结果未确认','not-attempted':'尚未提交'})[record.native?.submission?.state]??'等待投递';
+}
+function renderNotificationRecords(page){
+  element('notification-list').replaceChildren();
+  for(const record of notificationRecords){
+    const article=node('article',null,'check'),native=record.native??{},kind=record.kind==='monitoring-failure'?'监控状态提醒':'任务告警';
+    article.append(node('h2',kind+(record.mainId===null?' · 来源级':record.lifecycleId===null?' · 聊天级':'')),node('p',notificationState(record),'muted'));
+    if(text(record.body,180))article.append(node('p',text(record.body,180),'evidence'));
+    const permission=({'not-determined':'尚未决定',denied:'未允许',authorized:'已允许',provisional:'临时允许'})[native.authorization?.state]??'未确认';
+    const delivered=native.deliveredSnapshot?.present===true?'快照中存在':native.deliveredSnapshot?.present===false?'本次快照未见（不代表此前未展示）':'尚无送达快照';
+    const action=({default:'打开通知',dismiss:'关闭通知'})[native.userAction?.action]??'尚无动作记录';
+    article.append(node('p','授权：'+permission+' · 通知中心：'+delivered,'muted'),node('p','用户动作：'+action+' · 实际看见：未确认','muted'));
+    const details=node('details'),full=node('p',text(record.body,1200),'evidence');full.style='white-space:pre-line';
+    details.append(node('summary','完整通知与关联身份'),node('p',text(record.title,200)),full);
+    const ids=['通知：'+text(record.id,256),'来源：'+text(record.sourceKey,256),'主聊天：'+(record.mainId===null?'来源级':text(record.mainId,256)),'执行：'+(text(record.lifecycleId,256)||'未确认'),'尝试：'+(text(native.attemptId,128)||'尚未开始'),'系统请求：'+(text(native.nativeRequestId,200)||'尚未绑定')];
+    for(const value of ids)details.append(node('p',value,'muted'));
+    article.append(details);element('notification-list').append(article);
+  }
+  if(!notificationRecords.length)element('notification-list').append(node('p','此范围暂无保留的通知记录','muted'));
+  element('notification-log-status').textContent='读取于 '+new Date(page.generatedAt).toLocaleString()+' · 仅按需更新';
+  element('notification-log-gap').textContent=page.historyGap?'通知记录存在保留或覆盖缺口':'';
+  element('notification-log-more').hidden=!page.hasMore||notificationBefore===null;
+}
+function stateLine(analysis){
+  const parts=[states[analysis.state]??'分析状态未确认'];
+  if(Number.isFinite(analysis.waitMs)&&analysis.waitMs>=1000)parts.push('排队 '+Math.floor(analysis.waitMs/1000)+' 秒');
+  if(Number.isFinite(analysis.lagMs)&&analysis.lagMs>=1000)parts.push('分析滞后 '+Math.floor(analysis.lagMs/1000)+' 秒');
+  return parts.join(' · ');
+}
+function readArguments(){return selectedExecutionKey||historyCursor?{...(selectedExecutionKey?{executionKey:selectedExecutionKey}:{}),...(historyCursor?{historyCursor}:{}),expectedThreadId:scopeThreadId}:{};}
+function selectExecution(key,cursor=historyCursor){
+  if(stopped||!ready||!scopeThreadId)return;
+  selectedExecutionKey=key;historyCursor=cursor;generation++;clearTimeout(timer);timer=null;reset(false);clearNotificationLog();
+  element('summary').textContent='⚪ 正在读取检查记录';element('summary').setAttribute('data-signal','gray');
+  return refresh();
+}
+function renderHistory(view){
+  const history=view.history;if(!history)return;
+  historyCursor=text(history.cursor,256)||null;nextHistoryCursor=text(history.nextCursor,256)||null;
+  element('history').hidden=false;
+  element('history-current').disabled=history.selectedKey===history.currentKey&&!historyCursor;
+  element('history-more').hidden=!nextHistoryCursor;
+  for(const execution of list(history.executions).slice(0,20)){
+    if(!text(execution?.key,256))continue;
+    const time=Number.isFinite(execution.startedAt??execution.observedAt)?new Date(execution.startedAt??execution.observedAt).toLocaleString():'时间未确认';
+    const button=node('button',time+' · '+(executions[execution.status]??'状态未确认'),'history-entry');
+    button.type='button';button.setAttribute('data-execution-key',execution.key);button.setAttribute('aria-current',String(execution.key===history.selectedKey));button.onclick=()=>selectExecution(execution.key);element('history-list').append(button);
+  }
+  if(!list(history.executions).length)element('history-list').append(node('p','暂无保留的已监控执行','muted'));
+  if(history.historyGap)element('history-gap').textContent='先前的分页位置已过期，已返回最近记录';
+  const execution=view.execution;
+  if(execution?.historical)element('execution').textContent='历史执行 · '+(executions[execution.status]??'状态未确认')+(text(execution.request)?'\n'+text(execution.request):'');
+  else if(execution&&execution.status!=='running')element('execution').textContent='最近执行 · '+(executions[execution.status]??'状态未确认');
+}
+function render(view){
+  if(!view||!Object.hasOwn(lights,view.signal)||!view.analysis||typeof view.analysis.state!=='string')throw new Error('未收到兼容的检查结果');
+  const identity=text(view.identity?.threadId,128);
+  if(!identity){
+    clearView('当前会话未确认');
+    const gaps=[...list(view.discovery?.gaps),view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
+    for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
+    if(gaps.length)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
+    renderHealth(view.health);
+    return;
+  }
+  if(scopeThreadId&&scopeThreadId!==identity){selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;}
+  reset(identity!==lastIdentity);lastIdentity=identity;scopeThreadId=identity;
+  const analysis=view.analysis,byId=new Map(list(analysis.checks).filter(check=>check&&Object.hasOwn(labels,check.id)).map(check=>[check.id,check]));
+  const inheritanceGap=view.inheritance&&(view.inheritance.state!=='complete'||list(view.inheritance.gaps).length>0);
+  const recordRevalidating=!view.execution?.historical&&view.observation?.recordRevalidating===true;
+  let signal=view.signal,summary=text(view.summary)||'当前状态不可判断';
+  const green=!inheritanceGap&&!list(analysis.coverage?.contextGaps).length&&view.health?.state!=='failed'&&analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted','stale'].includes(analysis.state)&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>{const check=byId.get(id);return check&&(check.status==='clear'||check.applicability?.state==='not-triggered');});
+  if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?(view.health.orderingGap?'监控恢复状态未确认':'监控故障，当前状态不可判断'):inheritanceGap?'当前执行已接入，继承要求待补齐':states[analysis.state]??'当前分析不可判断';}
+  if(signal==='green'&&analysis.resultDisposition==='pending')summary='上轮正常 · 待分析';
+  if(recordRevalidating){signal='gray';summary='当前记录重验中';element('record-status').textContent='已核实资料保留 · 新活动尚未核实';}
+  if(view.execution?.historical){signal='gray';summary=view.history?.currentGap?'当前执行尚未确认 · 显示最近检查记录':'历史执行 · 仅表示当时的检查记录';}
+  element('summary').textContent=lights[signal]+' '+summary;element('summary').setAttribute('data-signal',signal);
+  if(!view.execution?.historical&&text(view.currentFacts?.request?.text,120)){
+    element('current-facts').hidden=false;
+    element('current-request').textContent=(recordRevalidating?'已核实请求：':'当前请求：')+text(view.currentFacts.request.text,120);
+    if(text(view.currentFacts.activity?.summary,160))element('current-activity').textContent=(recordRevalidating?'已核实活动：':'最近活动：')+text(view.currentFacts.activity.summary,160);
+  }
+  if(inheritanceGap)element('inheritance').textContent=view.inheritance.state==='pending'?'继承要求待补齐 · 相关检查不可判断':'继承要求存在缺口 · 相关检查不可判断';
+  element('analysis').textContent=(view.execution?.historical?'历史检查 · ':'')+stateLine(analysis);
+  renderHealth(view.health);
+  renderNotifications(view.notifications);
+  renderNotificationScope(view);
+  renderHistory(view);
+  const monitoring=view.monitoring;
+  if(monitoring?.taskId===identity&&typeof monitoring.paused==='boolean'&&text(monitoring.revision,2000)){
+    controlState={taskId:identity,paused:monitoring.paused,revision:monitoring.revision};
+    element('pause').hidden=false;element('pause').textContent=monitoring.paused?'恢复本聊天分析':'暂停本聊天分析';
+    if(monitoring.paused){element('summary').textContent='⚪ 本聊天分析已暂停';element('summary').setAttribute('data-signal','gray');element('analysis').textContent='继续采集 · 仅手动恢复分析';}
+  }
+  for(const issue of list(analysis.issues).slice(0,6)){
+    if(!issue||!text(issue.reason))continue;
+    const article=node('article',null,'issue');article.append(node('h2',labels[issue.checkId]??'需要关注'));
+    if(text(issue.reason)!==summary)article.append(node('p',text(issue.reason)));
+    for(const evidence of list(issue.evidence).slice(0,2)){
+      const excerpt=text(evidence?.text,240),reference=text(evidence?.reference,2000);
+      if(excerpt||reference)article.append(node('p',[excerpt,reference?'出处：'+reference:''].filter(Boolean).join('\n'),'evidence'));
+    }
+    element('issues').append(article);
+  }
+  for(const [id,label]of Object.entries(labels)){
+    const check=byId.get(id),row=node('section',null,'check'),title=node('h2',label);
+    const status=check?.judgmentState==='failed'?'判断失败':check?.applicability?.state==='not-triggered'?'未触发':check?.status==='attention'?'需要关注':check?.status==='clear'?'未见问题':'不可判断';
+    title.append(node('span',status,'check-status'));row.append(title,node('p',text(check?.reason)||'尚无此项检查结果','muted'));row.setAttribute('data-check',id);element('check-list').append(row);
+  }
+  element('identity').textContent='本机主会话：'+identity;
+  const discovery=view.discovery,coverage=[];
+  if(discovery){
+    coverage.push('本聊天：'+(discovery.currentIncluded===true?'已接入':'接入未确认'));
+    coverage.push('已接入聊天 '+count(discovery.tracked)+' · 来源 '+count(discovery.connected));
+    const counts=discovery.counts;
+    if(counts)coverage.push('目录：主聊天 '+count(counts.main)+' · 分叉 '+count(counts.fork)+' · 远程 '+count(counts.remote)+' · 云端 '+count(counts.cloud)+' · 未分类 '+count(counts.unknown));
+    coverage.push('发现覆盖：'+(discovery.complete===true?'已确认':'完整性尚未确认'));
+  }
+  if(analysis.coverage)coverage.push((view.inheritance?'当前执行材料覆盖：':'分析材料覆盖：')+(analysis.coverage.complete===true?'已确认':'存在缺口'));
+  if(view.inheritance)coverage.push('继承要求：'+(inheritanceGap?'待补齐或存在缺口':'已核实'));
+  element('coverage').textContent=coverage.join('\n');
+  const recordStates={'caught-up':'已追平','catching-up':'正在补读','partial-record':'等待记录写完','retained-history':'保留的历史记录',gap:'存在缺口'};
+  element('observation').textContent='执行记录：'+(recordStates[view.observation?.coverage]??'尚未确认');
+  const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),...list(analysis.coverage?.contextGaps),...list(view.inheritance?.gaps),view.observation?.gap,view.history?.currentGap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
+  for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
+  if(gaps.length||inheritanceGap||discovery?.complete===false||analysis.coverage?.complete===false)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
+  const technical=['分析状态：'+text(analysis.state,80)];
+  if(text(analysis.error?.code,120))technical.push('错误代码：'+text(analysis.error.code,120));
+  if(text(analysis.error?.message))technical.push(text(analysis.error.message));
+  element('technical').textContent=technical.join('\n');
+}
+function request(method,params){return new Promise((resolve,reject)=>{const n=++id;const timeout=setTimeout(()=>{pending.delete(n);reject(new Error('宿主响应超时'));},5000);pending.set(n,{resolve,reject,timeout});parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
+function completeOperation(){
+  busy=false;clearTimeout(timer);timer=null;if(stopped||document.hidden)return;
+  const wanted=notificationWanted;notificationWanted=null;
+  if(wanted&&wanted.scopeKey===notificationScopeKey&&element('notification-log').open){void readNotificationRecords(wanted.beforeSequence);return;}
+  timer=setTimeout(refresh,1500);
+}
+async function readNotificationRecords(beforeSequence){
+  if(stopped||!ready||!notificationScope||!element('notification-log').open)return;
+  if(beforeSequence!==undefined&&(!Number.isSafeInteger(beforeSequence)||beforeSequence<0))return;
+  if(busy||document.hidden){notificationWanted={scopeKey:notificationScopeKey,beforeSequence};element('notification-log-status').textContent='等待读取通知记录';return;}
+  const scope=notificationScope,key=notificationScopeKey,version=notificationVersion,g=generation;
+  clearTimeout(timer);timer=null;busy=true;element('notification-log-refresh').disabled=true;element('notification-log-more').disabled=true;element('notification-log-status').textContent='正在读取通知记录';
+  const current=()=>!stopped&&g===generation&&version===notificationVersion&&key===notificationScopeKey&&scope.threadId===scopeThreadId;
+  try{
+    const response=await request('tools/call',{name:'sentinel_notification_records',arguments:{expectedThreadId:scope.threadId,...(scope.executionKey?{executionKey:scope.executionKey}:{}),...(beforeSequence!==undefined?{beforeSequence}:{})}});
+    if(!current())return;
+    const page=response.structuredContent;
+    if(response.isError||page?.identity?.threadId!==scope.threadId||page.sourceKey!==scope.sourceKey||page.lifecycleId!==scope.lifecycleId||page.executionKey!==scope.executionKey||!Number.isSafeInteger(page.generatedAt)||page.generatedAt<0||!Number.isFinite(new Date(page.generatedAt).getTime())||!Array.isArray(page.records))throw new Error('通知记录范围未确认');
+    const records=page.records.slice(0,20);
+    if(records.some(record=>!text(record?.id,256)||!Number.isSafeInteger(record.sequence)||record.sequence<0||record.sourceKey!==scope.sourceKey||!['task-alert','monitoring-failure'].includes(record.kind)||(record.mainId===null?record.kind!=='monitoring-failure':record.mainId!==scope.threadId||record.lifecycleId!==scope.lifecycleId&&!(record.kind==='monitoring-failure'&&record.lifecycleId===null))||(beforeSequence!==undefined&&record.sequence>=beforeSequence)))throw new Error('通知记录范围未确认');
+    notificationRecords=records.sort((a,b)=>b.sequence-a.sequence);
+    notificationBefore=page.hasMore===true&&Number.isSafeInteger(page.nextBeforeSequence)&&page.nextBeforeSequence>=0&&(beforeSequence===undefined||page.nextBeforeSequence<beforeSequence)?page.nextBeforeSequence:null;
+    renderNotificationRecords({...page,historyGap:page.historyGap===true||page.hasMore===true&&notificationBefore===null});
+  }catch(error){if(current()){notificationRecords=[];notificationBefore=null;element('notification-list').replaceChildren();element('notification-log-more').hidden=true;element('notification-log-gap').textContent='';element('notification-log-status').textContent='通知记录读取失败 · 可重试';}}
+  finally{if(current()){element('notification-log-refresh').disabled=false;element('notification-log-more').disabled=false;}completeOperation();}
+}
+function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/notifications/host-context-changed'){generation++;clearView('会话已变化，重新核对中');clearTimeout(timer);timer=null;if(ready&&!busy)void refresh();}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
+addEventListener('message',onMessage);
+async function refresh(){if(stopped||document.hidden||busy||!ready)return;busy=true;const g=generation;try{const response=await request('tools/call',{name:'sentinel_current_chat',arguments:readArguments()});if(stopped||g!==generation)return;if(response.isError)throw new Error('当前检查读取失败');render(response.structuredContent);}catch(error){if(!stopped&&g===generation){clearView('本次读取失败，当前状态不可判断');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}}finally{completeOperation();}}
+async function setPaused(){
+  if(stopped||busy||!ready||!controlState)return;
+  const state=controlState,g=generation;clearTimeout(timer);timer=null;busy=true;element('pause').disabled=true;
+  try{
+    let response=await request('tools/call',{name:'sentinel_set_chat_analysis',arguments:{paused:!state.paused,expectedThreadId:state.taskId,revision:state.revision}});
+    if(stopped||g!==generation)return;
+    if(response.isError)throw new Error('本聊天暂停状态未确认');
+    if(response.structuredContent?.identity?.threadId!==state.taskId)throw new Error('当前聊天身份已变化');
+    if(selectedExecutionKey||historyCursor){
+      response=await request('tools/call',{name:'sentinel_current_chat',arguments:readArguments()});
+      if(stopped||g!==generation)return;
+      if(response.isError||response.structuredContent?.identity?.threadId!==state.taskId)throw new Error('历史检查读取尚未确认');
+    }
+    render(response.structuredContent);
+  }catch(error){if(!stopped&&g===generation){clearView('本聊天暂停状态未确认');element('error').textContent='刷新后可重试';element('technical').textContent=text(error.message);}}
+  finally{completeOperation();}
+}
+element('pause').onclick=setPaused;
+async function requestNotificationPermission(){
+  if(stopped||busy||!ready||!scopeThreadId)return;
+  const threadId=scopeThreadId,g=generation;clearTimeout(timer);timer=null;busy=true;element('notification-permission').disabled=true;
+  try{
+    let response=await request('tools/call',{name:'sentinel_request_notification_permission',arguments:{expectedThreadId:threadId}});
+    if(stopped||g!==generation)return;
+    if(response.isError||response.structuredContent?.identity?.threadId!==threadId)throw new Error('通知许可尚未确认');
+    if(selectedExecutionKey||historyCursor){response=await request('tools/call',{name:'sentinel_current_chat',arguments:readArguments()});if(stopped||g!==generation)return;if(response.isError||response.structuredContent?.identity?.threadId!==threadId)throw new Error('历史检查读取尚未确认');}
+    render(response.structuredContent);
+  }catch(error){if(!stopped&&g===generation){clearView('通知许可尚未确认');element('error').textContent='刷新后可重试';element('technical').textContent=text(error.message);}}
+  finally{completeOperation();}
+}
+element('notification-permission').onclick=requestNotificationPermission;
+element('notification-log').ontoggle=()=>{if(element('notification-log').open)return readNotificationRecords();notificationWanted=null;};
+element('notification-log-refresh').onclick=()=>readNotificationRecords();
+element('notification-log-more').onclick=()=>notificationBefore!==null?readNotificationRecords(notificationBefore):undefined;
+element('history-current').onclick=()=>selectExecution(null,null);
+element('history-more').onclick=()=>nextHistoryCursor?selectExecution(selectedExecutionKey,nextHistoryCursor):undefined;
+function visibility(){clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void refresh();}
+function teardown(){stopped=true;generation++;clearTimeout(timer);timer=null;clearNotificationLog();for(const p of pending.values()){clearTimeout(p.timeout);p.reject(new Error('页面已销毁'));}pending.clear();removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
+addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
+(async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.0'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');await refresh();}catch(error){clearView('宿主初始化未完成');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}})();
+</script>
+</html>

@@ -53,6 +53,9 @@ async function fixture(t) {
 
 test('communication diagnostics retain the first read failure through later source failures and connection recovery', async t => {
   const f = await fixture(t), secret = `Bearer ${f.token}`
+  // Keep a successful background tick from recovering the episode between faults.
+  f.faults.set('/v1/source/heartbeat', 'held')
+  await until(() => f.held.size === 1)
   f.faults.set('/v1/snapshot', { status: 503, body: { error: `${secret} https://private.invalid/${f.token}`, code: 'secretAlpha123', name: 'privateServerName' } })
   const startedAt = Date.now(), failed = await f.adapter.snapshot()
   assert.equal(failed.adapter.connected, false)
@@ -71,6 +74,7 @@ test('communication diagnostics retain the first read failure through later sour
   episode.first.operation = 'caller mutation'
   f.faults.delete('/v1/snapshot')
   f.faults.set('/v1/source/heartbeat', { body: { error: secret } })
+  for (const response of f.held) { response.writeHead(503, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: secret })) }
   await until(() => f.adapter.diagnostics().adapter.communicationFailure?.latest.operation === '/v1/source/heartbeat')
   assert.deepEqual(f.adapter.diagnostics().adapter.communicationFailure.first, first)
   f.faults.delete('/v1/source/heartbeat')

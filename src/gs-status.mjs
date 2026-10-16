@@ -77,23 +77,30 @@ export function childWait(task, source, tasks, current) {
 }
 
 export function gsStatus(task, source, current, descendantWait = null) {
+  const conservative = source.descriptor?.policy === 'chatgpt-main/1'
   const active = task.status === 'running' || task.status === 'unknown' && task.lastKnownStatus === 'running'
   const scope = currentEvents(task, task.events)
   const latest = scope.filter(event => activityKinds.has(event.kind) && !event.data?.refinesEventId).at(-1)
   const silence = { since: latest?.capturedAt ?? null, durationMs: latest ? Math.max(0, current - latest.capturedAt) : null, initial: !latest }
   const coverage = { complete: task.coverage.complete, gaps: task.coverage.gaps }
-  const waiting = source.status === 'connected' ? userWait(task, scope, current) ?? descendantWait : null
+  const waiting = source.status === 'connected' && !conservative ? userWait(task, scope, current) ?? descendantWait : null
   const requestId = task.requestId ?? task.instructionContext?.binding?.inputRef?.eventId
   const completed = task.analysis.completedAt != null && requestId != null && task.analysis.inputEventIds?.includes(requestId) && (!task.analysis.resultDisposition || ['current', 'reused'].includes(task.analysis.resultDisposition))
   const semanticGap = task.analysis.checks.some(check => check.judgmentState === 'failed' || check.id !== 'long_wait' && check.applicability?.state === 'triggered' && check.status === 'unknown') || completed && task.analysis.coverage?.complete === false
   if (waiting) waiting.semanticState = semanticGap ? 'insufficient' : completed ? 'complete' : 'pending'
   const base = { silence: { ...silence, exempt: Boolean(waiting) }, waiting, coverage }
+  if (conservative && (!latest || silence.durationMs >= 60_000)) {
+    const since = latest?.capturedAt ?? scope.findLast(event => event.kind === 'input')?.capturedAt ?? task.requestStartedAt ?? scope.find(event => event.kind === 'status' && event.data?.nativeType === 'task_started')?.capturedAt ?? null
+    base.waiting = { kind: 'unconfirmed', since, durationMs: since === null ? null : Math.max(0, current - since), evidenceIds: latest ? [latest.id] : [] }
+  }
   if (!active) return { light: null, label: task.status === 'unknown' ? '状态未知' : '已结束', reason: '不计入活动执行节点', ...base }
   if (source.status !== 'connected') return { light: 'gray', label: '不可判断', reason: '来源失联；不能把缺失消息当作原代理静默', ...base }
-  const alerts = task.alerts.filter(alert => alert.status === 'attention' && !waitExempts(alert, waiting, scope))
+  if (source.descriptor?.mode === 'observation-only') return { light: 'gray', label: '只读观察', reason: '仅提供执行观察；语义分析尚未接入', ...base, waiting: null }
+  const alerts = task.alerts.filter(alert => alert.status === 'attention' && !(conservative && alert.checkId === 'long_wait') && !waitExempts(alert, waiting, scope))
   if (alerts.length) return { light: 'red', label: '需要关注', reason: alerts.map(alert => alert.reason).join('；'), ...base }
   const activation = source.hierarchyContext?.activations.find(item => item.taskId === task.id && item.lifecycleId === task.lifecycleId)
   if (task.status === 'unknown' || source.hierarchyContext && (!activation || activation.state === 'unknown' || activation.sessionId === null)) return { light: 'gray', label: '不可判断', reason: '已知执行当前不可观察；不能凭缺失内部材料判断静默', ...base }
+  if (conservative && base.waiting?.kind === 'unconfirmed') return { light: 'gray', label: '等待原因未确认', reason: base.waiting.durationMs === null ? '尚无可见执行活动；等待原因及观察时长未确认' : `已观察至少 ${Math.floor(base.waiting.durationMs / 1000)} 秒；现有材料无法区分正常执行、等待与停滞`, ...base }
   if (waiting && task.coverage.complete && !task.instructionContext?.gaps?.length && !semanticGap) return { light: 'green', label: waiting.kind === 'user' ? '等待你' : '等待子代理', reason: (waiting.kind === 'user' ? '已观察到当前执行的用户等待开闭依据' : '已核对父等待审计及仍有活动的委派后代；下级状态独立保留') + (waiting.semanticState === 'pending' ? '；六项语义尚待完成' : ''), ...base }
   if (!waiting && (!latest || silence.durationMs >= 60_000)) return { light: 'yellow', label: '观察', reason: !latest ? '尚无可见执行活动' : `已 ${Math.floor(silence.durationMs / 1000)} 秒无新可见执行活动；是否卡死不可判断`, ...base }
   const complete = task.coverage.complete && task.analysis.coverage?.complete && !task.instructionContext?.gaps?.length && !task.analysis.error && !task.analysis.coverage?.dependencies?.length && task.analysis.checks.every(check => check.applicability?.state === 'not-triggered' || check.applicability?.state === 'triggered' && check.status === 'clear')
