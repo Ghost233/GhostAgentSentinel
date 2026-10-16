@@ -72,7 +72,7 @@ test('twenty objects share fresh host and project samples and directory heartbea
   assert.equal((await f.core.diagnostics()).retained.events, 20)
 })
 
-test('directory exclusions remain visible without reading fork, child, foreign or unknown materials', async t => {
+test('directory exclusions and unresolved fork coverage remain visible without opening excluded material', async t => {
   const f = await fixture(t)
   await f.add('ordinary')
   await f.add('fork', { forkedFromId: 'ordinary' })
@@ -82,10 +82,11 @@ test('directory exclusions remain visible without reading fork, child, foreign o
   await f.add('unknown', { environments: [{ environmentId: 'opaque-environment-id' }] })
   await f.adapter.refresh()
   assert.deepEqual((await f.core.snapshot()).tasks.map(task => task.id), ['ordinary'])
-  assert.ok(f.facts.reads.every(id => id === 'ordinary'))
+  assert.ok(f.facts.reads.every(id => ['ordinary', 'fork'].includes(id)), 'fork qualification may read metadata; excluded child and foreign entries are not opened')
   const coverage = f.adapter.discovery()
   assert.deepEqual(coverage.counts, { main: 1, fork: 1, child: 1, remote: 0, cloud: 0, unknown: 3 })
-  assert.ok(coverage.gaps.includes('fork-coverage-pending'))
+  assert.equal(coverage.gaps.includes('fork-coverage-pending'), true, 'metadata-only discovery must retain the known unverified fork gap')
+  assert.deepEqual(coverage.forkCoverage, { known: 1, verified: 0, pending: 1 })
   assert.ok(coverage.gaps.includes('unclassified-directory-entries'))
   assert.equal(coverage.complete, false)
 })

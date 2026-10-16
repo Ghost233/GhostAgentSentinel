@@ -14,6 +14,7 @@ const CATEGORIES = new Map([
   ['evidence', ['invalid_evidence']], ['expired', ['evidence_expired', 'analysis_expired']],
   ['configuration', ['configuration', 'analysis_config_conflict']],
   ['persistence', ['monitoring_outbox_capacity']],
+  ['collection', ['native_capture_capacity', 'native_capture_body_unavailable']],
   ['collection', ['EACCES', 'EPERM', 'ENOENT', 'ESTALE', 'EIO', 'ENOTDIR', 'EISDIR', 'EMFILE', 'ENFILE', 'ELOOP', 'ENOSPC', 'EROFS', 'record-source-unavailable', 'record-identity-changed', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'cursor-anchor-changed', 'record-malformed-or-over-limit', 'cursor-invalid', 'cursor-retains-gap', 'observation-unavailable', 'cursor-unavailable', 'record-path-unverified']],
   ['other', ['analysis_failed', 'collection_failed', 'unrecognized_error']],
 ].flatMap(([category, codes]) => codes.map(code => [code, category])));

@@ -24,7 +24,7 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
   const coverage = () => {
     const counts = counters()
     for (const item of catalog.values()) counts[item.kind]++
-    return { state, complete: false, directoryComplete, updatedAt, counts, gaps: [...new Set([...gaps, 'all-local-execution-coverage-unverified', ...(counts.fork ? ['fork-coverage-pending'] : []), ...(counts.unknown ? ['unclassified-directory-entries'] : [])])], ...(state === 'unavailable' && error ? { error: { ...error } } : {}) }
+    return { state, complete: false, directoryComplete, updatedAt, counts, gaps: [...new Set([...gaps, 'all-local-execution-coverage-unverified', ...(counts.unknown ? ['unclassified-directory-entries'] : [])])], ...(state === 'unavailable' && error ? { error: { ...error } } : {}) }
   }
   async function refresh() {
     if (closed) return coverage()
@@ -49,8 +49,9 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
             const kind = classifyThread(thread, sessionsRoot)
             if (!catalog.has(thread.id) && catalog.size >= LIMIT) {
               gaps.push('directory-capacity-reached')
-              const diagnostic = kind === 'main' ? [...catalog.values()].find(item => item.kind !== 'main') : null
-              if (kind !== 'main' || diagnostic) gaps.push('directory-diagnostic-entries-omitted')
+              const eligible = ['main', 'fork'].includes(kind)
+              const diagnostic = eligible ? [...catalog.values()].find(item => !['main', 'fork'].includes(item.kind)) : null
+              if (!eligible || diagnostic) gaps.push('directory-diagnostic-entries-omitted')
               if (!diagnostic) continue
               catalog.delete(diagnostic.id)
             }
@@ -74,7 +75,7 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
   }
   return {
     refresh, snapshot: coverage,
-    candidates: () => [...catalog.values()].filter(item => item.kind === 'main').map(item => item.id),
+    candidates: () => [...catalog.values()].filter(item => ['main', 'fork'].includes(item.kind)).map(item => item.id),
     has: id => catalog.has(id),
     kind: id => catalog.get(id)?.kind ?? null,
     diagnostics: () => ({ directoryEntries: catalog.size, directoryPending: pending ? 1 : 0, directoryPages: pagesRead, directoryCursor: cursor || archived ? 1 : 0 }),

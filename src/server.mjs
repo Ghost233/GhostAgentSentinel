@@ -1,10 +1,11 @@
+import { FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE } from './fork-proof.mjs'
 import { createServer } from 'node:http'
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, writeFile, rename, chmod, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createCore } from './core/index.mjs'
 import { createAnalyzer } from './analysis/index.mjs'
-import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig } from './protocol.mjs'
+import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig } from './protocol.mjs'
 import { normalizeEnrollment } from './enrollment-config.mjs'
 import { HIERARCHY_FEATURE } from './hierarchy.mjs'
 import { GS_FEATURE } from './gs-status.mjs'
@@ -133,7 +134,18 @@ export async function startServer({ dataDir, onIdle, ...options }) {
     if (request.headers.host !== expectedHost || !authorized(request, token)) return send(401, { error: 'private connection required' })
     if (stopping) return send(503, { error: 'core shutting down' })
     try {
-      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: [HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE] })
+      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: [FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE] })
+      if (request.method === 'GET' && request.url.startsWith('/v1/notifications/native')) {
+        const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
+        if (url.pathname !== '/v1/notifications/native') return send(404, { error: 'unknown endpoint' })
+        if ([...params.keys()].some(key => params.getAll(key).length !== 1)) throw new Error('duplicate native notification query field')
+        const query = Object.fromEntries(params)
+        for (const key of ['afterSequence', 'limit']) if (query[key] !== undefined) {
+          if (!/^\d+$/.test(query[key])) throw new Error('invalid native notification query integer')
+          query[key] = Number(query[key])
+        }
+        return send(200, await core.nativeNotificationRecords(query))
+      }
       if (request.method === 'GET' && request.url.startsWith('/v1/monitoring/failures')) {
         const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
         if (url.pathname !== '/v1/monitoring/failures') return send(404, { error: 'unknown endpoint' })
@@ -177,6 +189,8 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         case '/v1/monitoring/collection-outcome': result = await core.recordCollectionOutcome(body); break
         case '/v1/conversation/monitoring': result = await core.setConversationMonitoring(body); break
         case '/v1/notifications/claim': counts.notificationClaims++; result = await core.claimNotifications(identifier(body.sourceKey)); break
+        case '/v1/notifications/native/eligibility': result = await core.setNativeNotificationEligibility(body); break
+        case '/v1/notifications/native/result': result = await core.recordNativeNotificationResult(body); break
         case '/v1/sources': result = await core.configureSources(normalizeEnrollment(body)); break
         case '/v1/notifications/ack': {
           if (!body.result || !['submitted', 'failed'].includes(body.result.status)) throw new Error('invalid notification result')
@@ -191,7 +205,7 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         default: return send(404, { error: 'unknown endpoint' })
       }
       send(200, result ?? null)
-    } catch (error) { send(['analysis_config_conflict', 'hierarchy_version_unsupported', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : error.code === 'analysis_config_unconfirmed' ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
+    } catch (error) { send(['analysis_config_conflict', 'hierarchy_version_unsupported', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : error.code === 'analysis_config_unconfirmed' ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
     } finally { counts.activeRequests--; await flushIdle() }
   })
   server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)) })

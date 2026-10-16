@@ -7,9 +7,10 @@ import { none, isMany } from 'stream-chain/defs.js';
 import fs from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import { createHash } from 'node:crypto';
+import { nativeRecordIdentity } from '../src/fork-proof.mjs';
 
 const values = value => value === none ? [] : isMany(value) ? value.values : [value];
-const fields = /^(?:type|timestamp|ordinal|payload\.(?:type|turn_id|root_turn_id|thread_id|id|history_mode|forked_from_id|forked_from_ordinal_exclusive)|payload\.history_base\.(?:thread_id|end_ordinal_exclusive|end_byte_offset))$/;
+const fields = /^(?:type|timestamp|ordinal|payload\.(?:type|turn_id|root_turn_id|thread_id|id|originator|source|cli_version|cwd|history_mode|forked_from_id|forked_from_ordinal_exclusive)|payload\.history_base\.(?:thread_id|end_ordinal_exclusive|end_byte_offset))$/;
 
 export class Projection {
   constructor() {
@@ -83,11 +84,11 @@ const sourceIoCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'EIO', 'ENOTDIR', 'E
 
 export class BoundedReader {
   constructor(source, cursor = null, { mode = 'metadata', forkSuffix = false } = {}) {
-    if (!['metadata', 'material', 'history'].includes(mode)) throw new Error('unsupported reader mode');
-    this.mode = mode; this.materialMode = mode !== 'metadata'; this.historyMode = mode === 'history'; this.ordinalMode = this.historyMode || forkSuffix;
+    if (!['metadata', 'material', 'history', 'history-metadata', 'header'].includes(mode)) throw new Error('unsupported reader mode');
+    this.mode = mode; this.materialMode = ['material', 'history'].includes(mode); this.historyMode = ['history', 'history-metadata'].includes(mode); this.ordinalMode = this.historyMode || forkSuffix;
     this.historyRange = this.historyMode ? source.historyRange : null; this.nextOrdinal = null; this.forkProvenance = null;
     this.source = source;
-    this.scope = digest(JSON.stringify([typeof source.path === 'string' ? resolve(source.path) : '', source.threadId, source.hostRunId, profileKey(source.profile), ...(this.ordinalMode ? [mode, source.forkedFromId ?? null, this.historyRange] : [])]));
+    this.scope = digest(JSON.stringify([typeof source.path === 'string' ? resolve(source.path) : '', source.threadId, source.hostRunId, profileKey(source.profile), ...(this.ordinalMode ? [mode, source.forkedFromId ?? null, this.historyRange, source.expectedFileId ?? null, source.expectedHeader ?? null] : [])]));
     this.state = emptyState();
     this.offset = 0; this.committed = 0; this.pendingBytes = 0;
     this.rolling = Buffer.alloc(0); this.committedTail = Buffer.alloc(0);
@@ -103,13 +104,15 @@ export class BoundedReader {
     else if (profileKey(source.profile) !== profileKey(supportedProfile)) this.gap = 'unsupported-host-version';
     else if (this.historyMode && (!Number.isSafeInteger(this.historyRange?.endOrdinalExclusive) || this.historyRange.endOrdinalExclusive < 1 || !Number.isSafeInteger(this.historyRange?.endByteOffset) || this.historyRange.endByteOffset < 1)) this.gap = 'history-boundary-unverified';
     else if (cursor && this.materialMode && cursor.projectionMode !== this.mode) this.gap = 'material-cursor-baseline-missing';
+    else if (cursor && this.materialMode && cursor.nativeOriginVersion !== 1) this.gap = 'cursor-invalid';
+    else if (cursor && this.materialMode && cursor.state?.header && cursor.header?.threadId !== source.threadId) this.gap = 'cursor-invalid';
     if (cursor && !this.gap) {
       const s = cursor.state;
       if (cursor.format !== 2 || cursor.scope !== this.scope || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || !Number.isSafeInteger(cursor.attachSize) || cursor.attachSize < 0 || !Number.isSafeInteger(cursor.knownSize) || cursor.knownSize < cursor.offset || cursor.knownSize < cursor.attachSize || !/^[0-9a-f]{64}$/.test(cursor.guardHash ?? '') || typeof cursor.fileId !== 'string' || cursor.fileId.length > 100 || this.ordinalMode && !(cursor.nextOrdinal === null && cursor.offset === 0 && s?.header === false) && (!Number.isSafeInteger(cursor.nextOrdinal) || cursor.nextOrdinal < 0) || typeof s?.header !== 'boolean' || typeof s?.anchored !== 'boolean' || !['unknown', 'started', 'completed', 'aborted'].includes(s?.phase) || s.turnId !== null && (typeof s.turnId !== 'string' || s.turnId.length > 128) || s.at !== null && !Number.isSafeInteger(s.at)) {
         this.gap = 'cursor-invalid';
       } else {
         this.offset = this.committed = cursor.offset; this.fileId = cursor.fileId; this.guardHash = cursor.guardHash; this.attachSize = cursor.attachSize; this.knownSize = cursor.knownSize;
-        this.nextOrdinal = cursor.nextOrdinal ?? null; this.forkProvenance = cursor.forkProvenance ?? null;
+        this.nextOrdinal = cursor.nextOrdinal ?? null; this.forkProvenance = cursor.forkProvenance ?? null; this.header = cursor.header ?? null;
         this.state = { header: s.header, anchored: s.anchored, phase: s.phase, turnId: s.turnId, at: s.at, orphan: s.orphan === true };
         this.gap = cursor.gap === null ? null : 'cursor-retains-gap';
       }
@@ -122,10 +125,11 @@ export class BoundedReader {
     const startGap = !this.historyMode && this.state.phase === 'started' && this.state.at < this.source.hostStartedAt + 1000 ? this.state.at < this.source.hostStartedAt ? 'start-predates-host' : 'host-start-time-overlap' : null;
     const coverage = reason || this.gap || startGap ? 'gap' : this.stat && this.offset < Math.min(this.stat.size, this.historyRange?.endByteOffset ?? Infinity) ? 'catching-up' : this.pendingBytes ? 'partial-record' : this.stat ? 'caught-up' : 'catching-up';
     const gap = reason ?? this.gap ?? (!this.state.header ? 'main-header-unverified' : !this.state.anchored ? 'current-turn-not-observed' : startGap);
-    return { coverage, gap, observed: { ...this.state }, effectivePhase: !this.historyMode && coverage === 'caught-up' && !gap ? this.state.phase : 'unknown', offset: this.offset, committedOffset: this.committed, pendingBytes: this.pendingBytes, excluded: this.excluded, recentLifecycle: this.recentLifecycle.map(e => ({ ...e })), ...(this.materialMode ? { materials: this.materials.map(e => ({ ...e, data: { ...e.data } })) } : {}), metrics: { ...this.metrics }, ...(this.ordinalMode ? { captureThroughOffset: this.nextOrdinal === null ? -1 : this.nextOrdinal - 1, forkProvenance: this.forkProvenance } : {}), ...(this.error ? { error: { ...this.error } } : {}) };
+    return { coverage, gap, observed: { ...this.state }, effectivePhase: !this.historyMode && coverage === 'caught-up' && !gap ? this.state.phase : 'unknown', offset: this.offset, committedOffset: this.committed, pendingBytes: this.pendingBytes, excluded: this.excluded, recentLifecycle: this.recentLifecycle.map(e => ({ ...e })), ...(this.materialMode ? { materials: this.materials.map(e => ({ ...e, data: { ...e.data } })) } : {}), metrics: { ...this.metrics }, ...(this.ordinalMode ? { captureThroughOffset: this.nextOrdinal === null ? -1 : this.nextOrdinal - 1, forkProvenance: this.forkProvenance, header: this.header ?? null } : {}), ...(this.error ? { error: { ...this.error } } : {}) };
   }
 
   apply(row, recordStart) {
+    if (this.mode === 'header' && !this.state.header && (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId)) { this.gap = 'history-source-unverified'; return; }
     if (this.ordinalMode) {
       if (!Number.isSafeInteger(row.ordinal) || row.ordinal < 0 || this.nextOrdinal !== null && row.ordinal !== this.nextOrdinal) { this.gap = 'record-ordinal-unverified'; return; }
       this.nextOrdinal = row.ordinal + 1;
@@ -135,6 +139,9 @@ export class BoundedReader {
         if (this.state.header) this.gap = 'record-identity-changed';
         return;
       }
+      this.header = { threadId: row.payload.id, ordinal: row.ordinal, originator: row.payload.originator, sourceKind: row.payload.source, cliVersion: row.payload.cli_version, historyMode: row.payload.history_mode, cwd: row.payload.cwd, creationSourceThreadId: row.payload.forked_from_id ?? null, historyBase: row.payload.history_base ? { sourceThreadId: row.payload.history_base.thread_id, endOrdinalExclusive: row.payload.history_base.end_ordinal_exclusive, endByteOffset: row.payload.history_base.end_byte_offset } : null };
+      if (this.source.expectedHeader && JSON.stringify(this.header) !== JSON.stringify(this.source.expectedHeader)) { this.gap = 'history-source-generation-changed'; return; }
+      if (this.historyMode && row.ordinal >= this.historyRange.endOrdinalExclusive) { this.gap = 'history-generation-range-unverified'; return; }
       if (this.ordinalMode) {
         const payload = row.payload, base = payload.history_base;
         if (payload.history_mode !== 'paginated' || this.source.forkedFromId && payload.forked_from_id !== this.source.forkedFromId || base && (typeof base.thread_id !== 'string' || !base.thread_id || !Number.isSafeInteger(base.end_ordinal_exclusive) || base.end_ordinal_exclusive < 1 || !Number.isSafeInteger(base.end_byte_offset) || base.end_byte_offset < 1 || row.ordinal !== base.end_ordinal_exclusive) || !base && row.ordinal !== 0) { this.gap = 'fork-provenance-unverified'; return; }
@@ -146,9 +153,12 @@ export class BoundedReader {
     if (!this.state.header) return;
     if (row.payload?.thread_id && row.payload.thread_id !== this.source.threadId) { this.excluded++; return; }
     if (this.materialMode && row.type === 'event_msg' && row.payload?.type === 'item_completed' && row.payload.thread_id !== this.source.threadId) { this.excluded++; return; }
-    if (this.materialMode && this.state.anchored && this.state.turnId) {
-      const material = materialRecord(row, this.state.turnId, recordStart, this.offset + 1, this.turnTrigger);
-      if (material && material.turnId === this.state.turnId) {
+    const historyProducer = this.materialMode && this.historyMode && row.type === 'event_msg' && row.payload?.type === 'item_completed' && row.material.fields['payload.item.type']?.text === 'UserMessage';
+    if (this.materialMode && (this.state.anchored && this.state.turnId || historyProducer)) {
+      const turnId = historyProducer ? row.payload.turn_id : this.state.turnId;
+      const material = materialRecord(row, turnId, recordStart, this.offset + 1, turnId === this.state.turnId ? this.turnTrigger : null);
+      if (material && (material.turnId === this.state.turnId || historyProducer)) {
+        material.data.nativeRecordId = nativeRecordIdentity(this.fileId, this.header, recordStart, material.data.nativeType);
         if (this.ordinalMode) { material.captureOffset = row.ordinal; material.data.recordOrdinal = row.ordinal; }
         if (this.historyMode) Object.assign(material.data, { history: true, inherited: true, originRunId: material.turnId, sourceThreadId: this.source.threadId });
         this.materials.push(material);
@@ -169,8 +179,8 @@ export class BoundedReader {
     if (typeof id !== 'string' || !id || id.length > 128 || !Number.isFinite(Date.parse(row.timestamp))) { this.gap = 'invalid-lifecycle-record'; return; }
     this.state.anchored = true;
     const turnTrigger = this.materialMode && row.material.fields['payload.turn_attribution.turn_id']?.text === id ? row.material.turnTrigger ?? null : null;
-    this.recentLifecycle.push({ type, turnId: id, at: Date.parse(row.timestamp), recordStart, ...(this.materialMode ? { recordEnd: this.offset + 1, turnTrigger, ...(this.ordinalMode ? { captureOffset: row.ordinal, recordOrdinal: row.ordinal } : {}), ...(this.historyMode ? { history: true, inherited: true, originRunId: id, sourceThreadId: this.source.threadId } : {}) } : {}) });
-    if (this.mode === 'metadata' && this.recentLifecycle.length > 8) this.recentLifecycle.shift();
+    this.recentLifecycle.push({ type, turnId: id, at: Date.parse(row.timestamp), recordStart, ...(this.materialMode ? { recordEnd: this.offset + 1, turnTrigger, nativeRecordId: nativeRecordIdentity(this.fileId, this.header, recordStart, type), ...(this.ordinalMode ? { captureOffset: row.ordinal, recordOrdinal: row.ordinal } : {}), ...(this.historyMode ? { history: true, inherited: true, originRunId: id, sourceThreadId: this.source.threadId } : {}) } : {}) });
+    if (!this.materialMode && this.recentLifecycle.length > 8) this.recentLifecycle.shift();
     if (type === 'task_started') {
       if (this.materialMode) this.turnTrigger = turnTrigger;
       this.state = { header: true, anchored: true, phase: 'started', turnId: id, at: Date.parse(row.timestamp), orphan: Date.parse(row.timestamp) < this.source.hostStartedAt };
@@ -181,7 +191,7 @@ export class BoundedReader {
 
   consume(bytes) {
     let at = 0;
-    while (at < bytes.length && !this.gap && (!this.materialMode || this.recentLifecycle.length + this.materials.length < (this.maxEvents ?? 16))) {
+    while (at < bytes.length && !this.gap && (this.mode !== 'header' || !this.state.header) && (!this.materialMode || this.recentLifecycle.length + this.materials.length < (this.maxEvents ?? 16))) {
       const newline = bytes.indexOf(10, at);
       const end = newline < 0 ? bytes.length : newline;
       const part = bytes.subarray(at, end);
@@ -205,7 +215,7 @@ export class BoundedReader {
     }
   }
 
-  async pump({ budgetBytes = 262144, maxEvents = 16, available = this.available ?? true, profile = this.source.profile, hostRunId = this.source.hostRunId } = {}) {
+  async pump({ budgetBytes = 262144, maxEvents = 16, verifyOnly = false, available = this.available ?? true, profile = this.source.profile, hostRunId = this.source.hostRunId } = {}) {
     if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 16) throw new Error('invalid event budget');
     this.maxEvents = maxEvents;
     if (!Number.isSafeInteger(budgetBytes) || budgetBytes < 1 || budgetBytes > 262144) throw new Error('invalid read budget');
@@ -231,7 +241,7 @@ export class BoundedReader {
       const stat = await fs.stat(this.source.path);
       const opened = await this.handle.stat();
       const id = `${stat.dev}:${stat.ino}`;
-      if (!stat.isFile() || id !== `${opened.dev}:${opened.ino}` || this.fileId && this.fileId !== id) { this.gap = 'record-file-replaced'; return { ...this.view(), readBytes }; }
+      if (!stat.isFile() || id !== `${opened.dev}:${opened.ino}` || this.fileId && this.fileId !== id || this.source.expectedFileId && this.source.expectedFileId !== id) { this.gap = 'record-file-replaced'; return { ...this.view(), readBytes }; }
       this.fileId = id; this.attachSize ??= stat.size;
       if (this.historyMode && this.historyRange.endByteOffset > stat.size) { this.gap = 'history-range-unavailable'; return { ...this.view(), readBytes }; }
       if (stat.size < Math.max(this.offset, this.knownSize ?? this.attachSize)) { this.gap = 'record-file-truncated'; return { ...this.view(), readBytes }; }
@@ -240,7 +250,7 @@ export class BoundedReader {
       const unchanged = this.stat && stat.size === this.stat.size && stat.mtimeMs === this.stat.mtimeMs;
       if (!unchanged || this.needsGuard) {
         const guardSize = Math.min(64, this.committed);
-        if (guardSize >= budgetBytes) return { ...this.view('budget-too-small-for-guard'), readBytes };
+        if (guardSize > budgetBytes) return { ...this.view('budget-too-small-for-guard'), readBytes };
         if (guardSize) {
           const guard = Buffer.alloc(guardSize);
           const got = await this.handle.read(guard, 0, guardSize, this.committed - guardSize);
@@ -251,7 +261,7 @@ export class BoundedReader {
         this.needsGuard = false;
       }
       this.stat = { size: stat.size, mtimeMs: stat.mtimeMs };
-      const count = Math.min(budgetBytes - readBytes, Math.min(stat.size, this.historyRange?.endByteOffset ?? Infinity) - this.offset);
+      const count = verifyOnly ? 0 : Math.min(budgetBytes - readBytes, Math.min(stat.size, this.historyRange?.endByteOffset ?? Infinity) - this.offset);
       if (count > 0) {
         this.ioBuffer ??= Buffer.alloc(262144);
         const buffer = this.ioBuffer;
@@ -275,7 +285,7 @@ export class BoundedReader {
   }
 
   checkpoint() {
-    return { format: 2, scope: this.scope, offset: this.committed, attachSize: this.attachSize, knownSize: this.knownSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap, ...(this.ordinalMode ? { nextOrdinal: this.nextOrdinal, forkProvenance: this.forkProvenance } : {}), ...(this.materialMode ? { projectionMode: this.mode, turnTrigger: this.turnTrigger } : {}) };
+    return { format: 2, scope: this.scope, offset: this.committed, attachSize: this.attachSize, knownSize: this.knownSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap, ...(this.ordinalMode ? { nextOrdinal: this.nextOrdinal, forkProvenance: this.forkProvenance, header: this.header ?? null } : {}), ...(this.materialMode ? { header: this.header ?? null, nativeOriginVersion: 1, projectionMode: this.mode, turnTrigger: this.turnTrigger } : {}) };
   }
 
   async close() {
@@ -285,6 +295,8 @@ export class BoundedReader {
       await this.pumpComplete;
       await this.handle?.close(); this.handle = null; this.projection = null;
       this.ioBuffer?.fill(0); this.ioBuffer = null;
+      this.rolling.fill(0); this.committedTail.fill(0);
+      this.materials = []; this.recentLifecycle = []; this.turnTrigger = null;
     })();
     return this.closing;
   }
