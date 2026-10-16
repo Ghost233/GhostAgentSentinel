@@ -1,41 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import vm from 'node:vm'
+import { panelHarness as harness } from './helpers/chatgpt-panel.mjs'
 
-class Element {
-  constructor(tag = 'div') { this.tagName = tag.toUpperCase(); this.children = []; this.attributes = new Map(); this.open = false; this.className = ''; this.value = '' }
-  get textContent() { return this.value + this.children.map(child => typeof child === 'string' ? child : child.textContent).join('') }
-  set textContent(value) { this.value = String(value); this.children = [] }
-  set innerHTML(_value) { throw new Error('untrusted result must not be inserted as HTML') }
-  append(...children) { this.children.push(...children) }
-  replaceChildren(...children) { this.value = ''; this.children = children }
-  setAttribute(name, value) { this.attributes.set(name, String(value)) }
-  getAttribute(name) { return this.attributes.get(name) ?? null }
-}
 const ids = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait']
 const result = id => ({ signal: 'gray', summary: id ? id + ' 执行开始' : '无法确认当前观察', identity: { threadId: id }, observation: { coverage: 'caught-up', gap: null }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
 const material = (id = 'main-a', signal = 'red') => ({ ...result(id), signal, summary: '当前修改可能偏离请求', analysis: { connected: true, state: 'cooldown', resultDisposition: 'current', summary: '本轮六项检查已更新', waitMs: 0, lagMs: 2500, coverage: { complete: true, gaps: [] }, checks: ids.map(checkId => ({ id: checkId, status: checkId === 'request_drift' ? 'attention' : 'clear', reason: '已核对现有材料' })), issues: [{ checkId: 'request_drift', reason: '用户只要求改文字，代理却更改了数据层', evidence: [{ text: '<img src=x onerror="alert(1)"> 只改按钮文字', reference: 'record:private-evidence-id' }] }] }, discovery: { complete: false, directoryComplete: true, counts: { main: 3, fork: 1, child: 2, remote: 0, cloud: 0, unknown: 1 }, tracked: 3, connected: 1, currentIncluded: true, gaps: ['fork-coverage-pending'] } })
 
-async function harness(t) {
-  const html = await readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8')
-  const handlers = new Map(), elements = new Map(), timers = new Map(), sent = []
-  for (const match of html.matchAll(/<([a-z0-9]+)\b[^>]*\bid="([^"]+)"[^>]*>/g)) elements.set('#' + match[2], new Element(match[1]))
-  const element = key => { assert.ok(elements.has(key), 'actual panel markup contains ' + key); return elements.get(key) }
-  let timerId = 0
-  const parent = { postMessage: value => sent.push(value) }
-  const document = { hidden: false, querySelector: element, createElement: tag => new Element(tag) }
-  const context = vm.createContext({ parent, document, addEventListener: (event, callback) => handlers.set(event, callback), removeEventListener: event => handlers.delete(event), setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id }, clearTimeout: id => timers.delete(id) })
-  const flush = () => new Promise(resolve => setImmediate(resolve))
-  const reply = (id, value) => handlers.get('message')({ source: parent, data: { jsonrpc: '2.0', id, result: value } })
-  vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], context)
-  reply(sent[0].id, {}); await flush()
-  const deliver = async value => { reply(sent.findLast(row => row.method === 'tools/call').id, { structuredContent: value }); await flush() }
-  const refresh = async () => { const scheduled = [...timers].find(([, value]) => value.delay === 1500); assert.ok(scheduled); timers.delete(scheduled[0]); void scheduled[1].callback(); await flush(); return sent.findLast(row => row.method === 'tools/call').id }
-  const destroy = async () => { handlers.get('pagehide')?.(); await flush() }
-  t.after(destroy)
-  return { html, parent, document, handlers, timers, sent, element, deliver, refresh, reply, flush, destroy }
-}
 
 test('current facts stay visible while inherited requirements remain pending and cannot appear fully green', async t => {
   const page = await harness(t), view = material('main-a', 'green')
