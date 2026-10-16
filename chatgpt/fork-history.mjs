@@ -9,6 +9,7 @@ const MAX_DEPTH = FORK_LINEAGE_FRAMES
 const MAX_CANDIDATES = 4, MAX_DIRECTORY_ENTRIES = 8192, MAX_DIRECTORIES = 256
 const MAX_METADATA_CALLS = 144
 const CHANNELS = ['materials', 'recentLifecycle', 'historyMaterials', 'historyLifecycle', 'historyBoundaries']
+const HISTORY_FAILURES = new Set(['record-source-unavailable', 'record-identity-changed', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'cursor-anchor-changed', 'record-malformed-or-over-limit', 'invalid-lifecycle-record', 'unsupported-record-type', 'unsupported-event-type', 'cursor-invalid', 'cursor-retains-gap', 'compressed-data-invalid', 'native_origin_prefix_changed', 'native_origin_header_changed'])
 const readable = budget => Math.max(0, budget.bytes - 64 * budget.owner.nodes.length)
 const signature = (value, path = true) => JSON.stringify([value?.id, ...(path ? [value?.path] : []), value?.cwd, value?.source, value?.originator, value?.parentThreadId, value?.forkedFromId ?? null])
 const GAP = Symbol('fork-gap')
@@ -228,7 +229,7 @@ export class ForkHistoryReader {
       budget.bytes -= view.readBytes; output.readBytes += view.readBytes; budget.decoded -= view.decodedBytes ?? 0; output.decodedBytes += view.decodedBytes ?? 0
       if (view.coverage === 'gap' && this.source.nativeOriginVersion === 2 && resolution.candidates.filter(candidate => nativeStorageKey(candidate) === nativeStorageKey(path)).length > 1) throw failure('history-generation-equivalence-unverified')
       if (view.error) { this.error = view.error; throw failure(view.gap) }
-      if (resolution.phase === 'prefix' && view.coverage === 'gap' && ['record-malformed-or-over-limit', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'cursor-anchor-changed', 'invalid-lifecycle-record'].includes(view.gap)) {
+      if (view.coverage === 'gap' && HISTORY_FAILURES.has(view.gap?.split(':')[0])) {
         this.error = failureErrorInfo({ code: view.gap, stage: 'collection' }); throw failure(view.gap)
       }
       if (resolution.phase === 'header' && view.header) {
@@ -320,7 +321,7 @@ export class ForkHistoryReader {
       if (!node.pending.length) { node.ack = node.reader.checkpoint(); node.ackProof = clone(node.proof) }
     }
     await this.ancestry(node, budget, output)
-    if (!node.resolved) return
+    if (!node.resolved || node.parent && !node.reader.header) return
     if (node.parent) {
       const base = node.reader.forkProvenance?.historyBase, parent = node.parent
       if (!base || parent.source.historyRecordId !== base.sourceThreadId || JSON.stringify(parent.source.historyRange) !== JSON.stringify({ endOrdinalExclusive: base.endOrdinalExclusive, endByteOffset: base.endByteOffset }) || parent.source.historyRecordId !== parent.source.threadId && (!recordOwnerPath(parent.metadata?.record, base.sourceThreadId) || !recordOwnerPath(parent.metadata?.record, base.sourceThreadId, parent.source.path))) throw failure('cursor-invalid')
@@ -350,12 +351,15 @@ export class ForkHistoryReader {
 
   async advanceCurrent(budget, output) {
     const node = this.current
-    if (!node.pending.length && readable(budget) > 64 && budget.decoded >= 32768) {
-      const view = await this.readNode(node, { ...budget.options, budgetBytes: readable(budget), decodedBudgetBytes: budget.decoded, maxEvents: Math.max(1, budget.events) })
+    for (let pass = 0; pass < 2 && !node.pending.length && budget.events > 0 && readable(budget) > 64 && budget.decoded >= 32768; pass++) {
+      const position = node.reader.io?.position ?? 0, bytes = budget.bytes
+      const view = await this.readNode(node, { ...budget.options, budgetBytes: readable(budget), decodedBudgetBytes: budget.decoded, maxEvents: budget.events })
       budget.bytes -= view.readBytes; output.readBytes += view.readBytes; budget.decoded -= view.decodedBytes ?? 0; output.decodedBytes += view.decodedBytes ?? 0
       if (view.coverage === 'gap') { this.error = view.error; throw failure(view.gap) }
       if (view.coldRead) return
       node.pending = [...view.materials.map(value => ({ channel: 'materials', value })), ...view.recentLifecycle.map(value => ({ channel: 'recentLifecycle', value }))].sort((a, b) => a.value.captureOffset - b.value.captureOffset)
+      const io = node.reader.io
+      if (!io || io.compressed || io.closed || io.revalidation || io.phase !== 'replaying' || io.position !== position || budget.bytes === bytes || output.materials.length || output.recentLifecycle.length) break
     }
     while (node.pending.length && budget.events) {
       const { channel, value } = node.pending.shift()
@@ -409,6 +413,12 @@ export class ForkHistoryReader {
           for (const channel of history) output[channel] = []
         }
       }
+      const holdCurrent = () => {
+        this.currentGuardedCheckpoint ??= previous
+        this.currentGuardedOutput = { materials: output.materials, recentLifecycle: output.recentLifecycle }
+        output.materials = []; output.recentLifecycle = []
+        return this.view(output)
+      }
       const waitForBudget = () => { holdOutput(); this.budgetWaiting = true; return this.view(output) }
       this.budget = budget
       try {
@@ -430,14 +440,9 @@ export class ForkHistoryReader {
           }
           this.temporarilyUnavailable = false
         }
-        const holdCurrent = () => {
-          this.currentGuardedCheckpoint ??= previous
-          this.currentGuardedOutput = { materials: output.materials, recentLifecycle: output.recentLifecycle }
-          output.materials = []; output.recentLifecycle = []
-          return this.view(output)
-        }
         if (this.currentGuardedOutput) {
           output.materials = this.currentGuardedOutput.materials; output.recentLifecycle = this.currentGuardedOutput.recentLifecycle
+          budget.events -= output.materials.length + output.recentLifecycle.length
         } else await this.advanceCurrent(budget, output)
         if (!output.materials.length && !output.recentLifecycle.length && this.current.reader.io?.revalidation && readable(budget) >= 64 && budget.decoded > 0) {
           const checked = await this.readNode(this.current, { ...options, budgetBytes: readable(budget), decodedBudgetBytes: budget.decoded, verifyOnly: true })
@@ -445,7 +450,7 @@ export class ForkHistoryReader {
           if (checked.coverage === 'gap') { this.error = checked.error; throw failure(checked.gap) }
           if (!this.current.reader.io?.revalidation) await this.advanceCurrent(budget, output)
         }
-        if (output.materials.length || output.recentLifecycle.length) {
+        if (output.materials.length || output.recentLifecycle.length || this.currentGuardedOutput) {
           if (readable(budget) < 64 || budget.decoded < 1) return holdCurrent()
           const checked = await this.readNode(this.current, { ...options, budgetBytes: readable(budget), decodedBudgetBytes: budget.decoded, verifyOnly: true })
           budget.bytes -= checked.readBytes; output.readBytes += checked.readBytes; budget.decoded -= checked.decodedBytes ?? 0; output.decodedBytes += checked.decodedBytes ?? 0
@@ -472,7 +477,13 @@ export class ForkHistoryReader {
           if (checked.coverage === 'gap') { this.error = checked.error; throw failure(checked.gap) }
         }
         if (this.nodes.some(node => node.reader.io?.revalidation)) return this.view(output)
-        if (this.guardedOutput) { for (const channel of ['historyMaterials', 'historyLifecycle', 'historyBoundaries']) output[channel] = this.guardedOutput[channel]; this.guardedOutput = null }
+        if (this.guardedOutput) {
+          const history = ['historyMaterials', 'historyLifecycle', 'historyBoundaries'], count = history.reduce((sum, channel) => sum + this.guardedOutput[channel].length, 0)
+          if (count <= budget.events) {
+            for (const channel of history) output[channel] = this.guardedOutput[channel]
+            budget.events -= count; this.guardedOutput = null
+          }
+        }
         else {
           await this.ancestry(this.current, budget, output)
           if (this.current.resolved && this.current.parent && !this.current.parent.complete) await this.advance(this.current.parent, budget, output)
@@ -488,7 +499,7 @@ export class ForkHistoryReader {
         budget.phase = new Map()
         for (const value of budget.qualified.values()) await this.historyMetadata(value.recordId, value.metadata)
         for (const cwd of budget.projects) await this.producerProject(cwd)
-        const guards = this.nodes.filter(node => !node.codecPending && (node.reader.handle || node.history && node.reader.fileId))
+        const guards = this.nodes.filter(node => !node.codecPending && (node.reader.handle || node.history && node.reader.header))
         for (const [index, node] of guards.entries()) {
           const guardBudget = budget.bytes - 64 * (guards.length - index - 1)
           if (guardBudget < 64 || budget.decoded < 1) return waitForBudget()
@@ -504,10 +515,28 @@ export class ForkHistoryReader {
         if (this.closed) return this.view({ readBytes: output.readBytes, decodedBytes: output.decodedBytes })
         const reason = error?.[GAP] ? error.code.split(':')[0] : 'history-source-unavailable'
         if (this.historyPhase && !this.currentFailure) {
-          this.historyGap = reason; this.historyError = this.error ?? failureErrorInfo({ code: error?.[GAP] ? reason : error?.code ?? 'metadata-unavailable', stage: 'collection' }); this.error = null
+          this.historyGap = reason; this.historyError = this.error ?? (!error?.[GAP] || HISTORY_FAILURES.has(reason) ? failureErrorInfo({ code: error?.[GAP] ? reason : error?.code ?? 'metadata-unavailable', stage: 'collection' }) : null); this.error = null
           this.historyRetry = ['history-source-unavailable', 'history-enablement-unconfirmed', 'history-project-disabled'].includes(reason)
           this.guardedCheckpoint ??= this.replayCheckpoint(previous); this.guardedOutput = null
-          return this.view({ ...output, historyMaterials: [], historyLifecycle: [], historyBoundaries: [] })
+          if (!this.historyRetry) {
+            for (const node of this.nodes) {
+              if (node.history) { await node.reader.close(); node.pending = [] }
+              await node.resolution?.probe?.close()
+            }
+          }
+          output.historyMaterials = []; output.historyLifecycle = []; output.historyBoundaries = []
+          if (readable(budget) < 64 || budget.decoded < 1) return holdCurrent()
+          try {
+            const checked = await this.readNode(this.current, { ...options, budgetBytes: readable(budget), decodedBudgetBytes: budget.decoded, verifyOnly: true })
+            budget.bytes -= checked.readBytes; output.readBytes += checked.readBytes; budget.decoded -= checked.decodedBytes ?? 0; output.decodedBytes += checked.decodedBytes ?? 0
+            if (checked.coverage === 'gap') { this.gap = checked.gap; this.error = checked.error; return this.view({ readBytes: output.readBytes, decodedBytes: output.decodedBytes }) }
+            if (this.current.reader.io?.revalidation) return holdCurrent()
+          } catch (currentError) {
+            this.gap = currentError?.[GAP] ? currentError.code.split(':')[0] : 'record-source-unavailable'
+            this.error = failureErrorInfo({ code: currentError?.code ?? 'record-source-unavailable', stage: 'collection' })
+            return this.view({ readBytes: output.readBytes, decodedBytes: output.decodedBytes })
+          }
+          return this.view(output)
         }
         this.gap = reason
         if (!error?.[GAP]) this.error = failureErrorInfo({ code: error?.code ?? 'metadata-unavailable', stage: error?.stage ?? 'collection' })
@@ -526,7 +555,7 @@ export class ForkHistoryReader {
     const value = { format: 4, kind: this.source.nativeOriginVersion === 2 ? 'fork-lineage/2' : 'fork-lineage/1', receiptVersion: 2, captureThroughOffset: this.captureThroughOffset, deliveryThrough: clone(this.deliveryThrough), ...(this.historyGap && !this.historyRetry ? { historyGap: this.historyGap } : {}), frames, ...(resolution ? { resolution } : {}) }
     if (!this.guardedCheckpoint && !this.currentGuardedCheckpoint) return value
     const guarded = clone(this.guardedCheckpoint ?? value), current = this.currentGuardedCheckpoint ?? value
-    guarded.frames[0] = clone(current.frames[0])
+    guarded.frames[0] = { ...guarded.frames[0], reader: clone(current.frames[0].reader), proof: clone(current.frames[0].proof) }
     guarded.deliveryThrough.current = current.deliveryThrough.current
     guarded.captureThroughOffset = Math.max(guarded.deliveryThrough.current, guarded.deliveryThrough.history)
     if (this.historyGap && !this.historyRetry) guarded.historyGap = this.historyGap

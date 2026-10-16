@@ -359,9 +359,12 @@ export async function createCore({
   function coverageFor(task, read) {
     const source = sources.get(task.sourceKey);
     let scopedEvents = taskEvents(task, read);
-    if (source?.descriptor.policy === 'chatgpt-main/1' && task.requestId != null) {
-      const request = scopedEvents.findIndex(event => event.kind === 'input' && event.id === task.requestId);
-      if (request >= 0) scopedEvents = scopedEvents.slice(request);
+    if (source?.descriptor.policy === 'chatgpt-main/1') {
+      scopedEvents = scopedEvents.filter(event => !historical(event));
+      if (task.requestId != null) {
+        const request = scopedEvents.findIndex(event => event.kind === 'input' && event.id === task.requestId);
+        if (request >= 0) scopedEvents = scopedEvents.slice(request);
+      }
     }
     const inCurrentScope = gap => task.requestStartedAt == null || (gap.endAt ?? gap.at) >= task.requestStartedAt;
     const gaps = [

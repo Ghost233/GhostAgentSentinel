@@ -846,3 +846,258 @@ test('current-first fork cursor formats reject missing independent delivery wate
     assert.equal(view.currentFacts, undefined)
   })
 })
+
+test('an ancestor transport error cannot release current facts after the current file was replaced', async t => {
+  for (const nativeOriginVersion of [1, 2]) await t.test('native-origin/' + nativeOriginVersion, async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion }), readThread = f.native.readThread
+    let replaced = false
+    t.mock.method(f.native, 'readThread', async function (threadId) {
+      if (!replaced && threadId === id(16)) {
+        replaced = true; await f.replaceCurrent()
+        throw Object.assign(new Error('controlled ancestor transport failure after current replacement'), { code: 'EPIPE' })
+      }
+      return readThread.call(this, threadId)
+    })
+    const view = await f.read(F)
+    assert.equal(replaced, true)
+    assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).length, 0, 'current output still needs its own end fence when the ancestor query fails')
+    assert.equal(view.currentFacts, undefined)
+    assert.equal(view.observation.gap, 'record-file-replaced')
+    assert.equal(view.observation.phase, 'unknown')
+    assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+  })
+})
+
+test('restored current output shares one sixteen-event grant with new inherited output', async t => {
+  const f = await fixture(t, null, { generations: 4, nativeOriginVersion: 2, currentPaddingBytes: 600000 })
+  let view
+  for (let pump = 0; pump < 64; pump++) {
+    view = await f.read(F)
+    assert.ok(f.maxIngest <= 16, 'restoring current output must debit the grant before inherited delivery')
+    if (view.forkProvenance?.complete && view.observation.coverage === 'caught-up') break
+  }
+  assert.equal(view.forkProvenance.complete, true, JSON.stringify(view.observation))
+  const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+  assert.equal(task.currentRequest, 'Check this independent fork request')
+  assert.equal(task.events.filter(event => !event.data.history).length, 3)
+  assert.equal(task.instructionContext.userLimitRefs.length, 5)
+  assert.ok(task.events.every(event => Number.isSafeInteger(event.capturedAt)))
+  assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+})
+
+test('restored inherited output shares one sixteen-event grant with new current output and lost response recovery', async t => {
+  const f = await fixture(t, null, { generations: 4, nativeOriginVersion: 2, historyPaddingBytes: 600000, lostAck: true })
+  const { ForkHistoryReader } = await import('../chatgpt/fork-history.mjs'), readerPump = ForkHistoryReader.prototype.pump, pump = NativeJsonlSource.prototype.pump
+  let appended = false, secondAppend = false, restarted = false, rounds = 0
+  t.mock.method(ForkHistoryReader.prototype, 'pump', async function (options = {}) {
+    rounds++
+    const view = await readerPump.call(this, { ...options, budgetBytes: rounds === 1 ? 1536 : rounds === 2 ? 32768 : rounds === 8 ? 64 : 262144 })
+    return view
+  })
+  t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) {
+    const value = await pump.apply(this, args)
+    if (!appended && this.source.expectedHeader && this.source.path.endsWith('rollout-' + C + '.jsonl') && value.position >= this.source.historyRange.endByteOffset) {
+      appended = true; await f.growOriginal(false); await f.appendCurrentActivity()
+    }
+    return value
+  })
+  const first = new Map()
+  let view
+  for (let attempt = 0; attempt < 48; attempt++) {
+    if (rounds === 7 && !secondAppend) { secondAppend = true; await f.appendCurrentActivity() }
+    view = await f.read(F)
+    assert.ok(f.maxIngest <= 16, 'restoring inherited output must share the remaining grant with new current delivery')
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    for (const event of task?.events ?? []) {
+      assert.ok(Number.isSafeInteger(event.capturedAt))
+      const identity = [event.data.nativeRecordId, event.capturedAt, event.text]
+      if (first.has(event.id)) assert.deepEqual(identity, first.get(event.id))
+      else first.set(event.id, identity)
+    }
+    if (!restarted && view.history?.currentGap === 'observation-unavailable') { restarted = true; f.advance(1000); await f.restart() }
+    if (view.forkProvenance?.complete && view.observation.coverage === 'caught-up') break
+  }
+  assert.equal(appended, true)
+  assert.equal(restarted, true, 'the accepted inherited HTTP response is deliberately lost once')
+  assert.equal(view.forkProvenance.complete, true, JSON.stringify({ observation: view.observation, inheritance: view.inheritance, health: view.health }))
+  const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+  assert.equal(task.events.filter(event => !event.data.history).length, 5)
+  assert.equal(task.events.filter(event => event.text.startsWith('Fresh activity ')).length, 2)
+  assert.equal(task.instructionContext.userLimitRefs.length, 5)
+  assert.equal(task.events.length, first.size)
+  assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+})
+
+test('publishing another main chat cannot restore a fork binding invalidated by its ancestor', async t => {
+  const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, historyPaddingBytes: 600000 })
+  assert.equal((await f.catchUp(F)).forkProvenance.complete, true)
+  const before = (await f.core.snapshot()).tasks.find(task => task.id === F)
+  assert.equal(before.instructionContext.userLimitRefs.length, 2)
+  await f.growOriginal(true)
+  let view
+  for (let attempt = 0; attempt < 16; attempt++) { view = await f.read(F); if (view.inheritance?.gaps.includes('native_origin_prefix_changed')) break }
+  const invalidated = (await f.core.snapshot()).tasks.find(task => task.id === F)
+  assert.deepEqual(invalidated.instructionContext.userLimitRefs, [])
+  assert.ok(invalidated.instructionContext.gaps.includes('fork_context_pending'))
+  await f.appendOwnerRequest()
+  const after = (await f.core.snapshot()).tasks.find(task => task.id === F)
+  assert.deepEqual(after.instructionContext.binding.forkContext, invalidated.instructionContext.binding.forkContext)
+  assert.deepEqual(after.instructionContext.userLimitRefs, [])
+  assert.ok(after.instructionContext.gaps.includes('fork_context_pending'))
+  assert.equal(after.currentRequest, before.currentRequest)
+  assert.deepEqual(after.events.map(event => [event.id, event.capturedAt, event.text]), before.events.map(event => [event.id, event.capturedAt, event.text]))
+})
+
+test('permanent ancestor qualification gaps release decoder leases while current observation continues', { timeout: 30000 }, async t => {
+  const pump = NativeJsonlSource.prototype.pump, broken = []
+  t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) {
+    const value = await pump.apply(this, args)
+    if (value.phase === 'validating' && value.position > 0 && value.position < value.decodedSize) {
+      const owner = broken.find(item => this.source.path.startsWith(item.root + '/'))
+      if (owner) owner.invalidate = true
+    }
+    return value
+  })
+  for (let index = 0; index < 4; index++) {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, compressedOriginal: true, historyPaddingBytes: 1200000 }), item = { f, root: await fs.realpath(f.dir), invalidate: false }
+    broken.push(item)
+    const readThread = f.native.readThread
+    t.mock.method(f.native, 'readThread', async function (threadId) {
+      const metadata = await readThread.call(this, threadId)
+      return threadId === C && item.invalidate ? { ...metadata, thread: { ...metadata.thread, cwd: '/changed-ancestor-generation' } } : metadata
+    })
+    let view
+    for (let attempt = 0; attempt < 16; attempt++) { view = await f.read(F); if (view.inheritance?.gaps.includes('history-source-generation-changed')) break }
+    assert.equal(item.invalidate, true)
+    assert.ok(view.inheritance.gaps.includes('history-source-generation-changed'))
+    assert.equal(view.currentFacts.request.text, 'Check this independent fork request')
+    assert.equal(f.liveReaders, 1, 'a permanent inheritance gap retains only the current reader')
+    await f.appendCurrentActivity()
+    for (let attempt = 0; attempt < 4; attempt++) await f.read(F)
+    assert.equal((await f.core.snapshot()).tasks.find(task => task.id === F).events.filter(event => event.text.startsWith('Fresh activity ')).length, 1)
+  }
+  const fifth = await fixture(t, null, { generations: 1, original: false, nativeOriginVersion: 2, compressedCurrent: true })
+  const view = await fifth.catchUp(F)
+  assert.equal(view.forkProvenance.complete, true, JSON.stringify(view.observation))
+  assert.equal(view.currentFacts.request.text, 'Check this independent fork request')
+  for (const f of [...broken.map(item => item.f), fifth]) await f.close()
+  assert.ok([...broken.map(item => item.f), fifth].every(f => f.liveReaders === 0))
+})
+
+test('inheritance coverage restrictions do not become failure receipts while definite transport and decode failures do', async t => {
+  for (const kind of ['unknown-frame', 'disabled-project', 'unsupported-producer', 'transport', 'corrupt-frame']) await t.test(kind, async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, compressedOriginal: kind.includes('frame'), disabledProducer: kind === 'disabled-project', originalProducer: kind === 'unsupported-producer' ? '0.160.2' : null })
+    if (kind.includes('frame')) {
+      const path = join(f.dir, 'sessions', 'rollout-' + C + '.jsonl.zst'), bytes = await fs.readFile(path)
+      if (kind === 'unknown-frame') bytes[4] |= 1
+      await fs.writeFile(path, kind === 'corrupt-frame' ? bytes.subarray(0, bytes.length - 2) : bytes)
+    }
+    if (kind === 'transport') {
+      const readThread = f.native.readThread
+      t.mock.method(f.native, 'readThread', async function (threadId) {
+        if (threadId === C) throw Object.assign(new Error('controlled settled ancestor transport failure'), { code: 'EPIPE' })
+        return readThread.call(this, threadId)
+      })
+    }
+    let view
+    for (let attempt = 0; attempt < 16; attempt++) { view = await f.read(F); if (view.inheritance?.gaps.some(gap => gap !== 'fork_context_pending')) break }
+    assert.equal(view.currentFacts.request.text, 'Check this independent fork request')
+    assert.equal(view.inheritance.state, 'pending')
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F), scope = { sourceKey: task.sourceKey, mainId: F, lifecycleId: 'F' }
+    const first = await f.core.failureReceipts(scope)
+    const definite = ['transport', 'corrupt-frame'].includes(kind)
+    assert.equal(first.receipts.length, Number(definite), JSON.stringify({ gaps: view.inheritance.gaps, failures: first.receipts }))
+    if (definite) assert.equal(first.receipts[0].error.code, kind === 'transport' ? 'EPIPE' : 'compressed-data-invalid')
+    else assert.notEqual(view.health.state, 'failed')
+    for (let repeat = 0; repeat < 2; repeat++) await f.read(F)
+    assert.deepEqual((await f.core.failureReceipts(scope)).receipts, first.receipts, 'the same fault episode is not recorded or timed again')
+    assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+  })
+})
+
+test('an ancestor error with no remaining guard grant holds current delivery until a later verified pump', async t => {
+  const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, historyPaddingBytes: 600000 }), readThread = f.native.readThread
+  const { ForkHistoryReader } = await import('../chatgpt/fork-history.mjs'), readerPump = ForkHistoryReader.prototype.pump, sourcePump = NativeJsonlSource.prototype.pump
+  let decoded = 0, failed = false
+  t.mock.method(ForkHistoryReader.prototype, 'pump', async function (...args) { decoded = 0; return readerPump.apply(this, args) })
+  t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) { const value = await sourcePump.apply(this, args); decoded += value.decodedBytes; return value })
+  t.mock.method(f.native, 'readThread', async function (threadId) {
+    if (!failed && threadId === id(16) && decoded > 250000) { failed = true; throw Object.assign(new Error('controlled ancestor failure after shared grant was spent'), { code: 'EPIPE' }) }
+    return readThread.call(this, threadId)
+  })
+  const held = await f.read(F)
+  assert.equal(failed, true)
+  assert.equal(held.currentFacts, undefined)
+  assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).length, 0)
+  f.advance(1000)
+  const view = await f.catchUp(F), task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+  assert.equal(view.forkProvenance.complete, true, JSON.stringify(view.observation))
+  assert.equal(task.currentRequest, 'Check this independent fork request')
+  assert.equal(task.events.filter(event => !event.data.history).length, 3)
+  const first = task.events.map(event => [event.id, event.capturedAt, event.text])
+  f.advance(1000); await f.restart(); await f.catchUp(F)
+  assert.deepEqual((await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.id, event.capturedAt, event.text]), first)
+  assert.ok(f.maxIngest <= 16); assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+})
+
+test('completed small current prefix revalidation uses its remaining grant to observe continued appends', async t => {
+  const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, currentPaddingBytes: 4096 }), sourcePump = NativeJsonlSource.prototype.pump
+  let decoded = 0, maximumDecoded = 0
+  t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) {
+    try { const value = await sourcePump.apply(this, args); decoded += value.decodedBytes; return value }
+    catch (error) { decoded += error.decodedBytes ?? 0; throw error }
+  })
+  const observed = new Map(), counts = []
+  for (let sample = 0; sample < 16; sample++) {
+    await f.appendCurrentActivity(); f.advance(10); decoded = 0
+    await f.read(F)
+    maximumDecoded = Math.max(maximumDecoded, decoded); assert.ok(decoded <= 262144)
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    counts.push({ current: task?.events.filter(event => !event.data.history).length ?? 0, inherited: task?.events.filter(event => event.data.history).length ?? 0 })
+    for (const event of task?.events ?? []) {
+      const value = [event.capturedAt, event.text, event.data.nativeRecordId]
+      if (observed.has(event.id)) assert.deepEqual(value, observed.get(event.id))
+      else observed.set(event.id, value)
+    }
+  }
+  assert.ok(counts.at(-1).current > counts[1].current, JSON.stringify(counts))
+  assert.equal(counts.at(-1).current, 19, 'the original three current records and all sixteen new outputs are observed')
+  assert.ok(counts.at(-1).inherited > 0)
+  assert.ok(maximumDecoded <= 262144); assert.ok(f.maximumPumpBytes <= 262144)
+  assert.ok(f.maxIngest <= 16); assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumMetadataCalls <= 144)
+})
+
+test('continuing after small prefix validation preserves source integrity and original capture clocks', async t => {
+  for (const mutation of ['replace', 'truncate', 'same-size-rewrite', 'rewrite-and-append']) await t.test(mutation, async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, currentPaddingBytes: 4096 }), sourcePump = NativeJsonlSource.prototype.pump
+    let decoded = 0
+    t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) {
+      try { const value = await sourcePump.apply(this, args); decoded += value.decodedBytes; return value }
+      catch (error) { decoded += error.decodedBytes ?? 0; throw error }
+    })
+    assert.equal((await f.catchUp(F)).forkProvenance.complete, true)
+    const before = (await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId])
+    const path = join(f.dir, 'sessions', 'fork.jsonl'), bytes = await fs.readFile(path)
+    if (mutation === 'replace') await f.replaceCurrent()
+    else if (mutation === 'truncate') await fs.truncate(path, bytes.length - 1)
+    else {
+      const changed = Buffer.from(bytes.toString().replace('Check this independent fork request', 'Shift this independent fork request'))
+      assert.equal(changed.length, bytes.length); assert.notDeepEqual(changed, bytes)
+      await fs.writeFile(path, changed)
+      if (mutation === 'rewrite-and-append') await f.appendCurrentActivity()
+    }
+    f.advance(10)
+    let view
+    for (let sample = 0; sample < 8; sample++) {
+      decoded = 0; view = await f.read(F); assert.ok(decoded <= 262144)
+      if (view.health?.state === 'failed') break
+    }
+    const expected = mutation === 'replace' ? 'record-file-replaced' : mutation === 'truncate' ? 'record-file-truncated' : mutation === 'same-size-rewrite' ? 'record-rewrite-suspected' : 'native_origin_prefix_changed'
+    assert.equal(view.health.state, 'failed')
+    assert.equal(view.observation.gap, expected)
+    const after = (await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId])
+    assert.deepEqual(after, before)
+    assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maxIngest <= 16)
+    assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumMetadataCalls <= 144)
+  })
+})

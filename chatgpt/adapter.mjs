@@ -30,6 +30,7 @@ function requestIdentity(meta) {
 }
 
 function materialContext(snapshot, sourceKey, batch, inheritance = null) {
+  const previous = snapshot.sources.find(source => source.key === sourceKey)?.hierarchyContext
   const key = task => JSON.stringify([task.id, task.lifecycleId])
   const tasks = new Map(snapshot.tasks.filter(task => task.sourceKey === sourceKey).map(task => [key(task), task]))
   for (const task of batch.tasks) tasks.set(key(task), { ...tasks.get(key(task)), ...task })
@@ -50,11 +51,16 @@ function materialContext(snapshot, sourceKey, batch, inheritance = null) {
     activations.push({ taskId: task.id, lifecycleId: task.lifecycleId, sessionId: task.id, runId: proof ? task.lifecycleId : null, state, stateRefs: proof ? [reference(proof)] : [] })
     if (!start || !['composer', 'edit_user_message'].includes(start.data.turnTrigger)) continue
     for (const input of own.filter(event => event.kind === 'input' && event.data?.nativeType === 'item_completed/UserMessage' && event.data.runId === task.lifecycleId && event.data.inputOrigin === 'user-entry' && event.data.inherited === false && !event.data.history)) {
-      const receipt = input.data.forkHistoryPending === true && (inheritance?.taskId !== task.id || inheritance.complete) ? [...events.values()].find(event => event.taskId === task.id && event.data?.historyOwnerThreadId === task.id && event.data?.forkReceipt?.ownerGeneration === input.data.forkGeneration) : null
-      instructionBindings.push({ taskId: task.id, lifecycleId: task.lifecycleId, inputRef: reference(input), phase: 'consumed', origin: 'user-entry', originRefs: [reference(start), reference(input)], ancestorLimitRefs: [], ...(input.data.forkHistoryPending === true ? { forkContext: { generation: input.data.forkGeneration, ...((receipt || inheritance?.taskId === task.id && inheritance.complete && inheritance.generation === input.data.forkGeneration && inheritance.receiptId) ? { receiptId: receipt?.data.forkReceipt.id ?? inheritance.receiptId } : {}) } } : {}) })
+      let forkContext
+      if (input.data.forkHistoryPending === true) {
+        const retained = inheritance?.taskId !== task.id ? previous?.instructionBindings.find(binding => binding.taskId === task.id && binding.lifecycleId === task.lifecycleId && binding.inputRef.eventId === input.id && binding.forkContext?.generation === input.data.forkGeneration)?.forkContext : null
+        const receipt = inheritance?.taskId === task.id && inheritance.complete ? [...events.values()].find(event => event.taskId === task.id && event.data?.historyOwnerThreadId === task.id && event.data?.forkReceipt?.ownerGeneration === input.data.forkGeneration) : null
+        const receiptId = retained?.receiptId ?? receipt?.data.forkReceipt.id ?? (inheritance?.taskId === task.id && inheritance.complete && inheritance.generation === input.data.forkGeneration ? inheritance.receiptId : null)
+        forkContext = { generation: input.data.forkGeneration, ...(receiptId ? { receiptId } : {}) }
+      }
+      instructionBindings.push({ taskId: task.id, lifecycleId: task.lifecycleId, inputRef: reference(input), phase: 'consumed', origin: 'user-entry', originRefs: [reference(start), reference(input)], ancestorLimitRefs: [], ...(forkContext ? { forkContext } : {}) })
     }
   }
-  const previous = snapshot.sources.find(source => source.key === sourceKey)?.hierarchyContext
   return { schemaVersion: 1, revision: (previous?.revision ?? 0) + 1, sessions: [...sessions].map(sessionId => ({ sessionId })), activations, instructionBindings, relations: [], coverage: { complete: true, branchGaps: [] } }
 }
 
@@ -68,7 +74,8 @@ function materialView(view, task, { historical = false } = {}) {
   const currentFacts = !historical && request ? { request: { text: task.currentRequest, evidenceIds: [request.id] }, activity: { ...task.activity, evidenceIds: (task.activity?.evidenceIds ?? []).filter(id => own.some(event => event.id === id)) } } : null
   const forkBinding = task.instructionContext?.binding?.forkContext
   const inheritance = forkBinding ? { state: forkBinding.receiptId ? 'complete' : 'pending', gaps: [...new Set([...(task.instructionContext.gaps ?? []), ...(!historical ? view.inheritance?.gaps ?? [] : [])])] } : null
-  return { ...view, ...(currentFacts ? { currentFacts } : {}), ...(!historical && inheritance ? { inheritance } : {}), signal: task.conversationMonitoring?.paused ? 'gray' : task.gs?.light ?? 'gray', summary: (task.conversationMonitoring?.paused ? '本聊天分析已暂停，继续只读采集' : task.currentRequest ? task.gs?.reason ?? view.summary : '当前用户请求尚未核实，检查结论不可判断').slice(0, 240),
+  const revalidating = !historical && view.observation?.recordRevalidating === true
+  return { ...view, ...(currentFacts ? { currentFacts } : {}), ...(!historical && inheritance ? { inheritance } : {}), signal: task.conversationMonitoring?.paused || revalidating ? 'gray' : task.gs?.light ?? 'gray', summary: (task.conversationMonitoring?.paused ? '本聊天分析已暂停，继续只读采集' : revalidating ? '当前记录重验中' : task.currentRequest ? task.gs?.reason ?? view.summary : '当前用户请求尚未核实，检查结论不可判断').slice(0, 240),
     ...(task.conversationMonitoring ? { monitoring: task.conversationMonitoring } : {}),
     health: task.monitoringHealth,
     observation: { ...view.observation, gap: view.observation.gap ?? (!task.currentRequest ? 'current-user-request-unverified' : null) },
@@ -318,7 +325,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
       if (epoch !== sourceEpoch || generation !== entry.generation || source?.key !== connection.key) return entry.view
       const task = snapshot.tasks.find(task => task.sourceKey === connection.key && task.id === entry.id && task.lifecycleId === lifecycleId)
       if (!task || !collectMaterials && task.analysis.state !== 'observation-only') { await stop(entry, 'core-capability-unconfirmed'); return entry.view }
-      entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, ...(fork ? { currentCoverage: observed.currentCoverage } : {}), gap: observed.gap, readBytes: observed.readBytes, ...(nativeOriginVersion === 2 ? { decodedBytes: observed.decodedBytes } : {}), observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
+      entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, ...(fork ? { currentCoverage: observed.currentCoverage } : {}), gap: observed.gap, readBytes: observed.readBytes, ...(nativeOriginVersion === 2 ? { decodedBytes: observed.decodedBytes, recordRevalidating: observed.recordRevalidating === true } : {}), observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
       if (collectMaterials) entry.view = materialView(entry.view, task)
       if (fork) {
         entry.view.forkProvenance = observed.forkProvenance

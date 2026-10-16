@@ -55,6 +55,32 @@ test('current facts stay visible while inherited requirements remain pending and
   assert.match(page.element('#diagnostics-title').textContent, /有缺口/)
 })
 
+test('current record revalidation is gray, retains verified facts and recovers without leaking into history', async t => {
+  const page = await harness(t), view = material('main-a', 'green')
+  view.summary = '正常'
+  view.analysis.issues = []
+  view.analysis.checks = ids.map(id => ({ id, status: 'clear', reason: '已核对现有材料' }))
+  view.currentFacts = { request: { text: '只改文案', evidenceIds: ['input-current'] }, activity: { summary: '文案已更新', evidenceIds: ['result-current'], observedAt: 1000 } }
+  view.observation.recordRevalidating = true
+  await page.deliver(view)
+  assert.equal(page.element('#summary').getAttribute('data-signal'), 'gray')
+  assert.match(page.element('#summary').textContent, /当前记录重验中/)
+  assert.match(page.element('#record-status').textContent, /已核实.*新活动尚未核实/)
+  assert.match(page.element('#current-request').textContent, /已核实请求：只改文案/)
+  assert.match(page.element('#current-activity').textContent, /已核实活动：文案已更新/)
+  await page.refresh()
+  await page.deliver({ ...view, observation: { ...view.observation, recordRevalidating: false } })
+  assert.equal(page.element('#summary').getAttribute('data-signal'), 'green')
+  assert.equal(page.element('#record-status').textContent, '')
+  assert.match(page.element('#current-request').textContent, /^当前请求：/)
+  await page.refresh()
+  await page.deliver({ ...view, execution: { historical: true, key: 'older-execution', status: 'idle' } })
+  assert.match(page.element('#summary').textContent, /历史执行/)
+  assert.doesNotMatch(page.element('#summary').textContent, /重验/)
+  assert.equal(page.element('#record-status').textContent, '')
+  assert.equal(page.element('#current-facts').hidden, true)
+})
+
 test('pending inheritance preserves grounded findings and current facts clear when the displayed scope changes', async t => {
   const page = await harness(t), view = material()
   view.currentFacts = { request: { text: '只改文案', evidenceIds: ['input-current'] }, activity: { summary: '工具返回明确失败', evidenceIds: ['result-current'], observedAt: 1000 } }

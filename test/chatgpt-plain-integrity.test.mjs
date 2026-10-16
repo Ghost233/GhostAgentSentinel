@@ -101,6 +101,33 @@ test('a normal append spends bounded prefix-validation work before publishing it
   assert.deepEqual((await f.core.failureReceipts({ sourceKey })).receipts, [])
 })
 
+test('continuous growth keeps long current revalidation gray with verified facts until a stable window', async t => {
+  const f = await fixture(t, { padding: 'p'.repeat(600000) })
+  assert.equal((await f.catchUp()).observation.coverage, 'caught-up')
+  const original = (await f.core.snapshot()).tasks[0].events.map(event => [event.id, event.capturedAt, event.text])
+  const sourceKey = await f.source(), generation = (await f.core.snapshot()).tasks[0].events[0].data.nativeGenerationKey
+  assert.equal((await f.core.nativeOriginFence(sourceKey, generation)).prefix.offset, Buffer.byteLength(f.bytes), 'the whole long prefix was acknowledged before growth')
+  for (let index = 0; index < 4; index++) {
+    await fs.appendFile(f.path, f.tail.replace('"ordinal":4', '"ordinal":' + (4 + index)).replace('"id":"tail"', '"id":"tail-' + index + '"').replace('New verified tail', 'New verified tail ' + index))
+    const view = await f.read()
+    assert.equal(view.observation.recordRevalidating, true)
+    assert.equal(view.signal, 'gray')
+    assert.equal(view.summary, '当前记录重验中')
+    assert.equal(view.currentFacts.request.text, 'Inspect this request')
+    assert.deepEqual((await f.core.snapshot()).tasks[0].events.map(event => [event.id, event.capturedAt, event.text]), original)
+  }
+  assert.deepEqual((await f.core.failureReceipts({ sourceKey })).receipts, [])
+  assert.deepEqual((await f.core.nativeNotificationRecords({ sourceKey })).records, [])
+  const recovered = await f.catchUp()
+  assert.equal(recovered.observation.coverage, 'caught-up')
+  assert.equal(recovered.observation.recordRevalidating, false)
+  assert.notEqual(recovered.summary, '当前记录重验中')
+  const events = (await f.core.snapshot()).tasks[0].events
+  assert.deepEqual(events.slice(0, original.length).map(event => [event.id, event.capturedAt, event.text]), original)
+  assert.equal(events.filter(event => event.text.startsWith('New verified tail ')).length, 4)
+  assert.deepEqual((await f.core.failureReceipts({ sourceKey })).receipts, [])
+})
+
 test('a confirmed bad compressed frame creates one immediate collection notice and recovers without another notice', async t => {
   const f = await fixture(t, { compressed: true, invalidFrame: true }), view = await f.catchUp(), sourceKey = await f.source()
   assert.equal(view.health.state, 'failed')

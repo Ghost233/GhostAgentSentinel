@@ -8,6 +8,7 @@
 <h1>Sentinel · 当前会话</h1>
 <p id="summary" role="status">⚪ 正在核对当前会话</p>
 <p id="execution" class="muted"></p>
+<p id="record-status" class="muted" role="status"></p>
 <section id="current-facts" hidden><p id="current-request" class="muted"></p><p id="current-activity" class="muted"></p></section>
 <p id="inheritance" class="muted" role="status"></p>
 <p id="analysis">当前分析不可判断</p>
@@ -34,7 +35,7 @@ let notificationScope=null,notificationScopeKey=null,notificationVersion=0,notif
 const pending=new Map();
 function reset(collapse=true){
   controlState=null;element('pause').hidden=true;element('pause').disabled=false;
-  for(const name of ['identity','coverage','observation','technical','error','health','execution','current-request','current-activity','inheritance','history-gap','notification-status'])element(name).textContent='';
+  for(const name of ['identity','coverage','observation','technical','error','health','execution','record-status','current-request','current-activity','inheritance','history-gap','notification-status'])element(name).textContent='';
   element('current-facts').hidden=true;
   for(const name of ['issues','check-list','gaps','history-list'])element(name).replaceChildren();
   element('history').hidden=true;element('history-more').hidden=true;
@@ -146,16 +147,18 @@ function render(view){
   reset(identity!==lastIdentity);lastIdentity=identity;scopeThreadId=identity;
   const analysis=view.analysis,byId=new Map(list(analysis.checks).filter(check=>check&&Object.hasOwn(labels,check.id)).map(check=>[check.id,check]));
   const inheritanceGap=view.inheritance&&(view.inheritance.state!=='complete'||list(view.inheritance.gaps).length>0);
+  const recordRevalidating=!view.execution?.historical&&view.observation?.recordRevalidating===true;
   let signal=view.signal,summary=text(view.summary)||'当前状态不可判断';
   const green=!inheritanceGap&&!list(analysis.coverage?.contextGaps).length&&view.health?.state!=='failed'&&analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted','stale'].includes(analysis.state)&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>{const check=byId.get(id);return check&&(check.status==='clear'||check.applicability?.state==='not-triggered');});
   if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?(view.health.orderingGap?'监控恢复状态未确认':'监控故障，当前状态不可判断'):inheritanceGap?'当前执行已接入，继承要求待补齐':states[analysis.state]??'当前分析不可判断';}
   if(signal==='green'&&analysis.resultDisposition==='pending')summary='上轮正常 · 待分析';
+  if(recordRevalidating){signal='gray';summary='当前记录重验中';element('record-status').textContent='已核实资料保留 · 新活动尚未核实';}
   if(view.execution?.historical){signal='gray';summary=view.history?.currentGap?'当前执行尚未确认 · 显示最近检查记录':'历史执行 · 仅表示当时的检查记录';}
   element('summary').textContent=lights[signal]+' '+summary;element('summary').setAttribute('data-signal',signal);
   if(!view.execution?.historical&&text(view.currentFacts?.request?.text,120)){
     element('current-facts').hidden=false;
-    element('current-request').textContent='当前请求：'+text(view.currentFacts.request.text,120);
-    if(text(view.currentFacts.activity?.summary,160))element('current-activity').textContent='最近活动：'+text(view.currentFacts.activity.summary,160);
+    element('current-request').textContent=(recordRevalidating?'已核实请求：':'当前请求：')+text(view.currentFacts.request.text,120);
+    if(text(view.currentFacts.activity?.summary,160))element('current-activity').textContent=(recordRevalidating?'已核实活动：':'最近活动：')+text(view.currentFacts.activity.summary,160);
   }
   if(inheritanceGap)element('inheritance').textContent=view.inheritance.state==='pending'?'继承要求待补齐 · 相关检查不可判断':'继承要求存在缺口 · 相关检查不可判断';
   element('analysis').textContent=(view.execution?.historical?'历史检查 · ':'')+stateLine(analysis);
