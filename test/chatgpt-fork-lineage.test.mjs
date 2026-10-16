@@ -19,7 +19,7 @@ const id = number => '00000000-0000-4000-8000-' + number.toString(16).padStart(1
 const B = id(1), C = id(2), F = id(3), keys = [16, 17, 18, 19].map(id)
 const app = '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT', binary = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
 
-async function fixture(t, mutation = null, { generations = keys.length, sharedOwner = true, original = true, lostAck = false, legacyLineage = false, cwdBytes = 8, historyPaddingBytes = 0, failBootstrap = null, bootstrapError = null, onBootstrap = null, nativeOriginVersion = 1, compressedOriginal = false, compressedGenerations = false, duplicateOriginal = null, originalProducer = null, compressionCapability = true, disabledProducer = false, archivedMains = false, compressedCurrent = false, oldCurrentStart = false, currentPaddingBytes = 0, currentTerminal = null, exactHistoryBytes = 0, currentTool = false, lostCurrentAck = false } = {}) {
+async function fixture(t, mutation = null, { generations = keys.length, sharedOwner = true, original = true, lostAck = false, legacyLineage = false, cwdBytes = 8, historyPaddingBytes = 0, failBootstrap = null, bootstrapError = null, onBootstrap = null, nativeOriginVersion = 1, compressedOriginal = false, compressedGenerations = false, duplicateOriginal = null, originalProducer = null, compressionCapability = true, disabledProducer = false, archivedMains = false, compressedCurrent = false, oldCurrentStart = false, currentPaddingBytes = 0, currentTerminal = null, exactHistoryBytes = 0, exactGenerationBytes = 0, currentTool = false, lostCurrentAck = false } = {}) {
   const records = Array.from({ length: generations }, (_, index) => id(16 + index)), owners = records.map((record, index) => sharedOwner || index === generations - 1 ? B : record), project = '/' + 'p'.repeat(cwdBytes - 1)
   let clock = Date.now(), changed = false, pumpBytes = 0, maximumPumpBytes = 0, maximumReaders = 0, metadataCalls = 0, maximumMetadataCalls = 0, ownerTurn = 'B-' + (generations - 1), growOnForkRead = false, originalGrewAfterRead = false
   let dir, socketPath, unix, ws, server, core, adapter, cleanupPromise
@@ -75,6 +75,14 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
     const run = 'B-' + index, inheritedBytes = Buffer.byteLength(bytes)
     bytes = row(ordinal, 'session_meta', { ...header(owners[index]), ...(original ? { forked_from_id: C } : {}), ...(parentKey ? { history_base: { thread_id: parentKey, end_ordinal_exclusive: ordinal, end_byte_offset: inheritedBytes } } : {}) })
       + row(ordinal + 1, 'event_msg', start(run)) + row(ordinal + 2, 'event_msg', user(owners[index], run, 'Retain native requirement ' + index)) + row(ordinal + 3, 'event_msg', { type: 'task_complete', turn_id: run })
+    if (exactGenerationBytes && index === records.length - 1) {
+      const beginning = bytes.slice(0, bytes.lastIndexOf('\n', bytes.length - 2) + 1)
+      const ending = row(ordinal + 3, 'event_msg', { type: 'task_complete', turn_id: run, ignored_padding: '' })
+      const padding = exactGenerationBytes - Buffer.byteLength(beginning + ending)
+      assert.ok(padding >= 0)
+      bytes = beginning + row(ordinal + 3, 'event_msg', { type: 'task_complete', turn_id: run, ignored_padding: 'x'.repeat(padding) })
+      assert.equal(Buffer.byteLength(bytes), exactGenerationBytes)
+    }
     await fs.writeFile(paths[index], compressedGenerations ? zstdCompressSync(Buffer.from(bytes)) : bytes); ordinal += 4; parentKey = sharedOwner ? records[index] : owners[index]
   }
   const currentRow = (ordinal, type, payload) => row(ordinal, type, payload, clock - (oldCurrentStart ? 30000 : 1000)), ending = currentTerminal ?? (archivedMains ? 'completed' : null)
@@ -1353,4 +1361,169 @@ test('a partial historical prefix recovered from a public cursor can advance bey
   const after = (await f.core.snapshot()).tasks.find(task => task.id === F)
   for (const saved of before) assert.deepEqual(after.events.filter(event => event.id === saved[0]).map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), [saved])
   assert.ok(f.maxIngest <= 16); assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+})
+
+test('a first held historical package with no prior Core fence survives restart past its shorter saved prefix', async t => {
+  for (const { restart, rewrite = false, lostAck = false } of [{ restart: false }, { restart: true }, { restart: true, rewrite: true }, { restart: true, lostAck: true }]) await t.test(lostAck ? 'restart-after-accepted-longer-proof-response-loss' : rewrite ? 'restart-rejects-change-inside-old-witness' : restart ? 'restart-before-first-history-delivery' : 'same-reader-control', async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, exactHistoryBytes: 153600, lostAck })
+    const { ForkHistoryReader } = await import('../chatgpt/fork-history.mjs'), pump = ForkHistoryReader.prototype.pump
+    let held = 0, view
+    t.mock.method(ForkHistoryReader.prototype, 'pump', async function (...args) {
+      const value = await pump.apply(this, args)
+      if (this.guardedOutput) held = this.guardedOutput.historyMaterials.length + this.guardedOutput.historyLifecycle.length + this.guardedOutput.historyBoundaries.length
+      return value
+    })
+    for (let attempt = 0; attempt < 16 && !held; attempt++) view = await f.read(F)
+    assert.ok(held > 0, 'the original production path must hold its first historical package')
+    const cursorDirectory = join(f.dir, 'adapter/cursors'), cursorFiles = await fs.readdir(cursorDirectory)
+    const saved = (await Promise.all(cursorFiles.filter(name => name.endsWith('.json')).map(async name => JSON.parse(await fs.readFile(join(cursorDirectory, name), 'utf8'))))).find(value => value.reader.frames?.[0].source.threadId === F)
+    assert.ok(saved, JSON.stringify({ cursorFiles, observation: view.observation, health: view.health }))
+    const frame = saved.reader.frames.find(frame => frame.source.threadId === C), snapshot = await f.core.snapshot(), sourceKey = snapshot.sources[0].key
+    const fence = await f.core.nativeOriginFence(sourceKey, frame.originProof.key)
+    assert.equal(fence, null, 'this is first delivery, not recovery behind an existing high Core fence')
+    assert.ok(frame.originProof.next.offset > frame.reader.offset && frame.originProof.next.offset < frame.source.historyRange.endByteOffset)
+    const before = snapshot.tasks.find(task => task.id === F).events.map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId])
+    t.diagnostic(JSON.stringify({ restart, held, savedPrefix: frame.originProof.next.offset, materialAck: frame.reader.offset, expectedEnd: frame.source.historyRange.endByteOffset, coreFence: fence }))
+    if (restart) { f.advance(1000); await f.restart() }
+    if (rewrite) {
+      const path = join(f.dir, 'sessions', 'rollout-' + C + '.jsonl'), bytes = await fs.readFile(path), changeAt = Math.floor(frame.originProof.next.offset / 2)
+      assert.equal(bytes[changeAt], 120); bytes[changeAt] = 121
+      await fs.writeFile(path, Buffer.concat([bytes, Buffer.from('\n')]))
+    }
+    const ingest = f.core.ingest
+    let reported = false
+    t.mock.method(f.core, 'ingest', async function (sourceKey, batch) {
+      const proofs = new Map((batch.nativeOrigins ?? []).map(proof => [proof.key, proof]))
+      const uncovered = (batch.events ?? []).filter(event => event.data?.history && event.data.nativeRecordEnd > (proofs.get(event.data.nativeGenerationKey)?.next.offset ?? 0))
+      if (uncovered.length && !reported) { reported = true; t.diagnostic(JSON.stringify({ marker: 'short-restored-witness', uncovered: uncovered.map(event => ({ id: event.id, recordEnd: event.data.nativeRecordEnd, proofEnd: proofs.get(event.data.nativeGenerationKey)?.next.offset ?? null })) })) }
+      return ingest.call(this, sourceKey, batch)
+    })
+    let acceptedBeforeRestart = null
+    if (lostAck) {
+      let failed
+      for (let attempt = 0; attempt < 16; attempt++) { failed = await f.read(F); if (failed.history?.currentGap === 'observation-unavailable') break }
+      assert.equal(failed.history?.currentGap, 'observation-unavailable', 'the accepted production HTTP response must actually be lost')
+      const advanced = await f.core.nativeOriginFence(sourceKey, frame.originProof.key)
+      assert.equal(advanced.prefix.offset, frame.source.historyRange.endByteOffset)
+      const checkpoint = (await Promise.all((await fs.readdir(cursorDirectory)).filter(name => name.endsWith('.json')).map(async name => JSON.parse(await fs.readFile(join(cursorDirectory, name), 'utf8'))))).find(value => value.reader.frames?.[0].source.threadId === F)
+      const historical = checkpoint.reader.frames.find(value => value.source.threadId === C)
+      assert.equal(historical.reader.offset, frame.reader.offset, 'lost-response cursor retains the original low material ACK')
+      assert.deepEqual(historical.originProof.next, advanced.prefix, 'only fully verified E is promoted into the pre-send recovery witness')
+      acceptedBeforeRestart = (await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId])
+      t.diagnostic(JSON.stringify({ marker: 'accepted-longer-proof-response-loss', prior: frame.originProof.next.offset, coreFence: advanced.prefix.offset, persistedWitness: historical.originProof.next.offset, persistedAck: historical.reader.offset }))
+      f.advance(1000); await f.restart()
+    }
+    const ready = await f.catchUp(F)
+    const after = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    if (rewrite) {
+      assert.ok(ready.inheritance?.gaps.includes('native_origin_prefix_changed'), JSON.stringify({ inheritance: ready.inheritance, observation: ready.observation }))
+      assert.deepEqual(after.events.filter(event => event.data.history).map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), [])
+      for (const saved of before) assert.deepEqual(after.events.filter(event => event.id === saved[0]).map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), [saved])
+    } else {
+      assert.equal(ready.forkProvenance?.complete, true, JSON.stringify({ observation: ready.observation, inheritance: ready.inheritance, health: ready.health }))
+      for (const saved of before) assert.deepEqual(after.events.filter(event => event.id === saved[0]).map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), [saved])
+      assert.equal(after.instructionContext.userLimitRefs.length, 2)
+    }
+    if (acceptedBeforeRestart) assert.deepEqual(after.events.map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), acceptedBeforeRestart)
+    assert.ok(f.maxIngest <= 16); assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+  })
+})
+
+test('an exact two-pump historical guard progresses when a small ancestor guard follows it', async t => {
+  for (const largeBeforeSmall of [false, true]) await t.test(largeBeforeSmall ? 'large-parent-before-small-grandparent' : 'large-original-last-control', async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, ...(largeBeforeSmall ? { exactGenerationBytes: 524288 } : { exactHistoryBytes: 524288 }) })
+    const { ForkHistoryReader } = await import('../chatgpt/fork-history.mjs'), readerPump = ForkHistoryReader.prototype.pump, sourcePump = NativeJsonlSource.prototype.pump
+    const largePath = await fs.realpath(join(f.dir, 'sessions', largeBeforeSmall ? 'rollout-' + B + '_' + keys[0] + '.jsonl' : 'rollout-' + C + '.jsonl'))
+    let grew = false, held = 0, decoded = 0, restarts = 0
+    const progress = [], original = new Map()
+    t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) {
+      if (this.source.path === largePath && args[1] === undefined && !args[0].verifyOnly && this.position === 0 && !this.handle) restarts++
+      const value = await sourcePump.apply(this, args); decoded += value.decodedBytes
+      if (!grew && args[1] !== undefined && this.source.expectedHeader && this.source.path === largePath && value.position >= this.source.historyRange.endByteOffset) {
+        grew = true
+        if (largeBeforeSmall) await fs.appendFile(largePath, JSON.stringify({ ordinal: 8, type: 'event_msg', timestamp: new Date(f.clock).toISOString(), payload: { type: 'task_complete', turn_id: 'B-0' } }) + '\n')
+        else await f.growOriginal(false)
+      }
+      return value
+    })
+    t.mock.method(ForkHistoryReader.prototype, 'pump', async function (...args) {
+      decoded = 0
+      const view = await readerPump.apply(this, args), retained = this.guardedOutput
+      assert.ok(decoded <= 262144)
+      if (retained) held = Math.max(held, retained.historyMaterials.length + retained.historyLifecycle.length + retained.historyBoundaries.length)
+      return view
+    })
+    let view
+    for (let attempt = 0; attempt < 32; attempt++) {
+      view = await f.read(F)
+      const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+      for (const event of task?.events ?? []) {
+        const value = [event.capturedAt, event.text, event.data.nativeRecordId]
+        if (original.has(event.id)) assert.deepEqual(value, original.get(event.id))
+        else original.set(event.id, value)
+      }
+      progress.push({ readBytes: view.observation?.readBytes, history: task?.events.filter(event => event.data.history).length ?? 0, complete: view.forkProvenance?.complete ?? false, restarts })
+      if (view.forkProvenance?.complete) break
+    }
+    assert.equal(grew, true); assert.ok(held > 0)
+    assert.equal(view.forkProvenance?.complete, true, JSON.stringify({ largeBeforeSmall, held, restarts, progress, observation: view.observation, inheritance: view.inheritance, health: view.health }))
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    assert.equal(task.instructionContext.userLimitRefs.length, 2)
+    assert.equal(task.events.filter(event => event.data.history).length, 8)
+    const before = task.events.map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId])
+    f.advance(1000); await f.restart(); await f.catchUp(F)
+    assert.deepEqual((await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), before)
+    assert.ok(restarts < 8, 'a fixed source must not restart from zero indefinitely')
+    assert.ok(f.maxIngest <= 16); assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+  })
+})
+
+test('a restored witness remains trusted across checkpoint while its longer delivery proof waits for budget', async t => {
+  for (const rewrite of [false, true]) await t.test(rewrite ? 'reject-old-witness-change-after-second-restart' : 'unchanged-source-after-second-restart', async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, exactHistoryBytes: 153600 })
+    const { ForkHistoryReader } = await import('../chatgpt/fork-history.mjs'), readerPump = ForkHistoryReader.prototype.pump, sourcePump = NativeJsonlSource.prototype.pump
+    let held = false, restored = false, waiting = null, decoded = 0
+    t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) { const value = await sourcePump.apply(this, args); decoded += value.decodedBytes; return value })
+    t.mock.method(ForkHistoryReader.prototype, 'pump', async function (...args) {
+      decoded = 0
+      const value = await readerPump.apply(this, args)
+      assert.ok(decoded <= 262144)
+      held ||= Boolean(this.guardedOutput)
+      if (restored && this.guardedOutput) for (const node of this.nodes) {
+        const target = this.guardedTargets?.get(node), measured = node.verifier?.position
+        if (target && measured > target.prefix.offset && measured < target.delivery.prefix.offset) waiting = { prior: target.prefix, delivery: target.delivery.prefix, measured }
+      }
+      return value
+    })
+    const cursor = async () => {
+      const directory = join(f.dir, 'adapter/cursors')
+      return (await Promise.all((await fs.readdir(directory)).filter(name => name.endsWith('.json')).map(async name => JSON.parse(await fs.readFile(join(directory, name), 'utf8'))))).find(value => value.reader.frames?.[0].source.threadId === F)
+    }
+    for (let pump = 0; pump < 16 && !held; pump++) await f.read(F)
+    assert.equal(held, true)
+    const original = (await cursor()).reader.frames.find(frame => frame.source.threadId === C)
+    assert.ok(original.originProof.next.offset < original.source.historyRange.endByteOffset)
+    f.advance(1000); await f.restart(); restored = true
+    for (let pump = 0; pump < 16 && !waiting; pump++) await f.read(F)
+    assert.ok(waiting, 'the real verifier must first validate T and then wait inside T < position < E using its original grant')
+    const checkpoint = await cursor(), historical = checkpoint.reader.frames.find(frame => frame.source.threadId === C)
+    assert.deepEqual(historical.originProof.next, original.originProof.next, 'unfinished E cannot replace the trusted original witness')
+    assert.equal(historical.reader.offset, original.reader.offset)
+    assert.ok(waiting.delivery.offset > historical.originProof.next.offset)
+    const before = (await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId])
+    f.advance(1000); await f.restart()
+    if (rewrite) {
+      const path = join(f.dir, 'sessions', 'rollout-' + C + '.jsonl'), bytes = await fs.readFile(path), at = Math.floor(original.originProof.next.offset / 2)
+      assert.equal(bytes[at], 120); bytes[at] = 121
+      await fs.writeFile(path, Buffer.concat([bytes, Buffer.from('\n')]))
+    }
+    const ready = await f.catchUp(F), after = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    if (rewrite) {
+      assert.ok(ready.inheritance?.gaps.includes('native_origin_prefix_changed'), JSON.stringify({ inheritance: ready.inheritance, observation: ready.observation }))
+      assert.equal(after.events.filter(event => event.data.history).length, 0)
+    } else assert.equal(ready.forkProvenance?.complete, true, JSON.stringify({ inheritance: ready.inheritance, observation: ready.observation }))
+    for (const saved of before) assert.deepEqual(after.events.filter(event => event.id === saved[0]).map(event => [event.id, event.capturedAt, event.text, event.data.nativeRecordId]), [saved])
+    assert.ok(f.maxIngest <= 16); assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maximumReaders <= 4)
+    t.diagnostic(JSON.stringify({ rewrite, witness: waiting.prior.offset, partialDelivery: waiting.measured, delivery: waiting.delivery.offset, storedWitness: historical.originProof.next.offset, storedAck: historical.reader.offset }))
+  })
 })

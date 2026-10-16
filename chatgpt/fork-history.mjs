@@ -394,16 +394,16 @@ export class ForkHistoryReader {
       forkProvenance: { ...(current.forkProvenance ?? {}), ...(complete && this.current.parent ? { receiptId: this.receipt(this.current).id, generation: this.generation(this.current) } : {}), complete: Boolean(complete && !gap), gap: this.historyGap ?? gap ?? null, ...(this.historyError ? { error: this.historyError } : {}) }, ...(this.error ? { error: this.error } : {}) }
   }
 
-  async guardHeld(node, target, budget, output) {
+  async guardHeld(node, target, budget, output, reserve) {
     if (!node.verifier) {
       const cursor = node.reader.checkpoint(), header = node.reader.header
       await node.reader.close()
       node.reader = new BoundedReader(node.source, cursor, { mode: 'history', origins: this.origins })
       node.verifier = new NativeJsonlSource(node.source, cursor.io, { origins: this.origins, onHeader: () => header })
     }
-    const pump = async verifyOnly => {
+    const pump = async (verifyOnly, limit = target.prefix.offset) => {
       let value
-      try { value = await node.verifier.pump({ physicalBudget: budget.bytes, decodedBudget: budget.decoded, limit: target.prefix.offset, verifyOnly }) }
+      try { value = await node.verifier.pump({ physicalBudget: Math.max(0, budget.bytes - reserve), decodedBudget: Math.max(0, budget.decoded - reserve), limit, verifyOnly }) }
       catch (error) {
         budget.bytes -= error.physicalBytes ?? 0; output.readBytes += error.physicalBytes ?? 0
         budget.decoded -= error.decodedBytes ?? 0; output.decodedBytes += error.decodedBytes ?? 0
@@ -419,7 +419,16 @@ export class ForkHistoryReader {
     await pump(false)
     const range = node.verifier.rangeProof(), proof = node.verifier.proof()
     if (!range || !proof?.complete) return false
-    if (JSON.stringify(range) !== JSON.stringify(target)) throw failure('native_origin_prefix_changed')
+    const original = { key: target.key, headerHash: target.headerHash, prefix: target.prefix }
+    if (JSON.stringify(range) !== JSON.stringify(original)) throw failure('native_origin_prefix_changed')
+    if (target.delivery.prefix.offset > target.prefix.offset) {
+      await pump(false, target.delivery.prefix.offset)
+      const delivery = node.verifier.proof()
+      if (!delivery?.complete || delivery.next.offset < target.delivery.prefix.offset) return false
+      if (JSON.stringify(delivery.next) !== JSON.stringify(target.delivery.prefix)) throw failure('native_origin_prefix_changed')
+      node.replayTarget = clone(delivery)
+    }
+    if (node.verifier.proof().next.offset < target.requiredEnd) return false
     await pump(true)
     if (!node.verifier.proof()?.complete) return false
     node.originProof = node.verifier.proof()
@@ -549,17 +558,19 @@ export class ForkHistoryReader {
           const key = event.data?.nativeGenerationKey ?? event.nativeGenerationKey
           const node = this.nodes.find(value => value.history && nativeStorageKey(value.source.path) === key)
           const origin = node?.replayTarget ?? node?.originProof
-          if (node && !this.guardedTargets.has(node) && origin?.complete) this.guardedTargets.set(node, { key, headerHash: origin.headerHash, prefix: clone(origin.next) })
+          if (node && !this.guardedTargets.has(node) && origin?.complete) this.guardedTargets.set(node, { key, headerHash: origin.headerHash, prefix: clone(origin.next), delivery: { key, headerHash: node.originProof.headerHash, prefix: clone(node.originProof.next) }, requiredEnd: 0 })
+          const target = this.guardedTargets.get(node)
+          if (target) target.requiredEnd = Math.max(target.requiredEnd, event.data?.nativeRecordEnd ?? event.nativeRecordEnd)
         }
         budget.phase = new Map()
         for (const value of budget.qualified.values()) await this.historyMetadata(value.recordId, value.metadata)
         for (const cwd of budget.projects) await this.producerProject(cwd)
         const guards = this.nodes.filter(node => node.history && !node.codecPending && (node.reader.handle || node.reader.header))
         for (const [index, node] of guards.entries()) {
-          const guardBudget = budget.bytes - 64 * (guards.length - index)
+          const reserve = 64 * (guards.length - index), guardBudget = budget.bytes - reserve
           if (guardBudget < 64 || budget.decoded < 1) return await waitForBudget()
           if (this.guardedTargets.has(node)) {
-            if (!await this.guardHeld(node, this.guardedTargets.get(node), budget, output)) return await waitForBudget()
+            if (!await this.guardHeld(node, this.guardedTargets.get(node), budget, output, reserve)) return await waitForBudget()
             continue
           }
           const guarded = await this.readNode(node, { ...options, budgetBytes: guardBudget, decodedBudgetBytes: budget.decoded, verifyOnly: true })
