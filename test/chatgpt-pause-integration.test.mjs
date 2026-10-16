@@ -47,6 +47,7 @@ test('authenticated current-chat controls keep collecting and survive adapter/co
   const revision = paused.monitoring.revision
   await close(); await open()
   const restored = (await call('main-a')).structuredContent
+  assert.equal(restored.observation.coverage, 'caught-up', JSON.stringify(restored.observation))
   assert.equal(restored.monitoring.paused, true)
   assert.equal(restored.monitoring.revision, revision)
   const resumed = (await call('main-a', 'sentinel_set_chat_analysis', { expectedThreadId: 'main-a', paused: false, revision })).structuredContent

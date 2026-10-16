@@ -43,7 +43,10 @@ test('real directory and record IO failures reach durable receipts and the authe
   const missing = await read('main-a')
   assert.equal(missing.health.state, 'failed')
   assert.ok(missing.health.failures.some(failure => failure.error.code === 'ENOENT'))
-  assert.equal((await read('main-b')).health.state, 'failed', 'first attach failure remains explicitly source-scoped until that channel recovers')
+  assert.notEqual((await read('main-b')).health.state, 'failed', 'the verified main identity keeps a first attach failure out of another chat')
+  const unanchored = (await core.failureReceipts({ sourceKey })).receipts.find(receipt => receipt.mainId === 'main-a')
+  assert.equal(unanchored.lifecycleId, null, 'the scope retains its verified main without inventing an execution')
+  assert.equal(unanchored.state, 'active')
   await file('main-a')
   assert.equal((await read('main-a')).health.state, 'recovered')
   bFailed = true

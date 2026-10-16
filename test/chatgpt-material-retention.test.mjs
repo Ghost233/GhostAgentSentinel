@@ -22,7 +22,8 @@ async function fixture(t, entries) {
   let clock = Date.now()
   t.mock.method(Date, 'now', () => clock)
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-material-retention-')), coreDir = join(dir, 'core'), adapterDir = join(dir, 'adapter')
-  const hostBirth = clock - 10000, threads = new Map()
+  let hostBirth = clock - 10000, hostRunId = 'material-host'
+  const threads = new Map()
   for (const entry of entries) {
     const path = join(dir, entry.id + '.jsonl')
     await writeFile(path, row('session_meta', { id: entry.id }, clock) + turn(entry.id, entry.turn, entry.text, clock, entry.outputs ?? 1))
@@ -53,7 +54,7 @@ async function fixture(t, entries) {
   }
   await connect()
   const native = {
-    async sampleHost() { return { available: true, hostRunId: 'material-host', hostStartedAt: hostBirth, profile } },
+    async sampleHost() { return { available: true, hostRunId, hostStartedAt: hostBirth, profile } },
     async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
     async readThread(id) { const entry = threads.get(id); return entry ? { thread: { id, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path: entry.path, cwd: dir }, anchorTurnId: entry.anchorTurnId } : null },
     async close() {},
@@ -62,8 +63,8 @@ async function fixture(t, entries) {
     await adapter?.close()
     adapter = await startChatGPTAdapter({ core, native, sessionsRoot: dir, dataDir: adapterDir, installationId: 'material-retention', token: '7'.repeat(64), now: () => clock, collectMaterials, pollMs: 0 })
   }
-  const read = async id => {
-    const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + '7'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: id } } }) })
+  const read = async (id, selection = {}) => {
+    const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + '7'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: selection, _meta: { thread_id: id } } }) })
     assert.equal(response.status, 200)
     return (await response.json()).result.structuredContent
   }
@@ -74,7 +75,7 @@ async function fixture(t, entries) {
     await connect(); await start()
   }
   t.after(async () => { await adapter?.close(); await core?.close(); await server.close(); proxy.closeAllConnections(); await new Promise(resolve => proxy.close(resolve)); await rm(dir, { recursive: true, force: true }) })
-  return { dir, coreDir, adapterDir, threads, batches, deliveries, start, read, restart, get core() { return core }, now: () => clock, advance: ms => { clock += ms }, loseNextResponse: () => { dropNextEvents = true } }
+  return { dir, coreDir, adapterDir, threads, batches, deliveries, start, read, restart, get core() { return core }, now: () => clock, advance: ms => { clock += ms }, replaceHost: () => { hostRunId += '-next'; hostBirth = clock }, loseNextResponse: () => { dropNextEvents = true } }
 }
 
 test('material batches beyond sixteen records retain every first capture and use a cursor namespace distinct from metadata observation', async t => {
@@ -110,6 +111,93 @@ test('material batches beyond sixteen records retain every first capture and use
   assert.ok(Buffer.byteLength(checkpointText) <= 16384)
 })
 
+test('the authenticated current-chat panel can select a monitored prior execution without crossing chat identity', async t => {
+  const f = await fixture(t, [{ id: 'alpha', turn: 'alpha-one', text: 'Read alpha.log only' }, { id: 'beta', turn: 'beta-one', text: 'Read beta.log only' }])
+  await f.start(); await f.read('alpha'); await f.read('beta')
+  f.advance(1000)
+  await appendFile(f.threads.get('alpha').path, row('event_msg', { type: 'task_complete', turn_id: 'alpha-one' }, f.now()) + turn('alpha', 'alpha-two', 'Read alpha-next.log only', f.now() + 1))
+  f.threads.get('alpha').anchorTurnId = 'alpha-two'
+  const current = await f.read('alpha')
+  assert.deepEqual(current.history.executions.map(item => item.lifecycleId), ['alpha-two', 'alpha-one'])
+  assert.equal(current.execution.lifecycleId, 'alpha-two')
+  assert.equal(current.execution.historical, false)
+  const previous = current.history.executions.find(item => item.lifecycleId === 'alpha-one')
+  const old = await f.read('alpha', { executionKey: previous.key, expectedThreadId: 'alpha' })
+  assert.equal(old.identity.threadId, 'alpha')
+  assert.equal(old.execution.lifecycleId, 'alpha-one')
+  assert.equal(old.execution.historical, true)
+  assert.equal(old.execution.request, 'Read alpha.log only')
+  assert.equal(old.signal, 'gray', 'a historical result is not the current execution green light')
+  assert.equal(old.analysis.checks.length, 6)
+  assert.equal(old.history.selectedKey, previous.key)
+  assert.equal(JSON.stringify(old).includes('Read beta.log'), false)
+  const other = await f.read('beta', { executionKey: previous.key, expectedThreadId: 'beta' })
+  assert.equal(other.observation.gap, 'history-unavailable')
+  assert.equal(JSON.stringify(other).includes('Read alpha.log'), false)
+})
+
+test('monitored history survives core restart without rerunning ended executions and expires with its original evidence', async t => {
+  const f = await fixture(t, [{ id: 'main', turn: 'prior', text: 'Read prior.log only' }]), models = await controlledModels(t)
+  await f.core.configureAnalysis(models.config); await f.start(); await f.read('main'); await settled(f, [['main', 'prior']])
+  f.advance(1000)
+  await appendFile(f.threads.get('main').path, row('event_msg', { type: 'task_complete', turn_id: 'prior' }, f.now()) + turn('main', 'current', 'Read current.log only', f.now() + 1))
+  f.threads.get('main').anchorTurnId = 'current'
+  const view = await f.read('main'); await settled(f, [['main', 'current']])
+  const prior = view.history.executions.find(item => item.lifecycleId === 'prior'), before = models.requests.length
+  for (let attempt = 0; attempt < 3; attempt++) await f.read('main', { executionKey: prior.key, expectedThreadId: 'main' })
+  assert.equal(models.requests.length, before, 'viewing history cannot schedule old inference')
+  await f.restart()
+  const recovered = await f.read('main', { executionKey: prior.key, expectedThreadId: 'main' })
+  assert.equal(recovered.execution.key, prior.key)
+  assert.equal(recovered.execution.request, 'Read prior.log only')
+  assert.equal(recovered.execution.observedAt, prior.observedAt)
+  assert.equal(recovered.execution.historical, true)
+  f.advance(DAY + 1); await f.restart()
+  const expired = await f.read('main', { executionKey: prior.key, expectedThreadId: 'main' })
+  assert.equal(expired.observation.gap, 'history-unavailable')
+  assert.deepEqual(expired.history.executions, [])
+  assert.equal(JSON.stringify(expired).includes('Read prior.log'), false)
+  assert.equal(JSON.stringify(expired).includes('prior-user'), false)
+})
+
+test('history pages remain bounded while every retained execution stays reachable in its own chat', async t => {
+  const f = await fixture(t, [{ id: 'main', turn: 'turn-0', text: 'Read log 0' }]); await f.start(); await f.read('main')
+  for (let index = 1; index < 23; index++) {
+    f.advance(100)
+    await appendFile(f.threads.get('main').path, row('event_msg', { type: 'task_complete', turn_id: 'turn-' + (index - 1) }, f.now()) + turn('main', 'turn-' + index, 'Read log ' + index, f.now() + 1))
+    f.threads.get('main').anchorTurnId = 'turn-' + index
+    await f.read('main')
+  }
+  f.threads.get('main').anchorTurnId = 'turn-22'
+  let first
+  for (let pump = 0; pump < 20; pump++) { first = await f.read('main'); if (first.observation.coverage === 'caught-up') break }
+  assert.equal(first.observation.coverage, 'caught-up')
+  assert.equal(first.history.executions.length, 20)
+  assert.equal(first.history.hasMore, true)
+  assert.equal(typeof first.history.nextCursor, 'string')
+  const second = await f.read('main', { historyCursor: first.history.nextCursor, expectedThreadId: 'main' })
+  assert.equal(second.history.executions.length, 3)
+  assert.equal(second.history.hasMore, false)
+  const all = [...first.history.executions, ...second.history.executions]
+  assert.equal(new Set(all.map(item => item.key)).size, 23)
+  assert.deepEqual(all.map(item => item.lifecycleId), Array.from({ length: 23 }, (_, index) => 'turn-' + (22 - index)))
+})
+
+test('a newly qualified App generation can show retained history while the old turn is not a current execution', async t => {
+  const f = await fixture(t, [{ id: 'main', turn: 'ended-before-reopen', text: 'Read retained.log only' }]); await f.start(); await f.read('main')
+  f.advance(1000); await appendFile(f.threads.get('main').path, row('event_msg', { type: 'task_complete', turn_id: 'ended-before-reopen' }, f.now()))
+  const prior = await f.read('main'), key = prior.execution.key
+  f.advance(1000); f.replaceHost(); await f.start()
+  const recent = await f.read('main')
+  assert.equal(recent.identity.threadId, 'main')
+  assert.equal(recent.execution.key, key)
+  assert.equal(recent.execution.historical, true)
+  assert.equal(recent.execution.request, 'Read retained.log only')
+  assert.equal(recent.signal, 'gray')
+  assert.ok(recent.history.currentGap, 'history does not claim the old turn started in this App generation')
+  assert.ok((await f.core.snapshot()).tasks.every(task => task.status !== 'running'))
+})
+
 test('a lost core HTTP receipt replays native materials with their first capture time and cannot revive them after a day', async t => {
   const f = await fixture(t, [{ id: 'retained', turn: 'retained-turn', text: 'Inspect the current trace only' }])
   await f.start()
@@ -139,7 +227,7 @@ test('a lost core HTTP receipt replays native materials with their first capture
   assert.deepEqual(await f.core.claimNotifications(after.sources[0].key), [])
 })
 
-async function controlledModels(t) {
+async function controlledModels(t, choice = 'clear') {
   const requests = []
   const server = createServer(async (req, res) => {
     let text = ''; for await (const chunk of req) text += chunk
@@ -147,7 +235,7 @@ async function controlledModels(t) {
     requests.push({ path: req.url, body: decoded })
     res.setHeader('content-type', 'application/json')
     if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
-    else res.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(decoded.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) }))
+    else res.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(decoded.questions).map(id => [id, { type: 'choice', choice }])) }))
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) })
@@ -162,6 +250,23 @@ async function settled(f, ids) {
   }
   assert.fail('controlled analysis did not settle')
 }
+
+test('a historical execution retains the grounded problem and its own inline evidence after task alerts stop', async t => {
+  const f = await fixture(t, [{ id: 'main', turn: 'prior-alert', text: 'Read the log only' }]), models = await controlledModels(t, 'attention')
+  await f.core.configureAnalysis(models.config); await f.start(); await f.read('main')
+  const [original] = await settled(f, [['main', 'prior-alert']])
+  assert.ok(original.alerts.some(alert => alert.checkId === 'request_drift' && alert.status === 'attention'))
+  f.advance(1000)
+  await appendFile(f.threads.get('main').path, row('event_msg', { type: 'task_complete', turn_id: 'prior-alert' }, f.now()) + turn('main', 'next', 'Read next log only', f.now() + 1))
+  f.threads.get('main').anchorTurnId = 'next'
+  const current = await f.read('main'), prior = current.history.executions.find(item => item.lifecycleId === 'prior-alert')
+  const old = await f.read('main', { executionKey: prior.key, expectedThreadId: 'main' })
+  const issue = old.analysis.issues.find(issue => issue.checkId === 'request_drift')
+  assert.ok(issue, 'ending a task stops notices without deleting its monitored history finding')
+  assert.ok(issue.evidence.some(evidence => evidence.text === 'Read the log only'))
+  assert.ok(issue.evidence.every(evidence => !evidence.text.includes('next log')))
+  assert.equal(old.signal, 'gray')
+})
 
 test('two main chats keep their source context while completed turns stop analysis and never grant proof to a different current turn', async t => {
   const f = await fixture(t, [{ id: 'alpha', turn: 'alpha-one', text: 'Read alpha.log only' }, { id: 'beta', turn: 'beta-one', text: 'Read beta.log only' }]), models = await controlledModels(t)

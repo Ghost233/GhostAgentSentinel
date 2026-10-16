@@ -3,7 +3,7 @@ import { none, isMany } from 'stream-chain/defs.js'
 import { sanitizeObservation } from '../src/privacy.mjs'
 
 const values = value => value === none ? [] : isMany(value) ? value.values : [value]
-const metadata = new Set(['type', 'timestamp', 'ordinal', 'payload.history_mode', 'payload.forked_from_id', 'payload.forked_from_ordinal_exclusive', 'payload.history_base.thread_id', 'payload.history_base.end_ordinal_exclusive', 'payload.history_base.end_byte_offset', 'payload.type', 'payload.id', 'payload.role', 'payload.turn_id', 'payload.root_turn_id', 'payload.thread_id', 'payload.call_id', 'payload.name', 'payload.item.type', 'payload.item.id', 'payload.item.exit_code', 'payload.turn_attribution.turn_id', 'payload.turn_attribution.turn_trigger', 'payload.internal_chat_message_metadata_passthrough.turn_id'])
+const metadata = new Set(['type', 'timestamp', 'ordinal', 'payload.originator', 'payload.source', 'payload.cli_version', 'payload.cwd', 'payload.history_mode', 'payload.forked_from_id', 'payload.forked_from_ordinal_exclusive', 'payload.history_base.thread_id', 'payload.history_base.end_ordinal_exclusive', 'payload.history_base.end_byte_offset', 'payload.type', 'payload.id', 'payload.role', 'payload.turn_id', 'payload.root_turn_id', 'payload.thread_id', 'payload.call_id', 'payload.name', 'payload.item.type', 'payload.item.id', 'payload.item.exit_code', 'payload.turn_attribution.turn_id', 'payload.turn_attribution.turn_trigger', 'payload.internal_chat_message_metadata_passthrough.turn_id'])
 const bodies = new Set(['payload.message', 'payload.arguments', 'payload.input', 'payload.output', 'payload.item.aggregated_output'])
 const contentType = /^payload\.(?:item\.)?content\.\d+\.type$/
 const contentText = /^payload\.(?:item\.)?content\.\d+\.text$/
@@ -72,7 +72,7 @@ export class MaterialProjection {
       } else if (token.name === 'stringChunk' || token.name === 'numberChunk') {
         const scalar = this.scalar
         if (!scalar?.selected) continue
-        const limit = scalar.path === 'payload.arguments' ? 4096 : metadata.has(scalar.path) || contentType.test(scalar.path) ? 256 : 240
+        const limit = scalar.path === 'payload.cwd' ? 1024 : scalar.path === 'payload.arguments' ? 4096 : metadata.has(scalar.path) || contentType.test(scalar.path) ? 256 : 240
         scalar.length += token.value.length
         const scan = scalar.scan + token.value
         scalar.redacted ||= sanitizeObservation(scan).redacted
@@ -99,7 +99,7 @@ export class MaterialProjection {
     this.tokens(this.parse(none))
     if (this.stack.length) throw new Error('incomplete JSON record')
     const scalar = path => this.fields[path]?.text
-    return { ordinal: scalar('ordinal') === undefined ? undefined : Number(scalar('ordinal')), type: scalar('type'), timestamp: scalar('timestamp'), payload: Object.fromEntries(['type', 'id', 'role', 'turn_id', 'root_turn_id', 'thread_id', 'call_id', 'name', 'history_mode', 'forked_from_id', 'forked_from_ordinal_exclusive'].map(key => [key, scalar('payload.' + key)]).concat([['history_base', scalar('payload.history_base.thread_id') ? { thread_id: scalar('payload.history_base.thread_id'), end_ordinal_exclusive: Number(scalar('payload.history_base.end_ordinal_exclusive')), end_byte_offset: Number(scalar('payload.history_base.end_byte_offset')) } : undefined]])), material: { fields: this.fields, body: this.body, agentBody: this.agentBody, turnId: scalar('payload.internal_chat_message_metadata_passthrough.turn_id'), turnTrigger: scalar('payload.turn_attribution.turn_trigger') } }
+    return { ordinal: scalar('ordinal') === undefined ? undefined : Number(scalar('ordinal')), type: scalar('type'), timestamp: scalar('timestamp'), payload: Object.fromEntries(['type', 'id', 'role', 'turn_id', 'root_turn_id', 'thread_id', 'call_id', 'name', 'originator', 'source', 'cli_version', 'cwd', 'history_mode', 'forked_from_id', 'forked_from_ordinal_exclusive'].map(key => [key, scalar('payload.' + key)]).concat([['history_base', scalar('payload.history_base.thread_id') ? { thread_id: scalar('payload.history_base.thread_id'), end_ordinal_exclusive: Number(scalar('payload.history_base.end_ordinal_exclusive')), end_byte_offset: Number(scalar('payload.history_base.end_byte_offset')) } : undefined]])), material: { fields: this.fields, body: this.body, agentBody: this.agentBody, turnId: scalar('payload.internal_chat_message_metadata_passthrough.turn_id'), turnTrigger: scalar('payload.turn_attribution.turn_trigger') } }
   }
 }
 

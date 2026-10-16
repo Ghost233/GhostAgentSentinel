@@ -1,3 +1,5 @@
+import { createNativeOriginFences } from './native-origin-fences.mjs';
+import { nativeForkIdentity } from '../fork-proof.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -9,8 +11,10 @@ import { createInstructionLookup, instructionContext, eventRef, referenceKey } f
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
 import { analysisTimeConditions } from '../analysis/index.mjs';
 import { inferenceFailureInfo } from '../analysis/failure-info.mjs';
-import { normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope } from '../protocol.mjs';
+import { normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
+import { createNativeNotificationStore } from './native-notifications.mjs';
+import { createNativeCaptureProgress } from './native-capture-progress.mjs';
 
 const DAY = 24 * 60 * 60 * 1000;
 const CLAIM_MS = 60_000;
@@ -41,6 +45,7 @@ export async function createCore({
   }
   const write = db.prepare('INSERT INTO records(collection,key,value) VALUES(?,?,?) ON CONFLICT(collection,key) DO UPDATE SET value=excluded.value');
   const remove = db.prepare('DELETE FROM records WHERE collection=? AND key=?');
+  const beforeNativeWrite = db.prepare('SELECT value FROM records WHERE collection=? AND key=?');
   const failureStore = createFailureReceipts({ db, now });
   const rows = db.prepare('SELECT collection,key,value FROM records').all();
   const sources = new Map();
@@ -58,6 +63,11 @@ export async function createCore({
     else if (row.collection === 'settings' && row.key === 'enrollment') enrollment = { ...value, managed: value.managed ?? (value.configuredAt !== null) };
     else collections[row.collection]?.set(row.key, value);
   }
+  const nativeProgress = createNativeCaptureProgress({ db, seed: (function* () {
+    for (const source of sources.values()) if (source.descriptor.policy === 'chatgpt-main/1') for (const capture of source.hierarchyEvidenceCaptures ?? []) if (capture.nativeHistorical !== undefined) yield { registrationId: source.descriptor.registrationId, nativeRecordId: capture.nativeOriginId, firstCapturedAt: capture.capturedAt, locator: { sourceKey: source.key, taskId: capture.taskId, lifecycleId: capture.lifecycleId, eventId: capture.eventId } };
+  })() });
+  let nativeOrigins;
+  try { nativeOrigins = createNativeOriginFences({ db }); } catch (error) { db.close(); throw error; }
   let closed = false;
   let active = null;
   let pendingCancelledRequests = 0;
@@ -75,8 +85,15 @@ export async function createCore({
   const queued = new Set();
   const pendingPrunedTasks = new Set();
   const pendingPrunedSources = new Set();
-  const save = (collection, value) => write.run(collection, value.key ?? value.id, JSON.stringify(value));
-  const erase = (collection, key) => { remove.run(collection, key); collections[collection].delete(key); };
+  let nativeNotifications;
+  let nativeJournal = null;
+  const rememberNativeRow = (collection, key) => {
+    if (!nativeJournal) return;
+    const id = identity(collection, key);
+    if (!nativeJournal.rows.has(id)) nativeJournal.rows.set(id, { collection, key, value: beforeNativeWrite.get(collection, key)?.value ?? null });
+  };
+  const save = (collection, value) => { rememberNativeRow(collection, value.key ?? value.id); if (collection === 'notifications') nativeNotifications?.touch(value); return write.run(collection, value.key ?? value.id, JSON.stringify(value)); };
+  const erase = (collection, key) => { rememberNativeRow(collection, key); if (collection === 'notifications') nativeNotifications?.removed(notifications.get(key)); remove.run(collection, key); collections[collection].delete(key); };
   const taskEvents = (task, read) => read ? read.eventsByTask.get(task.key) ?? [] : Array.from(events.values()).filter(event => event.taskKey === task.key).sort((a, b) => a.capturedAt - b.capturedAt || a.sequence - b.sequence);
   const projectionRead = () => {
     const bySource = new Map(), eventsByTask = new Map();
@@ -112,6 +129,25 @@ export async function createCore({
     if (!scoped) throw new Error('Unknown ChatGPT conversation scope');
     return conversationFor(scoped);
   };
+  nativeNotifications = createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused: () => paused,
+    chatPaused: (sourceKey, mainId) => conversationSettings.get(identity(sources.get(sourceKey)?.descriptor.registrationId, mainId))?.paused === true,
+    taskNoticeEligible: notification => notificationMembers(notification).some(member => memberAlerts(member).length > 0),
+    accepted: notification => {
+      for (const member of notificationMembers(notification)) {
+        const task = tasks.get(member.taskKey);
+        for (const alert of task?.alerts ?? []) if (member.alertIds.includes(alert.id) && alert.notification?.id === notification.id) {
+          alert.lastSubmittedAt = now();
+          alert.notification = { id: notification.id, status: 'submitted', delivery: 'system-accepted', seen: 'unknown', at: now() };
+        }
+        if (task) save('tasks', task);
+      }
+    } });
+  for (let cursor = 0, page = 0; page < 11; page++) {
+    const retained = failureStore.list({ afterSequence: cursor, limit: 100 });
+    for (const receipt of retained.receipts) nativeNotifications.observeFailure(receipt);
+    if (!retained.hasMore) break;
+    cursor = retained.nextSequence;
+  }
   const contextFor = (task, read) => {
     const owner = sources.get(task.sourceKey), context = owner?.hierarchyContext;
     if (!context) return null;
@@ -119,6 +155,7 @@ export async function createCore({
     const source = read?.bySource.get(task.sourceKey) ?? { tasks: [...tasks.values()].filter(item => item.sourceKey === task.sourceKey), events: [...events.values()].filter(event => tasks.get(event.taskKey)?.sourceKey === task.sourceKey) };
     if (!source.instruction || current < source.instructionAt || current >= source.instruction.validUntil) source.instruction = createInstructionLookup(context, source.tasks, source.events, current, owner.descriptor.policy);
     source.instructionAt = current;
+    source.instruction.forkCaptureBudgetExceeded = owner.forkCaptureBudgetExceeded === true;
     const value = instructionContext(task, context, source.tasks, source.events, current, source.instruction);
     value.gaps = [...new Set([...value.gaps, ...(value.binding?.retentionGaps ?? [])])];
     return value;
@@ -131,8 +168,9 @@ export async function createCore({
     });
   };
   const resultKeyFor = (task, context, read) => {
+    context ??= contextFor(task, read);
     const coverage = coverageFor(task, read), input = { task: { id: task.id, lifecycleId: task.lifecycleId, status: task.status, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt }, source: sources.get(task.sourceKey)?.descriptor, events: publicEvents(task, context, read).filter(event => !historical(event)), coverage };
-    return fingerprint([task.revision, resultScopeFor(task, read), typeof analyzer?.timeConditions === 'function' ? analyzer.timeConditions(input, now()) : analysisTimeConditions(input, now())]);
+    return fingerprint([task.revision, resultScopeFor(task, read), typeof analyzer?.timeConditions === 'function' ? analyzer.timeConditions(input, now()) : analysisTimeConditions(input, now()), context && [context.binding, context.inheritedEvents.map(event => [eventRef(event), event.capturedAt]), context.gaps]]);
   };
   const resultScopeFor = (task, read) => {
     const source = sources.get(task.sourceKey), activation = source?.hierarchyContext?.activations.find(item => item.taskId === task.id && item.lifecycleId === task.lifecycleId);
@@ -192,7 +230,7 @@ export async function createCore({
     for (const key of queued) if (!retained.has(key)) queued.delete(key);
   }
 
-  const saveEnrollment = () => write.run('settings', 'enrollment', JSON.stringify(enrollment));
+  const saveEnrollment = () => { rememberNativeRow('settings', 'enrollment'); return write.run('settings', 'enrollment', JSON.stringify(enrollment)); };
   function enrollEnabledAdapter(descriptor) {
     if (descriptor.enroll !== true || enrollment.managed || enrollment.entries.some(entry => entry.registrationId === descriptor.registrationId)) return;
     const [entry] = normalizeEnrollment([{ registrationId: descriptor.registrationId, name: descriptor.name, ...(descriptor.profile === undefined ? {} : { profile: descriptor.profile }), enabled: true }]);
@@ -311,7 +349,7 @@ export async function createCore({
   // Stored activity is history, not proof that the original host is still running.
   for (const source of sources.values()) resetSource(source, 'Core restarted; source baseline is unknown');
   for (const notification of notifications.values()) {
-    if (['pending', 'claimed'].includes(notification.status)) {
+    if (['pending', 'claimed'].includes(notification.status) && !(notification.kind === 'monitoring-failure' && notification.status === 'pending')) {
       notification.status = 'cancelled';
       notification.error = 'Core restarted; delivery eligibility must be confirmed again';
       save('notifications', notification);
@@ -321,9 +359,12 @@ export async function createCore({
   function coverageFor(task, read) {
     const source = sources.get(task.sourceKey);
     let scopedEvents = taskEvents(task, read);
-    if (source?.descriptor.policy === 'chatgpt-main/1' && task.requestId != null) {
-      const request = scopedEvents.findIndex(event => event.kind === 'input' && event.id === task.requestId);
-      if (request >= 0) scopedEvents = scopedEvents.slice(request);
+    if (source?.descriptor.policy === 'chatgpt-main/1') {
+      scopedEvents = scopedEvents.filter(event => !historical(event));
+      if (task.requestId != null) {
+        const request = scopedEvents.findIndex(event => event.kind === 'input' && event.id === task.requestId);
+        if (request >= 0) scopedEvents = scopedEvents.slice(request);
+      }
     }
     const inCurrentScope = gap => task.requestStartedAt == null || (gap.endAt ?? gap.at) >= task.requestStartedAt;
     const gaps = [
@@ -378,6 +419,7 @@ export async function createCore({
 
   function prune() {
     const current = now();
+    const expiredNativeProgress = nativeProgress.prune(current);
     failureStore.prune(current);
     const cutoff = current - DAY;
     const expiredByTask = new Map();
@@ -468,7 +510,7 @@ export async function createCore({
       }
     }
     for (const notification of notifications.values()) {
-      if (notification.createdAt <= cutoff || !notificationMembers(notification).some(member => tasks.has(member.taskKey)) || notification.evidenceThrough <= cutoff) erase('notifications', notification.id);
+      if (notification.createdAt <= cutoff || notification.kind !== 'monitoring-failure' && !notificationMembers(notification).some(member => tasks.has(member.taskKey)) || notification.evidenceThrough <= cutoff) erase('notifications', notification.id);
     }
     for (const source of sources.values()) {
       const context = source.hierarchyContext;
@@ -517,7 +559,7 @@ export async function createCore({
       }
       if (!connected(source) && source.lastSeenAt <= cutoff && !Array.from(tasks.values()).some(task => task.sourceKey === source.key)) { failureStore.clearSource(source.key, current); erase('sources', source.key); }
     }
-    if (expiredByTask.size > 0) db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    if (expiredByTask.size > 0 || expiredNativeProgress > 0) db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   }
 
   function notificationScope(task) {
@@ -574,11 +616,13 @@ export async function createCore({
     });
   }
 
-  function notificationEligible(notification) {
+  function notificationEligible(notification, current) {
+    if (notification.kind === 'monitoring-failure') return nativeNotifications.scopeEligible(notification, current);
     return notificationMembers(notification).some(member => memberAlerts(member).length > 0);
   }
 
   function refreshNotification(notification) {
+    if (notification.kind === 'monitoring-failure') return;
     notification.members = notificationMembers(notification).flatMap(member => {
       const alerts = memberAlerts(member), task = tasks.get(member.taskKey);
       return alerts.length ? [{ taskKey: task.key, requestId: member.requestId, name: task.title, checkIds: alerts.map(alert => alert.checkId), alertIds: alerts.map(alert => alert.id), reasons: alerts.map(alert => alert.reason) }] : [];
@@ -644,6 +688,7 @@ export async function createCore({
     member.alertIds.push(...due.map(alert => alert.id));
     notification.evidenceThrough = Math.max(notification.evidenceThrough, task.analysis.through);
     refreshNotification(notification);
+    if (!nativeNotifications.prepareTask(notification, task)) return;
     notifications.set(notification.id, notification);
     save('notifications', notification);
   }
@@ -758,11 +803,11 @@ export async function createCore({
       task.analysis.state = 'failed';
       task.analysis.error = { ...failureErrorInfo(settledError), message: 'One or more analysis checks failed' };
     }
-    if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' && (error || !result.coverage?.dependencies?.length)) failureStore.settle({
-      sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId, roundId: round.id,
-      domain: 'analysis', outcome: settledError ? 'failed' : 'succeeded', attempted: true, settled: true,
-      settledAt: completedAt, error: settledError,
-    });
+    if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' && (error || !result.coverage?.dependencies?.length)) {
+      const settled = failureStore.settle({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId, roundId: round.id,
+        domain: 'analysis', outcome: settledError ? 'failed' : 'succeeded', attempted: true, settled: true, settledAt: completedAt, error: settledError });
+      nativeNotifications.observeFailure(settled.receipt);
+    }
     save('tasks', task);
     tick();
   }
@@ -869,12 +914,14 @@ export async function createCore({
     }
     for (const notification of notifications.values()) {
       expireClaim(notification);
-      if (['pending', 'claimed'].includes(notification.status) && !notificationEligible(notification)) {
+      if (['pending', 'claimed'].includes(notification.status) && !notificationEligible(notification, current)) {
         notification.status = 'cancelled';
         notification.error = 'Current alert eligibility is unknown';
         save('notifications', notification);
       }
     }
+    // Native maintenance uses this tick's time; legacy task checks keep their own clock reads.
+    nativeNotifications.reconcile(current);
     for (const task of tasks.values()) if (usable(task) && !observationOnly(task) && !paused && !conversationPaused(task) && !['unknown', 'failed', 'stale', 'interrupted'].includes(task.analysis.state) && !task.analysis.checks.some(check => check.judgmentState === 'failed')) makeNotification(task, task.alerts.filter(alert => alert.status === 'attention'));
     scheduleIdle();
     startNext();
@@ -948,6 +995,7 @@ export async function createCore({
     },
     async registerSource(descriptor) {
       ensureOpen();
+      if (descriptor.policy === 'chatgpt-main/1') nativeOrigins.checkVersion(descriptor.registrationId, descriptor.nativeOriginVersion ?? 1);
       enrollEnabledAdapter(descriptor);
       let source = Array.from(sources.values()).find(value => identity(value.descriptor.registrationId, value.descriptor.hostRunId) === identity(descriptor.registrationId, descriptor.hostRunId));
       if (!source) {
@@ -981,6 +1029,7 @@ export async function createCore({
       tick();
       return source.key;
     },
+    async nativeOriginFence(sourceKey, key) { ensureOpen(); const source = getSource(sourceKey); if (source.descriptor.policy !== 'chatgpt-main/1' || source.descriptor.nativeOriginVersion !== 2 || !/^[a-f0-9]{64}$/.test(key ?? '')) throw Object.assign(new Error('invalid native origin scope'), { code: 'native_origin_invalid' }); return nativeOrigins.read(source.descriptor.registrationId, key); },
     async heartbeat(sourceKey) {
       ensureOpen();
       const source = getSource(sourceKey);
@@ -994,6 +1043,53 @@ export async function createCore({
       ensureOpen();
       const source = getSource(sourceKey);
       if (source.hierarchyCaptureMigrationBlocked) throw Object.assign(new Error(HIERARCHY_CAPTURE_GAP), { code: 'hierarchy_context_invalid' });
+      if (source.descriptor.policy !== 'chatgpt-main/1' && batch.events?.some(event => event.data?.forkHistoryPending === true)) throw Object.assign(new Error('pending fork input requires ChatGPT main policy'), { code: 'hierarchy_context_invalid' });
+      const originPlan = source.descriptor.policy === 'chatgpt-main/1' ? nativeOrigins.project(source.descriptor.registrationId, source.descriptor.nativeOriginVersion ?? 1, batch.nativeOrigins, batch.events) : null;
+      const nativeCaptureTime = source.descriptor.policy === 'chatgpt-main/1' && batch.events?.some(event => event.data?.nativeRecordId) ? now() : null;
+      let nativePlan;
+      if (nativeCaptureTime !== null) {
+        try { nativePlan = nativeProgress.project(source.descriptor.registrationId, batch.events, nativeCaptureTime, locator => locator && events.get(identity(locator.sourceKey, locator.taskId, locator.lifecycleId, locator.eventId))); }
+        catch (error) {
+          if (['native_capture_capacity', 'native_capture_body_unavailable'].includes(error.code)) { rememberGap(source, { reason: error.code, at: nativeCaptureTime }); save('sources', source); }
+          throw error;
+        }
+        batch = { ...batch, events: nativePlan.events };
+      }
+      // Compact native proof identity is independent of its observation lifecycle.
+      // Keep the first body/container and never give replayed history a new clock.
+      const nativeCaptures = new Map((source.hierarchyEvidenceCaptures ?? []).filter(value => value.nativeOriginId).map(value => [value.nativeOriginId, { ...value }]));
+      const persistedNativeIds = new Set(nativeCaptures.keys());
+      const nativeScopes = new Map(), nativeBodies = new Map(), earlierNativeCaptures = new Map();
+      for (const capture of source.hierarchyEvidenceCaptures ?? []) {
+        if (!capture.nativeOriginId) continue;
+        const event = events.get(identity(sourceKey, capture.taskId, capture.lifecycleId, capture.eventId));
+        const first = nativeCaptures.get(capture.nativeOriginId);
+        if (first.capturedAt > capture.capturedAt) nativeCaptures.set(capture.nativeOriginId, { ...capture });
+        nativeScopes.set(identity(capture.nativeOriginId, capture.taskId, capture.nativeHistorical ?? Boolean(event && historical(event))), capture);
+        if (event) nativeBodies.set(referenceKey(capture), event);
+      }
+      if (source.descriptor.policy === 'chatgpt-main/1') batch = { ...batch, events: (batch.events ?? []).filter(event => {
+        const nativeId = nativeForkIdentity(event), first = nativeId && nativeCaptures.get(nativeId);
+        if (event.data?.nativeRecordId && nativeId) {
+          const scope = identity(nativeId, event.taskId, historical(event)), previous = nativeScopes.get(scope);
+          if (first) {
+            const body = nativeBodies.get(referenceKey(first));
+            if (first.capturedAt <= nativeCaptureTime - DAY || persistedNativeIds.has(nativeId) && !body) return false;
+            if (previous && referenceKey(previous) !== referenceKey(eventRef(event))) return false;
+            if (body && (body.text !== event.text || Boolean(body.data?.truncated) !== Boolean(event.data?.truncated) || Boolean(body.data?.redacted) !== Boolean(event.data?.redacted))) throw Object.assign(new Error('Native record body conflicts with its first capture'), { code: 'hierarchy_context_invalid' });
+            const earliest = Math.min(first.capturedAt, event.capturedAt);
+            if (earliest < first.capturedAt) { earlierNativeCaptures.set(nativeId, earliest); nativeCaptures.set(nativeId, { ...first, capturedAt: earliest }); }
+            event.capturedAt = earliest;
+            if (body?.evidence) event.evidence = body.evidence;
+          } else if (event.capturedAt <= nativeCaptureTime) nativeCaptures.set(nativeId, { ...eventRef(event), capturedAt: event.capturedAt });
+          if (!previous) nativeScopes.set(scope, { ...eventRef(event), capturedAt: event.capturedAt });
+          nativeBodies.set(referenceKey(eventRef(event)), event);
+          return true;
+        }
+        if (first && persistedNativeIds.has(nativeId) && !events.has(identity(sourceKey, first.taskId, first.lifecycleId, first.eventId))) return false;
+        if (nativeId && !first && event.capturedAt <= now()) nativeCaptures.set(nativeId, { ...eventRef(event), capturedAt: event.capturedAt });
+        return !first || first.capturedAt > now() - DAY && referenceKey(first) === referenceKey(eventRef(event));
+      }) };
       const incoming = batch.hierarchyContext, previous = source.hierarchyContext;
       let acceptedRuns, acceptedCaptures;
       if (incoming) {
@@ -1026,114 +1122,184 @@ export async function createCore({
         const expiredCaptures = new Set(source.hierarchyEvidenceCaptures.filter(value => value.capturedAt <= now() - DAY).map(referenceKey));
         if ((batch.events ?? []).some(event => expiredCaptures.has(referenceKey(eventRef(event))))) throw Object.assign(new Error('Expired hierarchy evidence cannot acquire a new first capture timestamp'), { code: 'hierarchy_context_invalid' });
       }
-      source.lastSeenAt = now();
-      if (batch.gaps) {
-        for (const reason of batch.gaps) {
-          rememberGap(source, { reason, at: now() });
-        }
+      // Only native ChatGPT batches need the new progress dependency. Persist
+      // its SQL first, but publish neither its memory nor the batch until both
+      // sides release this savepoint. Legacy/DSH ingestion keeps its old path.
+      let transaction = null, applyNativeProgress = null, applyNativeOrigins = null;
+      if (nativePlan || originPlan) {
+        transaction = { rows: new Map(), sequence, activeTaskKey: active?.taskKey ?? null };
+        db.exec('SAVEPOINT native_ingest'); nativeJournal = transaction;
       }
-      if (batch.tasks) source.baselineConfirmed = true;
-      save('sources', source);
-      noteSourceSeen(source);
-      const counts = { accepted: 0, duplicate: 0, expired: 0, paused };
-      for (const descriptor of batch.tasks ?? []) {
-        let task = findTask(sourceKey, descriptor.id, descriptor.lifecycleId);
-        if (!task) { task = newTask(sourceKey, descriptor); tasks.set(task.key, task); }
-        const before = JSON.stringify([task.title, task.status, task.sessionId, task.parentId, task.gaps, task.baselineConfirmed]);
-        task.title = descriptor.title;
-        task.status = descriptor.status;
-        if (task.status !== 'unknown') task.lastKnownStatus = task.status;
-        task.sessionId = descriptor.sessionId ?? task.sessionId;
-        task.parentId = descriptor.parentId ?? task.parentId;
-        for (const reason of descriptor.gaps ?? []) {
-          if (!task.gaps.includes(reason)) rememberGap(task, { reason, at: now() });
+      try {
+        if (originPlan) applyNativeOrigins = originPlan.stage(nativePlan?.hasProgress ?? false);
+        if (nativePlan) applyNativeProgress = nativePlan.stage((batch.events ?? []).map(event => ({ event: events.get(identity(sourceKey, event.taskId, event.taskLifecycleId, event.id)) ?? event, locator: { sourceKey, taskId: event.taskId, lifecycleId: event.taskLifecycleId, eventId: event.id } })));
+        if (source.descriptor.policy === 'chatgpt-main/1') {
+          const captures = new Map((acceptedCaptures ?? source.hierarchyEvidenceCaptures ?? []).map(value => [referenceKey(value), value]));
+          for (const event of batch.events ?? []) {
+            const nativeOriginId = nativeForkIdentity(event);
+            if (!nativeOriginId || event.capturedAt > now()) continue;
+            const reference = eventRef(event), id = referenceKey(reference);
+            if (captures.has(id)) { captures.get(id).nativeOriginId = nativeOriginId; if (event.data?.nativeRecordId) captures.get(id).nativeHistorical = historical(event); continue; }
+            // Reserve existing ledger space for current explicit execution proofs.
+            if (captures.size >= HIERARCHY_CAPTURE_LIMIT - 2000) { source.forkCaptureBudgetExceeded = true; continue; }
+            captures.set(id, { ...reference, capturedAt: event.capturedAt, nativeOriginId, ...(event.data?.nativeRecordId ? { nativeHistorical: historical(event) } : {}) });
+          }
+          acceptedCaptures = [...captures.values()];
+          source.hierarchyEvidenceCaptures = acceptedCaptures;
         }
-        task.gaps = [...new Set([...(task.gaps ?? []), ...(descriptor.gaps ?? [])])].filter(reason => reason !== 'Task baseline is not yet available');
-        task.gapRecords = (task.gapRecords ?? []).filter(gap => gap.reason !== 'Task baseline is not yet available');
-        task.baselineConfirmed = !(observationOnly(task) || source.descriptor.policy === 'chatgpt-main/1') || descriptor.status !== 'unknown';
-        const changed = before !== JSON.stringify([task.title, task.status, task.sessionId, task.parentId, task.gaps, task.baselineConfirmed]);
-        if (changed) {
-          task.updatedAt = now();
-          task.revision++;
-          if (task.status !== 'running') { cancelRound('Source task is no longer running', task); invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended'); }
-          save('tasks', task);
-        }
-      }
-      for (const original of batch.events ?? []) {
-        if (original.capturedAt > now()) {
-          rememberGap(source, { reason: 'Rejected event with a future capture timestamp', at: now() });
-          save('sources', source);
-          counts.expired++;
-          continue;
-        }
-        let task = findTask(sourceKey, original.taskId, original.taskLifecycleId);
-        if (!task) {
-          task = newTask(sourceKey, { id: original.taskId, lifecycleId: original.taskLifecycleId, title: original.taskId, status: 'unknown' });
-          task.gaps = ['Task baseline is not yet available'];
-          task.gapRecords = [{ reason: 'Task baseline is not yet available', at: now() }];
-          tasks.set(task.key, task);
-        }
-        const eventKey = identity(sourceKey, original.taskId, original.taskLifecycleId, original.id);
-        if (events.has(eventKey)) {
-          if (events.get(eventKey).capturedAt <= now() - DAY) counts.expired++;
-          else counts.duplicate++;
-          continue;
-        }
-        if (original.capturedAt <= now() - DAY) { counts.expired++; continue; }
-        const event = { ...copy(original), key: eventKey, taskKey: task.key, sequence: ++sequence };
-        events.set(eventKey, event);
-        save('events', event);
-        counts.accepted++;
-        task.updatedAt = now();
-        if (!historical(event)) task.lastActivity = Math.max(task.lastActivity ?? 0, event.capturedAt);
-        task.revision++;
-        if (!incoming && !source.hierarchyContext && source.descriptor.policy !== 'chatgpt-main/1') admitRequest(task, event);
-        if (event.kind === 'gap') {
-          rememberGap(task, { reason: event.text, at: event.capturedAt });
-        }
-        if (!historical(event) && event.kind === 'status' && ['running', 'idle', 'disposed', 'unknown'].includes(event.data?.status) && (source.descriptor.policy !== 'chatgpt-main/1' || task.baselineConfirmed)) {
-          task.status = event.data.status;
-          if (task.status !== 'unknown') task.lastKnownStatus = task.status;
-          if (task.status !== 'running') { cancelRound('Source task is no longer running', task); invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended'); }
-        }
-        save('tasks', task);
-      }
-      if (incoming) {
-        const materialKey = fingerprint([incoming.sessions, incoming.activations, incoming.relations, incoming.instructionBindings, incoming.waitBindings, incoming.coverage]);
-        if (materialKey !== source.hierarchyMaterialKey) { source.hierarchyMaterialKey = materialKey; source.hierarchyMaterialAt = now(); }
-        source.hierarchyContext = copy(incoming);
-        source.hierarchyRunBindings = acceptedRuns;
-        source.hierarchyEvidenceCaptures = acceptedCaptures;
-        for (const activation of incoming.activations) {
-          const prior = previous?.activations.find(item => item.taskId === activation.taskId && item.lifecycleId === activation.lifecycleId);
-          const task = findTask(sourceKey, activation.taskId, activation.lifecycleId);
-          if (task && prior?.runId && activation.runId && activation.runId !== prior.runId) {
-            delete task.notificationBinding;
-            cancelRound('Native execution activation changed', task, true); invalidateAlerts(task, 'superseded');
-            task.excludedInstructionIds = [...new Set([...(task.excludedInstructionIds ?? []), ...previous.instructionBindings.filter(binding => binding.taskId === task.id && binding.lifecycleId === task.lifecycleId && binding.phase === 'consumed').map(binding => binding.inputRef.eventId)])].slice(-1000);
-            task.currentRequest = ''; task.requestId = null; task.requestStartedAt = null;
-            task.analysis.state = 'unknown'; task.analysis.summary = null; task.analysis.checks = unknownChecks('New native execution has no consumed instruction'); task.revision++; save('tasks', task);
+        // A delayed earlier source capture may shorten, never extend, the shared
+        // native clock. Commit this only after the whole incoming proof validates.
+        for (const [nativeId, capturedAt] of nativePlan?.earlier ?? []) earlierNativeCaptures.set(nativeId, Math.min(earlierNativeCaptures.get(nativeId) ?? Infinity, capturedAt));
+        if (earlierNativeCaptures.size) {
+          for (const capture of acceptedCaptures) if (earlierNativeCaptures.has(capture.nativeOriginId)) capture.capturedAt = Math.min(capture.capturedAt, earlierNativeCaptures.get(capture.nativeOriginId));
+          const changed = new Set();
+          for (const event of events.values()) {
+            const eventSource = sources.get(tasks.get(event.taskKey)?.sourceKey);
+            if (eventSource?.descriptor.policy !== 'chatgpt-main/1' || eventSource.descriptor.registrationId !== source.descriptor.registrationId) continue;
+            const earliest = earlierNativeCaptures.get(nativeForkIdentity(event));
+            if (earliest === undefined || event.capturedAt <= earliest) continue;
+            event.capturedAt = earliest; save('events', event); changed.add(event.taskKey);
+          }
+          for (const other of sources.values()) if (other !== source && other.descriptor.policy === 'chatgpt-main/1' && other.descriptor.registrationId === source.descriptor.registrationId) {
+            let changed = false;
+            for (const capture of other.hierarchyEvidenceCaptures ?? []) if (earlierNativeCaptures.has(capture.nativeOriginId) && capture.capturedAt > earlierNativeCaptures.get(capture.nativeOriginId)) { capture.capturedAt = earlierNativeCaptures.get(capture.nativeOriginId); changed = true; }
+            if (changed) save('sources', other);
+          }
+          for (const key of changed) {
+            const task = tasks.get(key), retained = taskEvents(task).filter(event => !historical(event));
+            task.lastActivity = retained.length ? Math.max(...retained.map(event => event.capturedAt)) : null;
+            task.revision++; save('tasks', task);
           }
         }
-        for (const task of tasks.values()) if (task.sourceKey === sourceKey) bindNotificationRoot(task, incoming);
-        for (const binding of incoming.instructionBindings) if (binding.phase === 'consumed' && binding.origin !== 'runtime-notice' && (source.descriptor.policy !== 'chatgpt-main/1' || binding.origin === 'user-entry')) {
-          const task = findTask(sourceKey, binding.taskId, binding.lifecycleId), event = events.get(identity(sourceKey, binding.inputRef.taskId, binding.inputRef.lifecycleId, binding.inputRef.eventId));
-          if (task && event && !task.excludedInstructionIds?.includes(event.id)) { admitRequest(task, event); save('tasks', task); }
+        source.lastSeenAt = now();
+        if (batch.gaps) {
+          for (const reason of batch.gaps) {
+            rememberGap(source, { reason, at: now() });
+          }
         }
-        for (const task of tasks.values()) if (task.sourceKey === sourceKey) {
-          const context = contextFor(task), fingerprint = JSON.stringify([context.binding, context.inheritedEvents.map(event => [eventRef(event), event.capturedAt]), context.gaps]);
-          if (task.contextFingerprint !== fingerprint) {
-            cancelRound('Instruction context changed during analysis', task, true);
-            invalidateAlerts(task, 'unknown');
-            task.contextFingerprint = fingerprint; task.revision++;
-            task.analysis.state = 'unknown'; task.analysis.summary = null; task.analysis.checks = unknownChecks('Current instruction context has not been analyzed');
+        if (batch.tasks) source.baselineConfirmed = true;
+        save('sources', source);
+        noteSourceSeen(source);
+        const counts = { accepted: 0, duplicate: 0, expired: 0, paused };
+        for (const descriptor of batch.tasks ?? []) {
+          let task = findTask(sourceKey, descriptor.id, descriptor.lifecycleId);
+          if (!task) { task = newTask(sourceKey, descriptor); rememberNativeRow('tasks', task.key); tasks.set(task.key, task); }
+          const before = JSON.stringify([task.title, task.status, task.sessionId, task.parentId, task.gaps, task.baselineConfirmed]);
+          task.title = descriptor.title;
+          task.status = descriptor.status;
+          if (task.status !== 'unknown') task.lastKnownStatus = task.status;
+          task.sessionId = descriptor.sessionId ?? task.sessionId;
+          task.parentId = descriptor.parentId ?? task.parentId;
+          for (const reason of descriptor.gaps ?? []) {
+            if (!task.gaps.includes(reason)) rememberGap(task, { reason, at: now() });
+          }
+          task.gaps = [...new Set([...(task.gaps ?? []), ...(descriptor.gaps ?? [])])].filter(reason => reason !== 'Task baseline is not yet available');
+          task.gapRecords = (task.gapRecords ?? []).filter(gap => gap.reason !== 'Task baseline is not yet available');
+          task.baselineConfirmed = !(observationOnly(task) || source.descriptor.policy === 'chatgpt-main/1') || descriptor.status !== 'unknown';
+          const changed = before !== JSON.stringify([task.title, task.status, task.sessionId, task.parentId, task.gaps, task.baselineConfirmed]);
+          if (changed) {
+            task.updatedAt = now();
+            task.revision++;
+            if (task.status !== 'running') { cancelRound('Source task is no longer running', task); invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended'); }
             save('tasks', task);
           }
         }
-        save('sources', source); counts.hierarchyContext = { schemaVersion: 1, acceptedRevision: incoming.revision };
+        for (const original of batch.events ?? []) {
+          if (original.capturedAt > now()) {
+            rememberGap(source, { reason: 'Rejected event with a future capture timestamp', at: now() });
+            save('sources', source);
+            counts.expired++;
+            continue;
+          }
+          let task = findTask(sourceKey, original.taskId, original.taskLifecycleId);
+          if (!task) {
+            task = newTask(sourceKey, { id: original.taskId, lifecycleId: original.taskLifecycleId, title: original.taskId, status: 'unknown' });
+            rememberNativeRow('tasks', task.key);
+            task.gaps = ['Task baseline is not yet available'];
+            task.gapRecords = [{ reason: 'Task baseline is not yet available', at: now() }];
+            tasks.set(task.key, task);
+          }
+          const eventKey = identity(sourceKey, original.taskId, original.taskLifecycleId, original.id);
+          if (events.has(eventKey)) {
+            if (events.get(eventKey).capturedAt <= now() - DAY) counts.expired++;
+            else counts.duplicate++;
+            continue;
+          }
+          if (original.capturedAt <= now() - DAY) { counts.expired++; continue; }
+          const event = { ...copy(original), key: eventKey, taskKey: task.key, sequence: ++sequence };
+          events.set(eventKey, event);
+          save('events', event);
+          counts.accepted++;
+          task.updatedAt = now();
+          if (!historical(event)) task.lastActivity = Math.max(task.lastActivity ?? 0, event.capturedAt);
+          task.revision++;
+          if (!incoming && !source.hierarchyContext && source.descriptor.policy !== 'chatgpt-main/1') admitRequest(task, event);
+          if (event.kind === 'gap' && !historical(event)) {
+            rememberGap(task, { reason: event.text, at: event.capturedAt });
+          }
+          if (!historical(event) && event.kind === 'status' && ['running', 'idle', 'disposed', 'unknown'].includes(event.data?.status) && (source.descriptor.policy !== 'chatgpt-main/1' || task.baselineConfirmed)) {
+            task.status = event.data.status;
+            if (task.status !== 'unknown') task.lastKnownStatus = task.status;
+            if (task.status !== 'running') { cancelRound('Source task is no longer running', task); invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended'); }
+          }
+          save('tasks', task);
+        }
+        if (incoming) {
+          const materialKey = fingerprint([incoming.sessions, incoming.activations, incoming.relations, incoming.instructionBindings, incoming.waitBindings, incoming.coverage]);
+          if (materialKey !== source.hierarchyMaterialKey) { source.hierarchyMaterialKey = materialKey; source.hierarchyMaterialAt = now(); }
+          source.hierarchyContext = copy(incoming);
+          source.hierarchyRunBindings = acceptedRuns;
+          source.hierarchyEvidenceCaptures = acceptedCaptures;
+          for (const activation of incoming.activations) {
+            const prior = previous?.activations.find(item => item.taskId === activation.taskId && item.lifecycleId === activation.lifecycleId);
+            const task = findTask(sourceKey, activation.taskId, activation.lifecycleId);
+            if (task && prior?.runId && activation.runId && activation.runId !== prior.runId) {
+              delete task.notificationBinding;
+              cancelRound('Native execution activation changed', task, true); invalidateAlerts(task, 'superseded');
+              task.excludedInstructionIds = [...new Set([...(task.excludedInstructionIds ?? []), ...previous.instructionBindings.filter(binding => binding.taskId === task.id && binding.lifecycleId === task.lifecycleId && binding.phase === 'consumed').map(binding => binding.inputRef.eventId)])].slice(-1000);
+              task.currentRequest = ''; task.requestId = null; task.requestStartedAt = null;
+              task.analysis.state = 'unknown'; task.analysis.summary = null; task.analysis.checks = unknownChecks('New native execution has no consumed instruction'); task.revision++; save('tasks', task);
+            }
+          }
+          for (const task of tasks.values()) if (task.sourceKey === sourceKey) bindNotificationRoot(task, incoming);
+          for (const binding of incoming.instructionBindings) if (binding.phase === 'consumed' && binding.origin !== 'runtime-notice' && (source.descriptor.policy !== 'chatgpt-main/1' || binding.origin === 'user-entry')) {
+            const task = findTask(sourceKey, binding.taskId, binding.lifecycleId), event = events.get(identity(sourceKey, binding.inputRef.taskId, binding.inputRef.lifecycleId, binding.inputRef.eventId));
+            if (task && event && !task.excludedInstructionIds?.includes(event.id)) { admitRequest(task, event); save('tasks', task); }
+          }
+          for (const task of tasks.values()) if (task.sourceKey === sourceKey) {
+            const context = contextFor(task), fingerprint = JSON.stringify([context.binding, context.inheritedEvents.map(event => [eventRef(event), event.capturedAt]), context.gaps]);
+            if (task.contextFingerprint !== fingerprint) {
+              cancelRound('Instruction context changed during analysis', task, true);
+              invalidateAlerts(task, 'unknown');
+              task.contextFingerprint = fingerprint; task.revision++;
+              task.analysis.state = 'unknown'; task.analysis.summary = null; task.analysis.checks = unknownChecks('Current instruction context has not been analyzed');
+              save('tasks', task);
+            }
+          }
+          save('sources', source); counts.hierarchyContext = { schemaVersion: 1, acceptedRevision: incoming.revision };
+        }
+        if (transaction) { db.exec('RELEASE native_ingest'); nativeJournal = null; transaction = null; applyNativeProgress?.(); applyNativeOrigins?.(); }
+        if (batch.nativeOrigins) counts.nativeOrigins = batch.nativeOrigins.map(proof => nativeOrigins.read(source.descriptor.registrationId, proof.key));
+        tick();
+        return counts;
+      } catch (error) {
+        if (transaction) {
+          nativeJournal = null;
+          db.exec('ROLLBACK TO native_ingest'); db.exec('RELEASE native_ingest');
+          for (const { collection, key, value } of transaction.rows.values()) {
+            if (collections[collection]) { if (value === null) collections[collection].delete(key); else collections[collection].set(key, JSON.parse(value)); }
+            else if (collection === 'settings' && key === 'enrollment' && value !== null) enrollment = JSON.parse(value);
+          }
+          sequence = transaction.sequence;
+          // Cancellation of an own model call cannot be undone. Restored
+          // content stays intact; its result remains conservatively unknown.
+          if (transaction.activeTaskKey && active?.taskKey !== transaction.activeTaskKey) {
+            const task = tasks.get(transaction.activeTaskKey);
+            if (task) { task.analysis.state = 'interrupted'; task.analysis.summary = null; task.resultKey = null; task.resultScope = null; save('tasks', task); }
+          }
+        }
+        throw error;
       }
-      tick();
-      return counts;
     },
     async unregisterSource(sourceKey, reason = 'Source disconnected') {
       ensureOpen();
@@ -1207,10 +1373,10 @@ export async function createCore({
         nativeRunBindings: [...sources.values()].reduce((count, source) => count + (source.hierarchyRunBindings?.length ?? 0), 0), analysisReuseKeys: [...tasks.values()].reduce((count, task) => count + Number(task.resultKey != null) + Number(task.resultScope != null), 0), taskContextFingerprints: [...tasks.values()].filter(task => task.contextFingerprint != null).length,
         notificationBindings: [...tasks.values()].filter(task => task.notificationBinding).length, notificationBindingEvidenceRefs: [...tasks.values()].reduce((count, task) => count + (task.notificationBinding?.evidenceRefs.length ?? 0), 0), notificationMemberships: [...notifications.values()].reduce((count, notification) => count + notificationMembers(notification).length, 0) };
       return {
-        protocol: 1, pid: process.pid, generatedAt: now(), closed, failureReceipts: failureStore.diagnostics(),
+        protocol: 1, pid: process.pid, generatedAt: now(), closed, failureReceipts: failureStore.diagnostics(), nativeNotifications: nativeNotifications.diagnostics(),
         runtime: { connectedSources: closed ? 0 : Array.from(sources.values()).filter(connected).length, activeAnalyses: active ? 1 : 0, cancelledUnsettledRequests: pendingCancelledRequests, unsettledAnalysisCalls: admission.unsettledCalls, analysisAdmissionLimit: admission.limit, analysisAdmissionBlocked: admission.blocked },
         temporary: { queueKeys: queue.length, queueMemberships: queued.size, timers, pendingNotificationWindows: [...notifications.values()].filter(notification => notification.status === 'pending').length },
-        retained: { retentionMs: DAY, sources: sources.size, tasks: tasks.size, events: events.size, alerts: Array.from(tasks.values()).reduce((count, task) => count + task.alerts.length, 0), notifications: notifications.size, sourceGapRecords: Array.from(sources.values()).reduce((count, source) => count + (source.gapRecords?.length ?? 0), 0), taskGapRecords: Array.from(tasks.values()).reduce((count, task) => count + (task.gapRecords?.length ?? 0), 0), hierarchyEvidenceIdentities: Array.from(sources.values()).reduce((count, source) => count + (source.hierarchyEvidenceCaptures?.length ?? 0), 0), hierarchyEvidenceIdentityLimitPerSource: HIERARCHY_CAPTURE_LIMIT, ...metadata },
+        retained: { retentionMs: DAY, sources: sources.size, tasks: tasks.size, events: events.size, alerts: Array.from(tasks.values()).reduce((count, task) => count + task.alerts.length, 0), notifications: notifications.size, sourceGapRecords: Array.from(sources.values()).reduce((count, source) => count + (source.gapRecords?.length ?? 0), 0), taskGapRecords: Array.from(tasks.values()).reduce((count, task) => count + (task.gapRecords?.length ?? 0), 0), hierarchyEvidenceIdentities: Array.from(sources.values()).reduce((count, source) => count + (source.hierarchyEvidenceCaptures?.length ?? 0), 0), hierarchyEvidenceIdentityLimitPerSource: HIERARCHY_CAPTURE_LIMIT, nativeOriginFences: nativeOrigins.diagnostics(), nativeCaptureProgress: nativeProgress.diagnostics(locator => locator && events.get(identity(locator.sourceKey, locator.taskId, locator.lifecycleId, locator.eventId))), ...metadata },
         configuration: { sourcePlanEntries: enrollment.entries.length, conversationMonitoringScopes: conversationSettings.size, conversationMonitoringLimit: CONVERSATION_MONITORING_LIMIT, pausedConversations: [...conversationSettings.values()].filter(setting => setting.paused).length }, memory: process.memoryUsage(),
       };
     },
@@ -1225,12 +1391,26 @@ export async function createCore({
       if (source?.descriptor.policy !== 'chatgpt-main/1') throw new Error('Failure receipts require a known ChatGPT source');
       return failureStore.list(scope);
     },
+    async setNativeNotificationEligibility(value) {
+      ensureOpen();
+      return nativeNotifications.setEligibility(normalizeNativeNotificationEligibility(value));
+    },
+    async nativeNotificationRecords(value) {
+      ensureOpen();
+      return nativeNotifications.records(normalizeNativeNotificationQuery(value));
+    },
+    async recordNativeNotificationResult(value) {
+      ensureOpen();
+      return nativeNotifications.recordResult(normalizeNativeNotificationResult(value));
+    },
     async recordCollectionOutcome(value) {
       ensureOpen();
       const outcome = normalizeCollectionOutcome(value), source = sources.get(outcome.sourceKey);
       if (source?.descriptor.policy !== 'chatgpt-main/1') throw new Error('Collection outcomes require a known ChatGPT source');
-      if (outcome.mainId !== null && ![...tasks.values()].some(task => task.sourceKey === outcome.sourceKey && task.id === outcome.mainId && (outcome.lifecycleId === null || task.lifecycleId === outcome.lifecycleId))) throw new Error('Collection outcome scope is not a verified task');
-      return failureStore.settle({ ...outcome, domain: 'collection', attempted: true, settled: true });
+      if (outcome.mainId !== null && outcome.lifecycleId !== null && ![...tasks.values()].some(task => task.sourceKey === outcome.sourceKey && task.id === outcome.mainId && task.lifecycleId === outcome.lifecycleId)) throw new Error('Collection outcome scope is not a verified task');
+      const settled = failureStore.settle({ ...outcome, domain: 'collection', attempted: true, settled: true });
+      nativeNotifications.observeFailure(settled.receipt);
+      return settled;
     },
     async setConversationMonitoring(value) {
       ensureOpen();
@@ -1292,14 +1472,17 @@ export async function createCore({
     },
     async claimNotifications(sourceKey) {
       ensureOpen();
-      getSource(sourceKey);
+      const source = sources.get(sourceKey);
+      if (source?.descriptor.policy !== 'chatgpt-main/1' || !nativeNotifications.qualified(sourceKey)) getSource(sourceKey);
       tick();
       const claimed = [];
       for (const notification of notifications.values()) {
         if (notification.sourceKey !== sourceKey || notification.status !== 'pending' || now() < (notification.readyAt ?? notification.createdAt + GROUP_MS) || !notificationEligible(notification)) continue;
+        if (notification.kind === 'monitoring-failure' && !nativeNotifications.qualified(sourceKey)) continue;
         refreshNotification(notification);
         notification.status = 'claimed';
         notification.claimedAt = now();
+        nativeNotifications.claim(notification);
         for (const member of notification.members) {
           const task = tasks.get(member.taskKey);
           for (const alert of task?.alerts ?? []) if (member.alertIds.includes(alert.id)) { alert.lastAttemptAt = now(); alert.notification = { id: notification.id, status: 'claimed', delivery: 'unknown', seen: 'unknown', at: now() }; }
@@ -1319,6 +1502,7 @@ export async function createCore({
       expireClaim(notification);
       const asyncFailure = notification.status === 'submitted' && result.status === 'failed';
       if (notification.status !== 'claimed' && !asyncFailure) return { id, status: notification.status, delivery: notification.delivery, seen: notification.seen };
+      if (notification.kind === 'task-alert' || notification.kind === 'monitoring-failure') throw new Error('Native notifications require a matching native attempt result');
       notification.status = result.status;
       notification.delivery = result.status === 'submitted' ? 'system-accepted' : 'failed';
       notification.error = result.error ?? null;

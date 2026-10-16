@@ -70,3 +70,14 @@ test('a later fork execution reuses retained context refs from its earlier obser
   assert.equal(previous.events.find(item => item.id === 'old-user').capturedAt, at - 10)
   assert.equal(next.events.some(item => item.id === 'old-user'), false)
 })
+
+test('nested inherited user context requires every real header-owner boundary to connect back to the current fork', async t => {
+  for (const broken of [false, true]) await t.test(broken ? 'unrelated-header-owner' : 'connected-native-chain', async t => {
+    const { core, source } = await fixture(t), value = forkContextBatch()
+    Object.assign(value.events[2].data, { historyOwnerThreadId: 'fork', sourceThreadId: 'middle', recordOrdinal: 20 })
+    const nested = event('nested-boundary', 'status', 'Inherited middle history boundary', { nativeType: 'session_meta', sourceForm: 'session_meta/history_base', evidenceKind: 'fork-boundary', forkThreadId: 'fork', historyOwnerThreadId: broken ? 'unrelated' : 'middle', sourceThreadId: 'original', recordOrdinal: 10, endOrdinalExclusive: 10, endByteOffset: 500, history: true, inherited: true })
+    value.events.push(nested); value.hierarchyContext.instructionBindings[0].originRefs.push(ref('nested-boundary'))
+    if (broken) { await assert.rejects(core.ingest(source, value), error => error.code === 'hierarchy_context_invalid'); assert.deepEqual((await core.snapshot()).tasks, []) }
+    else { await core.ingest(source, value); const task = (await core.snapshot()).tasks[0]; assert.deepEqual(task.instructionContext.userLimitRefs, [ref('old-user')]); assert.equal(task.currentRequest, 'Inspect the new request') }
+  })
+})

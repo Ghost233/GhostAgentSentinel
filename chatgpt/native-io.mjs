@@ -187,7 +187,7 @@ export function createNativeIO({ pluginId, socketPath, processSample, profileSam
     async readThread(id) {
       const result = await rpc.request('thread/read', { threadId: id, includeTurns: false })
       const thread = result?.thread
-      if (!thread || thread.id !== id || thread.parentThreadId !== null || typeof thread.source !== 'string' || thread.originator !== 'Codex Desktop' || thread.forkedFromId) return { thread }
+      if (!thread || thread.id !== id || thread.parentThreadId !== null || typeof thread.source !== 'string' || thread.originator !== 'Codex Desktop') return { thread }
       const turns = await rpc.request('thread/turns/list', { threadId: id, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' })
       return { thread, anchorTurnId: turns?.data?.[0]?.id ?? null }
     },

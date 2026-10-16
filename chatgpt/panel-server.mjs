@@ -6,7 +6,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
 import { z } from 'zod'
 
-export async function startPanelServer({ read, control, token, port = 0 }) {
+export async function startPanelServer({ read, control, requestNotifications, notificationRecords, token, port = 0 }) {
   if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) throw new Error('installation authentication is required')
   const html = await readFile(new URL('./panel.html', import.meta.url), 'utf8'), sockets = new Set(), cleanups = new Set()
   let closed = false, activeRequests = 0, transports = 0
@@ -23,11 +23,12 @@ export async function startPanelServer({ read, control, token, port = 0 }) {
     const uri = 'ui://ghost-sentinel/current-chat.html'
     registerAppResource(mcp, 'sentinel-current-chat', uri, {}, async () => ({ contents: [{ uri, mimeType: RESOURCE_MIME_TYPE, text: html }] }))
     registerAppTool(mcp, 'sentinel_current_chat', {
-      title: 'Sentinel 会话检查', description: '只读查看当前本机主会话的观察、检查结果及证据缺口。', inputSchema: {},
+      title: 'Sentinel 会话检查', description: '只读查看当前本机主会话及24小时内已监控执行的检查结果。',
+      inputSchema: { executionKey: z.string().min(1).max(256).optional(), historyCursor: z.string().min(1).max(256).optional(), expectedThreadId: z.string().min(1).max(128).optional() },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       _meta: { ui: { resourceUri: uri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'thread' }] } },
-    }, async (_args, extra) => {
-      const view = await read(extra._meta)
+    }, async (selection, extra) => {
+      const view = await read(extra._meta, selection)
       return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
     })
     if (typeof control === 'function') registerAppTool(mcp, 'sentinel_set_chat_analysis', {
@@ -38,6 +39,22 @@ export async function startPanelServer({ read, control, token, port = 0 }) {
     }, async (change, extra) => {
       const view = await control(extra._meta, change)
       return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
+    })
+    if (typeof requestNotifications === 'function') registerAppTool(mcp, 'sentinel_request_notification_permission', {
+      title: '允许桌面通知', description: '在当前聊天身份核实后请求 GhostSentinel 自己的系统通知许可。',
+      inputSchema: { expectedThreadId: z.string().min(1).max(128) },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+    }, async (change, extra) => {
+      const view = await requestNotifications(extra._meta, change)
+      return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
+    })
+    if (typeof notificationRecords === 'function') registerAppTool(mcp, 'sentinel_notification_records', {
+      title: '本聊天通知记录', description: '只读核对当前聊天及所选执行的系统通知事实。',
+      inputSchema: { expectedThreadId: z.string().min(1).max(128), executionKey: z.string().min(1).max(256).optional(), beforeSequence: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional() },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+    }, async (selection, extra) => {
+      const result = await notificationRecords(extra._meta, selection)
+      return { content: [{ type: 'text', text: '本聊天通知记录' }], structuredContent: result }
     })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
     transports++

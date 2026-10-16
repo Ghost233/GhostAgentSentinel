@@ -1,16 +1,22 @@
-import { isAbsolute, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 
 const LIMIT = 256, PAGE_SIZE = 50, PAGES_PER_REFRESH = 4, TTL = 86400000
 const counters = () => ({ main: 0, fork: 0, child: 0, remote: 0, cloud: 0, unknown: 0 })
 
-export function classifyThread(thread, sessionsRoot) {
+export function nativeStorageRoot(path, sessionsRoot, nativeOriginVersion = 1) {
+  if (typeof path !== 'string' || !isAbsolute(path) || !(path.endsWith('.jsonl') || nativeOriginVersion === 2 && path.endsWith('.jsonl.zst'))) return null
+  const root = resolve(sessionsRoot), archive = basename(root) === 'sessions' ? join(dirname(root), 'archived_sessions') : null
+  return [root, archive].find(candidate => candidate && resolve(path).startsWith(candidate + sep)) ?? null
+}
+
+export function classifyThread(thread, sessionsRoot, nativeOriginVersion = 1) {
   if (!thread || typeof thread.id !== 'string' || !thread.id || thread.id.length > 128) return 'unknown'
   if (thread.parentThreadId || typeof thread.source === 'object' && thread.source?.subAgent) return 'child'
   const locations = [thread.cwd, thread.path, ...(Array.isArray(thread.environments) ? thread.environments.map(item => item?.cwd) : [])].filter(value => typeof value === 'string')
   if (locations.some(value => !isAbsolute(value))) return 'unknown'
   if (thread.parentThreadId !== null || !['cli', 'vscode', 'appServer'].includes(thread.source) || thread.originator !== 'Codex Desktop' || typeof thread.cwd !== 'string' || !isAbsolute(thread.cwd) || typeof thread.path !== 'string' || !isAbsolute(thread.path)) return 'unknown'
-  if (!resolve(thread.path).startsWith(resolve(sessionsRoot) + sep) || !thread.path.endsWith('.jsonl')) return 'unknown'
+  if (!nativeStorageRoot(thread.path, sessionsRoot, nativeOriginVersion)) return 'unknown'
   // Environment IDs are opaque in the locked native schema. A selected
   // environment without independently proved locality is not local evidence.
   if (thread.environments != null && (!Array.isArray(thread.environments) || thread.environments.some(item => item?.environmentId !== 'local'))) return 'unknown'
@@ -18,13 +24,13 @@ export function classifyThread(thread, sessionsRoot) {
   return thread.forkedFromId ? 'fork' : 'main'
 }
 
-export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
+export function createDiscovery({ native, sessionsRoot, nativeOriginVersion = 1, now = Date.now }) {
   const catalog = new Map()
   let cursor = null, archived = false, closed = false, pending = null, directoryComplete = false, updatedAt = null, state = 'pending', gaps = [], pagesRead = 0, error = null
   const coverage = () => {
     const counts = counters()
     for (const item of catalog.values()) counts[item.kind]++
-    return { state, complete: false, directoryComplete, updatedAt, counts, gaps: [...new Set([...gaps, 'all-local-execution-coverage-unverified', ...(counts.fork ? ['fork-coverage-pending'] : []), ...(counts.unknown ? ['unclassified-directory-entries'] : [])])], ...(state === 'unavailable' && error ? { error: { ...error } } : {}) }
+    return { state, complete: false, directoryComplete, updatedAt, counts, gaps: [...new Set([...gaps, 'all-local-execution-coverage-unverified', ...(counts.unknown ? ['unclassified-directory-entries'] : [])])], ...(state === 'unavailable' && error ? { error: { ...error } } : {}) }
   }
   async function refresh() {
     if (closed) return coverage()
@@ -46,11 +52,12 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
           if (!response || !Array.isArray(response.data) || response.data.length > PAGE_SIZE || response.nextCursor != null && (typeof response.nextCursor !== 'string' || !response.nextCursor || response.nextCursor.length > 4096)) throw Object.assign(new Error('invalid directory page'), { code: 'metadata-invalid-response', stage: 'metadata' })
           for (const thread of response.data) {
             if (typeof thread?.id !== 'string' || !thread.id || thread.id.length > 128) { gaps.push('directory-identity-invalid'); continue }
-            const kind = classifyThread(thread, sessionsRoot)
+            const kind = classifyThread(thread, sessionsRoot, nativeOriginVersion)
             if (!catalog.has(thread.id) && catalog.size >= LIMIT) {
               gaps.push('directory-capacity-reached')
-              const diagnostic = kind === 'main' ? [...catalog.values()].find(item => item.kind !== 'main') : null
-              if (kind !== 'main' || diagnostic) gaps.push('directory-diagnostic-entries-omitted')
+              const eligible = ['main', 'fork'].includes(kind)
+              const diagnostic = eligible ? [...catalog.values()].find(item => !['main', 'fork'].includes(item.kind)) : null
+              if (!eligible || diagnostic) gaps.push('directory-diagnostic-entries-omitted')
               if (!diagnostic) continue
               catalog.delete(diagnostic.id)
             }
@@ -74,7 +81,7 @@ export function createDiscovery({ native, sessionsRoot, now = Date.now }) {
   }
   return {
     refresh, snapshot: coverage,
-    candidates: () => [...catalog.values()].filter(item => item.kind === 'main').map(item => item.id),
+    candidates: () => [...catalog.values()].filter(item => ['main', 'fork'].includes(item.kind)).map(item => item.id),
     has: id => catalog.has(id),
     kind: id => catalog.get(id)?.kind ?? null,
     diagnostics: () => ({ directoryEntries: catalog.size, directoryPending: pending ? 1 : 0, directoryPages: pagesRead, directoryCursor: cursor || archived ? 1 : 0 }),

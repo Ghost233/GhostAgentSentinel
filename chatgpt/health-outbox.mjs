@@ -27,7 +27,7 @@ export async function openHealthOutbox({ dataDir, now = Date.now }) {
   function push(value) {
     if (closed) throw new Error('health outbox closed')
     const channel = value.channel ?? 'default'
-    if (!/^(default|directory|main:[a-f0-9]{64})$/.test(channel) || !identifier(value.sourceKey) || !identifier(value.roundId) || !['failed', 'succeeded'].includes(value.outcome) || !Number.isSafeInteger(value.settledAt) || value.settledAt < 0 || value.settledAt > now() || !(value.mainId === null && value.lifecycleId === null || identifier(value.mainId) && identifier(value.lifecycleId))) throw new Error('invalid collection settlement')
+    if (!/^(default|directory|main:[a-f0-9]{64})$/.test(channel) || !identifier(value.sourceKey) || !identifier(value.roundId) || !['failed', 'succeeded'].includes(value.outcome) || !Number.isSafeInteger(value.settledAt) || value.settledAt < 0 || value.settledAt > now() || !(value.mainId === null && value.lifecycleId === null || identifier(value.mainId) && (value.lifecycleId === null || identifier(value.lifecycleId)))) throw new Error('invalid collection settlement')
     prune()
     if (value.settledAt <= now() - DAY) return
     const body = { sourceKey: value.sourceKey, mainId: value.mainId, lifecycleId: value.lifecycleId, channel, roundId: value.roundId, outcome: value.outcome, settledAt: value.settledAt, ...(value.outcome === 'failed' ? { error: failureErrorInfo(value.error) } : {}) }
