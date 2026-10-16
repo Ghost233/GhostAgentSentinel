@@ -254,7 +254,7 @@ async function lifecycleIO(f, live) {
 }
 
 async function realDisconnectScenario(t, mode) {
-  const f = await fixture(t), live = await managed(f); let server, client
+  const f = await fixture(t), live = await managed(f); let server, client, bodyFailed = false
   try {
     server = await startServer({ dataDir: f.config.coreDataDir }); client = await connectCore({ dataDir: f.config.coreDataDir })
     const target = JSON.parse(await readFile(join(f.config.coreDataDir, 'runtime.json'))), registrationId = 'chatgpt:' + f.config.installationId
@@ -295,7 +295,15 @@ async function realDisconnectScenario(t, mode) {
     } }
     const result = await applyHelperChange({ operation: 'upgrade', destinationBundle: f.destinationBundle, candidateBundle: f.candidateBundle, configPath: f.configPath }, io)
     return { result, observed, before, sourceKey, registrationId }
-  } finally { await client?.close(); await server?.close() }
+  } catch (error) { bodyFailed = true; throw error }
+  finally {
+    const errors = []
+    for (const resource of [client, server]) { try { await resource?.close() } catch (error) { errors.push(error) } }
+    if (errors.length) {
+      t.diagnostic('realDisconnectScenario cleanup failed: ' + errors.map(error => String(error?.message ?? error)).join('; '))
+      if (!bodyFailed) throw new AggregateError(errors, 'realDisconnectScenario cleanup failed')
+    }
+  }
 }
 
 for (const mode of ['live-own', 'disabled-own', 'same-reg-peer', 'closed-own']) test(`disconnect guard uses real public Core receipts for ${mode}`, async t => {
