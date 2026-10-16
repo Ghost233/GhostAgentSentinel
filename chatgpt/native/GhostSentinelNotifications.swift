@@ -44,30 +44,7 @@ private func prefixValid(_ value: String) -> Bool { value.range(of: "^ghostsenti
 
 // User actions are safe identity facts only. No title, body, or transport token is stored.
 private let journalDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/GhostSentinel/NotificationFacts", isDirectory: true)
-private let journalURL = journalDirectory.appendingPathComponent("actions.json")
-private let journalLock = NSLock()
-private func journalRead() throws -> (events: [[String: Any]], gap: Bool) {
-    guard FileManager.default.fileExists(atPath: journalURL.path) else { return ([], false) }
-    var info = stat()
-    guard lstat(journalURL.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == getuid(), info.st_mode & 0o077 == 0 else { throw NSError(domain: identity, code: 1) }
-    let handle = try FileHandle(forReadingFrom: journalURL); defer { try? handle.close() }
-    let bytes = try handle.read(upToCount: 1048577) ?? Data()
-    guard bytes.count <= 1048576, let value = try JSONSerialization.jsonObject(with: bytes) as? [String: Any], let events = value["events"] as? [[String: Any]], events.count <= 256 else { throw NSError(domain: identity, code: 2) }
-    let cutoff = clock() - 86_400_000
-    return (events.filter { ($0["observedAt"] as? NSNumber)?.int64Value ?? 0 > cutoff }, value["historyGap"] as? Bool ?? false)
-}
-private func appendAction(_ value: [String: Any]) throws {
-    journalLock.lock(); defer { journalLock.unlock() }
-    var stored = try journalRead(); stored.events.append(value)
-    if stored.events.count > 256 { stored.events = Array(stored.events.suffix(256)); stored.gap = true }
-    try FileManager.default.createDirectory(at: journalDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-    let bytes = try JSONSerialization.data(withJSONObject: ["schemaVersion": 1, "events": stored.events, "historyGap": stored.gap])
-    guard bytes.count <= 1048576 else { throw NSError(domain: identity, code: 3) }
-    let temporary = journalDirectory.appendingPathComponent(UUID().uuidString + ".tmp")
-    try bytes.write(to: temporary, options: .withoutOverwriting)
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-    if rename(temporary.path, journalURL.path) != 0 { try? FileManager.default.removeItem(at: temporary); throw NSError(domain: identity, code: 4) }
-}
+private let actionJournal = NotificationActionJournal(url: journalDirectory.appendingPathComponent("actions.json"), clock: clock)
 
 private final class Delegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completion: @escaping (UNNotificationPresentationOptions) -> Void) { completion([.banner, .list, .sound]) }
@@ -80,7 +57,7 @@ private final class Delegate: NSObject, NSApplicationDelegate, UNUserNotificatio
         if response.actionIdentifier == UNNotificationDefaultActionIdentifier { action = "default" }
         else if response.actionIdentifier == UNNotificationDismissActionIdentifier { action = "dismiss" }
         else { return }
-        try? appendAction(["observationId": UUID().uuidString, "requestId": request.identifier, "action": action, "observedAt": clock(), "metadata": facts])
+        try? actionJournal.append(["observationId": UUID().uuidString, "requestId": request.identifier, "action": action, "observedAt": clock(), "metadata": facts])
     }
 }
 
@@ -96,7 +73,7 @@ private func snapshot(_ prefix: String, completion: @escaping ([String: Any]) ->
         center.getDeliveredNotifications { notifications in
             let pending = requests.filter { owned($0.identifier, prefix) }
             let delivered = notifications.filter { owned($0.request.identifier, prefix) }
-            journalLock.lock(); let journal = try? journalRead(); journalLock.unlock()
+            let journal = try? actionJournal.read()
             let actions = journal?.events.filter { owned($0["requestId"] as? String ?? "", prefix) } ?? []
             let deliveredFacts: [[String: Any]] = delivered.prefix(32).compactMap { item in
                 guard let facts = metadata(item.request.content.userInfo) else { return nil }
@@ -112,7 +89,9 @@ private func execute(_ request: [String: Any]) {
     let fields: [String: Set<String>] = ["status": [], "authorize": [], "snapshot": [], "submit": ["requestId", "title", "body", "metadata"], "cancel": ["requestIds"]]
     guard let allowed = fields[operation], Set(request.keys).isSubset(of: allowed.union(["schemaVersion", "operation", "ownerPrefix"])) else { reply(operation, error: "native_protocol"); return }
     switch operation {
-    case "status": settings { reply(operation, result: $0) }
+    case "status":
+        do { _ = try actionJournal.read() } catch { reply(operation, error: "native_unavailable"); return }
+        settings { reply(operation, result: $0) }
     case "authorize": center.requestAuthorization(options: [.alert, .sound]) { _, error in if error != nil { reply(operation, error: "native_unavailable") } else { settings { reply(operation, result: $0) } } }
     case "snapshot": snapshot(prefix) { reply(operation, result: $0) }
     case "cancel":
@@ -123,10 +102,11 @@ private func execute(_ request: [String: Any]) {
         guard let id = identifier(request["requestId"], maximum: 200), owned(id, prefix), let title = request["title"] as? String, !title.isEmpty, title.count <= 200, let body = request["body"] as? String, body.count <= 1200, let facts = metadata(request["metadata"]) else { reply(operation, error: "native_protocol"); return }
         settings { permission in
             guard ["authorized", "provisional"].contains(permission["authorization"] as? String ?? "") else { reply(operation, result: ["requestId": id, "accepted": false, "authorization": permission["authorization"] ?? "unknown", "observedAt": clock()]); return }
-            snapshot(prefix) { observed in
-                let pending = observed["pending"] as? [[String: Any]] ?? [], delivered = observed["delivered"] as? [[String: Any]] ?? []
-                if (pending + delivered).contains(where: { $0["requestId"] as? String == id }) { reply(operation, result: ["requestId": id, "accepted": true, "alreadyPresent": true, "authorization": permission["authorization"] ?? "unknown", "observedAt": clock()]); return }
-                guard observed["pendingHasMore"] as? Bool != true && observed["deliveredHasMore"] as? Bool != true else { reply(operation, error: "native_protocol"); return }
+            center.getPendingNotificationRequests { pending in
+              center.getDeliveredNotifications { delivered in
+                do {
+                    if try NotificationInventory.alreadyPresent(id, prefix: prefix, pending: pending.map { $0.identifier }, delivered: delivered.map { $0.request.identifier }) { reply(operation, result: ["requestId": id, "accepted": true, "alreadyPresent": true, "authorization": permission["authorization"] ?? "unknown", "observedAt": clock()]); return }
+                } catch { reply(operation, error: "native_protocol"); return }
                 let category = UNNotificationCategory(identifier: "GhostSentinelObservation", actions: [], intentIdentifiers: [], options: [.customDismissAction])
                 center.setNotificationCategories([category])
                 let content = UNMutableNotificationContent(); content.title = title; content.body = body; content.userInfo = facts; content.categoryIdentifier = category.identifier
@@ -134,6 +114,7 @@ private func execute(_ request: [String: Any]) {
                     if error != nil { reply(operation, error: "native_submission") }
                     else { reply(operation, result: ["requestId": id, "accepted": true, "authorization": permission["authorization"] ?? "unknown", "observedAt": clock()]) }
                 }
+              }
             }
         }
     default: reply(operation, error: "native_protocol")

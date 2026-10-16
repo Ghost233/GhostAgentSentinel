@@ -111,24 +111,31 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
 
   async function collectionOutcome(entry, outcome, error, roundId, channel = entry ? 'main:' + fingerprint(entry.id) : 'directory') {
     if (!healthOutbox || !source || closed) return
-    const scope = entry?.lifecycleVerified && entry.hostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: entry.lifecycleId } : { mainId: null, lifecycleId: null }
+    const scope = entry?.lifecycleVerified && entry.hostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: entry.lifecycleId } : entry?.qualifiedHostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: null } : { mainId: null, lifecycleId: null }
     const value = { sourceKey: source.key, ...scope, channel, roundId, outcome, settledAt: now(), ...(error ? { error: failureErrorInfo({ code: error.code ?? 'collection_failed', codeHash: error.codeHash, stage: error.stage ?? 'collection', status: error.status, details: error.details }) } : {}) }
     try {
       healthOutbox.push(value)
-      if (entry && outcome === 'succeeded' && scope.mainId !== null) healthOutbox.push({ ...value, mainId: null, lifecycleId: null })
+      if (entry && outcome === 'succeeded' && scope.mainId !== null) {
+        if (scope.lifecycleId !== null) healthOutbox.push({ ...value, lifecycleId: null })
+        healthOutbox.push({ ...value, mainId: null, lifecycleId: null })
+      }
       if (healthOutbox.diagnostics().pending < 256) outboxError = null
     } catch (failure) { outboxError = { state: 'failed', failures: [{ domain: 'collection', error: failureErrorInfo(failure) }] } }
     if (typeof core.recordCollectionOutcome === 'function') await healthOutbox.flush(value => core.recordCollectionOutcome(value))
   }
-  async function updateHealth(entry = null) {
+  async function updateHealth(entry = null, snapshot = null) {
     if (!healthOutbox || !source || closed) return
     const owner = source, epoch = sourceEpoch, key = owner.key
-    const snapshot = await core.snapshot().catch(() => null)
+    snapshot ??= await core.snapshot().catch(() => null)
     if (closed || epoch !== sourceEpoch || source !== owner) return
     sourceHealth = combineHealth(snapshot?.sources.find(value => value.key === key)?.monitoringHealth, healthOutbox.health({ sourceKey: key, mainId: null, lifecycleId: null }), outboxError)
     if (entry) {
       const task = snapshot?.tasks.find(task => task.sourceKey === key && task.id === entry.id && task.lifecycleId === entry.lifecycleId)
-      entry.health = combineHealth(task?.monitoringHealth, entry.lifecycleId ? healthOutbox.health({ sourceKey: key, mainId: entry.id, lifecycleId: entry.lifecycleId }) : null)
+      const receipts = entry.qualifiedHostRunId === owner.hostRunId ? await core.failureReceipts({ sourceKey: key, mainId: entry.id, lifecycleId: null }) : null
+      if (closed || epoch !== sourceEpoch || source !== owner) return
+      const failures = receipts?.receipts.filter(value => value.state === 'active') ?? []
+      const unanchored = receipts ? { state: failures.length ? 'failed' : receipts.hasMore ? 'unknown' : receipts.receipts.length ? 'recovered' : 'unknown', failures, orderingGap: receipts.orderingGap || receipts.hasMore } : null
+      entry.health = combineHealth(task?.monitoringHealth, unanchored, healthOutbox.health({ sourceKey: key, mainId: entry.id, lifecycleId: entry.lifecycleId ?? null }))
       entry.view.health = combineHealth(entry.health, sourceHealth)
     }
   }
@@ -203,9 +210,11 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
 
   async function prepare(entry, context, epoch) {
     const roundId = randomUUID()
+    entry.qualifiedHostRunId = null
     try {
       const before = await qualify(entry.id, entry.reader?.source, context)
       if (before.gap) { await fail(entry, before.gap, before.scope); return null }
+      entry.qualifiedHostRunId = before.source.hostRunId
       entry.fork = before.source.forkedFromId
       if (entry.blocked) {
         if (entry.blocked.scope === fingerprint(before.source)) { entry.view = gapView(entry.blocked.reason); return null }
@@ -293,11 +302,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
       entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, gap: observed.gap, readBytes: observed.readBytes, observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
       if (collectMaterials) entry.view = materialView(entry.view, task)
       if (fork) entry.view.forkProvenance = observed.forkProvenance
-      if (healthOutbox) {
-        sourceHealth = combineHealth(snapshot.sources.find(value => value.key === connection.key)?.monitoringHealth, healthOutbox.health({ sourceKey: connection.key, mainId: null, lifecycleId: null }), outboxError)
-        entry.health = combineHealth(task.monitoringHealth, healthOutbox.health({ sourceKey: connection.key, mainId: entry.id, lifecycleId }))
-        entry.view.health = combineHealth(entry.health, sourceHealth)
-      }
+      await updateHealth(entry, snapshot)
       return entry.view
     } catch (error) { await collectionOutcome(entry, 'failed', error, prepared.roundId); await stop(entry, 'observation-unavailable').catch(() => {}); await updateHealth(entry); return entry.view }
   }
@@ -411,9 +416,10 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
     const cursorIndex = selection.historyCursor ? records.findIndex(value => value.task.key === selection.historyCursor) : -1
     const page = records.slice(cursorIndex + 1, cursorIndex + 21), hasMore = records.length > cursorIndex + 21
     const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null, hasMore, cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0), currentGap: retainedOnly ? entry.view.observation?.gap ?? 'current-turn-not-observed' : null, retentionMs: 86400000 }
-    if (!selected) return { ...gapView(selection.executionKey ? 'history-unavailable' : 'current-turn-not-observed', entry.id), history }
+    if (!selected) return { ...gapView(selection.executionKey ? 'history-unavailable' : 'current-turn-not-observed', entry.id), health: entry.health, history }
     const historical = retainedOnly || selected !== current || ['ended', 'aborted'].includes(selected.item.status)
     const view = materialView({ ...entry.view, identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical })
+    if (selected === current) view.health = combineHealth(view.health, entry.health)
     if (historical) {
       view.signal = 'gray'; view.summary = retainedOnly ? '当前执行尚未确认 · 显示最近检查记录' : '历史执行 · 仅表示当时的检查记录'
       view.observation = { phase: selected.item.status === 'ended' ? 'completed' : selected.item.status === 'aborted' ? 'aborted' : 'unknown', status: selected.task.status, coverage: 'retained-history', gap: history.currentGap ?? (selected.task.currentRequest ? null : 'historical-user-request-unverified'), observedAt: selected.item.observedAt }
@@ -481,7 +487,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
       for (let page = 0; page < 11; page++) {
         const result = await core.nativeNotificationRecords({ sourceKey, afterSequence: cursor, limit: 100 })
         historyGap ||= result.historyGap
-        for (const record of result.records) if (record.mainId === null || record.mainId === id && record.lifecycleId === lifecycleId) values.set(record.id, record)
+        for (const record of result.records) if (record.mainId === null || record.mainId === id && (record.lifecycleId === lifecycleId || record.kind === 'monitoring-failure' && record.lifecycleId === null)) values.set(record.id, record)
         if (!result.hasMore) { complete = true; break }
         cursor = result.nextSequence
       }

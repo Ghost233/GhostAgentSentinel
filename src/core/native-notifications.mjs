@@ -43,10 +43,11 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     if (!owner || owner.descriptor.policy !== 'chatgpt-main/1' || owner.descriptor.hostRunId !== value.hostRunId || monitoringPaused() || value.evidenceThrough <= (current ?? now()) - DAY) return false;
     if (value.mainId !== null && chatPaused(value.sourceKey, value.mainId)) return false;
     if (value.kind === 'task-alert') return taskNoticeEligible(value);
+    if (value.mainId !== null && value.lifecycleId === null && [...tasks.values()].some(task => task.sourceKey === value.sourceKey && task.id === value.mainId && task.status === 'running')) return false;
     if (value.lifecycleId !== null) {
       const matches = [...tasks.values()].filter(task => task.sourceKey === value.sourceKey && task.id === value.mainId);
       const target = matches.find(task => task.lifecycleId === value.lifecycleId);
-      if (!target || target.status !== 'running' || matches.some(task => task.lifecycleId !== value.lifecycleId && task.status === 'running')) return false;
+      if (!target || target.status !== 'running' && !(value.collectionUnavailable === true && target.status === 'unknown') || matches.some(task => task.lifecycleId !== value.lifecycleId && task.status === 'running')) return false;
     }
     return true;
   }
@@ -84,6 +85,9 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     if (!value && !capacity()) return;
     value = value ? copy(value) : { id: randomUUID(), kind: 'monitoring-failure', sourceKey: receipt.sourceKey, hostRunId: owner.descriptor.hostRunId, mainId: receipt.mainId, lifecycleId: receipt.lifecycleId, groupKey, members: [], receiptIds: [], firstRoundIds: [], evidenceThrough: receipt.firstFailedAt, createdAt: current, readyAt: current, status: 'pending', delivery: 'unknown', seen: 'unknown', humanSeen: 'unknown', claimedAt: null };
     value.receiptIds.push(receipt.id); value.firstRoundIds.push(receipt.firstRoundId);
+    // A main-reader failure revokes task observation before its health notice is
+    // claimed. That unknown status is not loss of App/project qualification.
+    if (receipt.domain === 'collection' && receipt.mainId !== null && receipt.channel?.startsWith('main:')) value.collectionUnavailable = true;
     value.title = 'GhostSentinel · 监控状态提醒';
     value.body = `来源：${value.sourceKey}\n主聊天：${value.mainId ?? '身份未确认'}\n执行：${value.lifecycleId ?? '身份未确认'}\n已记录 ${value.receiptIds.length} 项监控故障（${receipt.domain} / ${receipt.error.category} / ${receipt.error.code}）；请在会话检查核对故障回执，当前是否恢复另行显示。`.slice(0, 1200);
     const link = { id: receipt.id, sequence: receipt.sequence, firstFailedAt: receipt.firstFailedAt, notificationId: value.id };

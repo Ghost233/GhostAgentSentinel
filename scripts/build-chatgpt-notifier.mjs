@@ -17,10 +17,11 @@ export async function buildNotificationApp({ outputDir = resolve('.scratch/nativ
   await writeFile(join(contents, 'Info.plist'), plist, { mode: 0o600 })
   const sdk = (await execute('/usr/bin/xcrun', ['--show-sdk-path'], { timeout: 10000, maxBuffer: 65536 })).stdout.trim()
   const source = fileURLToPath(new URL('../chatgpt/native/GhostSentinelNotifications.swift', import.meta.url))
-  await execute('/usr/bin/xcrun', ['swiftc', '-swift-version', '5', '-O', '-parse-as-library', '-sdk', sdk, '-module-cache-path', cache, '-framework', 'AppKit', '-framework', 'UserNotifications', source, '-o', executable], { timeout: 120000, maxBuffer: 1048576, env: { ...process.env, CLANG_MODULE_CACHE_PATH: cache, SWIFT_MODULE_CACHE_PATH: cache } })
+  const factsSource = fileURLToPath(new URL('../chatgpt/native/NotificationFacts.swift', import.meta.url))
+  await execute('/usr/bin/xcrun', ['swiftc', '-swift-version', '5', '-O', '-parse-as-library', '-sdk', sdk, '-module-cache-path', cache, '-framework', 'AppKit', '-framework', 'UserNotifications', source, factsSource, '-o', executable], { timeout: 120000, maxBuffer: 1048576, env: { ...process.env, CLANG_MODULE_CACHE_PATH: cache, SWIFT_MODULE_CACHE_PATH: cache } })
   await execute('/usr/bin/codesign', ['--force', '--sign', '-', '--identifier', 'com.ghostsentinel.notifications', bundle], { timeout: 10000, maxBuffer: 65536 })
   await execute('/usr/bin/codesign', ['--verify', '--strict', bundle], { timeout: 10000, maxBuffer: 65536 })
-  return { bundle, executable, bundleId: 'com.ghostsentinel.notifications', sourceSha256: createHash('sha256').update(await readFile(source)).digest('hex'), executableSha256: createHash('sha256').update(await readFile(executable)).digest('hex'), signed: 'adhoc-development', installed: false }
+  return { bundle, executable, bundleId: 'com.ghostsentinel.notifications', sourceSha256: createHash('sha256').update(await readFile(source)).digest('hex'), factsSourceSha256: createHash('sha256').update(await readFile(factsSource)).digest('hex'), executableSha256: createHash('sha256').update(await readFile(executable)).digest('hex'), signed: 'adhoc-development', installed: false }
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const output = process.argv[2]

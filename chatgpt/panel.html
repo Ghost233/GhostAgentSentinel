@@ -3,7 +3,7 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sentinel 会话检查</title>
 <style>
-:root{font:13px/1.5 system-ui;color-scheme:light dark}body{margin:0;padding:14px;overflow-wrap:anywhere}h1{font-size:14px;margin:0 0 8px}p{margin:5px 0}#summary{font-weight:600;font-size:14px}#analysis,.muted{color:GrayText;font-size:12px}.issue{padding:10px 0;border-bottom:1px solid color-mix(in srgb,GrayText 22%,transparent)}h2{font-size:13px;margin:0 0 4px}.evidence{font-size:12px;color:GrayText;line-height:1.45;margin-top:5px}details{margin-top:12px}summary{cursor:pointer;font-size:12px;color:GrayText}.check{padding:8px 0;border-bottom:1px solid color-mix(in srgb,GrayText 15%,transparent)}.check-status{font-size:12px;font-weight:400;margin-left:8px;color:GrayText}#coverage,#technical,#observation,#execution{white-space:pre-line}#error{color:GrayText;font-size:12px}.history-entry{display:block;width:100%;text-align:left;margin:5px 0;padding:6px 8px;font:inherit;border:1px solid GrayText;border-radius:5px;background:transparent;color:inherit;overflow-wrap:anywhere}.history-entry[aria-current=true]{border-width:2px;font-weight:600}
+:root{font:13px/1.5 system-ui;color-scheme:light dark}body{margin:0;padding:14px;overflow-wrap:anywhere}h1{font-size:14px;margin:0 0 8px}p{margin:5px 0}#summary{font-weight:600;font-size:14px}#analysis,.muted{color:GrayText;font-size:12px}.issue{padding:10px 0;border-bottom:1px solid color-mix(in srgb,GrayText 22%,transparent)}h2{font-size:13px;margin:0 0 4px}.evidence{white-space:pre-line;font-size:12px;color:GrayText;line-height:1.45;margin-top:5px}details{margin-top:12px}summary{cursor:pointer;font-size:12px;color:GrayText}.check{padding:8px 0;border-bottom:1px solid color-mix(in srgb,GrayText 15%,transparent)}.check-status{font-size:12px;font-weight:400;margin-left:8px;color:GrayText}#coverage,#technical,#observation,#execution{white-space:pre-line}#error{color:GrayText;font-size:12px}.history-entry{display:block;width:100%;text-align:left;margin:5px 0;padding:6px 8px;font:inherit;border:1px solid GrayText;border-radius:5px;background:transparent;color:inherit;overflow-wrap:anywhere}.history-entry[aria-current=true]{border-width:2px;font-weight:600}
 </style>
 <h1>Sentinel · 当前会话</h1>
 <p id="summary" role="status">⚪ 正在核对当前会话</p>
@@ -80,7 +80,7 @@ function renderNotificationRecords(page){
   element('notification-list').replaceChildren();
   for(const record of notificationRecords){
     const article=node('article',null,'check'),native=record.native??{},kind=record.kind==='monitoring-failure'?'监控状态提醒':'任务告警';
-    article.append(node('h2',kind+(record.mainId===null?' · 来源级':'')),node('p',notificationState(record),'muted'));
+    article.append(node('h2',kind+(record.mainId===null?' · 来源级':record.lifecycleId===null?' · 聊天级':'')),node('p',notificationState(record),'muted'));
     if(text(record.body,180))article.append(node('p',text(record.body,180),'evidence'));
     const permission=({'not-determined':'尚未决定',denied:'未允许',authorized:'已允许',provisional:'临时允许'})[native.authorization?.state]??'未确认';
     const delivered=native.deliveredSnapshot?.present===true?'快照中存在':native.deliveredSnapshot?.present===false?'本次快照未见（不代表此前未展示）':'尚无送达快照';
@@ -159,14 +159,13 @@ function render(view){
     element('pause').hidden=false;element('pause').textContent=monitoring.paused?'恢复本聊天分析':'暂停本聊天分析';
     if(monitoring.paused){element('summary').textContent='⚪ 本聊天分析已暂停';element('summary').setAttribute('data-signal','gray');element('analysis').textContent='继续采集 · 仅手动恢复分析';}
   }
-  const references=[];
   for(const issue of list(analysis.issues).slice(0,6)){
     if(!issue||!text(issue.reason))continue;
     const article=node('article',null,'issue');article.append(node('h2',labels[issue.checkId]??'需要关注'));
     if(text(issue.reason)!==summary)article.append(node('p',text(issue.reason)));
     for(const evidence of list(issue.evidence).slice(0,2)){
-      if(text(evidence?.text))article.append(node('p',text(evidence.text,240),'evidence'));
-      if(text(evidence?.reference,160))references.push(text(evidence.reference,160));
+      const excerpt=text(evidence?.text,240),reference=text(evidence?.reference,2000);
+      if(excerpt||reference)article.append(node('p',[excerpt,reference?'出处：'+reference:''].filter(Boolean).join('\n'),'evidence'));
     }
     element('issues').append(article);
   }
@@ -194,7 +193,6 @@ function render(view){
   const technical=['分析状态：'+text(analysis.state,80)];
   if(text(analysis.error?.code,120))technical.push('错误代码：'+text(analysis.error.code,120));
   if(text(analysis.error?.message))technical.push(text(analysis.error.message));
-  if(references.length)technical.push('依据引用：\n'+[...new Set(references)].join('\n'));
   element('technical').textContent=technical.join('\n');
 }
 function request(method,params){return new Promise((resolve,reject)=>{const n=++id;const timeout=setTimeout(()=>{pending.delete(n);reject(new Error('宿主响应超时'));},5000);pending.set(n,{resolve,reject,timeout});parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
@@ -217,7 +215,7 @@ async function readNotificationRecords(beforeSequence){
     const page=response.structuredContent;
     if(response.isError||page?.identity?.threadId!==scope.threadId||page.sourceKey!==scope.sourceKey||page.lifecycleId!==scope.lifecycleId||page.executionKey!==scope.executionKey||!Number.isSafeInteger(page.generatedAt)||page.generatedAt<0||!Number.isFinite(new Date(page.generatedAt).getTime())||!Array.isArray(page.records))throw new Error('通知记录范围未确认');
     const records=page.records.slice(0,20);
-    if(records.some(record=>!text(record?.id,256)||!Number.isSafeInteger(record.sequence)||record.sequence<0||record.sourceKey!==scope.sourceKey||!['task-alert','monitoring-failure'].includes(record.kind)||(record.mainId===null?record.kind!=='monitoring-failure':record.mainId!==scope.threadId||record.lifecycleId!==scope.lifecycleId)||(beforeSequence!==undefined&&record.sequence>=beforeSequence)))throw new Error('通知记录范围未确认');
+    if(records.some(record=>!text(record?.id,256)||!Number.isSafeInteger(record.sequence)||record.sequence<0||record.sourceKey!==scope.sourceKey||!['task-alert','monitoring-failure'].includes(record.kind)||(record.mainId===null?record.kind!=='monitoring-failure':record.mainId!==scope.threadId||record.lifecycleId!==scope.lifecycleId&&!(record.kind==='monitoring-failure'&&record.lifecycleId===null))||(beforeSequence!==undefined&&record.sequence>=beforeSequence)))throw new Error('通知记录范围未确认');
     notificationRecords=records.sort((a,b)=>b.sequence-a.sequence);
     notificationBefore=page.hasMore===true&&Number.isSafeInteger(page.nextBeforeSequence)&&page.nextBeforeSequence>=0&&(beforeSequence===undefined||page.nextBeforeSequence<beforeSequence)?page.nextBeforeSequence:null;
     renderNotificationRecords({...page,historyGap:page.historyGap===true||page.hasMore===true&&notificationBefore===null});

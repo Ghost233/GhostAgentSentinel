@@ -70,6 +70,24 @@ test('the lead finding keeps its inline evidence without repeating the same conc
   assert.ok(page.element('#issues').children[0].children.some(node => node.className === 'evidence'))
 })
 
+test('each issue keeps its own complete literal reference below the evidence rather than in diagnostics', async t => {
+  const page = await harness(t), view = material(), excerpt = '<img src=x onerror="alert(1)"> same excerpt'
+  const references = [('native:' + 'a'.repeat(180) + '<script>bad()</script>').padEnd(2000, 'x'), 'native:other-reference']
+  view.analysis.issues = references.map((reference, index) => ({ checkId: index ? 'validation_gap' : 'request_drift', reason: 'Issue ' + index, evidence: [{ text: excerpt, reference }] }))
+  await page.deliver(view)
+  const issues = page.element('#issues').children
+  assert.equal(issues.length, 2)
+  for (let index = 0; index < 2; index++) {
+    const evidence = issues[index].children.find(child => child.className === 'evidence')
+    assert.ok(evidence.textContent.includes(excerpt))
+    assert.ok(evidence.textContent.includes(references[index]), 'the complete bounded reference belongs to its own issue')
+    assert.equal(evidence.children.length, 0, 'both excerpt and reference are literal text')
+    assert.equal(issues[index].textContent.includes(references[1 - index]), false)
+  }
+  assert.equal(page.element('#technical').textContent.includes('native:'), false)
+  assert.match(page.html, /overflow-wrap:anywhere/)
+})
+
 test('the current-chat pause button uses its displayed identity and revision and keeps collection visible', async t => {
   const page = await harness(t)
   const view = material('main-a')
@@ -261,7 +279,7 @@ test('the actual panel DOM omits excluded child-agent counts while retaining cur
   assert.doesNotMatch(visible, /子代理|child|987/)
   assert.match(page.element('#coverage').textContent, /本聊天：已接入/)
   assert.match(page.element('#coverage').textContent, /主聊天 3/)
-  assert.match(page.element('#technical').textContent, /private-evidence-id/)
+  assert.match(page.element('#issues').textContent, /private-evidence-id/)
   assert.equal(page.element('#issues').children.length, 1)
 })
 
@@ -357,6 +375,24 @@ test('native notification permission is requested only by the current-chat butto
 const notificationView = (threadId = 'main-a', key = 'current', sourceKey = 'source-a') => ({ ...material(threadId), execution: { key, sourceKey, lifecycleId: 'turn-' + key, historical: key !== 'current', status: key === 'current' ? 'running' : 'ended' }, notifications: { scope: { sourceKey, lifecycleId: 'turn-' + key, executionKey: key }, permission: { authorization: 'authorized', requestInFlight: false } } })
 const notificationPage = (view, records, extra = {}) => ({ identity: { threadId: view.identity.threadId }, ...view.notifications.scope, generatedAt: 1000, records, hasMore: false, nextBeforeSequence: null, historyGap: false, ...extra })
 const nativeRecord = (view, id = 'notice-a', sequence = 30) => ({ id, sequence, sourceKey: view.notifications.scope.sourceKey, mainId: view.identity.threadId, lifecycleId: view.notifications.scope.lifecycleId, kind: 'task-alert', title: 'Scope concern', body: '<img src=x onerror="alert(1)"> Literal native body', status: 'submitted', delivery: 'system-accepted', humanSeen: 'unknown', native: { attemptId: 'attempt-' + id, nativeRequestId: 'native-' + id, authorization: { state: 'authorized' }, submission: { state: 'accepted' } } })
+
+test('chat-scoped pre-anchor health records stay visible only in their own chat and never become unscoped task alerts', async t => {
+  for (const mode of ['own-health', 'foreign-health', 'task-alert']) await t.test(mode, async t => {
+    const page = await harness(t), view = notificationView(), record = { ...nativeRecord(view), lifecycleId: null, kind: mode === 'task-alert' ? 'task-alert' : 'monitoring-failure', ...(mode === 'foreign-health' ? { mainId: 'other-chat' } : {}) }
+    await page.deliver(view)
+    page.element('#notification-log').open = true
+    const reading = page.element('#notification-log').ontoggle(); await page.flush()
+    page.reply(page.sent.findLast(row => row.method === 'tools/call').id, { structuredContent: notificationPage(view, [record]) }); await reading
+    if (mode === 'own-health') {
+      assert.match(page.element('#notification-list').textContent, /聊天级/)
+      assert.ok(page.element('#notification-list').textContent.includes(record.body))
+    } else {
+      assert.equal(page.element('#notification-list').textContent.includes(record.body), false)
+      assert.match(page.element('#notification-log-status').textContent, /失败/)
+    }
+    assert.equal(page.element('#issues').children.length, 1)
+  })
+})
 const openNotifications = async page => { page.element('#notification-log').open = true; const operation = page.element('#notification-log').ontoggle(); await page.flush(); return operation }
 
 test('native notification records are folded and read only on demand, with literal excerpts and distinct delivery facts', async t => {

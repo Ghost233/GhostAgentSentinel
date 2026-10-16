@@ -1395,7 +1395,7 @@ export async function createCore({
       ensureOpen();
       const outcome = normalizeCollectionOutcome(value), source = sources.get(outcome.sourceKey);
       if (source?.descriptor.policy !== 'chatgpt-main/1') throw new Error('Collection outcomes require a known ChatGPT source');
-      if (outcome.mainId !== null && ![...tasks.values()].some(task => task.sourceKey === outcome.sourceKey && task.id === outcome.mainId && (outcome.lifecycleId === null || task.lifecycleId === outcome.lifecycleId))) throw new Error('Collection outcome scope is not a verified task');
+      if (outcome.mainId !== null && outcome.lifecycleId !== null && ![...tasks.values()].some(task => task.sourceKey === outcome.sourceKey && task.id === outcome.mainId && task.lifecycleId === outcome.lifecycleId)) throw new Error('Collection outcome scope is not a verified task');
       const settled = failureStore.settle({ ...outcome, domain: 'collection', attempted: true, settled: true });
       nativeNotifications.observeFailure(settled.receipt);
       return settled;
