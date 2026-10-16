@@ -115,6 +115,33 @@ test('stop drains an installation backlog larger than four native pages without 
   assert.ok(f.calls.filter(value => value.operation === 'cancel').every(value => value.requestIds.length <= 100 && value.requestIds.every(id => id.startsWith(f.prefix))))
 })
 
+test('confirmed cancellation history cannot hide a later pending request or fabricate its cancellation acknowledgement', async t => {
+  const f = await fixture(t), tasks = Array.from({ length: 101 }, (_, index) => ({ id: 'cancel-main-' + index, lifecycleId: 'one', title: 'Owned cancellation main', status: 'running' }))
+  await f.core.ingest(f.facts.sourceKey, { tasks })
+  for (const task of tasks.slice(0, 100)) await f.fail(task.id)
+  await f.delivery.refresh(f.facts)
+  assert.equal(f.pending.size, 100)
+  await f.core.pause(); await f.delivery.refresh(f.facts)
+  assert.equal(f.pending.size, 0)
+  let records = (await f.core.nativeNotificationRecords({ sourceKey: f.facts.sourceKey, limit: 100 })).records
+  assert.equal(records.length, 100)
+  assert.ok(records.every(record => record.native.pendingCancellation.pending === false))
+  const previousCancellationCalls = f.calls.filter(value => value.operation === 'cancel').length
+  await f.core.resume(); await f.fail(tasks[100].id); await f.delivery.refresh(f.facts)
+  assert.equal(f.pending.size, 1)
+  const currentId = [...f.pending.keys()][0]
+  assert.equal(f.calls.filter(value => value.operation === 'cancel').length, previousCancellationCalls, 'confirmed history must not be cancelled again on ordinary refresh')
+  await f.core.pause(); const result = await f.delivery.refresh(f.facts)
+  assert.equal(f.pending.size, 0, 'the later pending request must be physically included in cancellation')
+  assert.equal(result.cancelled, 1)
+  const cancellation = f.calls.filter(value => value.operation === 'cancel').at(-1)
+  assert.deepEqual(cancellation.requestIds, [currentId])
+  const next = await f.core.nativeNotificationRecords({ sourceKey: f.facts.sourceKey, afterSequence: records.at(-1).sequence, limit: 100 })
+  assert.equal(next.records.length, 1)
+  assert.equal(next.records[0].native.nativeRequestId, currentId)
+  assert.equal(next.records[0].native.pendingCancellation.pending, false)
+})
+
 test('coalesced qualification loss aborts an owned submission and processes the latest false facts without re-confirming the source', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-native-inflight-loss-')), server = await startServer({ dataDir }), core = await connectCore({ dataDir })
   const sourceKey = await core.registerSource({ registrationId: 'chatgpt:inflight', hostRunId: 'host', name: 'ChatGPT', policy: 'chatgpt-main/1' })

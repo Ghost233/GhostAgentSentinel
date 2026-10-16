@@ -19,7 +19,7 @@ const id = number => '00000000-0000-4000-8000-' + number.toString(16).padStart(1
 const B = id(1), C = id(2), F = id(3), keys = [16, 17, 18, 19].map(id)
 const app = '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT', binary = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
 
-async function fixture(t, mutation = null, { generations = keys.length, sharedOwner = true, original = true, lostAck = false, legacyLineage = false, cwdBytes = 8, historyPaddingBytes = 0, failBootstrap = null, bootstrapError = null, onBootstrap = null, nativeOriginVersion = 1, compressedOriginal = false, compressedGenerations = false, duplicateOriginal = null, originalProducer = null, compressionCapability = true, disabledProducer = false, archivedMains = false, compressedCurrent = false } = {}) {
+async function fixture(t, mutation = null, { generations = keys.length, sharedOwner = true, original = true, lostAck = false, legacyLineage = false, cwdBytes = 8, historyPaddingBytes = 0, failBootstrap = null, bootstrapError = null, onBootstrap = null, nativeOriginVersion = 1, compressedOriginal = false, compressedGenerations = false, duplicateOriginal = null, originalProducer = null, compressionCapability = true, disabledProducer = false, archivedMains = false, compressedCurrent = false, oldCurrentStart = false, currentPaddingBytes = 0, currentTerminal = null } = {}) {
   const records = Array.from({ length: generations }, (_, index) => id(16 + index)), owners = records.map((record, index) => sharedOwner || index === generations - 1 ? B : record), project = '/' + 'p'.repeat(cwdBytes - 1)
   let clock = Date.now(), changed = false, pumpBytes = 0, maximumPumpBytes = 0, maximumReaders = 0, metadataCalls = 0, maximumMetadataCalls = 0, ownerTurn = 'B-' + (generations - 1)
   let dir, socketPath, unix, ws, server, core, adapter, cleanupPromise
@@ -46,7 +46,7 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
   dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-lineage-'))
   const sessionsRoot = join(dir, 'sessions'), archive = join(dir, 'archived_sessions')
   await fs.mkdir(sessionsRoot); await fs.mkdir(archive)
-  const row = (ordinal, type, payload) => JSON.stringify({ ordinal, type, payload, timestamp: new Date(clock - 1000).toISOString() }) + '\n'
+  const row = (ordinal, type, payload, at = clock - 1000) => JSON.stringify({ ordinal, type, payload, timestamp: new Date(at).toISOString() }) + '\n'
   const header = owner => ({ id: owner, cwd: project, originator: 'Codex Desktop', source: 'vscode', cli_version: supportedProfile.cliVersion, history_mode: 'paginated' })
   const start = run => ({ type: 'task_started', turn_id: run, turn_attribution: { turn_id: run, turn_trigger: 'composer' } })
   const user = (owner, run, text) => ({ type: 'item_completed', thread_id: owner, turn_id: run, item: { type: 'UserMessage', id: run + '-user', content: [{ type: 'text', text }] } })
@@ -70,10 +70,11 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
       + row(ordinal + 1, 'event_msg', start(run)) + row(ordinal + 2, 'event_msg', user(owners[index], run, 'Retain native requirement ' + index)) + row(ordinal + 3, 'event_msg', { type: 'task_complete', turn_id: run })
     await fs.writeFile(paths[index], compressedGenerations ? zstdCompressSync(Buffer.from(bytes)) : bytes); ordinal += 4; parentKey = sharedOwner ? records[index] : owners[index]
   }
-  const forkBytes = row(ordinal, 'session_meta', { ...header(F), forked_from_id: B, history_base: { thread_id: parentKey, end_ordinal_exclusive: ordinal, end_byte_offset: Buffer.byteLength(bytes) } })
-    + row(ordinal + 1, 'event_msg', start('F')) + row(ordinal + 2, 'event_msg', user(F, 'F', 'Check this independent fork request'))
-    + row(ordinal + 3, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'AgentMessage', id: 'F-output', content: [{ type: 'Text', text: 'New fork activity' }] } })
-    + (archivedMains ? row(ordinal + 4, 'event_msg', { type: 'task_complete', turn_id: 'F' }) : '')
+  const currentRow = (ordinal, type, payload) => row(ordinal, type, payload, clock - (oldCurrentStart ? 30000 : 1000)), ending = currentTerminal ?? (archivedMains ? 'completed' : null)
+  const forkBytes = currentRow(ordinal, 'session_meta', { ...header(F), forked_from_id: B, history_base: { thread_id: parentKey, end_ordinal_exclusive: ordinal, end_byte_offset: Buffer.byteLength(bytes) } })
+    + currentRow(ordinal + 1, 'event_msg', start('F')) + currentRow(ordinal + 2, 'event_msg', user(F, 'F', 'Check this independent fork request'))
+    + currentRow(ordinal + 3, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'AgentMessage', id: 'F-output', content: [{ type: 'Text', text: 'New fork activity' + 'p'.repeat(currentPaddingBytes) }] } })
+    + (ending ? currentRow(ordinal + 4, 'event_msg', { type: ending === 'completed' ? 'task_complete' : 'turn_aborted', turn_id: 'F' }) : '')
   await fs.writeFile(currentPath, compressedCurrent ? zstdCompressSync(Buffer.from(forkBytes)) : forkBytes)
   const sourcePaths = new Map(await Promise.all([...paths, ...(original ? [originalPath] : []), ...(duplicateOriginal ? [originalPath + '.zst'] : []), currentPath].map(async path => [await fs.realpath(path), path])))
   const originalOpen = fs.open
@@ -143,7 +144,9 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
     for (const [index, prior] of paths.entries()) { const next = join(archive, basename(prior)); await fs.rename(prior, next); sourcePaths.set(await fs.realpath(next), next); paths[index] = next }
     const prior = currentPath; currentPath = join(archive, basename(prior)); await fs.rename(prior, currentPath); sourcePaths.set(await fs.realpath(currentPath), currentPath)
   }
-  return { close: cleanup, get core() { return core }, get adapter() { return adapter }, dir, read, archiveMains, async catchUp(thread) { let view; for (let pump = 0; pump < 32; pump++) { view = await read(thread); if (['caught-up', 'retained-history'].includes(view.observation.coverage)) break } return view }, advance(ms = 500) { clock += ms }, get clock() { return clock }, get maxIngest() { return maxIngest }, get maximumPumpBytes() { return maximumPumpBytes }, get maximumReaders() { return maximumReaders }, get maximumMetadataCalls() { return maximumMetadataCalls }, get liveReaders() { return opened.size }, async compressOriginal() { const prior = originalPath; originalPath += '.zst'; await fs.writeFile(originalPath, zstdCompressSync(await fs.readFile(prior))); sourcePaths.set(await fs.realpath(originalPath), originalPath); await fs.rm(prior) }, async restart() { await adapter.close(); await core.close(); await server.close(); assert.equal(opened.size, 0); server = await startServer({ dataDir: join(dir, 'core'), now: () => clock }); core = await connectCore({ dataDir: join(dir, 'core') }); await openAdapter() }, async appendOwnerRequest() { ownerTurn = 'B-next'; const next = generations * 4 + Number(original) * 4; await fs.appendFile(paths.at(-1), row(next, 'event_msg', start(ownerTurn)) + row(next + 1, 'event_msg', user(B, ownerTurn, 'Inspect one new native owner request'))); return read(B) } }
+  const growOriginal = async rewrite => { const bytes = await fs.readFile(originalPath, 'utf8'); await fs.writeFile(originalPath, (rewrite ? bytes.replace('Keep the original project restriction', 'Swap the original project restriction') : bytes) + row(4, 'event_msg', { type: 'task_complete', turn_id: 'C' })) }
+  const appendForkOutput = () => fs.appendFile(currentPath, row(ordinal + 4, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'AgentMessage', id: 'F-later', content: [{ type: 'Text', text: 'New tail after ancestor growth' }] } }))
+  return { close: cleanup, get core() { return core }, get adapter() { return adapter }, dir, read, archiveMains, growOriginal, appendForkOutput, async catchUp(thread) { let view; for (let pump = 0; pump < 32; pump++) { view = await read(thread); if (['caught-up', 'retained-history'].includes(view.observation.coverage)) break } return view }, advance(ms = 500) { clock += ms }, get clock() { return clock }, get maxIngest() { return maxIngest }, get maximumPumpBytes() { return maximumPumpBytes }, get maximumReaders() { return maximumReaders }, get maximumMetadataCalls() { return maximumMetadataCalls }, get liveReaders() { return opened.size }, async compressOriginal() { const prior = originalPath; originalPath += '.zst'; await fs.writeFile(originalPath, zstdCompressSync(await fs.readFile(prior))); sourcePaths.set(await fs.realpath(originalPath), originalPath); await fs.rm(prior) }, async restart() { await adapter.close(); await core.close(); await server.close(); assert.equal(opened.size, 0); server = await startServer({ dataDir: join(dir, 'core'), now: () => clock }); core = await connectCore({ dataDir: join(dir, 'core') }); await openAdapter() }, async appendOwnerRequest() { ownerTurn = 'B-next'; const next = generations * 4 + Number(original) * 4; await fs.appendFile(paths.at(-1), row(next, 'event_msg', start(ownerTurn)) + row(next + 1, 'event_msg', user(B, ownerTurn, 'Inspect one new native owner request'))); return read(B) } }
   } catch (error) {
     try { await cleanup() } catch (cleanupError) { throw new AggregateError([error, cleanupError], 'lineage fixture bootstrap and cleanup failed', { cause: error }) }
     throw error
@@ -506,6 +509,57 @@ test('completed compressed histories release guards across pumps and cursor rest
   assert.equal(f.liveReaders, 1)
   const next = (await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.id, event.data.nativeRecordId, event.evidence, event.capturedAt])
   assert.deepEqual(next, first); assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumPumpBytes <= 262144)
+})
+
+test('completed plain history growth is revalidated before newly appended current material can be released', async t => {
+  for (const rewrite of [false, true]) await t.test(rewrite ? 'rewritten-prefix' : 'unchanged-prefix', async t => {
+    const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, historyPaddingBytes: 600000 })
+    assert.equal((await f.catchUp(F)).forkProvenance.complete, true)
+    const first = (await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text])
+    await f.growOriginal(rewrite); await f.appendForkOutput(); f.advance()
+    let view
+    for (let pump = 0; pump < 32; pump++) {
+      view = await f.read(F)
+      if (!rewrite && view.observation.coverage === 'caught-up' || rewrite && view.health?.state === 'failed') break
+    }
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    if (rewrite) {
+      assert.equal(view.health.state, 'failed')
+      assert.ok(view.health.failures.some(failure => failure.error.code === 'native_origin_prefix_changed'))
+      assert.deepEqual(task.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text]), first)
+    } else {
+      assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation))
+      assert.equal(task.events.filter(event => event.text === 'New tail after ancestor growth').length, 1)
+      assert.equal(view.health?.state === 'failed', false)
+    }
+    assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumPumpBytes <= 262144)
+  })
+})
+
+test('old fork completion and interruption found across pumps preserve current and inherited request references as ended history', async t => {
+  for (const currentTerminal of ['completed', 'aborted']) await t.test(currentTerminal, async t => {
+    const f = await fixture(t, null, { generations: 1, original: false, nativeOriginVersion: 2, oldCurrentStart: true, currentPaddingBytes: 600000, currentTerminal })
+    await f.read(F)
+    assert.deepEqual((await f.core.snapshot()).tasks, [])
+    let view
+    for (let pump = 0; pump < 100; pump++) {
+      view = await f.read(F)
+      assert.equal((await f.core.snapshot()).overview.runningTasks, 0)
+      if (view.observation.coverage === 'retained-history' && view.forkProvenance?.complete) break
+    }
+    assert.equal(view.observation.coverage, 'retained-history', JSON.stringify(view.observation)); assert.equal(view.forkProvenance.complete, true)
+    const task = (await f.core.snapshot()).tasks.find(task => task.id === F)
+    assert.equal(task.status, 'idle'); assert.equal(task.currentRequest, 'Check this independent fork request')
+    assert.equal(task.instructionContext.userLimitRefs.length, 1); assert.deepEqual(task.instructionContext.gaps, [])
+    const start = task.events.find(event => event.data.nativeType === 'task_started' && !event.data.history), input = task.events.find(event => event.kind === 'input' && !event.data.history)
+    assert.ok(task.instructionContext.binding.originRefs.some(ref => ref.eventId === start.id)); assert.ok(task.instructionContext.binding.originRefs.some(ref => ref.eventId === input.id))
+    const original = task.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text])
+    await f.restart()
+    for (let pump = 0; pump < 100; pump++) { view = await f.read(F); if (view.observation.coverage === 'retained-history' && view.forkProvenance?.complete) break }
+    assert.equal(view.forkProvenance?.complete, true, JSON.stringify({ observation: view.observation, health: view.health }))
+    assert.deepEqual((await f.core.snapshot()).tasks.find(task => task.id === F).events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text]), original)
+    assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumPumpBytes <= 262144)
+  })
 })
 
 test('four completed compressed trees cannot starve a fifth tree of the shared decoder leases', { timeout: 30000 }, async t => {

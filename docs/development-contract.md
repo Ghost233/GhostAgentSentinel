@@ -93,6 +93,8 @@ monitoring-notifications/1 提供 GET /v1/notifications/native、POST /v1/notifi
 
 ChatGPT 的通知驱动在共享核心登记可信 App／插件资格，每次提交前再核对具体主聊天的项目资格。资格未确认时不发送；来源失效、停用或暂停按对应范围取消尚未投递的请求。执行结束取消旧任务告警；已经成立的首次监控故障按 App、插件、项目、本聊天暂停及保留期独立判断，不能因任务结束、首次锚定或故障迅速恢复而丢弃，通知保留故障发生时的身份，恢复不另发通知。原生 IO 只管理本安装前缀下的请求，已显示的通知不因清理而改写历史。权限仅由 app-only 的显式面板动作申请；普通刷新不会弹出许可。独立原生组件使用固定 GhostSentinel bundle 身份，实际系统许可和展示仍须实机验收。
 
+撤销每批最多向原生 IO 提交 100 个请求 ID，一轮最多 11 批；只为实际提交的 ID 确认撤销结果。已确认不再待投递的撤销记录不占用后续批次，超过处理上限保留缺口，不能提前确认未提交的请求。
+
 sentinel_current_chat 可携带 expectedThreadId、executionKey 和 historyCursor，按当前已核实的主聊天返回本安装 24 小时内已监控执行。历史选择和分页不调度已结束执行的分析；首次采集时间不因核心或适配器重启延长。app-only 的 sentinel_notification_records 另按所选执行查询通知，每页最多 20 条，页面仅在用户打开、刷新或翻页时读取。所有返回均核对聊天、来源和执行范围，切换或销毁页面后晚到结果失效。
 
 history 或 inherited 材料保留为上下文，但不更新当前请求、任务状态、执行活动，也不作新验证。历史非用户材料的缺口保留在历史，不直接污染当前检查；缺少用户上下文所需的证明仍阻止完整判断。
@@ -110,6 +112,10 @@ nativeRecordId 在历史虚拟位置映射前固定，只用于重复采集和�
 chatgpt-fork-compression/1 是 v2 材料路径读取前必须确认的能力。生产 startFromInstallation 固定使用 nativeOriginVersion 2；直接适配器调用默认 1 仅保留旧合同，没有用户切换选项。NativeJsonlSource 隐藏 plain／zstd 差异，限定进程级最多 4 个压缩 lease、8 MiB 解码窗口及 64 KiB 待消费解码尾块。源身份和生产者项目资格先核实，再完成单 frame 校验；字典、附加 frame、尾随数据、截断或坏 frame 拒绝。无 checksum 的 frame 只说明格式、长度及 EOF，不宣称 checksum 通过。完整校验后才向材料链重放所需范围，切点之后的内容只作完整性校验。plain 与 zstd 同时存在时，两份候选须独立证明头部与所需前缀等价才能合并。
 
 POST /v1/source/native-origin 按 sourceKey 与 key 读取同 registration 的无正文进度。v2 采集批次最多携带 16 份 nativeOrigins，包含头摘要、revision、旧前缀、重新验证的旧前缀及新前缀；前缀由固定 64 KiB block 的 root/count 和末块 length/hash 表达，不保存正文、decoder 或 crypto 内部状态。核心另限 10000 份存储代防变记录。每条 v2 原生事件必须携带 nativeGenerationKey、nativeRecordStart、nativeRecordEnd，身份及范围须与本批完整证明吻合。不同切点并发时，不回退已经确认的较长前缀；旧 revision 扩展明确冲突，适配器返回已确认游标重新核验。
+
+plain 读取在接受材料前再次核对路径与打开文件的身份、大小和时间；同大小改写同时核对 mtime 与 ctime。追加后在共享物理及解码预算内重新核验最长已知前缀，验证完成前不认可新的物理签名或发布材料。重验中恢复游标仍保留最后可信签名。完成的历史读取器只在 plain 重验尚未完成时保留；已完成的压缩守卫及时归还解码名额。已确认的 compressed-data-invalid、native_origin_prefix_changed 和 native_origin_header_changed 进入固定采集失败分类；修订冲突、未知 frame 及正常预算等待不因此升级为失败。
+
+旧执行冷读采用同一材料投影的有界预扫及原游标重放。预扫继承首次已核实的文件身份、头部和前缀，不推进材料 ACK、captureThrough 或首采时间；暂停的材料 IO 先关闭，全部读取仍共用原每泵预算。仅同一执行的完成或中断记录可形成不含正文的 terminalProof，绑定存储键、头摘要、前缀、执行 ID、结束状态和时间。重放前再次验证来源，只豁免该执行的旧开始缺口；新执行和其它缺口独立判断。预扫尚未核实或真正未结束时保持不可判断，历史材料不恢复运行或调度模型。
 
 版本记录只随实际 Native 首采进度或存储代进度确定；future-only 或全部忽略批次不产生单独版本行。新写入的版本记录由两份各 10000 项的固定进度推得最多 20000 项。旧原型已遗留、没有可追溯进度的版本行保守保留，单列 legacyModeOnly 数量作为迁移门禁，不自动删除或重计时。按 registration 卸载须同时清除版本、存储代与首采进度；停用和普通来源回收不等同于卸载。
 

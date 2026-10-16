@@ -42,12 +42,13 @@ export function createNotificationDelivery({ core, native, installationId, quali
     }
   }
   async function cancel(values, snapshot, summary, all = false) {
-    const ids = all ? snapshot.pending.map(value => value.requestId) : values.filter(value => owned(value.native?.nativeRequestId) && (value.native.cancelRequestedAt || ['cancelled', 'expired', 'failed'].includes(value.status))).map(value => value.native.nativeRequestId)
-    if (!ids.length) return
-    const result = await native.cancel([...new Set(ids)].slice(0, 100))
-    const pending = new Set(result.pendingIds)
-    for (const notice of values) if (ids.includes(notice.native?.nativeRequestId)) await record(notice, { event: 'pending-cancelled', pending: pending.has(notice.native.nativeRequestId), observedAt: result.observedAt }, summary)
-    summary.cancelled += ids.filter(id => !pending.has(id)).length
+    const ids = [...new Set(all ? snapshot.pending.map(value => value.requestId).filter(owned) : values.filter(value => owned(value.native?.nativeRequestId) && value.native.pendingCancellation?.pending !== false && (value.native.cancelRequestedAt || ['cancelled', 'expired', 'failed'].includes(value.status))).map(value => value.native.nativeRequestId))]
+    for (let offset = 0; offset < Math.min(ids.length, 1100); offset += 100) {
+      const batch = ids.slice(offset, offset + 100), result = await native.cancel(batch), pending = new Set(result.pendingIds)
+      for (const notice of values) if (batch.includes(notice.native?.nativeRequestId)) await record(notice, { event: 'pending-cancelled', pending: pending.has(notice.native.nativeRequestId), observedAt: result.observedAt }, summary)
+      summary.cancelled += batch.filter(id => !pending.has(id)).length
+    }
+    if (ids.length > 1100) summary.historyGap = true
   }
   async function refreshSource(sourceKey) {
     const summary = { submitted: 0, suppressed: 0, failed: 0, cancelled: 0, historyGap: false, errorCode: null, stopped }

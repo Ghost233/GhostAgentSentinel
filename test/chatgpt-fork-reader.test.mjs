@@ -1,9 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { BoundedReader, supportedProfile } from '../chatgpt/bounded-reader.mjs'
+import { NativeJsonlSource } from '../chatgpt/native-jsonl-source.mjs'
 
 const at = 1_800_000_000_000
 const row = (ordinal, type, payload, time = at - 100_000) => JSON.stringify({ ordinal, type, timestamp: new Date(time).toISOString(), payload: type === 'session_meta' ? { originator: 'Codex Desktop', source: 'vscode', cli_version: supportedProfile.cliVersion, cwd: '/history-project', ...payload } : payload }) + '\n'
@@ -27,6 +28,59 @@ export async function forkFixture(t) {
   t.after(() => rm(dir, { recursive: true, force: true }))
   return { dir, source, parentPath, sessionsRoot, archiveRoot, range }
 }
+
+async function oldAnchorFixture(t, completed) {
+  const { ForkHistoryReader } = await import('../chatgpt/fork-history.mjs'), f = await forkFixture(t), old = at - 10000
+  const original = (await readFile(f.source.path, 'utf8')).replaceAll(new Date(at).toISOString(), new Date(old).toISOString())
+  await writeFile(f.source.path, original + row(10, 'response_item', { type: 'message', id: 'large-output', role: 'assistant', content: [{ type: 'output_text', text: 'p'.repeat(600000) }], internal_chat_message_metadata_passthrough: { turn_id: 'new-run' } }, old)
+    + (completed ? row(11, 'event_msg', { type: 'task_complete', turn_id: 'new-run' }, old) : ''))
+  const parent = { id: 'original', path: f.parentPath, cwd: f.dir, parentThreadId: null, originator: 'Codex Desktop', source: 'vscode', forkedFromId: null }
+  const native = { async readThread() { return { thread: parent } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } } }
+  const reader = new ForkHistoryReader({ ...f.source, nativeOriginVersion: 2 }, null, { native, sessionsRoot: f.sessionsRoot })
+  t.after(() => reader.close())
+  return { ...f, reader }
+}
+
+test('a fork error return accounts for the actual decoded bytes spent before a protocol gap', async t => {
+  const f = await oldAnchorFixture(t, false), pump = NativeJsonlSource.prototype.pump
+  await writeFile(f.source.path, (await readFile(f.source.path, 'utf8')).replaceAll(new Date(at - 10000).toISOString(), new Date(at).toISOString()).replace('"type":"response_item"', '"type":"unsupported_owned_record"'))
+  let physical = 0, decoded = 0
+  t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) {
+    try { const value = await pump.apply(this, args); physical += value.physicalBytes; decoded += value.decodedBytes; return value }
+    catch (error) { physical += error.physicalBytes ?? 0; decoded += error.decodedBytes ?? 0; throw error }
+  })
+  let view
+  for (let attempt = 0; attempt < 10; attempt++) {
+    physical = 0; decoded = 0; view = await f.reader.pump()
+    assert.equal(view.readBytes, physical); assert.equal(view.decodedBytes, decoded)
+    if (view.coverage === 'gap') break
+  }
+  assert.equal(view.gap, 'unsupported-record-type')
+  assert.ok(decoded > 0); assert.ok(decoded <= 262144)
+  assert.equal(view.readBytes, physical)
+  assert.equal(view.decodedBytes, decoded)
+})
+
+test('an old anchor completed in a later bounded pump can finish while a genuinely unfinished old anchor stays unknown', async t => {
+  for (const completed of [true, false]) await t.test(completed ? 'completed-after-first-pump' : 'still-unfinished', async t => {
+    const f = await oldAnchorFixture(t, completed)
+    let view
+    for (let pump = 0; pump < 20; pump++) {
+      view = await f.reader.pump()
+      assert.ok(view.readBytes <= 262144); assert.ok(view.decodedBytes <= 262144)
+      assert.notEqual(view.effectivePhase, 'started', 'a start before this Host never establishes current running')
+      if (view.coverage === 'caught-up') break
+    }
+    if (completed) {
+      assert.equal(view.gap, null, JSON.stringify({ gap: view.gap, coverage: view.coverage }))
+      assert.equal(view.coverage, 'caught-up'); assert.equal(view.effectivePhase, 'completed')
+      assert.equal(view.forkProvenance.complete, true)
+    } else {
+      assert.equal(view.effectivePhase, 'unknown'); assert.equal(view.coldRead.phase, 'scan')
+      assert.deepEqual(view.materials, []); assert.deepEqual(view.recentLifecycle, [])
+    }
+  })
+})
 
 test('fixed history mode reads only the verified ordinal and byte prefix and never calls inherited execution current', async t => {
   const f = await forkFixture(t)

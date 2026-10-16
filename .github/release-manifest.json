@@ -4,10 +4,10 @@
     "node": "v24.21.0",
     "npm": "11.19.1"
   },
-  "sha256": "dde7de05ebdb252567b309e404bcdd29d783c5136dc6b010d7b07e4f940250a3",
+  "sha256": "4fba602d9add2248301456a8a51fb151e7db73af449a44eb09bb71a5035d54a2",
   "files": {
-    "docs/chatgpt-observation.md": "6b942c5c4cd15157fc4ad3940be823559db32166b4a9e7e960dcdfbee20fd574",
-    "docs/development-contract.md": "b850f586498f0d58091771df0747ac6c94cfb915df4d401a60e36de4847702b1",
+    "docs/chatgpt-observation.md": "ab85a1a7c97235a44b9c6431eaa5dba4f5bd0a22097bace18bfbae9c2a1497c1",
+    "docs/development-contract.md": "6efbe2f0eed46a68f13580388f2917c56d04f99c67940c275e75a3d1de9abe54",
     "docs/installation.md": "28e0b54d67b276e589a1cea80fa439cfbe498c6adbac64adad83cf8d3023db5f",
     "docs/release-notes.md": "d217b13db88c61f217375770ce4125dd02173906b8c2cf6143758a4e3935abef",
     "docs/release-status.md": "c9c91731695bb66c27ab6963f4007223b9a9ff04103860db8a7fc26d6c640be7",
@@ -26,7 +26,7 @@
     "src/analysis/index.mjs": "578630772bca0e3330faa18995bca72df75cd6fe0e47d2ed06b6b73e72b0715d",
     "src/analysis/jev-rendering.mjs": "7f1285fe531cea41627c2ad1aaa9ec197888aa68efb1c3829de71a892fe39991",
     "src/core-client.mjs": "1cb1252cf0a0a89099b4175ae297b040495d624b9f8e0899e1fbb0761bee9afb",
-    "src/core/failure-receipts.mjs": "2a4ff3ef28caaf7bb3b6876febc83efbbc8f53555e2d2df5063e1f33f5b92146",
+    "src/core/failure-receipts.mjs": "07b8c7fc7a8ca545d30dfca0a6f33f110426d08f118cf144af79b086b8407d26",
     "src/core/index.mjs": "b3b5350a5fd0280d875e922ea0e05e605a46b41469e47ee194883de695b39c78",
     "src/core/native-capture-progress.mjs": "0fedfd24d2c7f2eb382f67ae55a627efd0aea9ada6854943608ab8129e72dd50",
     "src/core/native-notifications.mjs": "405cd287b05dd77f9bdfc39a6b1ab11842ff8116d4e4a2a72bc94381eb404765",
