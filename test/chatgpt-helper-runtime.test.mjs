@@ -12,7 +12,16 @@ import { createLazyCore } from '../chatgpt/lazy-core.mjs'
 const off = () => ({ async sampleHost() { return { available: false, reason: 'execution-source-unavailable' } }, async readEnablement() { assert.fail('App off must not read plugin state') }, async close() {} })
 async function installation(t) {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-helper-runtime-')), owned = []
-  t.after(async () => { await Promise.allSettled(owned.map(value => value.close())); await rm(dir, { recursive: true, force: true }) })
+  t.after(async () => {
+    const results = await Promise.allSettled(owned.map(value => Promise.resolve().then(() => value.close())))
+    const failures = results.filter(result => result.status === 'rejected').map(result => result.reason)
+    try { await rm(dir, { recursive: true, force: true }) } catch (error) { failures.push(error) }
+    if (failures.length) {
+      const message = 'Runtime fixture cleanup failed: ' + failures.map(error => error.message).join('; ')
+      t.diagnostic(message)
+      throw new AggregateError(failures, message)
+    }
+  })
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'missing.sock'), pluginId: 'ghost-sentinel@test' })
   const start = async () => { const runtime = await startFromInstallation({ configPath: prepared.configPath, native: off(), pollMs: 0 }); owned.push(runtime); return runtime }
   return { dir, prepared, owned, start }

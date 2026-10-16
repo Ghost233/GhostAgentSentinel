@@ -86,17 +86,18 @@ test('a duplicate helper CLI exits after verified reuse without releasing the ow
   await assert.rejects(stat(join(dir, 'adapter/runtime.lock')), { code: 'ENOENT' })
 })
 
-test('a standby helper opens its stable endpoint without contacting shared Core', async t => {
+test('existing-profile standby permits only retention maintenance and helper health remains independent of Core', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-standby-runtime-')), server = await startServer({ dataDir: join(dir, 'core') })
-  let runtime, coreHTTP = 0
+  let runtime; const coreHTTP = []
   t.after(async () => { await runtime?.close(); await server.close(); await rm(dir, { recursive: true, force: true }) })
   const original = globalThis.fetch
-  t.mock.method(globalThis, 'fetch', async function (url, ...args) { if (String(url).startsWith(server.url)) coreHTTP++; return original.call(this, url, ...args) })
+  t.mock.method(globalThis, 'fetch', async function (url, ...args) { if (String(url).startsWith(server.url + '/')) coreHTTP.push({ path: new URL(url).pathname, method: args[0]?.method ?? 'GET' }); return original.call(this, url, ...args) })
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'ghost-sentinel@test' })
   const native = { async sampleHost() { return { available: false, reason: 'execution-source-unavailable' } }, async readEnablement() { assert.fail('metadata cannot be read while App is off') }, async close() {} }
   runtime = await startFromInstallation({ configPath: prepared.configPath, native, pollMs: 0 })
   await runtime.refresh()
-  assert.equal(coreHTTP, 0, 'standby must not eagerly attach the shared Core')
+  const maintenance = [{ path: '/v1/health', method: 'GET' }, { path: '/v1/health', method: 'GET' }, { path: '/v1/diagnostics', method: 'GET' }]
+  assert.deepEqual(coreHTTP, maintenance, 'an existing profile permits cleanup only, without registration, analysis or notification writes')
   const config = JSON.parse(await readFile(prepared.configPath, 'utf8'))
   const health = await fetch(runtime.url + '/health', { headers: { authorization: 'Bearer ' + config.token } }).then(value => value.json())
   assert.equal(health.protocol, 'ghost-sentinel-chatgpt-helper/1')
@@ -104,7 +105,7 @@ test('a standby helper opens its stable endpoint without contacting shared Core'
   assert.equal(health.pid, process.pid)
   assert.equal(JSON.stringify(health).includes(config.token), false)
   assert.equal(JSON.stringify(health).includes(dir), false)
-  assert.equal(coreHTTP, 0, 'authenticated helper health is independent of Core')
+  assert.deepEqual(coreHTTP, maintenance, 'authenticated helper health is independent of Core')
   const firstURL = runtime.url
   await runtime.close()
   const legacy = { ...config }; delete legacy.port
@@ -112,5 +113,19 @@ test('a standby helper opens its stable endpoint without contacting shared Core'
   runtime = await startFromInstallation({ configPath: prepared.configPath, native: { ...native }, pollMs: 0 })
   assert.equal(runtime.url, firstURL, 'the existing own MCP endpoint survives an installation without a saved port')
   assert.equal(JSON.parse(await readFile(prepared.configPath, 'utf8')).port, config.port)
-  assert.equal(coreHTTP, 0)
+  assert.deepEqual(coreHTTP, [...maintenance, ...maintenance], 'restart checks existing retention once without reactivating collection')
+})
+
+test('a never-collected standby profile creates no Core while its helper endpoint remains available', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'sentinel-new-standby-')); let runtime
+  t.after(async () => { try { await runtime?.close() } finally { await rm(dir, { recursive: true, force: true }) } })
+  const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'missing.sock'), pluginId: 'sentinel@empty-standby' })
+  const original = globalThis.fetch; let unexpected = 0
+  t.mock.method(globalThis, 'fetch', async function (url, ...args) { if (!runtime || !String(url).startsWith(runtime.url + '/')) { unexpected++; assert.fail('an empty standby profile cannot contact or start Core') }; return original.call(this, url, ...args) })
+  runtime = await startFromInstallation({ configPath: prepared.configPath, native: { async sampleHost() { return { available: false } }, async close() {} }, pollMs: 0 })
+  await runtime.refresh(); await runtime.maintainRetention()
+  const config = JSON.parse(await readFile(prepared.configPath, 'utf8'))
+  assert.equal((await fetch(runtime.url + '/health', { headers: { authorization: 'Bearer ' + config.token } })).status, 200)
+  assert.equal(unexpected, 0)
+  await assert.rejects(stat(join(dir, 'core')), { code: 'ENOENT' })
 })

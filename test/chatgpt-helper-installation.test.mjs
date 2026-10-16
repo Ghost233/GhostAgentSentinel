@@ -6,6 +6,8 @@ import { randomUUID, createHash } from 'node:crypto'
 import { previewHelperChange, applyHelperChange } from '../chatgpt/helper-installation.mjs'
 import { parseHelperManagementArguments } from '../scripts/manage-chatgpt-helper.mjs'
 import { collectHelperPayload } from '../scripts/build-chatgpt-helper.mjs'
+import { startServer } from '../src/server.mjs'
+import { connectCore } from '../src/core-client.mjs'
 
 const hash = value => createHash('sha256').update(value).digest('hex')
 async function fixture(t) {
@@ -68,6 +70,8 @@ async function readyRuntime(f) {
   await writeFile(join(f.dataDir, 'runtime.json'), JSON.stringify({ format: 1, ...identity, url, startedAt: Date.now() }), { mode: 0o600 })
   await writeFile(join(f.dataDir, 'plugin/.mcp.json'), JSON.stringify({ mcpServers: { sentinel: { url: url + '/mcp', http_headers: { Authorization: 'Bearer ' + f.config.token } } } }), { mode: 0o600 })
   await writeFile(join(f.dataDir, 'plugin/.codex-plugin/plugin.json'), JSON.stringify({ name: 'ghost-sentinel', version: '0.1.0-dev.1', mcpServers: './.mcp.json' }), { mode: 0o600 })
+  const core = { protocol: 1, url: 'http://127.0.0.1:56111', token: 'b'.repeat(64), instanceId: randomUUID(), pid: 55555 }
+  await mkdir(f.config.coreDataDir, { recursive: true, mode: 0o700 }); await writeFile(join(f.config.coreDataDir, 'runtime.json'), JSON.stringify(core), { mode: 0o600 })
   const node = join(f.destinationBundle, 'Contents/Resources/node/bin/node'), entry = join(f.destinationBundle, 'Contents/Resources/observer/chatgpt/helper-main.mjs'), main = join(f.destinationBundle, 'Contents/MacOS/GhostSentinelHelper')
   const io = { ...f.io, async execute(file, args) {
     if (file.endsWith('/GhostSentinelHelper')) { assert.deepEqual(args, ['--status']); return { stdout: JSON.stringify({ ok: true, bundleId: 'com.ghostsentinel.helper', command: '--status', serviceStatus: 'enabled', unregisterCompleted: false }) } }
@@ -78,7 +82,7 @@ async function readyRuntime(f) {
       return { stdout: (field === 'comm=' ? pid === identity.pid ? node : main : pid === identity.pid ? node + ' ' + entry + ' --config ' + f.configPath : main + ' --agent') + '\n' }
     }
     return f.io.execute(file, args)
-  }, async request(target, path, body) { assert.equal(target.url, url); assert.equal(target.token, f.config.token); assert.equal(path, '/health'); assert.equal(body, undefined); return identity } }
+  }, async request(target, path, body) { if (target.url === core.url) { assert.equal(path, '/v1/health'); assert.equal(body, undefined); return { protocol: 1, instanceId: core.instanceId, features: ['chatgpt-installation-purge/1', 'chatgpt-retention-maintenance/1'] } }; assert.equal(target.url, url); assert.equal(target.token, f.config.token); assert.equal(path, '/health'); assert.equal(body, undefined); return identity } }
   return { io, identity, wrapper, node, entry, main }
 }
 
@@ -96,6 +100,23 @@ test('approval resume adopts only the first saved port after exact helper identi
   assert.equal(JSON.stringify(result).includes(f.config.installationId), false)
 })
 
+for (const feature of [null, 'chatgpt-installation-purge/1', 'chatgpt-retention-maintenance/1']) test(feature ? `approval resume keeps maintenance when existing Core lacks ${feature}` : 'approval resume releases maintenance only after real Core capabilities are confirmed', async t => {
+  let server, client
+  t.after(async () => { try { await client?.close() } finally { await server?.close() } })
+  const f = await fixture(t), pending = await pendingInstall(f), live = await readyRuntime(f)
+  server = await startServer({ dataDir: f.config.coreDataDir }); client = await connectCore({ dataDir: f.config.coreDataDir })
+  const target = JSON.parse(await readFile(join(f.config.coreDataDir, 'runtime.json')))
+  const io = { ...live.io, async request(value, path, body) {
+    if (value.url === target.url) { assert.equal(path, '/v1/health'); assert.equal(body, undefined); const health = await client.health(); return { ...health, features: health.features.filter(value => value !== feature) } }
+    return live.io.request(value, path, body)
+  } }
+  const result = await applyHelperChange({ operation: 'install', destinationBundle: f.destinationBundle, configPath: f.configPath, resume: pending.operationId }, io)
+  assert.equal(result.status, feature ? 'pending-runtime-verification' : 'complete')
+  assert.equal(result.collectionResumed, !feature)
+  if (feature) { assert.equal(result.diagnostic.code, 'core-activation-feature-missing'); assert.ok(await lstat(join(f.dataDir, 'maintenance.json'))) }
+  else await assert.rejects(lstat(join(f.dataDir, 'maintenance.json')), { code: 'ENOENT' })
+})
+
 async function managed(f) {
   const pending = await pendingInstall(f), live = await readyRuntime(f)
   await applyHelperChange({ operation: 'install', destinationBundle: f.destinationBundle, configPath: f.configPath, resume: pending.operationId }, live.io)
@@ -103,12 +124,12 @@ async function managed(f) {
 }
 async function lifecycleIO(f, live) {
   const core = { protocol: 1, url: 'http://127.0.0.1:56111', token: 'b'.repeat(64), instanceId: randomUUID(), pid: 55555 }
-  await mkdir(f.config.coreDataDir, { mode: 0o700 }); await writeFile(join(f.config.coreDataDir, 'runtime.json'), JSON.stringify(core), { mode: 0o600 })
+  await mkdir(f.config.coreDataDir, { recursive: true, mode: 0o700 }); await writeFile(join(f.config.coreDataDir, 'runtime.json'), JSON.stringify(core), { mode: 0o600 })
   const steps = []; let nodeAlive = true, wrapperAlive = true
   const io = { ...live.io, async signal(pid, signal) { assert.equal(pid, live.identity.pid); assert.equal(signal, 'SIGTERM'); assert.ok(await lstat(join(f.dataDir, 'maintenance.json'))); steps.push('TERM'); nodeAlive = false; wrapperAlive = false; await rm(join(f.dataDir, 'runtime.json')); await rm(join(f.dataDir, 'runtime.lock'), { recursive: true }) }, async request(target, path, body) {
     if (target.url === core.url) {
       assert.equal(target.token, core.token)
-      if (path === '/v1/health') return { protocol: 1, instanceId: core.instanceId, features: ['chatgpt-installation-purge/1'] }
+      if (path === '/v1/health') return { protocol: 1, instanceId: core.instanceId, features: ['chatgpt-installation-purge/1', 'chatgpt-retention-maintenance/1'] }
       if (path === '/v1/sources') return { entries: [{ registrationId: 'chatgpt:' + f.config.installationId, status: nodeAlive ? 'connected' : 'disconnected' }] }
       if (path === '/v1/chatgpt/installation/purge') { assert.deepEqual(body, { installationId: f.config.installationId }); steps.push('core-purge'); return { installationId: f.config.installationId, registrationId: 'chatgpt:' + f.config.installationId, status: 'complete', logical: { status: 'purged' }, physical: { status: 'checkpointed', secureDelete: true } } }
     }
@@ -123,6 +144,60 @@ async function lifecycleIO(f, live) {
   } }
   return { io, steps, core }
 }
+
+for (const form of ['declared', 'absolute']) test(`exact ${form} wrapper display resumes and stops only the owned Node`, async t => {
+  const f = await fixture(t), pending = await pendingInstall(f), live = await readyRuntime(f)
+  const command = form === 'declared' ? 'GhostSentinelHelper' : live.main
+  const io = { ...live.io, async execute(file, args) {
+    if (file === '/bin/ps' && args[0] === '-p' && Number(args[1]) === live.wrapper && ['comm=', 'args='].includes(args[3])) return { stdout: command + (args[3] === 'args=' ? ' --agent' : '') + '\n' }
+    return live.io.execute(file, args)
+  } }
+  const result = await applyHelperChange({ operation: 'install', destinationBundle: f.destinationBundle, configPath: f.configPath, resume: pending.operationId }, io)
+  assert.equal(result.status, 'complete', JSON.stringify(result)); assert.equal(result.collectionResumed, true)
+  const controlled = await lifecycleIO(f, { ...live, io })
+  const removed = await applyHelperChange({ operation: 'uninstall', destinationBundle: f.destinationBundle, configPath: f.configPath }, controlled.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed)); assert.deepEqual(controlled.steps, ['TERM', 'core-purge', 'unregister'])
+})
+
+test('wrapper display pairs cannot mix or bypass exact UID, parent and Node arguments', async t => {
+  const f = await fixture(t), pending = await pendingInstall(f), live = await readyRuntime(f)
+  const options = { operation: 'install', destinationBundle: f.destinationBundle, configPath: f.configPath, resume: pending.operationId }
+  for (const change of ['literal-with-absolute-args', 'absolute-with-literal-args', 'other-path', 'foreign-uid', 'wrong-parent', 'wrong-node-config']) {
+    const io = { ...live.io, async execute(file, args) {
+      if (file === '/bin/ps' && args[0] === '-p') {
+        const wrapper = Number(args[1]) === live.wrapper, field = args[3]
+        if (wrapper && field === 'comm=') return { stdout: (change === 'literal-with-absolute-args' ? 'GhostSentinelHelper' : change === 'other-path' ? '/foreign/GhostSentinelHelper' : live.main) + '\n' }
+        if (wrapper && field === 'args=') return { stdout: (change === 'absolute-with-literal-args' ? 'GhostSentinelHelper' : change === 'other-path' ? '/foreign/GhostSentinelHelper' : live.main) + ' --agent\n' }
+        if (wrapper && field === 'uid=,ppid=,lstart=' && ['foreign-uid', 'wrong-parent'].includes(change)) return { stdout: (process.getuid() + (change === 'foreign-uid' ? 1 : 0)) + ' ' + (change === 'wrong-parent' ? 99 : 1) + ' Sat Oct 17 12:00:00 2026\n' }
+        if (!wrapper && field === 'args=' && change === 'wrong-node-config') return { stdout: live.node + ' ' + live.entry + ' --config /foreign/installation.json\n' }
+      }
+      return live.io.execute(file, args)
+    } }
+    const result = await applyHelperChange(options, io)
+    assert.equal(result.status, 'pending-runtime-verification', change); assert.equal(result.collectionResumed, false, change)
+    assert.equal(result.diagnostic.code, change === 'wrong-parent' ? 'helper-managed-parent-unconfirmed' : 'helper-process-ownership-unconfirmed', change)
+    assert.ok(await lstat(join(f.dataDir, 'maintenance.json')))
+  }
+})
+
+test('a bare exact wrapper role is unconfirmed residue, never a PID to signal', async t => {
+  const f = await fixture(t), pending = await pendingInstall(f); let controls = 0
+  const options = { operation: 'uninstall', destinationBundle: f.destinationBundle, configPath: f.configPath, resume: pending.operationId }
+  const io = { ...f.io, async request() { throw Object.assign(new Error('closed fixture endpoint'), { code: 'ECONNREFUSED' }) }, async execute(file, args) {
+    if (file === '/bin/ps') { assert.equal(args[0], '-axo'); return { stdout: process.getuid() + ' 12344 GhostSentinelHelper --agent\n' } }
+    if (file.endsWith('/GhostSentinelHelper')) { controls++; return { stdout: JSON.stringify({ ok: true, bundleId: 'com.ghostsentinel.helper', command: args[0], serviceStatus: 'notRegistered', unregisterCompleted: false }) } }
+    return f.io.execute(file, args)
+  } }
+  const result = await applyHelperChange(options, io)
+  assert.equal(result.status, 'failed'); assert.equal(result.error.code, 'cancellation-absent-runtime-unconfirmed'); assert.equal(controls, 0)
+  assert.ok(await lstat(f.destinationBundle)); assert.ok(await lstat(f.configPath)); assert.ok(await lstat(join(f.dataDir, 'maintenance.json')))
+  const unrelated = { ...io, async execute(file, args) {
+    if (file === '/bin/ps') return { stdout: `${process.getuid() + 1} 12344 GhostSentinelHelper --agent\n${process.getuid()} 12346 /foreign/GhostSentinelHelper --agent\n${process.getuid()} 12347 GhostSentinelHelper --status\n${process.getuid()} 12348 /foreign/node /foreign/helper-main.mjs --config /foreign/installation.json\n` }
+    if (file.endsWith('/GhostSentinelHelper')) return { stdout: JSON.stringify({ ok: true, bundleId: 'com.ghostsentinel.helper', command: args[0], serviceStatus: 'notRegistered', unregisterCompleted: false }) }
+    return f.io.execute(file, args)
+  } }
+  assert.equal((await applyHelperChange(options, unrelated)).status, 'cancelled')
+})
 
 test('upgrade stops only the verified managed Node, unregisters and retains a recoverable old bundle', async t => {
   const f = await fixture(t), live = await managed(f), controlled = await lifecycleIO(f, live)

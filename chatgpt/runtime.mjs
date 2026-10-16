@@ -4,7 +4,7 @@ import { homedir } from 'node:os'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import { setTimeout as delay } from 'node:timers/promises'
-import { createLazyCore } from './lazy-core.mjs'
+import { createLazyCore, retentionProfileSignature } from './lazy-core.mjs'
 import { createNativeIO } from './native-io.mjs'
 import { startChatGPTAdapter } from './adapter.mjs'
 import { createNativeNotificationIO } from './native-notifications.mjs'
@@ -129,10 +129,44 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     if (Date.now() >= deadline) throw new Error('helper owner startup or endpoint cannot be verified')
     await delay(25)
   }
-  let adapter, closing = null
-  const core = createLazyCore({ dataDir: config.coreDataDir })
+  let adapter, closing = null, stopping = false, retentionTimer = null, retentionPending = null, retentionSignature = null, retentionNextAt = null, retentionError = null
+  function retentionObserved(value, error) {
+    if (stopping) return
+    const next = value?.retention ? value.retention.nextExpiryAt : value?.nextExpiryAt, generatedAt = value?.generatedAt
+    if (error || !Number.isSafeInteger(generatedAt) || next !== null && (!Number.isSafeInteger(next) || next <= generatedAt)) {
+      retentionError = error?.code ?? 'retention_deadline_unconfirmed'; retentionNextAt = Date.now() + 60000
+    } else { retentionError = null; retentionNextAt = next === null ? null : Date.now() + next - generatedAt }
+    scheduleRetention()
+  }
+  const core = createLazyCore({ dataDir: config.coreDataDir, onRetention: retentionObserved })
+  function scheduleRetention() {
+    clearTimeout(retentionTimer); retentionTimer = null
+    if (stopping) return
+    const delay = retentionNextAt === null ? 60000 : Math.max(1000, Math.min(60000, retentionNextAt - Date.now()))
+    retentionTimer = setTimeout(() => { retentionTimer = null; void maintainRetention() }, delay)
+    retentionTimer.unref()
+  }
+  function maintainRetention(force = false) {
+    if (stopping) return Promise.resolve()
+    if (retentionPending) return retentionPending
+    retentionPending = (async () => {
+      try {
+        adapter?.diagnostics()
+        const signature = await retentionProfileSignature(config.coreDataDir)
+        if (stopping) return
+        if (!signature) { retentionSignature = null; retentionNextAt = null; retentionError = null; return }
+        if (!force && signature === retentionSignature && (retentionNextAt === null || retentionNextAt > Date.now())) return
+        const result = await core.maintenance()
+        if (stopping) return
+        retentionSignature = await retentionProfileSignature(config.coreDataDir)
+        if (result) retentionObserved(result)
+      } catch (error) { retentionError = error.code ?? 'retention_maintenance_unavailable'; retentionNextAt = Date.now() + 60000 }
+    })().finally(() => { retentionPending = null; scheduleRetention() })
+    return retentionPending
+  }
   const close = () => closing ??= (async () => {
-    try { const stopped = adapter?.close(); await core.cancelPending(); await stopped } finally {
+    stopping = true; clearTimeout(retentionTimer); retentionTimer = null
+    try { const stopped = adapter?.close(); await core.cancelPending(); await retentionPending; await stopped } finally {
       try { await core.close() } finally {
         const owner = await record(join(lock, 'owner.json'))
         if (owner && identityMatches(owner, identity)) {
@@ -145,10 +179,12 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
   })()
   try {
     await writePrivateJson(join(lock, 'owner.json'), identity)
+    await maintainRetention(true)
     const rawHostIO = native ?? createNativeIO({ pluginId: config.pluginId, socketPath: config.metadataSocket })
     const hostIO = { ...rawHostIO, async sampleHost() { const reason = await maintenance(config); return reason ? { available: false, reason } : rawHostIO.sampleHost() } }
     const notifier = notificationIO ?? (config.notificationBundlePath ? createNativeNotificationIO({ bundlePath: config.notificationBundlePath, installationId: config.installationId }) : undefined)
     adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, collectMaterials: true, nativeOriginVersion: 2, runtimeStatus: () => ({ ...identity }) })
+    adapter.diagnostics()
     const selectedPort = portOf(adapter.url)
     if (port && selectedPort !== port) throw new Error('helper changed its configured endpoint')
     if (config.port === undefined) await writePrivateJson(configPath, { ...config, port: selectedPort })
@@ -157,6 +193,6 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     await writePrivateJson(join(pluginDir, '.mcp.json'), { mcpServers: { sentinel: { url: adapter.url + '/mcp', http_headers: { Authorization: 'Bearer ' + config.token } } } })
     const value = { format: 1, ...identity, url: adapter.url, startedAt: Date.now() }
     await writePrivateJson(join(config.dataDir, 'runtime.json'), value)
-    return { ...value, reused: false, pluginDir, refresh: adapter.refresh, diagnostics: adapter.diagnostics, close }
+    return { ...value, reused: false, pluginDir, refresh: adapter.refresh, maintainRetention, diagnostics: () => ({ ...adapter.diagnostics(), retention: { timers: retentionTimer ? 1 : 0, pending: retentionPending ? 1 : 0, nextAt: retentionNextAt, errorCode: retentionError } }), close }
   } catch (error) { await close(); throw error }
 }

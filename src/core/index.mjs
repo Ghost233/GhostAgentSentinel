@@ -1414,13 +1414,33 @@ export async function createCore({
       const metadata = { hierarchySessions: contexts.reduce((count, context) => count + context.sessions.length, 0), hierarchyActivations: contexts.reduce((count, context) => count + context.activations.length, 0), hierarchyRelations: contexts.reduce((count, context) => count + context.relations.length, 0), hierarchyReferences,
         nativeRunBindings: [...sources.values()].reduce((count, source) => count + (source.hierarchyRunBindings?.length ?? 0), 0), analysisReuseKeys: [...tasks.values()].reduce((count, task) => count + Number(task.resultKey != null) + Number(task.resultScope != null), 0), taskContextFingerprints: [...tasks.values()].filter(task => task.contextFingerprint != null).length,
         notificationBindings: [...tasks.values()].filter(task => task.notificationBinding).length, notificationBindingEvidenceRefs: [...tasks.values()].reduce((count, task) => count + (task.notificationBinding?.evidenceRefs.length ?? 0), 0), notificationMemberships: [...notifications.values()].reduce((count, notification) => count + notificationMembers(notification).length, 0) };
-      return {
+      const diagnostics = {
         protocol: 1, pid: process.pid, generatedAt: now(), closed, failureReceipts: failureStore.diagnostics(), nativeNotifications: nativeNotifications.diagnostics(),
         runtime: { connectedSources: closed ? 0 : Array.from(sources.values()).filter(connected).length, activeAnalyses: active ? 1 : 0, cancelledUnsettledRequests: pendingCancelledRequests, unsettledAnalysisCalls: admission.unsettledCalls, analysisAdmissionLimit: admission.limit, analysisAdmissionBlocked: admission.blocked },
         temporary: { queueKeys: queue.length, queueMemberships: queued.size, timers, pendingNotificationWindows: [...notifications.values()].filter(notification => notification.status === 'pending').length },
         retained: { retentionMs: DAY, sources: sources.size, tasks: tasks.size, events: events.size, alerts: Array.from(tasks.values()).reduce((count, task) => count + task.alerts.length, 0), notifications: notifications.size, sourceGapRecords: Array.from(sources.values()).reduce((count, source) => count + (source.gapRecords?.length ?? 0), 0), taskGapRecords: Array.from(tasks.values()).reduce((count, task) => count + (task.gapRecords?.length ?? 0), 0), hierarchyEvidenceIdentities: Array.from(sources.values()).reduce((count, source) => count + (source.hierarchyEvidenceCaptures?.length ?? 0), 0), hierarchyEvidenceIdentityLimitPerSource: HIERARCHY_CAPTURE_LIMIT, nativeOriginFences: nativeOrigins.diagnostics(), nativeCaptureProgress: nativeProgress.diagnostics(locator => locator && events.get(identity(locator.sourceKey, locator.taskId, locator.lifecycleId, locator.eventId))), ...metadata },
         configuration: { sourcePlanEntries: enrollment.entries.length, conversationMonitoringScopes: conversationSettings.size, conversationMonitoringLimit: CONVERSATION_MONITORING_LIMIT, pausedConversations: [...conversationSettings.values()].filter(setting => setting.paused).length }, memory: process.memoryUsage(),
       };
+      let nextExpiryAt = null;
+      const deadline = at => { if (Number.isSafeInteger(at) && at >= 0) nextExpiryAt = nextExpiryAt === null ? at : Math.min(nextExpiryAt, at); };
+      const captured = at => { if (Number.isSafeInteger(at) && at >= 0) deadline(at + DAY); };
+      const gaps = values => { for (const gap of values ?? []) if (!['Core restarted; source baseline is unknown', 'Earlier evidence expired after 24 hours', HIERARCHY_CAPTURE_GAP].includes(gap.reason)) captured(gap.at); };
+      for (const event of events.values()) captured(event.capturedAt);
+      for (const task of tasks.values()) {
+        if (task.analysis.summary) captured(task.analysis.summaryAt ?? task.analysis.completedAt);
+        if (!liveIdentity(task) && task.updatedAt + DAY > diagnostics.generatedAt) captured(task.updatedAt);
+        for (const alert of task.alerts) captured(alert.firstAt);
+        gaps(task.gapRecords);
+      }
+      for (const source of sources.values()) {
+        if (!connected(source) && source.lastSeenAt + DAY > diagnostics.generatedAt) captured(source.lastSeenAt);
+        if (source.hierarchyContext?.instructionBindings.length && source.hierarchyMaterialAt + DAY > diagnostics.generatedAt) captured(source.hierarchyMaterialAt);
+        gaps(source.gapRecords);
+      }
+      for (const notice of notifications.values()) { captured(notice.createdAt); captured(notice.evidenceThrough); }
+      deadline(diagnostics.failureReceipts.nextExpiryAt); deadline(diagnostics.nativeNotifications.nextExpiryAt);
+      diagnostics.retention = { retentionMs: DAY, nextExpiryAt };
+      return diagnostics;
     },
     async conversationMonitoring(value) {
       ensureOpen();

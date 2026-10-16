@@ -79,7 +79,10 @@ export function createFailureReceipts({ db, now = Date.now }) {
   }
   const matches = (value, scope) => ['sourceKey', 'mainId', 'lifecycleId'].every(field => scope[field] === undefined || value[field] === scope[field]);
   const sameScope = (value, input) => matches(value, input) && value.domain === input.domain && (value.channel ?? 'default') === (input.channel ?? 'default');
-  const stats = () => ({ closed, receipts: receipts.size, states: states.size, activeStates: [...states.values()].filter(value => value.active).length, recoveryWatermarks: [...states.values()].filter(value => value.kind === 'recovery').length, recoveryWatermarkEvictions, orderingGap: recoveryWatermarkEvictions > 0, maximumReceipts: LIMIT, maximumStates: LIMIT, retentionMs: DAY, latestSequence: sequence, prunedThroughSequence: prunedThrough });
+  const stats = () => {
+    const expiry = Math.min(Infinity, ...[...receipts.values()].map(value => value.firstFailedAt + DAY), ...[...states.values()].map(value => value.updatedAt + DAY));
+    return { nextExpiryAt: expiry === Infinity ? null : expiry, closed, receipts: receipts.size, states: states.size, activeStates: [...states.values()].filter(value => value.active).length, recoveryWatermarks: [...states.values()].filter(value => value.kind === 'recovery').length, recoveryWatermarkEvictions, orderingGap: recoveryWatermarkEvictions > 0, maximumReceipts: LIMIT, maximumStates: LIMIT, retentionMs: DAY, latestSequence: sequence, prunedThroughSequence: prunedThrough };
+  };
   function health(scope, at) {
     if (!identifier(scope?.sourceKey) || !identifier(scope.mainId) && scope.mainId !== null || !identifier(scope.lifecycleId) && scope.lifecycleId !== null || scope.mainId === null && scope.lifecycleId !== null) throw new Error('Failure health scope identity is incomplete');
     maintain(at);

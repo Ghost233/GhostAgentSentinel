@@ -8,6 +8,7 @@ export const CONVERSATION_MONITORING_FEATURE = 'conversation-monitoring/1'
 export const MONITORING_FAILURES_FEATURE = 'monitoring-failures/1'
 export const MONITORING_NOTIFICATIONS_FEATURE = 'monitoring-notifications/1'
 export const CHATGPT_INSTALLATION_PURGE_FEATURE = 'chatgpt-installation-purge/1'
+export const CHATGPT_RETENTION_MAINTENANCE_FEATURE = 'chatgpt-retention-maintenance/1'
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000
 const kinds = new Set(['input', 'output', 'tool-start', 'tool-result', 'status', 'gap'])
 const statuses = new Set(['running', 'idle', 'disposed', 'unknown'])

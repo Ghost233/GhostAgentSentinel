@@ -4,11 +4,11 @@
     "node": "v24.21.0",
     "npm": "11.19.1"
   },
-  "sha256": "1854e6af2b5dc4bc028bf440f56c5a5bc747cfff584a39544226ea2c34ec8804",
+  "sha256": "0d038b8274edeaf381c36656eb8c88c6a19ab3cf19b6a4fe2d8e375f688351af",
   "files": {
     "GLOSSARY.md": "d55c80a7fd7863d180f24dc48c6be79bfe773cfa0d5201c6ee042b3bdf2ccb87",
     "README.md": "3f4d99de3ed623a089c0929a0dff948668d59e6f6a5b3977a61c00f9ff0dd5be",
-    "docs/chatgpt-observation.md": "a88fd3ac0218c1e52a9cd3420e520f504c306438fea47689728736d02d76855f",
+    "docs/chatgpt-observation.md": "8e30f923f3d2a5906561ce7cb2fd03edebad4f5e19163c972a8a420bdb1ae765",
     "docs/development-contract.md": "0fd13858deab5a3c56679fd42f5ef91078bcea964364d7bec7a5e42247abbbf4",
     "docs/installation.md": "28e0b54d67b276e589a1cea80fa439cfbe498c6adbac64adad83cf8d3023db5f",
     "docs/release-notes.md": "d217b13db88c61f217375770ce4125dd02173906b8c2cf6143758a4e3935abef",
@@ -26,10 +26,10 @@
     "src/analysis/index.mjs": "578630772bca0e3330faa18995bca72df75cd6fe0e47d2ed06b6b73e72b0715d",
     "src/analysis/jev-rendering.mjs": "7f1285fe531cea41627c2ad1aaa9ec197888aa68efb1c3829de71a892fe39991",
     "src/core-client.mjs": "afb514d83fe87a5c7a13d2ab5e9709fd39c62d57665d6e781085c2ff5fa69eae",
-    "src/core/failure-receipts.mjs": "6373cb17758431926cb88baa7d77631c06c77d47744ee6c67600d5e326b19b20",
-    "src/core/index.mjs": "c739d520aa7a31ff4da329cf480b06c9e507d523210790e8d82ed6e28d318727",
+    "src/core/failure-receipts.mjs": "8cc929ae4552b555e56f124ae11a5deb73efd48ea14e0b011b278fc8a377642b",
+    "src/core/index.mjs": "5b38218ceadc557839308ead60d2c0ad7be2106e74a68fc2d884e9446794da6c",
     "src/core/native-capture-progress.mjs": "6d305a4875f0ffa283addd8dff0f86cd3e11ff9261715a48dae24cb69bf5e8f9",
-    "src/core/native-notifications.mjs": "c44393a732844af71115afaeec34b72823afc8c225cf89c6ccd82b205737ea07",
+    "src/core/native-notifications.mjs": "6bc7bbf313f0ab8e990e6ec15bb6cb1336411fc2efe13c2d65308ca5cc91e4da",
     "src/core/native-origin-fences.mjs": "f0074c1b94ab6e987dec01b7c6e0b68f91a3c2d311eab94058162bf3c07813f8",
     "src/daemon.mjs": "266344416a159c9e54dd01c297f39a8ca1e5ed5648ef0a2607aeb4b74354c4d8",
     "src/enrollment-config.mjs": "9b7c7836e9eb3905c0ef97365fbe1d30537682ad0806a876ced3547c175ceeb3",
@@ -40,7 +40,7 @@
     "src/instruction-context.mjs": "19c2b2f1071acd89e2bc05029aba0d0697087bb3701e84a92089f9c1515e0f45",
     "src/native-origin.mjs": "0afc126bfa484df8a5fa4d8559d2ad3b2cbda9b4b7c3928d316c05a1a990310c",
     "src/privacy.mjs": "82bb8e6c661414e02d68f608d4c78915c365c02ad87add4d5dec2ba137b69972",
-    "src/protocol.mjs": "7ddd34ee20e8b39d8ca6fb055bd04df45740ee8bf1076730cb46b79366c0c7ad",
-    "src/server.mjs": "ec4c41d8264e6131654490dcaf0efd911dbf90816d7770a0e1093c381702c127"
+    "src/protocol.mjs": "bc35e28e70fd4f4ab68fc91b618117ca40752139a05a8b589f4e37f605af0d74",
+    "src/server.mjs": "68a41ae57f0a265473647247a44aff0b4fc1ab8a317e3fa7f759f123f5318a6f"
   }
 }

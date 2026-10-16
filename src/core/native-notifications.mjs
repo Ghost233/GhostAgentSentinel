@@ -177,6 +177,6 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
       const values = [...notifications.values()].filter(value => native(value) && value.sourceKey === sourceKey && value.nativeSequence > afterSequence).sort((a, b) => a.nativeSequence - b.nativeSequence), page = values.slice(0, limit);
       return { records: page.map(publicRecord), nextSequence: page.at(-1)?.nativeSequence ?? afterSequence, hasMore: values.length > page.length, historyGap: historyGap || afterSequence < prunedThrough, maximumRecords: LIMIT, qualification: qualified(sourceKey) ? 'confirmed' : 'unconfirmed' };
     },
-    diagnostics: () => ({ records: [...notifications.values()].filter(native).length, failureLinks: links.size, eligibilitySources: eligibility.size, maximumEligibilitySources: 256, maximumRecords: LIMIT, maximumFailureLinks: LIMIT, maximumReceiptsPerNotice: 100, latestSequence: sequence, prunedThroughSequence: prunedThrough, historyGap }),
+    diagnostics: () => ({ nextExpiryAt: links.size ? Math.min(...[...links.values()].map(value => value.firstFailedAt + DAY)) : null, records: [...notifications.values()].filter(native).length, failureLinks: links.size, eligibilitySources: eligibility.size, maximumEligibilitySources: 256, maximumRecords: LIMIT, maximumFailureLinks: LIMIT, maximumReceiptsPerNotice: 100, latestSequence: sequence, prunedThroughSequence: prunedThrough, historyGap }),
   };
 }

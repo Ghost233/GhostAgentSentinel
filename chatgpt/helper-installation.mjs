@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { createNativeNotificationIO } from './native-notifications.mjs'
 import { loadCursor } from './cursor-store.mjs'
 import { connectCore } from '../src/core-client.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE } from '../src/protocol.mjs'
 
 const execute = promisify(execFile)
 const bundleId = 'com.ghostsentinel.helper', version = '0.1.0-dev.1'
@@ -174,17 +175,17 @@ async function control(destination, command, io) {
   if (response.ok !== true || response.bundleId !== bundleId || response.command !== command || !['notRegistered', 'enabled', 'requiresApproval', 'notFound'].includes(response.serviceStatus) || typeof response.unregisterCompleted !== 'boolean') fail('helper-control-protocol-invalid')
   return response
 }
-async function processRecord(pid, expectedCommand, expectedArguments, io) {
+async function processRecord(pid, expectedForms, io) {
   const record = (await io.execute('/bin/ps', ['-p', String(pid), '-o', 'uid=,ppid=,lstart=', '-ww'])).stdout.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)
   const command = (await io.execute('/bin/ps', ['-p', String(pid), '-o', 'comm=', '-ww'])).stdout.trim()
   const args = (await io.execute('/bin/ps', ['-p', String(pid), '-o', 'args=', '-ww'])).stdout.trim()
-  if (!record || Number(record[1]) !== uid() || command !== expectedCommand || args !== expectedArguments) fail('helper-process-ownership-unconfirmed')
+  if (!record || Number(record[1]) !== uid() || !expectedForms.some(([expectedCommand, expectedArguments]) => command === expectedCommand && args === expectedArguments)) fail('helper-process-ownership-unconfirmed')
   return { pid, parent: Number(record[2]), started: record[3] }
 }
 function hasManagedProcess(output, options) {
   return output.split('\n').some(line => {
     const row = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)
-    return row && Number(row[1]) === uid() && (row[3] === join(options.destinationBundle, main) + ' --agent' || row[3].includes('helper-main.mjs') && row[3].endsWith(' --config ' + options.configPath))
+    return row && Number(row[1]) === uid() && (row[3] === 'GhostSentinelHelper --agent' || row[3] === join(options.destinationBundle, main) + ' --agent' || row[3].includes('helper-main.mjs') && row[3].endsWith(' --config ' + options.configPath))
   })
 }
 async function runtimeIdentity(state, io) {
@@ -199,8 +200,9 @@ async function runtimeIdentity(state, io) {
   const health = await io.request({ url: runtime.url, token: config.token }, '/health')
   if (!fields.every(key => owner[key] === health[key])) fail('helper-health-identity-unconfirmed')
   const node = join(root, 'Contents/Resources/node/bin/node'), entryPath = join(root, 'Contents/Resources/observer/chatgpt/helper-main.mjs'), executable = join(root, main)
-  const child = await processRecord(owner.pid, node, node + ' ' + entryPath + ' --config ' + options.configPath, io)
-  const wrapper = await processRecord(child.parent, executable, executable + ' --agent', io)
+  const child = await processRecord(owner.pid, [[node, node + ' ' + entryPath + ' --config ' + options.configPath]], io)
+  // ps displays argv[0]; require a coherent exact pair from the signed service contract.
+  const wrapper = await processRecord(child.parent, [[executable, executable + ' --agent'], ['GhostSentinelHelper', 'GhostSentinelHelper --agent']], io)
   if (wrapper.parent !== 1) fail('helper-managed-parent-unconfirmed')
   const processes = (await io.execute('/bin/ps', ['-axo', 'uid=,pid=,args=', '-ww'])).stdout.split('\n').map(line => line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).filter(Boolean)
   const matching = processes.filter(row => Number(row[1]) === uid() && row[3].includes('helper-main.mjs') && row[3].endsWith(' --config ' + options.configPath))
@@ -429,7 +431,11 @@ async function resumeChange(state, io) {
       transaction.completed.push('explicit-register-retry-returned-' + status.serviceStatus)
     }
     if (status.serviceStatus !== 'enabled') { transaction.status = status.serviceStatus === 'requiresApproval' ? 'pending-approval' : 'pending-runtime-verification'; fail('helper-service-not-enabled') }
+    transaction.status = 'pending-runtime-verification'
     await runtimeIdentity(state, io)
+    const activationCore = await managementCore(config, io)
+    try { if (![CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE].every(feature => activationCore.health.features?.includes(feature))) fail('core-activation-feature-missing') }
+    finally { await activationCore.client?.close() }
     const current = await configuration(options.configPath)
     if (configIdentity(current) !== transaction.configIdentity || current.port !== config.port || transaction.knownPort !== null && transaction.knownPort !== current.port) fail('installation-config-changed')
     if (transaction.operation === 'upgrade') {

@@ -35,7 +35,7 @@ for (const state of ['app-absent', 'host-unknown', 'plugin-disabled', 'plugin-un
   if (state.startsWith('app-') || state === 'host-unknown') assert.deepEqual(metadata, [], 'an absent or unknown Host must not initialize metadata')
 })
 
-async function qualifiedFixture(t) {
+async function qualifiedFixture(t, { collectMaterials = false, omitFeature } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-helper-toggle-')), socketPath = join(tmpdir(), 'gs-q-' + randomUUID().slice(0, 12) + '.sock')
   const calls = [], coreCalls = [], releases = new Set(), websocket = new WebSocketServer({ noServer: true }), unix = createServer()
   let present = true, enabled = true, native, server, core, adapter, client, nextHealth = null, nextThread = null, nextIngest = null, hostPid = 12
@@ -68,13 +68,28 @@ async function qualifiedFixture(t) {
   await new Promise(resolve => unix.listen(socketPath, resolve))
   native = createNativeIO({ pluginId: 'sentinel@test', socketPath, profileSample: async () => supportedProfile, processSample: async () => present ? [{ pid: 11, ppid: 1, command: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT', started }, { pid: hostPid, ppid: 11, command: '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server', started }] : [] })
   server = await startServer({ dataDir: join(dir, 'core') }); client = await connectCore({ dataDir: join(dir, 'core') })
-  const health = async () => { coreCalls.push('health'); const value = await client.health(), gate = nextHealth; nextHealth = null; if (gate) { gate.entered(); await gate.wait }; return value }
+  const health = async () => { coreCalls.push('health'); const value = await client.health(), gate = nextHealth; nextHealth = null; if (gate) { gate.entered(); await gate.wait }; return omitFeature ? { ...value, features: value.features.filter(feature => feature !== omitFeature) } : value }
   const ingest = async (...args) => { const value = await client.ingest(...args), gate = nextIngest; nextIngest = null; if (gate) { gate.entered(); await gate.wait }; return value }
   core = { ...client, health, ingest }
-  adapter = await startChatGPTAdapter({ core, native, sessionsRoot: dir, dataDir: join(dir, 'adapter'), installationId: 'qualification-toggle', token: 'd'.repeat(64), pollMs: 0 })
+  adapter = await startChatGPTAdapter({ core, native, sessionsRoot: dir, dataDir: join(dir, 'adapter'), installationId: 'qualification-toggle', token: 'd'.repeat(64), pollMs: 0, collectMaterials, ...(collectMaterials ? { nativeOriginVersion: 2 } : {}) })
   const hold = method => { let entered, release; const started = new Promise(resolve => { entered = resolve }), wait = new Promise(resolve => { release = resolve }); releases.add(release); if (method === 'health') nextHealth = { entered, wait }; else if (method === 'thread') nextThread = { entered, wait }; else nextIngest = { entered, wait }; return { started, release } }
   return { adapter, core, native, calls, coreCalls, setEnabled(value) { enabled = value }, setPresent(value) { present = value }, setGeneration(value) { hostPid = value }, holdHealth: () => hold('health'), holdThread: () => hold('thread'), holdIngest: () => hold('ingest'), async restartCore() { await client.close(); await server.close(); server = await startServer({ dataDir: join(dir, 'core') }); client = await connectCore({ dataDir: join(dir, 'core') }); Object.assign(core, client, { health, ingest }) } }
 }
+
+for (const feature of ['chatgpt-installation-purge/1', 'chatgpt-retention-maintenance/1']) test(`material qualification refuses a Core missing ${feature} before reading a thread`, async t => {
+  const f = await qualifiedFixture(t, { collectMaterials: true, omitFeature: feature })
+  const view = await f.adapter.read({ thread_id: 'owned-main' })
+  assert.equal(view.observation.gap, 'core-capability-unavailable')
+  assert.equal(f.calls.includes('thread/read'), false)
+  assert.equal((await f.core.snapshot()).sources.some(source => source.descriptor.registrationId === 'chatgpt:qualification-toggle'), false)
+})
+
+test('a Core with both cleanup capabilities admits the same material source', async t => {
+  const f = await qualifiedFixture(t, { collectMaterials: true })
+  await f.adapter.read({ thread_id: 'owned-main' })
+  assert.equal(f.calls.includes('thread/read'), true)
+  assert.equal((await f.core.snapshot()).sources.some(source => source.descriptor.registrationId === 'chatgpt:qualification-toggle'), true)
+})
 
 test('plugin off releases metadata and only its source, then reenables at the same panel endpoint', async t => {
   const f = await qualifiedFixture(t), url = f.adapter.url
