@@ -168,8 +168,10 @@ test('an empty profile settles its WAL checkpoint and a later Core exit does not
 test('maintenance reopens the same dormant profile without restoring sources or analysis and Core exits naturally', async t => {
   let managedServer, inspection, facade, idleDone
   const idle = new Promise(resolve => { idleDone = resolve })
-  t.after(async () => { try { await facade?.close() } finally { try { await inspection?.close() } finally { await managedServer?.close() } } })
-  const f = await fixture(t), old = await f.client.registerSource({ registrationId: 'dormant-own-source', hostRunId: 'old', name: 'Owned' })
+  const f = await fixture(t)
+  // Keep late-bound resources in the fixture that aggregates errors and removes their directory.
+  f.owned.push({ close: () => facade?.close() }, { close: () => inspection?.close() }, { close: () => managedServer?.close() })
+  const old = await f.client.registerSource({ registrationId: 'dormant-own-source', hostRunId: 'old', name: 'Owned' })
   await f.client.ingest(old, { tasks: [{ id: 'retained', lifecycleId: 'run', title: 'Retained', status: 'running' }], events: [{ id: 'retained-input', taskId: 'retained', taskLifecycleId: 'run', kind: 'input', text: 'RETAINED OWNED MATERIAL', capturedAt: f.clock, occurredAt: null }] })
   await f.closeServer(); f.setClock(f.clock + 1000)
   let connects = 0
