@@ -30,6 +30,22 @@ let prefix = "ghostsentinel:0123456789abcdef01234567:"
             try check(!String(decoding: bytes, as: UTF8.self).contains("old-chat"), "expired execution identity remains on disk")
             try journal.append(["observedAt": clock, "requestId": prefix + "fresh"])
             try check(try journal.read().events.count == 1, "maintenance must retain a fresh action")
+        } else if mode == "journal-uninstall" {
+            let url = URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("actions.json"), clock: Int64 = 200_000_000
+            let journal = NotificationActionJournal(url: url, clock: { clock })
+            let other = "ghostsentinel:aaaaaaaaaaaaaaaaaaaaaaaa:other"
+            try journal.append(["observedAt": clock, "requestId": prefix + "one", "metadata": ["mainId": "removed-main"]])
+            try journal.append(["observedAt": clock, "requestId": other, "metadata": ["mainId": "kept-main"]])
+            try check(try journal.purge(prefix: prefix) == 1, "uninstall must clear its own action facts")
+            try check(try journal.purge(prefix: prefix) == 0, "repeated uninstall must be idempotent")
+            let events = try journal.read().events, bytes = try Data(contentsOf: url)
+            try check(events.count == 1 && events[0]["requestId"] as? String == other, "another installation must retain its actions")
+            try check(!String(decoding: bytes, as: UTF8.self).contains("removed-main"), "removed action identity must not remain in the journal")
+            do { _ = try journal.purge(prefix: "ghostsentinel:"); throw CheckFailure.mismatch("broad uninstall prefix accepted") } catch is CheckFailure { throw CheckFailure.mismatch("broad uninstall prefix accepted") } catch {}
+            try check(try Data(contentsOf: url) == bytes, "a rejected broad prefix must preserve disk facts")
+            let invalid = Data("invalid-json".utf8); try invalid.write(to: url)
+            do { _ = try journal.purge(prefix: prefix); throw CheckFailure.mismatch("unreadable action facts silently erased") } catch is CheckFailure { throw CheckFailure.mismatch("unreadable action facts silently erased") } catch {}
+            try check(try Data(contentsOf: url) == invalid, "a failed purge must retain its original error evidence")
         } else if mode == "journal-boundaries" {
             let url = URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("actions.json"), clock: Int64 = 200_000_000
             let journal = NotificationActionJournal(url: url, clock: { clock })

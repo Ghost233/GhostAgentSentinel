@@ -86,7 +86,7 @@ private func snapshot(_ prefix: String, completion: @escaping ([String: Any]) ->
 private func execute(_ request: [String: Any]) {
     let operation = request["operation"] as? String ?? "invalid"
     guard request["schemaVersion"] as? Int == 1, let prefix = request["ownerPrefix"] as? String, prefixValid(prefix), Bundle.main.bundleIdentifier == identity else { reply(operation, error: "native_protocol"); return }
-    let fields: [String: Set<String>] = ["status": [], "authorize": [], "snapshot": [], "submit": ["requestId", "title", "body", "metadata"], "cancel": ["requestIds"]]
+    let fields: [String: Set<String>] = ["status": [], "authorize": [], "snapshot": [], "purge-installation": [], "submit": ["requestId", "title", "body", "metadata"], "cancel": ["requestIds"]]
     guard let allowed = fields[operation], Set(request.keys).isSubset(of: allowed.union(["schemaVersion", "operation", "ownerPrefix"])) else { reply(operation, error: "native_protocol"); return }
     switch operation {
     case "status":
@@ -98,6 +98,18 @@ private func execute(_ request: [String: Any]) {
         guard let ids = request["requestIds"] as? [String], ids.count <= 100, ids.allSatisfy({ owned($0, prefix) }) else { reply(operation, error: "native_protocol"); return }
         center.removePendingNotificationRequests(withIdentifiers: ids)
         center.getPendingNotificationRequests { requests in reply(operation, result: ["pendingIds": requests.filter { ids.contains($0.identifier) }.map { $0.identifier }, "observedAt": clock()]) }
+    case "purge-installation":
+        center.getPendingNotificationRequests { requests in
+            let ids = Array(requests.filter { owned($0.identifier, prefix) }.prefix(100).map { $0.identifier })
+            center.removePendingNotificationRequests(withIdentifiers: ids)
+            center.getPendingNotificationRequests { remaining in
+                do {
+                    let cleared = try actionJournal.purge(prefix: prefix)
+                    let count = remaining.filter { owned($0.identifier, prefix) }.count
+                    reply(operation, result: ["complete": count == 0, "requestedCancellations": ids.count, "remainingPending": count, "clearedActions": cleared, "deliveredPreserved": true, "observedAt": clock()])
+                } catch { reply(operation, error: "native_unavailable") }
+            }
+        }
     case "submit":
         guard let id = identifier(request["requestId"], maximum: 200), owned(id, prefix), let title = request["title"] as? String, !title.isEmpty, title.count <= 200, let body = request["body"] as? String, body.count <= 1200, let facts = metadata(request["metadata"]) else { reply(operation, error: "native_protocol"); return }
         settings { permission in

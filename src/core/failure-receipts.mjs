@@ -92,6 +92,14 @@ export function createFailureReceipts({ db, now = Date.now }) {
   }
   maintain();
   return {
+    prepareClearSources(sourceKeys) {
+      const selectedReceipts = [...receipts].filter(([, receipt]) => sourceKeys.has(receipt.sourceKey)), selectedStates = [...states].filter(([, state]) => sourceKeys.has(state.sourceKey));
+      return { receiptIds: new Set(selectedReceipts.map(([id]) => id)), removed: { failureReceipts: selectedReceipts.length, failureReceiptStates: selectedStates.length }, stage() {
+        for (const [id] of selectedReceipts) remove.run(COLLECTION, id);
+        for (const [key] of selectedStates) remove.run(STATES, key);
+        return () => { for (const [id] of selectedReceipts) receipts.delete(id); for (const [key] of selectedStates) states.delete(key); };
+      } };
+    },
     settle(input) {
       if (closed) throw new Error('Failure receipt store is closed');
       if (input.attempted !== true || input.settled !== true || !['failed', 'succeeded'].includes(input.outcome) || ['cancelled', 'analyzer_unconfigured'].includes(input.error?.code)) return { created: false, receipt: null };

@@ -278,6 +278,6 @@ element('history-more').onclick=()=>nextHistoryCursor?selectExecution(selectedEx
 function visibility(){clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void refresh();}
 function teardown(){stopped=true;generation++;clearTimeout(timer);timer=null;clearNotificationLog();for(const p of pending.values()){clearTimeout(p.timeout);p.reject(new Error('页面已销毁'));}pending.clear();removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
-(async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.0'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');await refresh();}catch(error){clearView('宿主初始化未完成');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}})();
+(async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');await refresh();}catch(error){clearView('宿主初始化未完成');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}})();
 </script>
 </html>

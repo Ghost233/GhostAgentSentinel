@@ -11,7 +11,7 @@ import { createInstructionLookup, instructionContext, eventRef, referenceKey } f
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
 import { analysisTimeConditions } from '../analysis/index.mjs';
 import { inferenceFailureInfo } from '../analysis/failure-info.mjs';
-import { normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult } from '../protocol.mjs';
+import { normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
 import { createNativeNotificationStore } from './native-notifications.mjs';
 import { createNativeCaptureProgress } from './native-capture-progress.mjs';
@@ -1307,6 +1307,48 @@ export async function createCore({
       if (source) resetSource(source, reason);
       tick();
       return { sourceKey, status: 'disconnected' };
+    },
+    async purgeChatGPTInstallation(value) {
+      ensureOpen();
+      const { installationId } = normalizeChatGPTInstallationPurge(value), registrationId = 'chatgpt:' + installationId;
+      const selectedSources = [...sources].filter(([, source]) => source.descriptor.registrationId === registrationId && source.descriptor.policy === 'chatgpt-main/1');
+      if (selectedSources.some(([, source]) => connected(source))) throw Object.assign(new Error('Stop the ChatGPT installation before purging its Core data'), { code: 'chatgpt_installation_connected' });
+      const sourceKeys = new Set(selectedSources.map(([key]) => key)), selectedTasks = [...tasks].filter(([, task]) => sourceKeys.has(task.sourceKey)), taskKeys = new Set(selectedTasks.map(([key]) => key));
+      const selected = { sources: selectedSources, tasks: selectedTasks, events: [...events].filter(([, event]) => sourceKeys.has(event.sourceKey) || taskKeys.has(event.taskKey)), notifications: [...notifications].filter(([, notice]) => sourceKeys.has(notice.sourceKey)), conversationSettings: [...conversationSettings].filter(([, setting]) => setting.registrationId === registrationId) };
+      const sharedEnrollment = [...sources.values()].some(source => source.descriptor.registrationId === registrationId && source.descriptor.policy !== 'chatgpt-main/1');
+      const nextEnrollment = { ...enrollment, entries: enrollment.entries.filter(entry => entry.registrationId !== registrationId || sharedEnrollment) };
+      const failurePlan = failureStore.prepareClearSources(sourceKeys);
+      const plans = [nativeProgress.prepareClearRegistration(registrationId), nativeOrigins.prepareClearRegistration(registrationId), failurePlan, nativeNotifications.prepareClearSources(sourceKeys, new Set(selected.notifications.map(([id]) => id)), failurePlan.receiptIds)];
+      const counts = { ...Object.fromEntries(Object.entries(selected).map(([name, entries]) => [name, entries.length])), summaries: selectedTasks.filter(([, task]) => task.analysis.summary).length, enrollmentEntries: enrollment.entries.length - nextEnrollment.entries.length, ...Object.assign({}, ...plans.map(plan => plan.removed)) };
+      const empty = Object.fromEntries(Object.keys(counts).map(name => [name, 0]));
+      const errorInfo = (stage, error) => ({ stage, code: String(error.code ?? 'sqlite_error').slice(0, 100), message: String(error.message ?? 'SQLite operation failed').slice(0, 500) });
+      for (const [, task] of selectedTasks) cancelRound('ChatGPT installation data purge', task);
+      const publish = [];
+      let started = false;
+      try {
+        // Private indexes publish only after the enclosing SQLite transaction commits.
+        db.exec('SAVEPOINT chatgpt_installation_purge'); started = true;
+        for (const [collection, entries] of Object.entries(selected)) for (const [key] of entries) remove.run(collection, key);
+        if (counts.enrollmentEntries) write.run('settings', 'enrollment', JSON.stringify(nextEnrollment));
+        for (const plan of plans) publish.push(plan.stage());
+        db.exec('RELEASE chatgpt_installation_purge');
+      } catch (error) {
+        const errors = [errorInfo('logical', error)];
+        try { if (started) { db.exec('ROLLBACK TO chatgpt_installation_purge'); db.exec('RELEASE chatgpt_installation_purge'); } } catch (rollback) { errors.push(errorInfo('rollback', rollback)); }
+        return { installationId, registrationId, status: 'failed', logical: { status: errors.length > 1 ? 'unknown' : 'retained', removed: empty, remaining: errors.length > 1 ? null : counts }, physical: { status: 'not-attempted', secureDelete: true }, errors, retryable: true };
+      }
+      for (const [collection, entries] of Object.entries(selected)) for (const [key] of entries) collections[collection].delete(key);
+      for (const apply of publish) apply();
+      enrollment = nextEnrollment;
+      for (const key of taskKeys) { queued.delete(key); pendingPrunedTasks.delete(key); }
+      for (let index = queue.length - 1; index >= 0; index--) if (taskKeys.has(queue[index])) queue.splice(index, 1);
+      for (const key of sourceKeys) pendingPrunedSources.delete(key);
+      let physical, errors = [];
+      try {
+        const checkpoint = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+        physical = { status: checkpoint.busy === 0 && checkpoint.log === checkpoint.checkpointed ? 'checkpointed' : 'busy', secureDelete: true, wal: { busy: checkpoint.busy, logFrames: checkpoint.log, checkpointedFrames: checkpoint.checkpointed } };
+      } catch (error) { physical = { status: 'failed', secureDelete: true }; errors = [errorInfo('physical', error)]; }
+      return { installationId, registrationId, status: physical.status === 'checkpointed' ? 'complete' : 'incomplete', logical: { status: 'purged', removed: counts, remaining: empty }, physical, errors, retryable: physical.status !== 'checkpointed' };
     },
     async snapshot() {
       ensureOpen();

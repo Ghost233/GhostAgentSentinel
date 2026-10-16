@@ -7,6 +7,7 @@ export const CHATGPT_MAIN_FEATURE = 'chatgpt-main/1'
 export const CONVERSATION_MONITORING_FEATURE = 'conversation-monitoring/1'
 export const MONITORING_FAILURES_FEATURE = 'monitoring-failures/1'
 export const MONITORING_NOTIFICATIONS_FEATURE = 'monitoring-notifications/1'
+export const CHATGPT_INSTALLATION_PURGE_FEATURE = 'chatgpt-installation-purge/1'
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000
 const kinds = new Set(['input', 'output', 'tool-start', 'tool-result', 'status', 'gap'])
 const statuses = new Set(['running', 'idle', 'disposed', 'unknown'])
@@ -19,6 +20,11 @@ function object(value, field) {
 function string(value, field, max = 500) {
   if (typeof value !== 'string' || !value.trim() || value.length > max) throw new Error(`${field} must be a nonempty string (max ${max})`)
   return value
+}
+export function normalizeChatGPTInstallationPurge(value) {
+  object(value, 'ChatGPT installation purge')
+  if (Object.keys(value).length !== 1 || !Object.hasOwn(value, 'installationId')) throw new Error('ChatGPT installation purge requires only installationId')
+  return { installationId: string(value.installationId, 'installationId', 1992) }
 }
 function strings(value, field) {
   if (!Array.isArray(value) || value.length > 100) throw new Error(`${field} must be a bounded list`)

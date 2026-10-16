@@ -68,7 +68,7 @@ function executionSubcommand(command) {
 // Connect only to the existing metadata service. This object has no API for
 // launching an App, resuming a thread or writing configuration.
 export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-server-control/app-server-control.sock') } = {}) {
-  let connection = null, opening = null, closed = false, sequence = 0, initialized = false
+  let connection = null, opening = null, disconnecting = null, closed = false, sequence = 0, initialized = false
   const pending = new Map()
   const fail = (code = 'metadata-unavailable') => { for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(metadataError(code)) }; pending.clear(); initialized = false }
   async function dispose(ws) {
@@ -86,6 +86,7 @@ export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-
     })
   }
   async function connect() {
+    if (disconnecting) await disconnecting
     if (closed) throw metadataError('cancelled')
     if (connection?.readyState === WebSocket.OPEN && initialized) return
     if (opening) return opening
@@ -105,7 +106,7 @@ export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-
       })
       try {
         await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', () => reject(metadataError('metadata-unavailable'))) })
-        await wire('initialize', { clientInfo: { name: 'ghost_sentinel_chatgpt', version: '0.1.0-dev.0' }, capabilities: { experimentalApi: true } })
+        await wire('initialize', { clientInfo: { name: 'ghost_sentinel_chatgpt', version: '0.1.0-dev.1' }, capabilities: { experimentalApi: true } })
         if (closed || connection !== ws) throw metadataError(closed ? 'cancelled' : 'metadata-unavailable')
         ws.send(JSON.stringify({ method: 'initialized' })); initialized = true
       } catch (error) {
@@ -116,14 +117,21 @@ export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-
     })().finally(() => { opening = null })
     return opening
   }
+  function disconnect() {
+    if (disconnecting) return disconnecting
+    const ws = connection, pendingOpening = opening
+    connection = null; fail('cancelled')
+    disconnecting = (async () => { await dispose(ws); await pendingOpening?.catch(() => {}) })().finally(() => { disconnecting = null })
+    return disconnecting
+  }
   return {
     async request(method, params) { if (!readonlyMethods.has(method)) throw new Error('non-observation method rejected'); await connect(); return wire(method, params) },
     diagnostics: () => ({ closed, pendingRequests: pending.size, deadlineTimers: pending.size, connected: connection?.readyState === WebSocket.OPEN }),
+    disconnect,
     async close() {
-      if (closed) return
-      closed = true; fail('cancelled')
-      const ws = connection; connection = null
-      await dispose(ws)
+      if (closed) return disconnecting
+      closed = true
+      await disconnect()
     },
   }
 }
@@ -202,6 +210,7 @@ export function createNativeIO({ pluginId, socketPath, processSample, profileSam
       return { user, effective: explicitDisabled ? 'disabled' : setting(result.config) }
     },
     diagnostics: () => rpc.diagnostics(),
+    disconnectMetadata: () => rpc.disconnect(),
     async close() { closed = true; await rpc.close(); profileCache = null },
   }
 }

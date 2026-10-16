@@ -19,7 +19,16 @@ export function createNativeOriginFences({ db }) {
     const known = versions.get(registrationId) ?? (legacy.has(registrationId) ? 1 : null)
     if (known !== null && known !== requested) throw fail('native_origin_upgrade_unverified')
   }
+  function prepareClearRegistration(registrationId) {
+    const selected = [...entries.keys()].filter(key => JSON.parse(key)[0] === registrationId)
+    return { removed: { nativeOriginFences: selected.length, nativeOriginVersions: Number(versions.has(registrationId)) }, stage() {
+      for (const key of selected) remove.run(COLLECTION, key)
+      remove.run(VERSIONS, registrationId)
+      return () => { for (const key of selected) entries.delete(key); versions.delete(registrationId); legacy.delete(registrationId) }
+    } }
+  }
   return {
+    prepareClearRegistration,
     checkVersion: version,
     read(registrationId, key) { version(registrationId, 2); return structuredClone(entries.get(keyOf(registrationId, key)) ?? null) },
     project(registrationId, requested, origins = [], events = []) {
@@ -48,6 +57,6 @@ export function createNativeOriginFences({ db }) {
       } }
     },
     diagnostics() { const backed = new Set([...legacy, ...[...entries.keys()].map(key => JSON.parse(key)[0])]); return { generations: entries.size, limit: LIMIT, registrations: versions.size, newRegistrationLimit: LIMIT * 2, legacyModeOnly: [...versions.keys()].filter(key => !backed.has(key)).length } },
-    clearRegistration(registrationId) { for (const key of [...entries.keys()].filter(key => JSON.parse(key)[0] === registrationId)) { remove.run(COLLECTION, key); entries.delete(key) } remove.run(VERSIONS, registrationId); versions.delete(registrationId); legacy.delete(registrationId) },
+    clearRegistration(registrationId) { prepareClearRegistration(registrationId).stage()() },
   }
 }

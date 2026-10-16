@@ -153,6 +153,13 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     return { record: publicRecord(value), maySubmit };
   }
   return { touch, removed, prepareTask, observeFailure, scopeEligible, qualified, reconcile, cancel, publicRecord, claim, recordResult,
+    prepareClearSources(sourceKeys, notificationIds, receiptIds) {
+      const selected = [...links].filter(([id, link]) => notificationIds.has(link.notificationId) || receiptIds.has(id)), selectedEligibility = [...eligibility.keys()].filter(key => sourceKeys.has(key));
+      return { removed: { nativeNotificationLinks: selected.length, nativeEligibilityScopes: selectedEligibility.length }, stage() {
+        for (const [id] of selected) remove.run(LINKS, id);
+        return () => { for (const [id] of selected) links.delete(id); for (const key of selectedEligibility) eligibility.delete(key); };
+      } };
+    },
     setEligibility(facts) {
       const owner = source(facts.sourceKey);
       if (owner.descriptor.hostRunId !== facts.hostRunId) throw new Error('Native notification source generation does not match');

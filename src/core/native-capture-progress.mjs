@@ -40,8 +40,16 @@ export function createNativeCaptureProgress({ db, seed = [] }) {
     commit(initial, true)
   }
   expiry()
+  function prepareClearRegistration(registrationId) {
+    const selected = [...records].filter(([, record]) => record.registrationId === registrationId)
+    return { removed: { nativeCaptureProgress: selected.length }, stage() {
+      for (const [key] of selected) remove.run(COLLECTION, key)
+      return () => { for (const [key] of selected) records.delete(key); expiry() }
+    } }
+  }
 
   return {
+    prepareClearRegistration,
     project(registrationId, incoming, current, lookup) {
       const changes = new Map(), earlier = new Map(), output = []; let existingProgress = false
       for (const event of incoming) {
@@ -96,12 +104,12 @@ export function createNativeCaptureProgress({ db, seed = [] }) {
       return { records: records.size, limit: LIMIT, expired: expired.length, locators: values.filter(record => record.locator).length, bodyGaps: values.filter(record => !record.expired && lookup(record.locator)?.data?.nativeRecordId !== record.nativeRecordId).length, expiredLocators: expired.filter(record => record.locator !== undefined).length, expiredTimestamps: expired.filter(record => record.firstCapturedAt !== undefined).length }
     },
     clearRegistration(registrationId) {
-      const selected = [...records].filter(([, record]) => record.registrationId === registrationId)
+      const plan = prepareClearRegistration(registrationId)
+      let apply
       db.exec('SAVEPOINT native_capture_progress_clear')
-      try { for (const [key] of selected) remove.run(COLLECTION, key); db.exec('RELEASE native_capture_progress_clear') }
+      try { apply = plan.stage(); db.exec('RELEASE native_capture_progress_clear') }
       catch (failure) { db.exec('ROLLBACK TO native_capture_progress_clear'); db.exec('RELEASE native_capture_progress_clear'); throw failure }
-      for (const [key] of selected) records.delete(key)
-      expiry()
+      apply()
     },
   }
 }
