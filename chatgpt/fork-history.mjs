@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { NativeJsonlSource, nativeStorageKey } from './native-jsonl-source.mjs'
 import { BoundedReader } from './bounded-reader.mjs'
+import { supportsStorageProducer } from './storage-compatibility.mjs'
 import { emptyForkProof, foldForkProof, forkGeneration, receiptIdentity, validForkProof, nativeRecordIdentity, FORK_LINEAGE_FRAMES, FORK_LEGACY_PRODUCER, FORK_LEGACY_MODE, isLegacyForkProducer } from '../src/fork-proof.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 
@@ -235,7 +236,7 @@ export class ForkHistoryReader {
       }
       if (resolution.phase === 'header' && view.header) {
         const header = view.header
-        const matches = header.threadId === resolution.metadata.record.id && header.originator === 'Codex Desktop' && header.sourceKind === resolution.metadata.record.source && (header.cliVersion === this.source.profile.cliVersion || isLegacyForkProducer(header.cliVersion)) && header.ordinal < base.endOrdinalExclusive
+        const matches = header.threadId === resolution.metadata.record.id && header.originator === 'Codex Desktop' && header.sourceKind === resolution.metadata.record.source && supportsStorageProducer(header.cliVersion) && header.ordinal < base.endOrdinalExclusive
         if (matches) {
           await this.producerProject(header.cwd); budget.projects.add(header.cwd)
           const source = { ...probe.source, cwd: header.cwd }

@@ -4,10 +4,6 @@ import { homedir } from 'node:os'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import { setTimeout as delay } from 'node:timers/promises'
-import { createLazyCore, retentionProfileSignature } from './lazy-core.mjs'
-import { createNativeIO } from './native-io.mjs'
-import { startChatGPTAdapter } from './adapter.mjs'
-import { createNativeNotificationIO } from './native-notifications.mjs'
 
 async function readPrivateConfig(path) {
   const info = await lstat(path)
@@ -145,7 +141,7 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     if (Date.now() >= deadline) throw new Error('helper owner startup or endpoint cannot be verified')
     await delay(25)
   }
-  let adapter, closing = null, stopping = false, retentionTimer = null, retentionPending = null, retentionSignature = null, retentionNextAt = null, retentionError = null
+  let adapter, core, retentionProfileSignature, closing = null, stopping = false, retentionTimer = null, retentionPending = null, retentionSignature = null, retentionNextAt = null, retentionError = null
   let stopReason = 'requested', readyResolve, closedResolve, closedReject
   const ready = new Promise(resolve => { readyResolve = resolve })
   const closed = new Promise((resolve, reject) => { closedResolve = resolve; closedReject = reject })
@@ -158,7 +154,6 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     } else { retentionError = null; retentionNextAt = next === null ? null : Date.now() + next - generatedAt }
     scheduleRetention()
   }
-  const core = createLazyCore({ dataDir: config.coreDataDir, onRetention: retentionObserved })
   function scheduleRetention() {
     clearTimeout(retentionTimer); retentionTimer = null
     if (stopping) return
@@ -186,8 +181,8 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
   }
   const close = () => closing ??= (async () => {
     stopping = true; clearTimeout(retentionTimer); retentionTimer = null
-    try { const stopped = adapter?.close(); if (ownership !== 'plugin') await core.cancelPending(); await retentionPending; await stopped } finally {
-      try { await core.close() } finally {
+    try { const stopped = adapter?.close(); if (ownership !== 'plugin') await core?.cancelPending(); await retentionPending; await stopped } finally {
+      try { await core?.close() } finally {
         const owner = await record(join(lock, 'owner.json'))
         if (owner && identityMatches(owner, identity)) {
           const value = await record(join(config.dataDir, 'runtime.json'))
@@ -199,6 +194,11 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
   })().then(() => { const result = { reason: stopReason }; closedResolve(result); return result }, error => { closedReject(error); throw error })
   try {
     await writePrivateJson(join(lock, 'owner.json'), identity)
+    const [coreIO, { createNativeIO }, { startChatGPTAdapter }, { createNativeNotificationIO }] = await Promise.all([
+      import('./lazy-core.mjs'), import('./native-io.mjs'), import('./adapter.mjs'), import('./native-notifications.mjs'),
+    ])
+    retentionProfileSignature = coreIO.retentionProfileSignature
+    core = coreIO.createLazyCore({ dataDir: config.coreDataDir, onRetention: retentionObserved })
     await maintainRetention(true)
     const rawHostIO = native ?? createNativeIO({ pluginId: config.pluginId, socketPath: config.metadataSocket })
     const hostIO = { ...rawHostIO, async sampleHost() { const reason = await maintenance(config); return reason ? { available: false, reason } : rawHostIO.sampleHost() } }

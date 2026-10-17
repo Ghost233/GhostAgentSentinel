@@ -147,7 +147,7 @@ test('qualification loss aborts in-flight analysis, seals late output and retain
   const prepared = await prepareInstallation({ dataDir, coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@inflight' })
   const config = JSON.parse(await readFile(prepared.configPath, 'utf8')), hostStartedAt = Date.now() - 10000, at = Date.now() - 1000, path = join(dir, 'main.jsonl')
   const line = (type, payload, offset = 0) => JSON.stringify({ type, timestamp: new Date(at + offset).toISOString(), payload }) + '\n'
-  await writeFile(path, line('session_meta', { id: 'main' }) + line('event_msg', { type: 'task_started', turn_id: 'turn', turn_attribution: { turn_id: 'turn', turn_trigger: 'composer' } })
+  await writeFile(path, line('session_meta', { id: 'main', cli_version: supportedProfile.cliVersion, originator: 'Codex Desktop', source: 'vscode', cwd: dir }) + line('event_msg', { type: 'task_started', turn_id: 'turn', turn_attribution: { turn_id: 'turn', turn_trigger: 'composer' } })
     + line('event_msg', { type: 'item_completed', thread_id: 'main', turn_id: 'turn', item: { type: 'UserMessage', id: 'message', content: [{ type: 'text', text: 'Read the requested log only' }] } }, 1)
     + line('response_item', { type: 'message', role: 'assistant', internal_chat_message_metadata_passthrough: { turn_id: 'turn' }, content: [{ type: 'output_text', text: 'Reading the requested log' }] }, 2))
   const thread = { id: 'main', parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path, cwd: dir }
@@ -200,7 +200,7 @@ test('a pending chat metadata read is cancelled on disable and cannot re-registe
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-plugin-metadata-cancel-')), server = await startServer({ dataDir: join(dir, 'core') })
   const client = await connectCore({ dataDir: join(dir, 'core') }); let runtime, enabled = true, hold = false, release, entered
   const reached = new Promise(resolve => { entered = resolve }), path = join(dir, 'main.jsonl'), hostStartedAt = Date.now() - 10000
-  await writeFile(path, JSON.stringify({ type: 'session_meta', payload: { id: 'main' } }) + '\n' + JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(), payload: { type: 'task_started', turn_id: 'turn' } }) + '\n')
+  await writeFile(path, JSON.stringify({ type: 'session_meta', payload: { id: 'main', cli_version: supportedProfile.cliVersion, originator: 'Codex Desktop', source: 'vscode', cwd: dir } }) + '\n' + JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(), payload: { type: 'task_started', turn_id: 'turn' } }) + '\n')
   t.after(async () => { release?.(); await runtime?.close(); await client.close(); await server.close(); await rm(dir, { recursive: true, force: true }) })
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@metadata-cancel' })
   const thread = { id: 'main', parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path, cwd: dir }
@@ -237,7 +237,7 @@ for (const globalLoss of ['disabled', 'unknown']) test(`a project-only enablemen
   t.after(async () => { await runtime?.close(); await client.close(); await server.close(); await rm(dir, { recursive: true, force: true }) })
   const hostStartedAt = Date.now() - 10000, at = Date.now() - 1000
   const threads = ['a', 'b'].map(id => ({ id, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path: join(dir, id + '.jsonl'), cwd: join(dir, 'project-' + id) }))
-  for (const thread of threads) await writeFile(thread.path, JSON.stringify({ type: 'session_meta', payload: { id: thread.id } }) + '\n' + JSON.stringify({ type: 'event_msg', timestamp: new Date(at).toISOString(), payload: { type: 'task_started', turn_id: 'turn-' + thread.id } }) + '\n')
+  for (const thread of threads) await writeFile(thread.path, JSON.stringify({ type: 'session_meta', payload: { id: thread.id, cli_version: supportedProfile.cliVersion, originator: 'Codex Desktop', source: 'vscode', cwd: thread.cwd } }) + '\n' + JSON.stringify({ type: 'event_msg', timestamp: new Date(at).toISOString(), payload: { type: 'task_started', turn_id: 'turn-' + thread.id } }) + '\n')
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@project-gap' })
   const native = {
     async sampleHost() { return { available: true, hostRunId: 'host', hostStartedAt, profile: supportedProfile } },
@@ -382,7 +382,7 @@ for (const notificationFailure of [false, true]) test(`an unsupported profile re
   const prepared = await prepareInstallation({ dataDir, coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@profile-change' })
   const config = JSON.parse(await readFile(prepared.configPath, 'utf8')), hostStartedAt = Date.now() - 10000, at = Date.now() - 1000, path = join(dir, 'main.jsonl')
   const line = (type, payload, offset = 0) => JSON.stringify({ type, timestamp: new Date(at + offset).toISOString(), payload }) + '\n'
-  await writeFile(path, line('session_meta', { id: 'main' }) + line('event_msg', { type: 'task_started', turn_id: 'turn', turn_attribution: { turn_id: 'turn', turn_trigger: 'composer' } })
+  await writeFile(path, line('session_meta', { id: 'main', cli_version: supportedProfile.cliVersion, originator: 'Codex Desktop', source: 'vscode', cwd: dir }) + line('event_msg', { type: 'task_started', turn_id: 'turn', turn_attribution: { turn_id: 'turn', turn_trigger: 'composer' } })
     + line('event_msg', { type: 'item_completed', thread_id: 'main', turn_id: 'turn', item: { type: 'UserMessage', id: 'message', content: [{ type: 'text', text: 'Read the requested log only' }] } }, 1)
     + line('response_item', { type: 'message', role: 'assistant', internal_chat_message_metadata_passthrough: { turn_id: 'turn' }, content: [{ type: 'output_text', text: 'Reading the requested log' }] }, 2))
   const thread = { id: 'main', parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path, cwd: dir }
