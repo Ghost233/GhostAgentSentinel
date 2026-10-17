@@ -583,6 +583,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   let panel
   try { panel = await startPanelServer({ read, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, token, port }) }
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }
+  if (onQualificationLost) await qualification()
   const schedule = () => { if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(); schedule() }, pollMs) }
   if (pollMs && typeof native.listThreads === 'function') void refresh()
   schedule()

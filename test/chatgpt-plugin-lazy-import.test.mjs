@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.mjs'
+import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 
 async function guarded(prepared, script) {
   const events = join(prepared.pluginDir, 'import-events.jsonl')
@@ -22,7 +23,11 @@ test('authenticated owner lookup remains available when collection modules canno
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-lazy-lookup-')); let runtime
   t.after(async () => { await runtime?.close(); await rm(dir, { recursive: true, force: true }) })
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@lazy-lookup' })
-  runtime = await startFromInstallation({ configPath: prepared.configPath, pollMs: 0, ownership: 'plugin', native: { async close() {} } })
+  const native = {
+    async sampleHost() { return { available: true, hostRunId: 'lazy-lookup-host', hostStartedAt: 1, profile: supportedProfile } },
+    async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async close() {},
+  }
+  runtime = await startFromInstallation({ configPath: prepared.configPath, pollMs: 0, ownership: 'plugin', native })
   const script = `
     import assert from 'node:assert/strict'
     const { resolvePluginOwner } = await import(${JSON.stringify(new URL('../chatgpt/runtime.mjs', import.meta.url).href)})

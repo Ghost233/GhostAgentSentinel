@@ -142,7 +142,7 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     await delay(25)
   }
   let adapter, core, retentionProfileSignature, closing = null, stopping = false, retentionTimer = null, retentionPending = null, retentionSignature = null, retentionNextAt = null, retentionError = null
-  let stopReason = 'requested', readyResolve, closedResolve, closedReject
+  let stopReason = 'requested', qualificationRevoked = false, readyResolve, closedResolve, closedReject
   const ready = new Promise(resolve => { readyResolve = resolve })
   const closed = new Promise((resolve, reject) => { closedResolve = resolve; closedReject = reject })
   closed.catch(() => {})
@@ -209,9 +209,9 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
       await writePrivateJson(configPath, config)
     }
     const notifier = notificationIO ?? (config.notificationBundlePath ? createNativeNotificationIO({ bundlePath: config.notificationBundlePath, installationId: config.installationId }) : undefined)
-    const onQualificationLost = ownership === 'plugin' ? reason => { stopReason = reason; void ready.then(close).catch(() => {}) } : undefined
-    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, collectMaterials: true, nativeOriginVersion: 2, initialEnrollmentBaseline, runtimeStatus: () => ({ ...identity }), onQualificationLost })
-    adapter.diagnostics()
+    const onQualificationLost = ownership === 'plugin' ? reason => { qualificationRevoked = true; stopReason = reason; void ready.then(close).catch(() => {}) } : undefined
+    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, collectMaterials: true, nativeOriginVersion: 2, initialEnrollmentBaseline, runtimeStatus: () => { if (ownership === 'plugin' && (qualificationRevoked || stopping)) throw new Error('plugin observation is stopping'); return { ...identity } }, onQualificationLost })
+    if (qualificationRevoked || adapter.diagnostics().closed) throw Object.assign(new Error('plugin startup qualification was revoked'), { code: 'plugin_startup_qualification_revoked' })
     const selectedPort = portOf(adapter.url)
     if (port && selectedPort !== port) throw new Error('helper changed its configured endpoint')
     if (config.port === undefined) await writePrivateJson(configPath, { ...config, port: selectedPort })
@@ -222,7 +222,16 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     }
     const value = { format: 1, ...identity, url: adapter.url, startedAt: Date.now() }
     await writePrivateJson(join(config.dataDir, 'runtime.json'), value)
+    if (qualificationRevoked) throw Object.assign(new Error('plugin startup qualification was revoked'), { code: 'plugin_startup_qualification_revoked' })
     readyResolve()
     return { ...value, reused: false, pluginDir, refresh: adapter.refresh, maintainRetention, diagnostics: () => ({ ...adapter.diagnostics(), retention: { timers: retentionTimer ? 1 : 0, pending: retentionPending ? 1 : 0, nextAt: retentionNextAt, errorCode: retentionError } }), closed, close }
-  } catch (error) { readyResolve(); await close(); throw error }
+  } catch (error) {
+    readyResolve()
+    try { await close() } catch (cleanup) {
+      const failure = new AggregateError([error, cleanup], 'Observation startup failed and cleanup was incomplete', { cause: error })
+      if (error?.code !== undefined) failure.code = error.code
+      throw failure
+    }
+    throw error
+  }
 }

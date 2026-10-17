@@ -13,6 +13,7 @@ const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-
 const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
 const fail = code => { throw Object.assign(new Error(code), { code }) }
 const inside = (path, root) => path === root || path.startsWith(root + sep)
+const temporaryCursor = key => /^cursors\/[a-f0-9]{64}\.json\.[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\.tmp$/.test(key)
 const identity = info => JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs, info.uid, info.mode])
 const directoryIdentity = info => JSON.stringify([info.dev, info.ino, info.uid, info.mode])
 const optional = async path => { try { return await lstat(path) } catch (error) { if (error.code === 'ENOENT') return null; throw error } }
@@ -336,7 +337,13 @@ async function previewInventory(paths, config, receipt, transaction) {
   }
   const exact = new Set(['installation.json', 'runtime.json', 'runtime.lock/owner.json', 'maintenance.json', 'health-outbox.sqlite', 'health-outbox.sqlite-wal', 'health-outbox.sqlite-shm', ...descriptorNames])
   const dirs = new Set(['plugin', 'plugin/.codex-plugin', '.agents', '.agents/plugins', 'cursors', 'runtime.lock'])
-  let count = 0
+  let count = 0, liveOwner
+  async function liveCursorWriter() {
+    if (liveOwner === undefined) {
+      try { liveOwner = Boolean(config && await resolvePluginOwner({ configPath: paths.configPath })) } catch { liveOwner = false }
+    }
+    return liveOwner
+  }
   async function scan(path, prefix = '') {
     const parent = await optional(path)
     if (!parent) return
@@ -344,9 +351,12 @@ async function previewInventory(paths, config, receipt, transaction) {
     directories[path] = directoryIdentity(parent)
     for (const name of await readdir(path)) {
       if (++count > 4096) { blockers.push({ code: 'installation_inventory_budget_exceeded', entries: ['state'] }); return }
-      const key = prefix + name, info = await lstat(join(path, name)), cursor = /^cursors\/[a-f0-9]{64}\.json$/.test(key)
+      const key = prefix + name, cursor = /^cursors\/[a-f0-9]{64}\.json$/.test(key), temporary = temporaryCursor(key)
+      let info
+      try { info = await lstat(join(path, name)) } catch (error) { if (error.code === 'ENOENT' && temporary && await liveCursorWriter()) continue; throw error }
+      const activeWrite = temporary && info.isFile() && (info.mode & 0o7777) === 0o600 && info.uid === process.getuid() && await liveCursorWriter()
       if (info.isDirectory() && dirs.has(key) && !info.isSymbolicLink()) { await scan(join(path, name), key + '/'); if (count > 4096) return }
-      else if (!info.isFile() || info.mode & 0o077 || info.uid !== process.getuid() || !exact.has(key) && !cursor) entries.push('state/' + key)
+      else if (!info.isFile() || info.mode & 0o077 || info.uid !== process.getuid() || !exact.has(key) && !cursor && !activeWrite) entries.push('state/' + key)
     }
   }
   await scan(paths.stateDir)
@@ -419,7 +429,11 @@ async function stopInstallation(plan, config, transaction, io) {
   let remaining
   do {
     remaining = await ownedProcesses(plan.paths, releases)
-    if (!remaining.length && !await optional(join(plan.paths.stateDir, 'runtime.lock')) && !await optional(join(plan.paths.stateDir, 'runtime.json'))) return { remaining: 0, naturalExit: true }
+    if (!remaining.length && !await optional(join(plan.paths.stateDir, 'runtime.lock')) && !await optional(join(plan.paths.stateDir, 'runtime.json'))) {
+      const inventory = await previewInventory(plan.paths, config, (await record(plan.paths.receipt))?.value, transaction)
+      if (inventory.blockers.length) fail('installation_files_unconfirmed_after_stop')
+      return { remaining: 0, naturalExit: true }
+    }
     await delay(100)
   } while (Date.now() < deadline)
   fail('plugin_process_exit_not_observed')
