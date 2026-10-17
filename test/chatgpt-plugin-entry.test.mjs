@@ -10,10 +10,16 @@ import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 
+async function installStdioDefinition(prepared) {
+  await writeFile(join(prepared.pluginDir, '.codex-plugin/plugin.json'), JSON.stringify({ name: 'ghost-sentinel', version: '0.1.0-dev.1', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查' } }), { mode: 0o600 })
+  await writeFile(join(prepared.pluginDir, '.mcp.json'), JSON.stringify({ mcpServers: { sentinel: { command: process.execPath, args: [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', prepared.configPath], cwd: new URL('../', import.meta.url).pathname } } }), { mode: 0o600 })
+}
+
 test('the controlled plugin entry reuses one verified observer and emits no stdout pretending to be MCP stdio', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-plugin-entry-')); let runtime, child
   t.after(async () => { if (child && child.exitCode === null) { child.kill('SIGTERM'); await once(child, 'close') }; await runtime?.close(); await rm(dir, { recursive: true, force: true }) })
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@entry' })
+  await installStdioDefinition(prepared)
   runtime = await startFromInstallation({ configPath: prepared.configPath, pollMs: 0, ownership: 'plugin', native: { async sampleHost() { return { available: true, hostRunId: 'host', hostStartedAt: 1, profile: supportedProfile } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async close() {} } })
   child = spawn(process.execPath, [new URL('../chatgpt/plugin-main.mjs', import.meta.url).pathname, '--config', prepared.configPath], { stdio: ['ignore', 'pipe', 'pipe'] })
   let output = '', diagnostic = '', timer
@@ -36,6 +42,7 @@ test('a qualified plugin observation process exits naturally after disable with 
   t.after(async () => { if (child && child.exitCode === null) { child.kill('SIGTERM'); await once(child, 'close') }; await peer.close(); await server.close(); await rm(dir, { recursive: true, force: true }) })
   const dshSource = await peer.registerSource({ registrationId: 'dsh-peer', hostRunId: 'dsh-run', name: 'DSH peer' })
   const prepared = await prepareInstallation({ dataDir, coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@process' })
+  await installStdioDefinition(prepared)
   const setting = join(dir, 'enabled.json'); await writeFile(setting, 'true')
   const script = `
     import { readFile } from 'node:fs/promises'

@@ -95,12 +95,13 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   if (onQualificationLost !== undefined && typeof onQualificationLost !== 'function') throw new Error('invalid qualification loss handler')
   if (initialEnrollmentBaseline !== undefined && (!initialEnrollmentBaseline || typeof initialEnrollmentBaseline.initialize !== 'boolean' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(initialEnrollmentBaseline.id ?? ''))) throw new Error('invalid initial enrollment baseline')
   let baselineInitializationAvailable = initialEnrollmentBaseline?.initialize === true, baselineCoreInstanceId = null
-  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
+  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (reason === 'unsupported-host-version') view.summary = '当前 App 版本尚未适配，材料采集已停止'; if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
   await mkdir(join(dataDir, 'cursors'), { recursive: true, mode: 0o700 })
   const healthOutbox = collectMaterials ? await openHealthOutbox({ dataDir, now }) : null
   let closed = false, closing = null, timer = null, refreshPending = null, source = null, sourceEpoch = 0, registration = null
   let sourceHealth = null, outboxError = null, coreInstanceId = null
   let notificationPending = null, notificationError = null
+  let qualifiedHost = null
   const threads = new Map(), operations = new Set()
   const delivery = notificationIO ? createNotificationDelivery({ core, native: notificationIO, installationId, qualify: qualifyNotification, now }) : null
   const storageVersion = collectMaterials && nativeOriginVersion === 2 ? 2 : 1
@@ -219,7 +220,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     return registered?.hostRunId === host.hostRunId ? registered : null
   }
 
-  const hostGap = host => host?.available !== true ? host?.reason ?? 'source-unavailable' : profileKey(host.profile) !== profileKey(supportedProfile) ? 'unsupported-host-version' : typeof host.hostRunId !== 'string' || !host.hostRunId || !Number.isSafeInteger(host.hostStartedAt) ? 'source-generation-unverified' : null
+  const hostGap = host => host?.available !== true ? host?.reason ?? 'source-unavailable' : typeof host.hostRunId !== 'string' || !host.hostRunId || !Number.isSafeInteger(host.hostStartedAt) ? 'source-generation-unverified' : null
   function qualificationLost(reason) {
     if (!onQualificationLost || closed) return
     // Closing is deliberately not awaited by the collection or notification
@@ -231,13 +232,15 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     let host, user
     try { host = await native.sampleHost() }
     catch (error) { if (!onQualificationLost) throw error; const gap = 'host-verification-unavailable'; qualificationLost(gap); return { host: null, gap } }
-    const gap = hostGap(host) ?? (expected && (host.hostRunId !== expected.hostRunId || host.hostStartedAt !== expected.hostStartedAt) ? 'source-generation-changed' : null)
+    const previous = expected ?? qualifiedHost
+    const gap = hostGap(host) ?? (previous && (host.hostRunId !== previous.hostRunId || host.hostStartedAt !== previous.hostStartedAt) ? 'source-generation-changed' : null)
     if (gap) { qualificationLost(gap); return { host, gap } }
     try { user = await native.readEnablement(null) }
     catch (error) { if (!onQualificationLost) throw error; const gap = 'plugin-enablement-unconfirmed'; qualificationLost(gap); return { host, gap } }
     const enabledGap = user?.user !== 'enabled' || user?.effective !== 'enabled' ? user?.user === 'disabled' || user?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed' : null
-    if (enabledGap) qualificationLost(enabledGap)
-    return { host, gap: enabledGap }
+    if (enabledGap) { qualificationLost(enabledGap); return { host, gap: enabledGap } }
+    if (onQualificationLost && !qualifiedHost) qualifiedHost = { hostRunId: host.hostRunId, hostStartedAt: host.hostStartedAt }
+    return { host, gap: profileKey(host.profile) !== profileKey(supportedProfile) ? 'unsupported-host-version' : null }
   }
   async function projectSetting(context, cwd) {
     if (!context.projects.has(cwd)) context.projects.set(cwd, Promise.resolve().then(() => native.readEnablement(cwd)).then(setting => ({ setting }), () => ({ unavailable: true })))

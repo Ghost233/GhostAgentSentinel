@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
-import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.mjs'
+import { prepareInstallation, startFromInstallation, resolvePluginOwner } from '../chatgpt/runtime.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { notificationPrefix } from '../chatgpt/native-notifications.mjs'
 
@@ -298,4 +298,130 @@ for (const mode of ['snapshot-failed', 'cancel-failed', 'pending-remains', 'hist
   await assert.rejects(stat(join(dir, 'adapter/runtime.json')), { code: 'ENOENT' })
   assert.equal(runtime.diagnostics().healthOutbox.closed, true)
   assert.ok((await client.snapshot()).sources.every(source => source.status === 'disconnected'))
+})
+
+test('a real stdio installation starts and resolves one authenticated plugin owner using its private saved HTTP port', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'sentinel-plugin-stdio-installation-')), server = await startServer({ dataDir: join(dir, 'core') })
+  const client = await connectCore({ dataDir: join(dir, 'core') }); let runtime
+  t.after(async () => { await runtime?.close(); await client.close(); await server.close(); await rm(dir, { recursive: true, force: true }) })
+  const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@stdio-installation' })
+  const manifestPath = join(prepared.pluginDir, '.codex-plugin/plugin.json'), connectionPath = join(prepared.pluginDir, '.mcp.json')
+  const manifest = JSON.stringify({ name: 'ghost-sentinel', version: '0.1.0-dev.1', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查' } })
+  const connection = JSON.stringify({ mcpServers: { sentinel: { command: process.execPath, args: [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', prepared.configPath], cwd: new URL('../', import.meta.url).pathname } } })
+  await writeFile(manifestPath, manifest, { mode: 0o600 }); await writeFile(connectionPath, connection, { mode: 0o600 })
+  const native = { async sampleHost() { return { available: true, hostRunId: 'host', hostStartedAt: 1, profile: supportedProfile } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async listThreads() { return { data: [], nextCursor: null } }, async close() {} }
+  runtime = await startFromInstallation({ configPath: prepared.configPath, native, pollMs: 0, ownership: 'plugin' })
+  await runtime.refresh()
+  assert.equal((await client.snapshot()).sources[0].status, 'connected', 'the installed stdio definition does not prevent complete observation startup')
+  const resolved = await resolvePluginOwner({ configPath: prepared.configPath })
+  assert.equal(resolved.runId, runtime.runId); assert.equal(resolved.ownership, 'plugin')
+  const reused = await startFromInstallation({ configPath: prepared.configPath, native, pollMs: 0, ownership: 'plugin' })
+  assert.equal(reused.reused, true); assert.equal(reused.runId, runtime.runId); await reused.close()
+  assert.equal(await readFile(manifestPath, 'utf8'), manifest)
+  assert.equal(await readFile(connectionPath, 'utf8'), connection)
+  const config = JSON.parse(await readFile(prepared.configPath, 'utf8')), port = Number(new URL(runtime.url).port)
+  assert.equal(config.port, port)
+  try {
+    await writeFile(prepared.configPath, JSON.stringify({ ...config, port: port === 65535 ? port - 1 : port + 1 }), { mode: 0o600 })
+    await assert.rejects(resolvePluginOwner({ configPath: prepared.configPath }), /untrusted helper endpoint/)
+    await assert.rejects(startFromInstallation({ configPath: prepared.configPath, native, pollMs: 0, ownership: 'plugin' }), /untrusted helper endpoint/)
+  } finally { await writeFile(prepared.configPath, JSON.stringify(config), { mode: 0o600 }) }
+  const first = runtime
+  await first.close()
+  runtime = await startFromInstallation({ configPath: prepared.configPath, native, pollMs: 0, ownership: 'plugin' })
+  assert.equal(runtime.url, first.url); assert.notEqual(runtime.runId, first.runId)
+  assert.equal((await resolvePluginOwner({ configPath: prepared.configPath })).runId, runtime.runId)
+  await runtime.close()
+  await assert.rejects(startFromInstallation({ configPath: prepared.configPath, native, pollMs: 0 }), /untrusted helper endpoint/)
+})
+
+for (const loss of ['disabled', 'unknown', 'enablement-failed', 'host-lost', 'generation-changed', 'identity-unconfirmed', 'start-time-unconfirmed']) test(`an unsupported material profile keeps one gray observer until ${loss} revokes global eligibility`, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'sentinel-plugin-unsupported-')); let runtime, changed = false, enablementReads = 0, materialReads = 0
+  t.after(async () => { await runtime?.close(); await rm(dir, { recursive: true, force: true }) })
+  const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@unsupported' })
+  const native = {
+    async sampleHost() {
+      if (changed && loss === 'host-lost') return { available: false, reason: 'execution-source-unavailable' }
+      return { available: true, hostRunId: changed && loss === 'identity-unconfirmed' ? null : changed && loss === 'generation-changed' ? 'different-host' : 'host', hostStartedAt: changed && loss === 'start-time-unconfirmed' ? null : 1, profile: { appVersion: '26.1013.31256', appBuild: '20586', cliVersion: '0.163.0-alpha.10.2' } }
+    },
+    async readEnablement(cwd) { enablementReads++; assert.equal(cwd, null); if (changed && loss === 'enablement-failed') throw new Error('owned global configuration unavailable'); return { user: changed && ['disabled', 'unknown'].includes(loss) ? loss : 'enabled', effective: changed && ['disabled', 'unknown'].includes(loss) ? loss : 'enabled' } },
+    async listThreads() { materialReads++; assert.fail('an unsupported material profile cannot read the chat directory') },
+    async readThread() { materialReads++; assert.fail('an unsupported material profile cannot read a chat record') }, async close() {},
+  }
+  runtime = await startFromInstallation({ configPath: prepared.configPath, native, pollMs: 20, ownership: 'plugin' })
+  await runtime.refresh()
+  assert.equal(runtime.diagnostics().closed, false)
+  const config = JSON.parse(await readFile(prepared.configPath, 'utf8'))
+  const health = await fetch(runtime.url + '/health', { headers: { authorization: 'Bearer ' + config.token } }).then(value => value.json())
+  assert.equal(health.runId, runtime.runId); assert.equal(health.ownership, 'plugin')
+  const response = await fetch(runtime.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + config.token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'unverified-chat' } } }) })
+  const view = (await response.json()).result.structuredContent
+  assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'unsupported-host-version')
+  assert.match(view.summary, /版本尚未适配.*材料采集已停止/)
+  assert.equal(view.identity.threadId, null, 'unsupported material does not claim a verified current chat')
+  const reads = enablementReads
+  for (let n = 0; enablementReads <= reads && n < 100; n++) await delay(5)
+  assert.ok(enablementReads > reads, 'safe global eligibility checks continue with the same observer')
+  assert.equal(materialReads, 0)
+  await assert.rejects(stat(join(dir, 'core')), { code: 'ENOENT' })
+  changed = true; await runtime.refresh()
+  assert.deepEqual(await completed(runtime.closed), { reason: loss === 'disabled' ? 'plugin-disabled' : ['unknown', 'enablement-failed'].includes(loss) ? 'plugin-enablement-unconfirmed' : loss === 'generation-changed' ? 'source-generation-changed' : ['identity-unconfirmed', 'start-time-unconfirmed'].includes(loss) ? 'source-generation-unverified' : 'execution-source-unavailable' })
+  await assert.rejects(stat(join(dir, 'adapter/runtime.lock')), { code: 'ENOENT' })
+})
+
+for (const notificationFailure of [false, true]) test(`an unsupported profile revokes an existing source and in-flight analysis while preserving its gray owner${notificationFailure ? ' and notification cleanup error' : ''}`, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'sentinel-plugin-profile-change-')), dataDir = join(dir, 'adapter')
+  let runtime, profile = supportedProfile, enabled = true, modelReached, modelConnectionClosed = false, heldResponse, modelRequests = 0, materialReads = 0, notifierCancellations = 0, failNotifications = false
+  const reached = new Promise(resolve => { modelReached = resolve })
+  const model = createServer(async (req, res) => { for await (const chunk of req) void chunk; modelRequests++; heldResponse = res; res.once('close', () => { modelConnectionClosed = true }); modelReached() })
+  await new Promise(resolve => model.listen(0, '127.0.0.1', resolve))
+  const server = await startServer({ dataDir: join(dir, 'core') }), client = await connectCore({ dataDir: join(dir, 'core') })
+  t.after(async () => { failNotifications = false; await runtime?.close(); await client.close(); await server.close(); model.closeAllConnections(); await new Promise(resolve => model.close(resolve)); await rm(dir, { recursive: true, force: true }) })
+  const baseUrl = 'http://127.0.0.1:' + model.address().port
+  await client.configureAnalysis({ llm: { baseUrl, model: 'owned-extractor' }, jev: { baseUrl, model: 'owned-judge' } })
+  const prepared = await prepareInstallation({ dataDir, coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@profile-change' })
+  const config = JSON.parse(await readFile(prepared.configPath, 'utf8')), hostStartedAt = Date.now() - 10000, at = Date.now() - 1000, path = join(dir, 'main.jsonl')
+  const line = (type, payload, offset = 0) => JSON.stringify({ type, timestamp: new Date(at + offset).toISOString(), payload }) + '\n'
+  await writeFile(path, line('session_meta', { id: 'main' }) + line('event_msg', { type: 'task_started', turn_id: 'turn', turn_attribution: { turn_id: 'turn', turn_trigger: 'composer' } })
+    + line('event_msg', { type: 'item_completed', thread_id: 'main', turn_id: 'turn', item: { type: 'UserMessage', id: 'message', content: [{ type: 'text', text: 'Read the requested log only' }] } }, 1)
+    + line('response_item', { type: 'message', role: 'assistant', internal_chat_message_metadata_passthrough: { turn_id: 'turn' }, content: [{ type: 'output_text', text: 'Reading the requested log' }] }, 2))
+  const thread = { id: 'main', parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path, cwd: dir }
+  const native = {
+    async sampleHost() { return { available: true, hostRunId: 'host', hostStartedAt, profile } },
+    async readEnablement() { return { user: enabled ? 'enabled' : 'disabled', effective: enabled ? 'enabled' : 'disabled' } },
+    async listThreads() { materialReads++; return { data: [thread], nextCursor: null } }, async readThread() { materialReads++; return { thread, anchorTurnId: 'turn' } }, async close() {},
+  }
+  const notificationIO = {
+    async settings() { return { authorization: 'denied', observedAt: Date.now() } },
+    async snapshot() { if (failNotifications) throw Object.assign(new Error('owned notification cleanup unavailable'), { code: 'native_unavailable' }); return { pending: [], delivered: [], actions: [], observedAt: Date.now() } },
+    async cancel() { return { pendingIds: [], observedAt: Date.now() } }, cancelPendingOperations() { notifierCancellations++ }, close() {},
+  }
+  runtime = await startFromInstallation({ configPath: prepared.configPath, native, notificationIO, pollMs: 0, ownership: 'plugin' })
+  await runtime.refresh(); await completed(reached)
+  const before = await client.snapshot(), task = before.tasks.find(task => task.id === 'main'), readCount = materialReads
+  assert.equal(task.analysis.state, 'analyzing')
+  failNotifications = notificationFailure
+  profile = { appVersion: '26.1013.31256', appBuild: '20586', cliVersion: '0.163.0-alpha.10.2' }
+  await runtime.refresh()
+  assert.equal(runtime.diagnostics().closed, false); assert.equal(runtime.diagnostics().openReaders, 0)
+  for (let n = 0; !modelConnectionClosed && n < 100; n++) await delay(2)
+  assert.equal(modelConnectionClosed, true)
+  heldResponse.end(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+  const read = async () => {
+    const response = await fetch(runtime.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + config.token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'main' } } }) })
+    return (await response.json()).result.structuredContent
+  }
+  let view = await read()
+  if (notificationFailure) for (let n = 0; view.notifications.errorCode !== 'native_unavailable' && n < 100; n++) { await delay(2); view = await read() }
+  assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'unsupported-host-version')
+  assert.match(view.summary, /版本尚未适配.*材料采集已停止/)
+  assert.equal(view.notifications.errorCode, notificationFailure ? 'native_unavailable' : null)
+  assert.ok(notifierCancellations > 0)
+  assert.equal(materialReads, readCount, 'unsupported material never reaches directory or record metadata IO')
+  assert.equal((await fetch(runtime.url + '/health', { headers: { authorization: 'Bearer ' + config.token } }).then(response => response.json())).runId, runtime.runId)
+  const after = await client.snapshot(), retained = after.tasks.find(value => value.key === task.key)
+  assert.equal(after.sources.find(value => value.key === task.sourceKey).status, 'disconnected')
+  assert.deepEqual(retained.events, task.events); assert.equal(retained.analysis.completedAt, null); assert.equal(modelRequests, 1)
+  failNotifications = false; enabled = false; await runtime.refresh()
+  assert.deepEqual(await completed(runtime.closed), { reason: 'plugin-disabled' })
 })

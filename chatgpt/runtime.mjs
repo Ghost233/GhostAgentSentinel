@@ -116,7 +116,7 @@ export async function resolvePluginOwner({ configPath } = {}) {
   if (!info.isDirectory() || info.mode & 0o077 || typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('private installation directory required')
   const owner = await record(join(config.dataDir, 'runtime.lock/owner.json'))
   if (!owner) return null
-  const runtime = await existing(config, owner, await stablePort(config), 'plugin')
+  const runtime = await existing(config, owner, config.port ?? 0, 'plugin')
   return runtime && !runtime.dead ? { ...runtime, token: config.token } : null
 }
 
@@ -126,7 +126,7 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
   const config = await readPrivateConfig(configPath), pluginDir = join(config.dataDir, 'plugin')
   const info = await lstat(config.dataDir)
   if (!info.isDirectory() || info.mode & 0o077 || typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('private installation directory required')
-  const lock = join(config.dataDir, 'runtime.lock'), port = await stablePort(config), runId = randomUUID()
+  const lock = join(config.dataDir, 'runtime.lock'), port = ownership === 'plugin' ? config.port ?? 0 : await stablePort(config), runId = randomUUID()
   const identity = { protocol: HELPER_PROTOCOL, installationId: config.installationId, runId, pid: process.pid, version: HELPER_VERSION, ...(ownership === 'plugin' ? { ownership } : {}) }
   const deadline = Date.now() + 2500
   while (true) {

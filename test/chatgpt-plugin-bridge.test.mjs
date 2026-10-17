@@ -21,6 +21,8 @@ async function bounded(promise, label) {
 async function setup(t) {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-bridge-')), core = await startServer({ dataDir: join(dir, 'core') })
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@bridge' })
+  await writeFile(join(prepared.pluginDir, '.codex-plugin/plugin.json'), JSON.stringify({ name: 'ghost-sentinel', version: '0.1.0-dev.1', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查' } }), { mode: 0o600 })
+  await writeFile(join(prepared.pluginDir, '.mcp.json'), JSON.stringify({ mcpServers: { sentinel: { command: process.execPath, args: [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', prepared.configPath], cwd: new URL('../', import.meta.url).pathname } } }), { mode: 0o600 })
   const statePath = join(dir, 'enabled.json'), callsPath = join(dir, 'calls.txt'), pidsPath = join(dir, 'owner-pids.txt'), children = []
   await writeFile(statePath, 'true'); await writeFile(callsPath, ''); await writeFile(pidsPath, '')
   t.after(async () => {
