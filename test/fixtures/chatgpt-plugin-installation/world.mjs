@@ -24,6 +24,7 @@ export async function unlaunchedWorld(t) {
     async inspect() { return structuredClone(this.state) },
     async register() { this.state = { ...this.state, installed: true, enabled: 'enabled', marketplaceRegistered: true, pluginPath: join(installRoot, 'state/plugin'), revision: 'r' + ++this.revision }; return this.inspect() },
     async setEnabled(value, revision) { assert.equal(revision, this.state.revision); this.state.enabled = value ? 'enabled' : 'disabled'; this.state.revision = 'r' + ++this.revision; return this.inspect() },
+    async initializeConnection() {},
     async unregister() { this.state = { ...this.state, installed: false, enabled: 'disabled', marketplaceRegistered: false, pluginPath: null, revision: 'r' + ++this.revision }; return this.inspect() },
   }
   const options = { operation: 'install', installRoot, packageRoot, pluginId: host.state.pluginId, pluginName: 'ghost-sentinel', marketplaceName: 'fault-loop', coreDataDir: join(dir, 'core'), sessionsRoot: join(dir, 'sessions'), metadataSocket: join(dir, 'metadata.sock') }
@@ -49,13 +50,18 @@ export async function installationWorld(t) {
       if (enabled && this.failNextEnable) { const code = this.failNextEnable; this.failNextEnable = null; throw Object.assign(new Error('Owned enable fault'), { code }) }
       this.state.enabled = enabled ? 'enabled' : 'disabled'; this.state.revision = 'r' + ++this.revision
       hostState.enabled = enabled; await writeFile(statePath, JSON.stringify(hostState), { mode: 0o600 })
-      if (enabled && this.autoStart) {
+      return this.inspect()
+    },
+    async initializeConnection(expected) {
+      assert.equal(expected, this.state.revision)
+      assert.equal(this.state.enabled, 'enabled')
+      if (this.failNextInitialize) { const code = this.failNextInitialize; this.failNextInitialize = null; throw Object.assign(new Error('Owned initialization fault'), { code }) }
+      if (this.autoStart) {
         const launch = JSON.parse(await readFile(join(installRoot, 'state/plugin/.mcp.json'), 'utf8')).mcpServers.sentinel
         const child = spawn(launch.command, launch.args, { cwd: launch.cwd, stdio: ['pipe', 'pipe', 'pipe'] })
         child.ended = once(child, 'close'); child.errors = ''; child.stderr.on('data', data => { child.errors += data }); child.stdout.on('data', () => {}); child.stdin.on('error', () => {}); children.push(child)
         child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'owned-installation-host', version: '1' } } }) + '\n')
       }
-      return this.inspect()
     },
     async unregister() { this.calls.push('unregister'); this.state = { ...this.state, installed: false, enabled: 'disabled', marketplaceRegistered: false, pluginPath: null, revision: 'r' + ++this.revision }; return this.inspect() },
   }

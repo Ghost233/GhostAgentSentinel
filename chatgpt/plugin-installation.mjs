@@ -538,6 +538,7 @@ async function installRelease(plan, config, transaction, io) {
   if (!before.installed || before.enabled !== 'disabled' || before.pluginPath !== paths.pluginDir) fail('plugin_enablement_unconfirmed')
   transaction.hostRevision = checkedHost(await io.host.setEnabled(true, before.revision), config.pluginId).revision
   await journal(paths, transaction, 'awaiting-activation')
+  await io.host.initializeConnection(transaction.hostRevision)
   const activation = await installedOwner(plan, release, io)
   await requireWrittenDescriptors(paths, written)
   await save(paths.receipt, { ...receipt, status: 'installed' })
@@ -562,6 +563,8 @@ async function restoreRelease(plan, config, transaction, io) {
   const host = checkedHost(await io.host.inspect(), config.pluginId)
   if (host.revision !== transaction.hostRevision) fail('plugin_host_concurrently_changed')
   transaction.hostRevision = checkedHost(await io.host.setEnabled(true, host.revision), config.pluginId).revision
+  await journal(plan.paths, transaction, 'restoring-activation')
+  await io.host.initializeConnection(transaction.hostRevision)
   const release = await packageAt(join(plan.paths.releases, receipt.activeDigest), io, receipt.activeDigest)
   return { status: 'complete', activation: await installedOwner(plan, release, io), restoredDigest: receipt.activeDigest }
 }

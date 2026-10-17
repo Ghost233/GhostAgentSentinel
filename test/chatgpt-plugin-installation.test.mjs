@@ -128,6 +128,46 @@ test('metadata enabled without a spawned owner stays resumable and cannot be rep
   assert.equal(removed.status, 'complete', JSON.stringify(removed))
 })
 
+test('connection initialization failure after a confirmed enable preserves the revision needed for natural failure cleanup', async t => {
+  const f = await unlaunchedWorld(t)
+  let initialized = 0
+  f.host.initializeConnection = async revision => {
+    initialized++
+    assert.equal(revision, f.host.state.revision)
+    assert.equal(f.host.state.enabled, 'enabled')
+    throw Object.assign(new Error('Owned connection initialization failure'), { code: 'owned_initialization_failed' })
+  }
+  const result = await applyPluginChange(await previewPluginChange(f.options, f.io), f.io)
+  assert.equal(result.errorCode, 'owned_initialization_failed')
+  assert.equal(initialized, 1)
+  assert.equal(result.failureCleanup?.naturalExit, true, JSON.stringify(result))
+  assert.equal(result.failureCleanup.remaining, 0)
+  assert.equal(f.host.state.enabled, 'disabled')
+})
+
+test('a failed upgrade connection initialization restores the old release without losing pause or first capture', { timeout: 30000 }, async t => {
+  const f = await installationWorld(t), first = await f.packageFixture('0.2.0-dev.1'), second = await f.packageFixture('0.2.0-dev.2')
+  const installed = await applyPluginChange(await previewPluginChange({ ...f.options, packageRoot: first }, f.io), f.io)
+  assert.equal(installed.status, 'complete', JSON.stringify(installed))
+  const configPath = join(f.installRoot, 'state/installation.json'), before = JSON.parse(await readFile(configPath, 'utf8'))
+  const task = (await f.core.snapshot()).tasks.find(task => task.id === 'resource-main'), capturedAt = task.events.find(event => event.kind === 'input').capturedAt
+  const scope = { registrationId: 'chatgpt:' + before.installationId, taskId: task.id }, monitoring = await f.core.conversationMonitoring(scope)
+  await f.core.setConversationMonitoring({ ...scope, paused: true, revision: monitoring.revision })
+  f.host.failNextInitialize = 'owned_initialization_failed'
+  const failed = await applyPluginChange(await previewPluginChange({ ...f.options, operation: 'upgrade', packageRoot: second }, f.io), f.io)
+  assert.equal(failed.errorCode, 'owned_initialization_failed')
+  assert.equal(failed.rollback?.status, 'complete', JSON.stringify(failed))
+  assert.equal(failed.rollback.restoredDigest, installed.digest)
+  assert.equal(f.host.state.enabled, 'enabled')
+  const after = JSON.parse(await readFile(configPath, 'utf8'))
+  for (const key of ['installationId', 'token']) assert.equal(after[key], before[key])
+  assert.equal((await f.core.conversationMonitoring(scope)).paused, true)
+  assert.equal((await f.core.snapshot()).tasks.find(row => row.id === task.id).events.find(event => event.kind === 'input').capturedAt, capturedAt)
+  await f.core.heartbeat(f.peer)
+  const removed = await applyPluginChange(await previewPluginChange({ ...f.options, operation: 'uninstall' }, f.io), f.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed))
+})
+
 test('resuming a staged installation preserves user-edited descriptors and blocks unproved partial writes', { timeout: 30000 }, async t => {
   const f = await installationWorld(t), packageRoot = await f.packageFixture('0.2.0-dev.1')
   f.io.timeoutMs = 100; f.host.autoStart = false

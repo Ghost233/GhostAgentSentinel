@@ -88,7 +88,7 @@ export function createPluginHost({ socketPath, marketplacePath, marketplaceName,
     const own = user ? setting(user.config, pluginId) : null, effective = setting(config?.config, pluginId)
     const denied = Array.isArray(config?.layers) && config.layers.some(layer => !layer.disabledReason && setting(layer.config, pluginId) === false)
     const enabled = own === false || effective === false || denied || summary?.enabled === false ? 'disabled' : own === true && effective === true && summary?.enabled === true ? 'enabled' : 'unknown'
-    return { view: { pluginId, installed: summary?.installed ?? false, enabled, revision: user?.version ?? null, pluginPath: summary ? pluginPath : null, marketplaceRegistered: matches.length === 1, version: summary?.localVersion ?? summary?.version ?? null }, user }
+    return { view: { pluginId, installed: summary?.installed ?? false, enabled, revision: user?.version ?? null, pluginPath: summary ? pluginPath : null, marketplaceRegistered: matches.length === 1, version: summary?.localVersion ?? summary?.version ?? null }, user, staticServerConfigured: Object.hasOwn(config?.config?.mcp_servers ?? {}, 'sentinel') }
   }
   const inspect = async () => (await readState()).view
   async function mutate(method, params) {
@@ -156,6 +156,7 @@ export function createPluginHost({ socketPath, marketplacePath, marketplaceName,
     if (!before.view.installed || !before.view.marketplaceRegistered) throw failure('plugin_host_not_installed')
     if (before.view.revision !== expectedRevision) throw failure('plugin_host_revision_conflict')
     if (!before.user || !editable(before.user.config, pluginId)) throw failure('plugin_host_enablement_unconfirmed')
+    if (value && before.staticServerConfigured) throw failure('plugin_host_server_name_conflict')
     if (setting(before.user.config, pluginId) === value) return before.view
     let result
     try {
@@ -165,5 +166,18 @@ export function createPluginHost({ socketPath, marketplacePath, marketplaceName,
     if (typeof result?.version !== 'string' || result.filePath !== before.user.name.file || after.view.revision !== result.version || setting(after.user?.config, pluginId) !== value) throw failure('plugin_host_write_unconfirmed')
     return after.view
   }
-  return { inspect, register, setEnabled, unregister, close: () => rpc.close() }
+  async function initializeConnection(expectedRevision) {
+    if (typeof expectedRevision !== 'string' || !expectedRevision) throw failure('plugin_host_revision_required')
+    const before = await readState()
+    if (before.view.revision !== expectedRevision) throw failure('plugin_host_revision_conflict')
+    if (!before.view.installed || before.view.enabled !== 'enabled') throw failure('plugin_host_activation_qualification_changed')
+    if (before.staticServerConfigured) throw failure('plugin_host_server_name_conflict')
+    const discovery = await rpc.request('mcpServerStatus/list', { serverName: 'sentinel', detail: 'toolsAndAuthOnly', limit: 1 })
+    if (!Array.isArray(discovery?.data) || discovery.data.length !== 1 || discovery.data[0]?.name !== 'sentinel' || discovery.data[0].pluginId !== pluginId) throw failure('plugin_host_discovery_unconfirmed')
+    const after = await readState()
+    if (after.view.revision !== expectedRevision) throw failure('plugin_host_revision_conflict')
+    if (!after.view.installed || after.view.enabled !== 'enabled' || after.staticServerConfigured) throw failure('plugin_host_activation_qualification_changed')
+    return after.view
+  }
+  return { inspect, register, setEnabled, initializeConnection, unregister, close: () => rpc.close() }
 }

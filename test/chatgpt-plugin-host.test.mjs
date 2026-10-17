@@ -31,6 +31,7 @@ async function fixture(t) {
     else if (message.method === 'plugin/read') result = { plugin: { summary: summary(), marketplaceName: options.marketplaceName, marketplacePath, mcpServers: ['sentinel'] } }
     else if (message.method === 'config/read') {
       const config = { plugins: { ...(state.ownSettingMissing ? {} : { [options.pluginId]: { enabled: state.enabled } }), 'unrelated@other': { enabled: state.otherEnabled } }, ...(state.marketConfig ? { marketplaces: { [options.marketplaceName]: state.marketConfig } } : {}) }
+      if (state.staticServer) config.mcp_servers = { sentinel: { command: 'unrelated-static-server' } }
       const layer = { name: { type: 'user', file: join(root, 'config.toml') }, version: state.revision, config }
       if (state.malformedOwn) config.plugins[options.pluginId] = 'untrusted'
       result = { config, layers: state.ambiguousUser ? [layer, { ...layer }] : [layer] }
@@ -57,6 +58,11 @@ async function fixture(t) {
       state.installed = false; state.enabled = false; state.revision = 'user-revision-' + ++state.writes; result = {}
     } else if (message.method === 'marketplace/remove') {
       assert.equal(message.params.marketplaceName, options.marketplaceName); state.registered = false; result = { marketplaceName: options.marketplaceName, installedRoot: null }
+    } else if (message.method === 'mcpServerStatus/list') {
+      assert.deepEqual(message.params, { serverName: 'sentinel', detail: 'toolsAndAuthOnly', limit: 1 })
+      state.discovered = true
+      result = { data: state.discoveryData ?? [{ name: 'sentinel', pluginId: options.pluginId, tools: {}, authStatus: 'unsupported' }], nextCursor: null }
+      if (state.discoveryConcurrentChange) { state.revision = 'user-disabled-during-discovery'; state.enabled = false; state.otherEnabled = false }
     } else { ws.send(JSON.stringify({ id: message.id, error: { code: -32601, message: 'unexpected mutation in read-only test' } })); return }
     ws.send(JSON.stringify({ id: message.id, result }))
   }))
@@ -80,6 +86,7 @@ test('stopping one plugin writes only its enabled key with a configuration revis
   const after = await f.host.setEnabled(false, before.revision)
   assert.equal(after.enabled, 'disabled'); assert.equal(after.revision, 'user-revision-2')
   assert.equal(f.state.otherEnabled, true)
+  assert.ok(!f.calls.some(call => call.method === 'mcpServerStatus/list'))
   const writes = f.calls.filter(call => call.method === 'config/batchWrite')
   assert.equal(writes.length, 1)
   assert.deepEqual(writes[0].params, { edits: [{ keyPath: 'plugins."' + f.options.pluginId + '".enabled', value: false, mergeStrategy: 'replace' }], expectedVersion: 'user-revision-1', filePath: join(f.options.pluginPath, '../config.toml'), reloadUserConfig: true })
@@ -91,7 +98,61 @@ test('enabling the managed plugin applies only its own revision-protected settin
   assert.equal(after.enabled, 'enabled'); assert.equal(f.state.otherEnabled, true)
   const writes = f.calls.filter(call => call.method === 'config/batchWrite')
   assert.deepEqual(writes.map(call => call.params), [{ edits: [{ keyPath: 'plugins.' + JSON.stringify(f.options.pluginId) + '.enabled', value: true, mergeStrategy: 'replace' }], expectedVersion: before.revision, filePath: join(f.options.pluginPath, '../config.toml'), reloadUserConfig: true }])
-  assert.ok(f.calls.every(call => ['initialize', 'initialized', 'plugin/list', 'plugin/read', 'config/read', 'config/batchWrite'].includes(call.method)))
+  assert.ok(f.calls.every(call => ['initialize', 'initialized', 'plugin/list', 'plugin/read', 'config/read', 'config/batchWrite', 'mcpServerStatus/list'].includes(call.method)))
+})
+
+test('the installer initializes only the managed MCP connection after confirmed enable without a panel, tool call or global reload', async t => {
+  const f = await fixture(t); f.state.enabled = false
+  const enabled = await f.host.setEnabled(true, (await f.host.inspect()).revision)
+  assert.equal(f.state.discovered, undefined, 'the write revision is returned before connection initialization can fail')
+  await f.host.initializeConnection(enabled.revision)
+  assert.equal(f.state.discovered, true, 'persisted enablement alone does not initialize the plugin connection')
+  assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 1)
+  assert.ok(!f.calls.some(call => ['mcpServer/tool/call', 'config/mcpServer/reload', 'plugin/reconcile', 'thread/resume'].includes(call.method)))
+  assert.equal(f.state.otherEnabled, true)
+})
+
+test('an existing static server with the same name blocks activation before any configuration write or connection', async t => {
+  const f = await fixture(t); f.state.enabled = false; f.state.staticServer = true
+  await assert.rejects(f.host.setEnabled(true, (await f.host.inspect()).revision), { code: 'plugin_host_server_name_conflict' })
+  assert.equal(f.state.enabled, false)
+  assert.equal(f.state.otherEnabled, true)
+  assert.ok(!f.calls.some(call => ['config/batchWrite', 'mcpServerStatus/list'].includes(call.method)))
+})
+
+test('missing or unrelated discovery results cannot complete plugin activation', async t => {
+  for (const data of [[], [{ name: 'unrelated' }], [{ name: 'sentinel' }, { name: 'sentinel' }], { length: 1, 0: { name: 'sentinel' } }, [{ name: 'sentinel', pluginId: 'unrelated@other' }], [{ name: 'sentinel' }], [{ name: 'sentinel', pluginId: null }]]) {
+    const f = await fixture(t); f.state.enabled = false; f.state.discoveryData = data
+    const enabled = await f.host.setEnabled(true, (await f.host.inspect()).revision)
+    await assert.rejects(f.host.initializeConnection(enabled.revision), { code: 'plugin_host_discovery_unconfirmed' })
+    assert.equal(f.state.enabled, true, 'the confirmed configuration write is retained for the installation transaction to recover')
+    assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 1)
+    assert.equal(f.state.otherEnabled, true)
+  }
+})
+
+test('a lost discovery connection preserves the written setting and is not retried or called successful', async t => {
+  const f = await fixture(t); f.state.enabled = false; f.state.disconnectOn = 'mcpServerStatus/list'
+  const enabled = await f.host.setEnabled(true, (await f.host.inspect()).revision)
+  await assert.rejects(f.host.initializeConnection(enabled.revision), { code: 'plugin_host_unavailable' })
+  assert.equal(f.state.enabled, true)
+  assert.equal(f.state.otherEnabled, true)
+  assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 1)
+})
+
+test('connection initialization requires current enabled qualification and preserves a concurrent user change', async t => {
+  const f = await fixture(t), before = await f.host.inspect()
+  f.state.enabled = false
+  await assert.rejects(f.host.initializeConnection(before.revision), { code: 'plugin_host_activation_qualification_changed' })
+  f.state.revision = 'changed-before-initialization'
+  await assert.rejects(f.host.initializeConnection(before.revision), { code: 'plugin_host_revision_conflict' })
+  assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 0)
+  f.state.enabled = true; f.state.discoveryConcurrentChange = true
+  await assert.rejects(f.host.initializeConnection(f.state.revision), { code: 'plugin_host_revision_conflict' })
+  assert.equal(f.state.enabled, false)
+  assert.equal(f.state.otherEnabled, false)
+  assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 1)
+  assert.equal(f.calls.filter(call => call.method === 'config/batchWrite').length, 0)
 })
 
 test('a concurrent user write is preserved rather than retried or reported as a completed toggle', async t => {
