@@ -197,7 +197,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
 
   async function fail(entry, gap, scope = 'task') {
-    if (scope === 'source' && onQualificationLost && ['plugin-disabled', 'plugin-enablement-unconfirmed'].includes(gap)) qualificationLost(gap)
+    if (scope === 'source' && onQualificationLost && ['plugin-disabled', 'plugin-enablement-unconfirmed'].includes(gap)) await qualificationLost(gap)
     if (scope === 'source') await stopSource(gap)
     else await stop(entry, gap)
     return entry.view
@@ -221,24 +221,26 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
 
   const hostGap = host => host?.available !== true ? host?.reason ?? 'source-unavailable' : typeof host.hostRunId !== 'string' || !host.hostRunId || !Number.isSafeInteger(host.hostStartedAt) ? 'source-generation-unverified' : null
+  let qualificationLoss, qualificationError
   function qualificationLost(reason) {
-    if (!onQualificationLost || closed) return
-    // Closing is deliberately not awaited by the collection or notification
-    // operation that detected the loss: close itself waits for those operations.
-    void close(reason).catch(() => {})
-    onQualificationLost(reason)
+    if (!onQualificationLost || closed) return qualificationLoss
+    return qualificationLoss ??= (async () => {
+      // Await only endpoint withdrawal. Full close waits for this operation.
+      try { await onQualificationLost(reason) } catch (error) { qualificationError = error }
+      void close(reason).catch(() => {})
+    })()
   }
   async function qualification(expected = null) {
     let host, user
     try { host = await native.sampleHost() }
-    catch (error) { if (!onQualificationLost) throw error; const gap = 'host-verification-unavailable'; qualificationLost(gap); return { host: null, gap } }
+    catch (error) { if (!onQualificationLost) throw error; const gap = 'host-verification-unavailable'; await qualificationLost(gap); return { host: null, gap } }
     const previous = expected ?? qualifiedHost
     const gap = hostGap(host) ?? (previous && (host.hostRunId !== previous.hostRunId || host.hostStartedAt !== previous.hostStartedAt) ? 'source-generation-changed' : null)
-    if (gap) { qualificationLost(gap); return { host, gap } }
+    if (gap) { await qualificationLost(gap); return { host, gap } }
     try { user = await native.readEnablement(null) }
-    catch (error) { if (!onQualificationLost) throw error; const gap = 'plugin-enablement-unconfirmed'; qualificationLost(gap); return { host, gap } }
+    catch (error) { if (!onQualificationLost) throw error; const gap = 'plugin-enablement-unconfirmed'; await qualificationLost(gap); return { host, gap } }
     const enabledGap = user?.user !== 'enabled' || user?.effective !== 'enabled' ? user?.user === 'disabled' || user?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed' : null
-    if (enabledGap) { qualificationLost(enabledGap); return { host, gap: enabledGap } }
+    if (enabledGap) { await qualificationLost(enabledGap); return { host, gap: enabledGap } }
     if (onQualificationLost && !qualifiedHost) qualifiedHost = { hostRunId: host.hostRunId, hostStartedAt: host.hostStartedAt }
     return { host, gap: supportsHostProfile(host.profile) ? null : 'unsupported-host-version' }
   }
@@ -603,6 +605,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       threads.clear()
       try { await healthOutbox?.close() } catch (reason) { cleanup.push({ status: 'rejected', reason }) }
       const failures = cleanup.filter(value => value.status === 'rejected').map(value => value.reason)
+      if (qualificationError) failures.unshift(qualificationError)
       if (failures.length) throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'Observation cleanup failed')
     })()
   }

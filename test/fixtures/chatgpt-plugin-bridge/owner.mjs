@@ -17,9 +17,13 @@ const native = {
     if (finite) await delay(finite)
     while (!closed && await stat(join(config.sessionsRoot, 'hold-native')).then(() => true, () => false)) await delay(10)
     await appendFile(callsPath, 'completed:' + id + '\n')
-    return { thread: { id, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path: join(config.sessionsRoot, id + '.jsonl'), cwd: config.sessionsRoot }, anchorTurnId: null }
+    return { thread: { id, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path: join(config.sessionsRoot, id + '.jsonl'), cwd: config.sessionsRoot }, anchorTurnId: id === 'resource-main' ? 'resource-turn' : null }
   },
-  async close() { closed = true },
+  async close() {
+    closed = true
+    await appendFile(callsPath, 'native-close-start\n')
+    while (await stat(join(config.sessionsRoot, 'hold-close')).then(() => true, () => false)) await delay(10)
+  },
 }
 const runtime = await startFromInstallation({ configPath, native, pollMs: 20, ownership: 'plugin' })
 if (process.send) process.send({ runId: runtime.runId, pid: runtime.pid, reused: runtime.reused })

@@ -11,6 +11,9 @@ import { startServer } from '../src/server.mjs'
 import { startPluginBridge } from '../chatgpt/plugin-bridge.mjs'
 import { PassThrough } from 'node:stream'
 import { createServer } from 'node:http'
+import { connectCore } from '../src/core-client.mjs'
+import { resourceMaterial } from './fixtures/chatgpt-plugin-lazy/resource-material.mjs'
+import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 
 async function bounded(promise, label) {
   const controller = new AbortController()
@@ -23,8 +26,9 @@ async function setup(t) {
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@bridge' })
   await writeFile(join(prepared.pluginDir, '.codex-plugin/plugin.json'), JSON.stringify({ name: 'ghost-sentinel', version: '0.1.0-dev.1', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查' } }), { mode: 0o600 })
   await writeFile(join(prepared.pluginDir, '.mcp.json'), JSON.stringify({ mcpServers: { sentinel: { command: process.execPath, args: [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', prepared.configPath], cwd: new URL('../', import.meta.url).pathname } } }), { mode: 0o600 })
-  const statePath = join(dir, 'enabled.json'), callsPath = join(dir, 'calls.txt'), pidsPath = join(dir, 'owner-pids.txt'), children = []
+  const statePath = join(dir, 'enabled.json'), callsPath = join(dir, 'calls.txt'), pidsPath = join(dir, 'owner-pids.txt'), faultPath = join(dir, 'fault.json'), auditPath = join(dir, 'audit.jsonl'), children = []
   await writeFile(statePath, 'true'); await writeFile(callsPath, ''); await writeFile(pidsPath, '')
+  await writeFile(faultPath, '{}'); await writeFile(auditPath, '')
   t.after(async () => {
     await writeFile(statePath, 'false')
     for (const child of children) if (child.exitCode === null && child.signalCode === null) { const ended = once(child, 'close'); child.kill('SIGTERM'); await bounded(ended, 'test child cleanup failed') }
@@ -36,8 +40,8 @@ async function setup(t) {
     const [identity] = await bounded(once(child, 'message'), 'owner did not start: ' + child.errors)
     return { child, identity }
   }
-  function bridge({ launchOwner = false } = {}) {
-    const args = launchOwner ? [new URL('./fixtures/chatgpt-plugin-bridge/bridge.mjs', import.meta.url).pathname, prepared.configPath, statePath, callsPath, pidsPath] : [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', prepared.configPath]
+  function bridge({ launchOwner = false, faults = false } = {}) {
+    const args = faults ? [new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url).pathname, prepared.configPath, faultPath, auditPath] : launchOwner ? [new URL('./fixtures/chatgpt-plugin-bridge/bridge.mjs', import.meta.url).pathname, prepared.configPath, statePath, callsPath, pidsPath] : [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', prepared.configPath]
     const child = track(spawn(process.execPath, args, { stdio: ['pipe', 'pipe', 'pipe'] }))
     let buffer = '', id = 0
     const pending = new Map(), messages = []
@@ -49,15 +53,193 @@ async function setup(t) {
         if (pending.has(message.id)) { pending.get(message.id)(message); pending.delete(message.id) }
       }
     })
-    function request(method, params = {}) {
-      const requestId = ++id, response = new Promise(resolve => { pending.set(requestId, resolve) })
+    function request(method, params = {}, requestId = ++id) {
+      const response = new Promise(resolve => { pending.set(requestId, resolve) })
       child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params }) + '\n')
       return bounded(response, 'bridge request failed ' + method + ': ' + child.errors)
     }
     return { child, request, messages }
   }
-  return { ...prepared, dir, statePath, callsPath, pidsPath, owner, bridge }
+  return { ...prepared, dir, statePath, callsPath, pidsPath, faultPath, auditPath, owner, bridge }
 }
+
+for (const kind of ['health-timeout', 'health-network', 'http-503', 'http-close']) test(`a committed pause survives ${kind} as an explicit unknown followed by a fresh read and explicit resume`, async t => {
+  const env = await setup(t), owner = await env.owner(), bridge = env.bridge({ faults: true }), core = await connectCore({ dataDir: join(env.dir, 'core') })
+  t.after(() => core.close())
+  await writeFile(join(env.dir, 'resource-main.jsonl'), resourceMaterial({ at: Date.now(), cwd: env.dir, producerVersion: supportedProfile.cliVersion }))
+  await bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'transient-io', version: '1' } })
+  const call = (name, args = {}) => bridge.request('tools/call', { name, arguments: args, _meta: { thread_id: 'resource-main' } })
+  const before = await call('sentinel_current_chat')
+  assert.equal(before.result.structuredContent.monitoring.paused, false)
+  await writeFile(env.faultPath, JSON.stringify({ kind }))
+  const unconfirmed = await call('sentinel_set_chat_analysis', { paused: true, expectedThreadId: 'resource-main', revision: before.result.structuredContent.monitoring.revision })
+  assert.deepEqual(unconfirmed.error, { code: -32603, message: 'Observation temporarily unconfirmed; request outcome may be unknown' })
+  assert.equal(unconfirmed.result, undefined, 'no unqualified view is forwarded as success')
+  assert.equal(owner.child.exitCode, null)
+  assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
+  assert.equal((await core.snapshot()).tasks.find(task => task.id === 'resource-main').conversationMonitoring.paused, true)
+  await writeFile(env.faultPath, '{}')
+  const paused = await call('sentinel_current_chat')
+  assert.equal(paused.result.structuredContent.monitoring.paused, true)
+  const resumed = await call('sentinel_set_chat_analysis', { paused: false, expectedThreadId: 'resource-main', revision: paused.result.structuredContent.monitoring.revision })
+  assert.equal(resumed.result.structuredContent.monitoring.paused, false)
+  const facts = (await readFile(env.auditPath, 'utf8')).trim().split('\n').map(JSON.parse)
+  assert.deepEqual(facts.filter(fact => fact.event === 'control-committed').map(fact => fact.paused), [true, false], 'mutations are never replayed')
+  assert.equal(facts.filter(fact => fact.event === 'mcp-request' && fact.method === 'initialize').length, 1, 'HTTP replacement cannot replay initialization')
+  assert.ok(facts.filter(fact => fact.event === 'mcp-request' && fact.method === 'tools/call').every(fact => fact.protocolVersion === '2025-03-26'), 'a rebuilt HTTP transport retains the negotiated protocol')
+  assert.equal(bridge.messages.filter(message => message.id === unconfirmed.id).length, 1, 'send and reply failure settle the request once')
+  assert.doesNotMatch(JSON.stringify(bridge.messages), /secret-|Bearer|token/)
+  bridge.child.stdin.end()
+  assert.deepEqual(await bounded(bridge.child.ended, 'recovered bridge did not exit on EOF'), [0, null], bridge.child.errors)
+  await writeFile(env.statePath, 'false')
+  assert.deepEqual(await bounded(owner.child.ended, 'owned observer did not exit after disable'), [0, null], owner.child.errors)
+})
+
+test('persistent unconfirmed health remains bounded without emitting material and still exits after disable', async t => {
+  const env = await setup(t), owner = await env.owner(), bridge = env.bridge({ faults: true })
+  await bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'persistent-unknown', version: '1' } })
+  await writeFile(env.faultPath, JSON.stringify({ kind: 'persistent-health-network' }))
+  for (let n = 0; n < 40; n++) {
+    const response = await bridge.request('tools/list')
+    assert.equal(response.error?.code, -32603)
+    assert.equal(response.result, undefined)
+  }
+  await delay(1100)
+  assert.equal(bridge.child.exitCode, null, 'unknown availability is distinct from confirmed owner revocation')
+  assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
+  const facts = (await readFile(env.auditPath, 'utf8')).trim().split('\n').map(JSON.parse)
+  assert.equal(facts.filter(fact => fact.event === 'mcp-request').length, 1, 'none of the unconfirmed requests reach the owner')
+  await writeFile(env.statePath, 'false')
+  assert.deepEqual(await bounded(owner.child.ended, 'owner remained after disable during unknown health'), [0, null], owner.child.errors)
+  assert.deepEqual(await bounded(bridge.child.ended, 'bridge remained after disabled owner ended'), [0, null], bridge.child.errors)
+})
+
+test('qualification revokes the owner endpoint before closing IO while its process lock fences cleanup', async t => {
+  const env = await setup(t), owner = await env.owner(), bridge = env.bridge()
+  await bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'revocation-fence', version: '1' } })
+  await writeFile(join(env.dir, 'hold-close'), 'held')
+  try {
+    await writeFile(env.statePath, 'false')
+    for (let n = 0; n < 100 && !(await readFile(env.callsPath, 'utf8')).includes('native-close-start'); n++) await delay(10)
+    assert.match(await readFile(env.callsPath, 'utf8'), /native-close-start/)
+    assert.equal(owner.child.exitCode, null, 'cleanup remains in its real native IO stage')
+    assert.equal(JSON.parse(await readFile(join(env.dir, 'adapter/runtime.lock/owner.json'), 'utf8')).runId, owner.identity.runId, 'the live owner lock remains a generation fence')
+    assert.equal(await resolvePluginOwner({ configPath: env.configPath }), null, 'the stopped endpoint is no longer publishable before process cleanup finishes')
+    assert.deepEqual(await bounded(bridge.child.ended, 'withdrawn endpoint retained a bridge'), [0, null], bridge.child.errors)
+  } finally { await rm(join(env.dir, 'hold-close'), { force: true }); await bounded(owner.child.ended, 'fenced owner did not finish natural cleanup') }
+})
+
+test('a failed notification produces no invented response and does not close the next request', async t => {
+  const env = await setup(t), owner = await env.owner(), bridge = env.bridge({ faults: true })
+  await bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'notification-failure', version: '1' } })
+  await writeFile(env.faultPath, JSON.stringify({ kind: 'notification-network' }))
+  bridge.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n')
+  for (let n = 0; n < 100 && !(await readFile(env.auditPath, 'utf8')).includes('notification-fault'); n++) await delay(10)
+  assert.match(await readFile(env.auditPath, 'utf8'), /notification-fault/)
+  await writeFile(env.faultPath, '{}')
+  assert.ok((await bridge.request('tools/list')).result.tools.length)
+  assert.equal(bridge.messages.length, 2, 'the failed notification has no reply ID')
+  bridge.child.stdin.end()
+  assert.deepEqual(await bounded(bridge.child.ended, 'notification failure prevented EOF cleanup'), [0, null], bridge.child.errors)
+  await writeFile(env.statePath, 'false')
+  assert.deepEqual(await bounded(owner.child.ended, 'notification fixture owner remained'), [0, null], owner.child.errors)
+})
+
+test('a late old HTTP response cannot satisfy a reused client ID after lazy transport replacement', async t => {
+  const env = await setup(t), owner = await env.owner(), bridge = env.bridge({ faults: true })
+  await writeFile(join(env.dir, 'resource-main.jsonl'), resourceMaterial({ at: Date.now(), cwd: env.dir, producerVersion: supportedProfile.cliVersion }))
+  await bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'late-http', version: '1' } })
+  const params = { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'resource-main' } }
+  const before = await bridge.request('tools/call', params)
+  await writeFile(env.faultPath, JSON.stringify({ kind: 'http-close' }))
+  const failed = await bridge.request('tools/call', { ...params, name: 'sentinel_set_chat_analysis', arguments: { paused: true, expectedThreadId: 'resource-main', revision: before.result.structuredContent.monitoring.revision } }, 'reused-id')
+  assert.equal(failed.error.code, -32603)
+  await writeFile(env.faultPath, '{}')
+  const fresh = await bridge.request('tools/call', params, 'reused-id')
+  assert.equal(fresh.result.structuredContent.monitoring.paused, true)
+  for (let n = 0; n < 100 && !(await readFile(env.auditPath, 'utf8')).includes('late-old-transport-response'); n++) await delay(10)
+  await delay(50)
+  assert.match(await readFile(env.auditPath, 'utf8'), /late-old-transport-response/)
+  assert.equal(bridge.messages.filter(message => message.id === 'reused-id').length, 2, 'only the first unknown and the new request settle')
+  await writeFile(env.statePath, 'false')
+  assert.deepEqual(await bounded(owner.child.ended, 'late HTTP fixture owner remained'), [0, null], owner.child.errors)
+  assert.deepEqual(await bounded(bridge.child.ended, 'late HTTP bridge remained'), [0, null], bridge.child.errors)
+})
+
+test('cancellation maps only an active client request to its unique upstream ID', async t => {
+  const env = await setup(t), owner = await env.owner(), bridge = env.bridge({ faults: true })
+  await bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'cancel-mapping', version: '1' } })
+  await writeFile(join(env.dir, 'hold-native'), 'held')
+  bridge.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 'cancel-me', method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'cancel-chat' } } }) + '\n')
+  for (let n = 0; n < 100 && !(await readFile(env.callsPath, 'utf8')).includes('cancel-chat'); n++) await delay(10)
+  const cancel = requestId => bridge.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId } }) + '\n')
+  cancel('cancel-me'); cancel('unknown-id'); cancel(1)
+  for (let n = 0; n < 100 && !(await readFile(env.auditPath, 'utf8')).includes('notifications/cancelled'); n++) await delay(10)
+  const facts = (await readFile(env.auditPath, 'utf8')).trim().split('\n').map(JSON.parse)
+  const upstream = facts.find(fact => fact.method === 'tools/call'), cancellations = facts.filter(fact => fact.method === 'notifications/cancelled')
+  assert.equal(cancellations.length, 1)
+  assert.equal(cancellations[0].requestId, upstream.id)
+  assert.notEqual(cancellations[0].requestId, 'cancel-me')
+  await rm(join(env.dir, 'hold-native'))
+  assert.ok((await bridge.request('tools/list')).result.tools.length)
+  await writeFile(env.statePath, 'false')
+  assert.deepEqual(await bounded(owner.child.ended, 'cancel fixture owner remained'), [0, null], owner.child.errors)
+  assert.deepEqual(await bounded(bridge.child.ended, 'cancel bridge remained'), [0, null], bridge.child.errors)
+})
+
+for (const method of ['ping', '']) test(`upstream method ${JSON.stringify(method)} retains its server ID instead of being discarded as an unmatched response`, async t => {
+  const env = await setup(t), owner = await env.owner(), bridge = env.bridge({ faults: true })
+  await bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'server-message', version: '1' } })
+  await writeFile(env.faultPath, JSON.stringify({ kind: 'server-request', method }))
+  assert.ok((await bridge.request('tools/list')).result.tools.length)
+  for (let n = 0; n < 100 && !bridge.messages.some(message => message.id === 'owned-server-request'); n++) await delay(10)
+  assert.deepEqual(bridge.messages.find(message => message.id === 'owned-server-request'), { jsonrpc: '2.0', id: 'owned-server-request', method })
+  await writeFile(env.faultPath, '{}')
+  bridge.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 'owned-server-request', result: {} }) + '\n')
+  for (let n = 0; n < 100 && !(await readFile(env.auditPath, 'utf8')).includes('"method":"response"'); n++) await delay(10)
+  const response = (await readFile(env.auditPath, 'utf8')).trim().split('\n').map(JSON.parse).find(fact => fact.method === 'response')
+  assert.equal(response.id, 'owned-server-request')
+  bridge.child.stdin.end()
+  assert.deepEqual(await bounded(bridge.child.ended, 'server-request bridge remained after EOF'), [0, null], bridge.child.errors)
+  await writeFile(env.statePath, 'false')
+  assert.deepEqual(await bounded(owner.child.ended, 'server-request fixture owner remained'), [0, null], owner.child.errors)
+})
+
+test('an empty client method cannot collide with a normal request upstream ID', async t => {
+  const env = await setup(t), owner = await env.owner(), bridge = env.bridge()
+  await bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'empty-method', version: '1' } })
+  await writeFile(join(env.dir, 'hold-native'), 'held')
+  try {
+    bridge.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 'normal-client', method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'held-method-chat' } } }) + '\n')
+    for (let n = 0; n < 100 && !(await readFile(env.callsPath, 'utf8')).includes('held-method-chat'); n++) await delay(10)
+    assert.match(await readFile(env.callsPath, 'utf8'), /held-method-chat/)
+    bridge.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: '', params: {} }) + '\n')
+    for (let n = 0; n < 100 && !bridge.messages.some(message => message.id === 2 || message.id === 'normal-client'); n++) await delay(10)
+    assert.equal(bridge.messages.some(message => message.id === 'normal-client'), false, 'an unknown empty method cannot settle the still-held normal request')
+    assert.equal(bridge.messages.find(message => message.id === 2)?.error?.code, -32601)
+    await rm(join(env.dir, 'hold-native'))
+    for (let n = 0; n < 100 && !bridge.messages.some(message => message.id === 'normal-client'); n++) await delay(10)
+    assert.equal(bridge.messages.find(message => message.id === 'normal-client')?.result?.structuredContent.identity.threadId, 'held-method-chat')
+  } finally {
+    await rm(join(env.dir, 'hold-native'), { force: true }); await writeFile(env.statePath, 'false')
+    assert.deepEqual(await bounded(owner.child.ended, 'empty method owner remained'), [0, null], owner.child.errors)
+    assert.deepEqual(await bounded(bridge.child.ended, 'empty method bridge remained'), [0, null], bridge.child.errors)
+  }
+})
+
+for (const kind of ['health-401', 'health-403', 'health-404', 'health-503', 'health-identity']) test(`${kind} cannot retain a bridge or leak a committed pause result`, async t => {
+  const env = await setup(t), owner = await env.owner(), bridge = env.bridge({ faults: true })
+  await writeFile(join(env.dir, 'resource-main.jsonl'), resourceMaterial({ at: Date.now(), cwd: env.dir, producerVersion: supportedProfile.cliVersion }))
+  await bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'identity-failure', version: '1' } })
+  const before = await bridge.request('tools/call', { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'resource-main' } })
+  await writeFile(env.faultPath, JSON.stringify({ kind }))
+  bridge.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 'blocked-result', method: 'tools/call', params: { name: 'sentinel_set_chat_analysis', arguments: { paused: true, expectedThreadId: 'resource-main', revision: before.result.structuredContent.monitoring.revision }, _meta: { thread_id: 'resource-main' } } }) + '\n')
+  assert.deepEqual(await bounded(bridge.child.ended, 'untrusted owner retained the bridge'), [0, null], bridge.child.errors)
+  assert.equal(bridge.messages.some(message => message.id === 'blocked-result'), false)
+  assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId, 'only this unhealthy connection exits')
+  await writeFile(env.statePath, 'false')
+  assert.deepEqual(await bounded(owner.child.ended, 'identity fixture owner remained'), [0, null], owner.child.errors)
+})
 
 test('real stdio MCP initialization, app tools, resource and current-chat metadata reach one independently owned observation', async t => {
   const env = await setup(t), owner = await env.owner(), bridge = env.bridge()

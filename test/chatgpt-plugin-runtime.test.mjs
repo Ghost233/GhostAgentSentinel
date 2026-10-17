@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, writeFile, readdir, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile, readdir, rm, stat, chmod } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -10,12 +10,65 @@ import { connectCore } from '../src/core-client.mjs'
 import { prepareInstallation, startFromInstallation, resolvePluginOwner } from '../chatgpt/runtime.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { notificationPrefix } from '../chatgpt/native-notifications.mjs'
+import fs from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 
 async function completed(promise) {
   const controller = new AbortController()
   try { return await Promise.race([promise, delay(2000, null, { signal: controller.signal }).then(() => assert.fail('plugin-owned runtime did not finish cleanup'))]) }
   finally { controller.abort() }
 }
+
+for (const stage of ['configuration', 'publication']) test(`startup revocation fences ${stage} IO before it can leave a published endpoint`, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'sentinel-startup-publication-')), dataDir = join(dir, 'adapter')
+  const server = await startServer({ dataDir: join(dir, 'core') })
+  const prepared = await prepareInstallation({ dataDir, coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'unused.sock'), pluginId: 'sentinel@startup-publication' })
+  let enterWrite, releaseWrite, enteredClose, releaseClose, markRevoked, startup, checks = 0, revoked = false, publicationWrites = 0, publicationFinished = false, closedBeforePublication = false
+  const writeEntered = new Promise(resolve => { enterWrite = resolve }), writeGate = new Promise(resolve => { releaseWrite = resolve })
+  const closeEntered = new Promise(resolve => { enteredClose = resolve }), closeGate = new Promise(resolve => { releaseClose = resolve })
+  const revokedSeen = new Promise(resolve => { markRevoked = resolve }), originalWrite = fs.promises.writeFile, originalRename = fs.promises.rename
+  fs.promises.writeFile = async (path, data, ...options) => {
+    const configuration = String(path).startsWith(prepared.configPath + '.') && JSON.parse(String(data)).port !== undefined
+    const publication = String(path).startsWith(join(dataDir, 'runtime.json.'))
+    if (publication) publicationWrites++
+    if (stage === 'configuration' && configuration || stage === 'publication' && publication) { enterWrite(); await writeGate }
+    return originalWrite(path, data, ...options)
+  }
+  fs.promises.rename = async (from, to) => { const result = await originalRename(from, to); if (String(to) === join(dataDir, 'runtime.json')) publicationFinished = true; return result }
+  syncBuiltinESMExports()
+  const native = {
+    async sampleHost() { return { available: true, hostRunId: 'startup-host', hostStartedAt: 1, profile: supportedProfile } },
+    async readEnablement() {
+      if (++checks === 1) return { user: 'enabled', effective: 'enabled' }
+      await writeEntered; revoked = true; markRevoked()
+      return { user: 'disabled', effective: 'disabled' }
+    },
+    async listThreads() { return { data: [], nextCursor: null } },
+    async close() { closedBeforePublication = stage === 'publication' && !publicationFinished; enteredClose(); await closeGate },
+  }
+  try {
+    startup = startFromInstallation({ configPath: prepared.configPath, native, ownership: 'plugin', pollMs: 20 }).then(value => ({ value }), error => ({ error }))
+    await completed(writeEntered); await completed(revokedSeen)
+    if (stage === 'configuration') await completed(closeEntered)
+    else {
+      const config = JSON.parse(await readFile(prepared.configPath, 'utf8'))
+      // A real request yields to qualification; no scheduling sleep opens the race.
+      await fetch('http://127.0.0.1:' + config.port + '/health', { headers: { authorization: 'Bearer ' + config.token }, signal: AbortSignal.timeout(1000) }).catch(() => {})
+    }
+    releaseWrite(); releaseClose()
+    const result = await completed(startup)
+    assert.equal(revoked, true)
+    assert.equal(result.error?.code, 'plugin_startup_qualification_revoked')
+    if (stage === 'configuration') assert.equal(publicationWrites, 0, 'revocation before publication must prevent even starting its write')
+    else { assert.equal(publicationWrites, 1); assert.equal(closedBeforePublication, false, 'in-flight publication must finish and be withdrawn before IO closes') }
+    await assert.rejects(stat(join(dataDir, 'runtime.json')), { code: 'ENOENT' })
+    await assert.rejects(stat(join(dataDir, 'runtime.lock')), { code: 'ENOENT' })
+  } finally {
+    releaseWrite(); releaseClose(); if (startup) await completed(startup)
+    fs.promises.writeFile = originalWrite; fs.promises.rename = originalRename; syncBuiltinESMExports()
+    await server.close(); await rm(dir, { recursive: true, force: true })
+  }
+})
 
 test('plugin disable closes the observation runtime while retaining its installation and the DSH shared Core client', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-plugin-runtime-'))
@@ -194,6 +247,32 @@ test('plugin cleanup reports a native close failure but still closes its panel, 
   await assert.rejects(stat(join(dir, 'adapter/runtime.lock')), { code: 'ENOENT' })
   assert.equal(runtime.diagnostics().transports, 0)
   assert.equal(runtime.diagnostics().healthOutbox.closed, true)
+})
+
+for (const mode of ['requested', 'qualification']) test(`publication revocation and cleanup errors both survive ${mode} shutdown without retaining active IO`, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'sentinel-revocation-error-'))
+  let runtime, enabled = true, nativeClosed = 0
+  t.after(async () => { await runtime?.close().catch(() => {}); await rm(dir, { recursive: true, force: true }) })
+  const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'unused.sock'), pluginId: 'sentinel@revocation-errors' })
+  const cleanupError = new Error('Owned native cleanup failure')
+  const native = {
+    async sampleHost() { return { available: true, hostRunId: 'owned-host', hostStartedAt: 1, profile: supportedProfile } },
+    async readEnablement() { return { user: enabled ? 'enabled' : 'disabled', effective: enabled ? 'enabled' : 'disabled' } },
+    async close() { nativeClosed++; throw cleanupError },
+  }
+  runtime = await startFromInstallation({ configPath: prepared.configPath, native, ownership: 'plugin', pollMs: 0 })
+  await chmod(join(dir, 'adapter/runtime.json'), 0o644)
+  if (mode === 'qualification') { enabled = false; await runtime.refresh() }
+  else void runtime.close().catch(() => {})
+  const error = await runtime.closed.then(() => assert.fail('failed cleanup cannot pass'), error => error)
+  assert.ok(error instanceof AggregateError)
+  assert.ok(error.errors.some(failure => failure.message === 'untrusted helper record'), 'the publication withdrawal failure remains visible')
+  assert.ok(error.errors.includes(cleanupError), 'the separate native close failure is not overwritten')
+  assert.equal(nativeClosed, 1)
+  assert.equal(runtime.diagnostics().closed, true)
+  assert.equal(runtime.diagnostics().healthOutbox.closed, true)
+  await assert.rejects(fetch(runtime.url + '/health', { signal: AbortSignal.timeout(1000) }))
+  assert.equal(JSON.parse(await readFile(join(dir, 'adapter/runtime.lock/owner.json'), 'utf8')).runId, runtime.runId, 'unconfirmed cleanup is not silently presented as fully removed')
 })
 
 test('a pending chat metadata read is cancelled on disable and cannot re-register a late source', async t => {

@@ -99,10 +99,21 @@ async function existing(config, owner, port, ownership) {
   }
   try { process.kill(owner.pid, 0) } catch (error) { if (error.code === 'ESRCH') return { dead: true }; throw new Error('helper owner cannot be verified') }
   if (!runtime) return null
+  async function unavailable() {
+    const [currentOwner, currentRuntime] = await Promise.all([record(join(config.dataDir, 'runtime.lock/owner.json')), record(join(config.dataDir, 'runtime.json'))])
+    if (!currentOwner || !currentRuntime) return null
+    if (!identityMatches(currentOwner, owner) || !identityMatches(currentRuntime, runtime) || currentRuntime.url !== runtime.url) throw new Error('untrusted helper endpoint')
+    try { process.kill(owner.pid, 0) } catch (error) { if (error.code === 'ESRCH') return { dead: true }; throw new Error('helper owner cannot be verified') }
+    throw Object.assign(new Error('live helper endpoint cannot be verified'), { code: 'plugin_owner_health_unavailable' })
+  }
   let response
   try { response = await fetch(runtime.url + '/health', { headers: { authorization: 'Bearer ' + config.token }, redirect: 'error', signal: AbortSignal.timeout(750) }) }
-  catch { throw new Error('live helper endpoint cannot be verified') }
-  if (response.status !== 200 || !identityMatches(await response.json(), owner)) throw new Error('live helper endpoint identity mismatch')
+  catch { return unavailable() }
+  if (response.status !== 200) throw new Error('live helper endpoint identity mismatch')
+  let body
+  try { body = await response.text() }
+  catch { return unavailable() }
+  if (!identityMatches(JSON.parse(body), owner)) throw new Error('live helper endpoint identity mismatch')
   return runtime
 }
 
@@ -141,7 +152,7 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     if (Date.now() >= deadline) throw new Error('helper owner startup or endpoint cannot be verified')
     await delay(25)
   }
-  let adapter, core, retentionProfileSignature, closing = null, stopping = false, retentionTimer = null, retentionPending = null, retentionSignature = null, retentionNextAt = null, retentionError = null
+  let adapter, core, retentionProfileSignature, closing = null, revoking = null, publicationPending = null, stopping = false, retentionTimer = null, retentionPending = null, retentionSignature = null, retentionNextAt = null, retentionError = null
   let stopReason = 'requested', qualificationRevoked = false, readyResolve, closedResolve, closedReject
   const ready = new Promise(resolve => { readyResolve = resolve })
   const closed = new Promise((resolve, reject) => { closedResolve = resolve; closedReject = reject })
@@ -179,18 +190,34 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     })().finally(() => { retentionPending = null; scheduleRetention() })
     return retentionPending
   }
+  const revokePublication = () => revoking ??= (async () => {
+    // Startup retains write errors; withdrawal must still check partial publication.
+    await publicationPending?.catch(() => {})
+    const owner = await record(join(lock, 'owner.json'))
+    if (owner && identityMatches(owner, identity)) {
+      const value = await record(join(config.dataDir, 'runtime.json'))
+      if (value && identityMatches(value, identity)) await rm(join(config.dataDir, 'runtime.json'), { force: true })
+    }
+  })()
   const close = () => closing ??= (async () => {
     stopping = true; clearTimeout(retentionTimer); retentionTimer = null
-    try { const stopped = adapter?.close(); if (ownership !== 'plugin') await core?.cancelPending(); await retentionPending; await stopped } finally {
-      try { await core?.close() } finally {
-        const owner = await record(join(lock, 'owner.json'))
-        if (owner && identityMatches(owner, identity)) {
-          const value = await record(join(config.dataDir, 'runtime.json'))
-          if (value && identityMatches(value, identity)) await rm(join(config.dataDir, 'runtime.json'), { force: true })
-          await rm(lock, { recursive: true, force: true })
-        }
+    const failures = []
+    const attempt = async run => { try { await run() } catch (error) { for (const failure of error instanceof AggregateError ? error.errors : [error]) if (!failures.includes(failure)) failures.push(failure) } }
+    await attempt(revokePublication)
+    const stopped = adapter?.close(); stopped?.catch(() => {})
+    if (ownership !== 'plugin') await attempt(() => core?.cancelPending())
+    await attempt(() => retentionPending)
+    await attempt(() => stopped)
+    await attempt(() => core?.close())
+    await attempt(async () => {
+      const owner = await record(join(lock, 'owner.json'))
+      if (owner && identityMatches(owner, identity)) {
+        const value = await record(join(config.dataDir, 'runtime.json'))
+        if (value && identityMatches(value, identity)) await rm(join(config.dataDir, 'runtime.json'), { force: true })
+        await rm(lock, { recursive: true, force: true })
       }
-    }
+    })
+    if (failures.length) throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'Observation cleanup failed')
   })().then(() => { const result = { reason: stopReason }; closedResolve(result); return result }, error => { closedReject(error); throw error })
   try {
     await writePrivateJson(join(lock, 'owner.json'), identity)
@@ -209,7 +236,7 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
       await writePrivateJson(configPath, config)
     }
     const notifier = notificationIO ?? (config.notificationBundlePath ? createNativeNotificationIO({ bundlePath: config.notificationBundlePath, installationId: config.installationId }) : undefined)
-    const onQualificationLost = ownership === 'plugin' ? reason => { qualificationRevoked = true; stopReason = reason; void ready.then(close).catch(() => {}) } : undefined
+    const onQualificationLost = ownership === 'plugin' ? reason => { qualificationRevoked = true; stopReason = reason; const revoked = revokePublication(); void ready.then(close).catch(() => {}); return revoked } : undefined
     adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, collectMaterials: true, nativeOriginVersion: 2, initialEnrollmentBaseline, runtimeStatus: () => { if (ownership === 'plugin' && (qualificationRevoked || stopping)) throw new Error('plugin observation is stopping'); return { ...identity } }, onQualificationLost })
     if (qualificationRevoked || adapter.diagnostics().closed) throw Object.assign(new Error('plugin startup qualification was revoked'), { code: 'plugin_startup_qualification_revoked' })
     const selectedPort = portOf(adapter.url)
@@ -221,8 +248,10 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
       await writePrivateJson(join(pluginDir, '.mcp.json'), { mcpServers: { sentinel: { url: adapter.url + '/mcp', http_headers: { Authorization: 'Bearer ' + config.token } } } })
     }
     const value = { format: 1, ...identity, url: adapter.url, startedAt: Date.now() }
-    await writePrivateJson(join(config.dataDir, 'runtime.json'), value)
-    if (qualificationRevoked) throw Object.assign(new Error('plugin startup qualification was revoked'), { code: 'plugin_startup_qualification_revoked' })
+    if (stopping || qualificationRevoked) throw Object.assign(new Error('plugin startup qualification was revoked'), { code: 'plugin_startup_qualification_revoked' })
+    publicationPending = writePrivateJson(join(config.dataDir, 'runtime.json'), value)
+    await publicationPending
+    if (stopping || qualificationRevoked) throw Object.assign(new Error('plugin startup qualification was revoked'), { code: 'plugin_startup_qualification_revoked' })
     readyResolve()
     return { ...value, reused: false, pluginDir, refresh: adapter.refresh, maintainRetention, diagnostics: () => ({ ...adapter.diagnostics(), retention: { timers: retentionTimer ? 1 : 0, pending: retentionPending ? 1 : 0, nextAt: retentionNextAt, errorCode: retentionError } }), closed, close }
   } catch (error) {
