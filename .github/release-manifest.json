@@ -4,12 +4,12 @@
     "node": "v24.21.0",
     "npm": "11.19.1"
   },
-  "sha256": "a06e704a6c60a267e80802c5b4c4afb90426fc0646e0657b837ba44d52201cb2",
+  "sha256": "35e8178a72907c4985a453d3e9aa60b8f6b8a64d073fec0deb9e12587d127fdb",
   "files": {
     "GLOSSARY.md": "1d0b588569ace172964e582a0cf6d040562dddbe7a3c7b1af42b7ffd75200f42",
     "README.md": "3f4d99de3ed623a089c0929a0dff948668d59e6f6a5b3977a61c00f9ff0dd5be",
-    "docs/chatgpt-observation.md": "4927d1a47f1532674301a7b05dde647b4529b03d1a95311b3f7a650954b6e6c3",
-    "docs/development-contract.md": "0fd13858deab5a3c56679fd42f5ef91078bcea964364d7bec7a5e42247abbbf4",
+    "docs/chatgpt-observation.md": "f31cf5423ec72209e945f04dfd27acde3a6d0419c85ea2e126298febac927f5d",
+    "docs/development-contract.md": "0bc71aa0ef8cfda2c22cdb3cc26b1b1e3d004ca4a08f825c8db75352b9fc3840",
     "docs/installation.md": "28e0b54d67b276e589a1cea80fa439cfbe498c6adbac64adad83cf8d3023db5f",
     "docs/release-notes.md": "d217b13db88c61f217375770ce4125dd02173906b8c2cf6143758a4e3935abef",
     "docs/release-status.md": "c9c91731695bb66c27ab6963f4007223b9a9ff04103860db8a7fc26d6c640be7",

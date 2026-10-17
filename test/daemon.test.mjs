@@ -197,7 +197,7 @@ test('a failed configuration file write leaves its revision usable and does not 
 })
 
 test('Native Host and ClientRemote expose bounded configuration CAS and preserve its conflict code', async t => {
-  const { req, clientRequire } = await import('./dsh-native-runtime.mjs')
+  const { req, clientRequire, resolveGatewayBrowserClientPath } = await import('./dsh-native-runtime.mjs')
   const { Context } = req('@deepseek-ai/cordis'), { createAdapter } = await import('../dsh/host.mjs'), { runInNewContext } = await import('node:vm')
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-native-config-'))
   let server, host, adapter, front, control, blocker
@@ -205,23 +205,27 @@ test('Native Host and ClientRemote expose bounded configuration CAS and preserve
   server = await startServer({ dataDir }); host = new Context()
   await host.plugin(req('@deepseek-ai/dsh-llm').default)
   for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop']) await host.plugin(req(`@deepseek-ai/${name}`).default, { agents: [] })
-  await host.plugin(req('@deepseek-ai/dsh-typert-registry').default); await host.plugin(req('@deepseek-ai/dsh-api-gateway').default)
+  await host.plugin(req('@deepseek-ai/dsh-typert-registry').default)
+  await host.plugin(req('@deepseek-ai/dsh-api-remote-access').default)
+  await host.plugin(req('@deepseek-ai/dsh-api-gateway').default)
+  const { Peer } = req('@deepseek-ai/dsh-client-connection')
+  const peer = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' })
   adapter = createAdapter(host, { dataDir, registrationId: 'native-config' }, { flushMs: 50, heartbeatMs: 5000 })
   const end = Date.now() + 5000
   while (!adapter.connected) { assert.ok(Date.now() < end, 'actual Native adapter connected'); await delay(10) }
-  const invoke = (method, args = {}) => host.typertGateway.invoke({ namespace: 'sentinel', method, args })
+  const invoke = (method, args = {}) => host.typertGateway.invoke({ namespace: 'sentinel', method, args, peer })
   const initial = await invoke('analysisConfigState')
   const configured = await invoke('configureAnalysisIfCurrent', { config: { llm: { model: 'native' } }, revision: initial.revision })
   assert.equal(configured.config.llm.model, 'native')
-  const conflict = await host.typertGateway.dispatchRpc('sentinel/configureAnalysisIfCurrent', { args: { config: {}, revision: initial.revision } })
+  const conflict = await host.typertGateway.dispatchRpc('sentinel/configureAnalysisIfCurrent', { args: { config: {}, revision: initial.revision } }, undefined, peer)
   assert.equal(conflict.ok, false); assert.equal(conflict.error.code, 'analysis_config_conflict')
   for (const revision of ['', 'x'.repeat(2001), {}]) await assert.rejects(invoke('configureAnalysisIfCurrent', { config: {}, revision }), /boundary validation|修订|revision/)
   assert.deepEqual(await invoke('analysisConfigState'), configured)
   front = new Context(); front.provide('slots', { inject() { return () => {} } })
   await front.plugin(req('@deepseek-ai/dsh-typert-registry').default)
-  front.provide('connection', { registerGenerationSource: () => () => {}, start: () => ({ stop() {} }), rpc: { open: async function *() {}, call: (_, endpoint, payload) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload))) } })
+  front.provide('connection', { registerGenerationSource: () => () => {}, start: () => ({ stop() {} }), rpc: { open: async function *() {}, call: (_, endpoint, payload) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), undefined, peer) } })
   let remoteFactory, factory
-  runInNewContext(await readFile(req.resolve('@deepseek-ai/dsh-api-gateway/client'), 'utf8'), { window: { crypto: globalThis.crypto, __ModuleLoader__: { load(value) { remoteFactory = value.factory } } }, crypto: globalThis.crypto, setTimeout, clearTimeout, AbortController, AbortSignal, console })
+  runInNewContext(await readFile(await resolveGatewayBrowserClientPath(), 'utf8'), { window: { crypto: globalThis.crypto, __ModuleLoader__: { load(value) { remoteFactory = value.factory } } }, crypto: globalThis.crypto, setTimeout, clearTimeout, AbortController, AbortSignal, console })
   const remote = remoteFactory(req); await front.plugin({ inject: remote.inject, apply: remote.apply })
   const style = { remove() {} }
   runInNewContext(await readFile(new URL('../dsh/client.js', import.meta.url), 'utf8'), { window: { __ModuleLoader__: { load(value) { factory = value.factory } } }, document: { createElement: () => style, head: { appendChild() {} } }, setTimeout, clearTimeout, setInterval, clearInterval, AbortController, AbortSignal, console })

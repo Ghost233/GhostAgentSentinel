@@ -142,7 +142,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       if (entry && outcome === 'succeeded') entry.enrollmentPhase = 'established'
       if (entry && outcome === 'succeeded' && scope.mainId !== null) {
         if (scope.lifecycleId !== null) healthOutbox.push({ ...value, lifecycleId: null })
-        healthOutbox.push({ ...value, mainId: null, lifecycleId: null })
+        const sourceRecovery = { ...value, mainId: null, lifecycleId: null }
+        delete sourceRecovery.enrollmentPhase
+        healthOutbox.push(sourceRecovery)
       }
       if (healthOutbox.diagnostics().pending < 256) outboxError = null
     } catch (failure) { outboxError = { state: 'failed', failures: [{ domain: 'collection', error: failureErrorInfo(failure) }] } }

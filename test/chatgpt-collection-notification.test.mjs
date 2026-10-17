@@ -159,3 +159,45 @@ test('six verified never-monitored main chats keep six ENOENT receipts and submi
   t.diagnostic(JSON.stringify({ cleanupErrors: cleanup.map(error => error.code ?? error.name), primaryFailurePreserved: Boolean(primary), cleanupCount: cleanup.length }))
   if (primary || cleanup.length) throw new AggregateError([...(primary ? [primary] : []), ...cleanup], primary ? primary.message : 'Owned fixture cleanup failed')
 })
+
+test('a header-only unanchored success drains source recovery and never blocks a later chat failure', async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-unanchored-settlement-')), clock = Date.now(), submissions = []
+  let runtime, client, server, includeFailure = false
+  t.after(async () => { await runtime?.close(); await client?.close(); await server?.close(); await fs.rm(dir, { recursive: true, force: true }) })
+  const sessionsRoot = join(dir, 'sessions'), archiveRoot = join(dir, 'archived_sessions'), coreDataDir = join(dir, 'core')
+  await fs.mkdir(sessionsRoot); await fs.mkdir(archiveRoot)
+  const header = { id: 'header-only', path: join(sessionsRoot, 'header.jsonl'), cwd: dir, source: 'vscode', originator: 'Codex Desktop', parentThreadId: null, forkedFromId: null }
+  const missing = { ...header, id: 'later-failure', path: join(archiveRoot, 'missing.jsonl'), archived: true }
+  await fs.writeFile(header.path, JSON.stringify({ type: 'session_meta', timestamp: new Date(clock).toISOString(), payload: { id: header.id } }) + '\n')
+  const native = {
+    async sampleHost() { return { available: true, hostRunId: 'settlement-host', hostStartedAt: clock - 1000, profile: supportedProfile } },
+    async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
+    async listThreads({ archived }) { return { data: archived ? includeFailure ? [missing] : [] : [header], nextCursor: null } },
+    async readThread(id) { return { thread: id === header.id ? header : missing, anchorTurnId: null } }, async close() {},
+  }
+  const notificationIO = {
+    async settings() { return { authorization: 'authorized', alertSetting: 'enabled', notificationCenterSetting: 'enabled', observedAt: Date.now() } },
+    async snapshot() { return { pending: [], delivered: [], actions: [], observedAt: Date.now(), historyGap: false } },
+    async submit(value) { submissions.push(value); return { requestId: value.requestId, accepted: true, authorization: 'authorized', observedAt: Date.now() } },
+    async cancel() { return { pendingIds: [], observedAt: Date.now() } }, close() {},
+  }
+  server = await startServer({ dataDir: coreDataDir }); client = await connectCore({ dataDir: coreDataDir })
+  const { configPath } = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir, sessionsRoot, metadataSocket: join(dir, 'unused.sock'), pluginId: 'owned-settlement@sentinel-test' })
+  runtime = await startFromInstallation({ configPath, native, notificationIO, pollMs: 0 })
+  const settle = async () => {
+    const deadline = performance.now() + 3000
+    while (runtime.diagnostics().pendingOperations) { assert.ok(performance.now() < deadline, 'owned adapter work settles'); await delay(2) }
+  }
+  await runtime.refresh(); await settle()
+  const sourceKey = (await client.snapshot()).sources.find(value => value.descriptor.policy === 'chatgpt-main/1').key
+  assert.equal(runtime.diagnostics().healthOutbox.pending, 0, 'unanchored source recovery is accepted rather than poisoning the ordered outbox')
+  assert.ok((await client.snapshot()).tasks.every(task => task.events.every(event => event.data?.nativeType !== 'task_started')), 'a header does not fabricate task_started')
+  includeFailure = true
+  await runtime.refresh(); await settle()
+  const receipts = (await client.failureReceipts({ sourceKey })).receipts
+  assert.equal(receipts.length, 1, 'later failures still reach the public Core')
+  assert.equal(receipts[0].mainId, missing.id); assert.equal(receipts[0].error.code, 'ENOENT')
+  assert.equal(receipts[0].enrollmentPhase, 'initial-unanchored', 'per-main initial enrollment classification is retained')
+  assert.equal(runtime.diagnostics().healthOutbox.pending, 0)
+  assert.equal(submissions.length, 1, 'the later first failure still submits its notification')
+})

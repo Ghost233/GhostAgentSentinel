@@ -118,14 +118,17 @@ test('an existing core without hierarchy capability stays connected as flat moni
 test('native gateway exposes only observer controls and JSON parameters reach analysis and notification methods', async t => {
   const f = await fixture(t)
   await f.ctx.plugin(req('@deepseek-ai/dsh-typert-registry').default)
+  await f.ctx.plugin(req('@deepseek-ai/dsh-api-remote-access').default)
   await f.ctx.plugin(req('@deepseek-ai/dsh-api-gateway').default)
+  const { Peer } = req('@deepseek-ai/dsh-client-connection')
+  const peer = new Peer(f.ctx, { principal: { kind: 'owner' }, interactions: 'none' })
   await f.install()
   const config = { llm: { baseUrl: 'http://127.0.0.1:54841', model: 'fake-model' } }
-  const response = await f.ctx.typertGateway.invoke({ namespace: 'sentinel', method: 'configureAnalysis', args: { config } })
+  const response = await f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'configureAnalysis', args: { config } })
   assert.deepEqual(response, config)
-  const snapshot = await f.ctx.typertGateway.invoke({ namespace: 'sentinel', method: 'snapshot', args: {} })
+  const snapshot = await f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'snapshot', args: {} })
   assert.equal(snapshot.protocol, 1); assert.equal(snapshot.adapter.connected, true)
-  await assert.rejects(f.ctx.typertGateway.invoke({ namespace: 'sentinel', method: 'followup', args: {} }))
+  await assert.rejects(f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'followup', args: {} }))
 })
 
 test('native GS summary RPC reaches the authenticated shared core with adapter-owned source identity and no full snapshot fallback', async t => {
@@ -139,12 +142,15 @@ test('native GS summary RPC reaches the authenticated shared core with adapter-o
   } })
   t.after(async () => { await server.close(); await rm(dataDir, { recursive: true, force: true }) })
   await f.ctx.plugin(req('@deepseek-ai/dsh-typert-registry').default)
+  await f.ctx.plugin(req('@deepseek-ai/dsh-api-remote-access').default)
   await f.ctx.plugin(req('@deepseek-ai/dsh-api-gateway').default)
+  const { Peer } = req('@deepseek-ai/dsh-client-connection')
+  const peer = new Peer(f.ctx, { principal: { kind: 'owner' }, interactions: 'none' })
   await f.install()
   const actor = await f.create('native-summary-target')
   let summary
   for (let index = 0; index < 100; index++) {
-    summary = await f.ctx.typertGateway.invoke({ namespace: 'sentinel', method: 'gsSummary', args: { sessionId: actor.agent.session.id } })
+    summary = await f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'gsSummary', args: { sessionId: actor.agent.session.id } })
     if (summary.scopeKnown && Object.values(summary.counts).reduce((sum, count) => sum + count, 0) === 1) break
     await new Promise(resolve => setTimeout(resolve, 5))
   }
@@ -156,7 +162,7 @@ test('native GS summary RPC reaches the authenticated shared core with adapter-o
   assert.equal(snapshotReads, 0)
   assert.equal(healthReads, 1)
   assert.ok(!JSON.stringify(summary).includes('request-native-summary-target'))
-  const unknown = await f.ctx.typertGateway.invoke({ namespace: 'sentinel', method: 'gsSummary', args: { sessionId: 'another-source-only' } })
+  const unknown = await f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'gsSummary', args: { sessionId: 'another-source-only' } })
   assert.equal(unknown.sourceKey, summary.sourceKey)
   assert.equal(unknown.scopeKnown, false)
   assert.equal(unknown.coverage.complete, false)
