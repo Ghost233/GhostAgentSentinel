@@ -18,9 +18,10 @@ export async function startPanelServer({ read, control, requestNotifications, no
     if (req.headers.origin && !['https://chatgpt.com', 'https://chat.openai.com'].includes(req.headers.origin)) return res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"Origin rejected"}')
     if (req.method === 'GET' && req.url === '/health' && typeof runtimeStatus === 'function') {
       try {
-        const { installationId, runId, pid, version } = await runtimeStatus()
+        const { installationId, runId, pid, version, ownership } = await runtimeStatus()
         if ([installationId, runId, version].some(value => typeof value !== 'string' || !value || value.length > 256) || !Number.isSafeInteger(pid) || pid < 1) throw new Error('invalid helper identity')
-        return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ protocol: 'ghost-sentinel-chatgpt-helper/1', installationId, runId, pid, version }))
+        if (ownership !== undefined && ownership !== 'plugin') throw new Error('invalid observation ownership')
+        return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ protocol: 'ghost-sentinel-chatgpt-helper/1', installationId, runId, pid, version, ...(ownership ? { ownership } : {}) }))
       } catch { return res.writeHead(503, { 'content-type': 'application/json' }).end('{"error":"Helper status unavailable"}') }
     }
     if (req.url !== '/mcp') return res.writeHead(404, { 'content-type': 'application/json' }).end('{"error":"Not found"}')

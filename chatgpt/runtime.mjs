@@ -81,7 +81,7 @@ async function record(path) {
   } catch (error) { if (error.code === 'ENOENT') return null; throw error }
 }
 const ownIdentity = (value, config) => value?.protocol === HELPER_PROTOCOL && value.installationId === config.installationId && value.version === HELPER_VERSION && Number.isSafeInteger(value.pid) && value.pid > 0 && typeof value.runId === 'string' && /^[a-f0-9-]{36}$/.test(value.runId)
-const identityMatches = (a, b) => ['protocol', 'installationId', 'version', 'pid', 'runId'].every(key => a[key] === b[key])
+const identityMatches = (a, b) => ['protocol', 'installationId', 'version', 'pid', 'runId', 'ownership'].every(key => a[key] === b[key])
 const portOf = url => { const parsed = new URL(url); if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1' || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash || !parsed.port) throw new Error('untrusted helper endpoint'); return Number(parsed.port) }
 async function stablePort(config) {
   const connection = await record(join(config.dataDir, 'plugin/.mcp.json'))
@@ -92,8 +92,9 @@ async function stablePort(config) {
   if (entry.url !== `http://127.0.0.1:${port}/mcp` || config.port !== undefined && config.port !== port) throw new Error('helper endpoint differs from installation')
   return port
 }
-async function existing(config, owner, port) {
+async function existing(config, owner, port, ownership) {
   if (!ownIdentity(owner, config)) throw new Error('untrusted helper owner')
+  if ((owner.ownership ?? 'helper') !== ownership) throw new Error('existing observation has different process ownership')
   const runtime = await record(join(config.dataDir, 'runtime.json'))
   if (runtime) {
     if (!ownIdentity(runtime, config) || !identityMatches(runtime, owner)) throw new Error('untrusted helper endpoint')
@@ -109,20 +110,31 @@ async function existing(config, owner, port) {
   return runtime
 }
 
-export async function startFromInstallation({ configPath, pollMs = 1500, native, notificationIO } = {}) {
+export async function resolvePluginOwner({ configPath } = {}) {
   if (typeof configPath !== 'string' || !isAbsolute(configPath)) throw new Error('explicit private configuration path required')
+  const config = await readPrivateConfig(configPath), info = await lstat(config.dataDir)
+  if (!info.isDirectory() || info.mode & 0o077 || typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('private installation directory required')
+  const owner = await record(join(config.dataDir, 'runtime.lock/owner.json'))
+  if (!owner) return null
+  const runtime = await existing(config, owner, await stablePort(config), 'plugin')
+  return runtime && !runtime.dead ? { ...runtime, token: config.token } : null
+}
+
+export async function startFromInstallation({ configPath, pollMs = 1500, native, notificationIO, ownership = 'helper' } = {}) {
+  if (typeof configPath !== 'string' || !isAbsolute(configPath)) throw new Error('explicit private configuration path required')
+  if (!['helper', 'plugin'].includes(ownership)) throw new Error('invalid observation ownership')
   const config = await readPrivateConfig(configPath), pluginDir = join(config.dataDir, 'plugin')
   const info = await lstat(config.dataDir)
   if (!info.isDirectory() || info.mode & 0o077 || typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('private installation directory required')
   const lock = join(config.dataDir, 'runtime.lock'), port = await stablePort(config), runId = randomUUID()
-  const identity = { protocol: HELPER_PROTOCOL, installationId: config.installationId, runId, pid: process.pid, version: HELPER_VERSION }
+  const identity = { protocol: HELPER_PROTOCOL, installationId: config.installationId, runId, pid: process.pid, version: HELPER_VERSION, ...(ownership === 'plugin' ? { ownership } : {}) }
   const deadline = Date.now() + 2500
   while (true) {
     try { await mkdir(lock, { mode: 0o700 }); break }
     catch (error) { if (error.code !== 'EEXIST') throw error }
     const owner = await record(join(lock, 'owner.json'))
     if (owner) {
-      const live = await existing(config, owner, port)
+      const live = await existing(config, owner, port, ownership)
       if (live?.dead) {
         const current = await record(join(lock, 'owner.json'))
         if (current && identityMatches(current, owner)) { await rm(join(config.dataDir, 'runtime.json'), { force: true }); await rm(lock, { recursive: true, force: true }) }
@@ -134,6 +146,10 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     await delay(25)
   }
   let adapter, closing = null, stopping = false, retentionTimer = null, retentionPending = null, retentionSignature = null, retentionNextAt = null, retentionError = null
+  let stopReason = 'requested', readyResolve, closedResolve, closedReject
+  const ready = new Promise(resolve => { readyResolve = resolve })
+  const closed = new Promise((resolve, reject) => { closedResolve = resolve; closedReject = reject })
+  closed.catch(() => {})
   function retentionObserved(value, error) {
     if (stopping) return
     const next = value?.retention ? value.retention.nextExpiryAt : value?.nextExpiryAt, generatedAt = value?.generatedAt
@@ -170,7 +186,7 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
   }
   const close = () => closing ??= (async () => {
     stopping = true; clearTimeout(retentionTimer); retentionTimer = null
-    try { const stopped = adapter?.close(); await core.cancelPending(); await retentionPending; await stopped } finally {
+    try { const stopped = adapter?.close(); if (ownership !== 'plugin') await core.cancelPending(); await retentionPending; await stopped } finally {
       try { await core.close() } finally {
         const owner = await record(join(lock, 'owner.json'))
         if (owner && identityMatches(owner, identity)) {
@@ -180,7 +196,7 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
         }
       }
     }
-  })()
+  })().then(() => { const result = { reason: stopReason }; closedResolve(result); return result }, error => { closedReject(error); throw error })
   try {
     await writePrivateJson(join(lock, 'owner.json'), identity)
     await maintainRetention(true)
@@ -193,16 +209,20 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
       await writePrivateJson(configPath, config)
     }
     const notifier = notificationIO ?? (config.notificationBundlePath ? createNativeNotificationIO({ bundlePath: config.notificationBundlePath, installationId: config.installationId }) : undefined)
-    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, collectMaterials: true, nativeOriginVersion: 2, initialEnrollmentBaseline, runtimeStatus: () => ({ ...identity }) })
+    const onQualificationLost = ownership === 'plugin' ? reason => { stopReason = reason; void ready.then(close).catch(() => {}) } : undefined
+    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, collectMaterials: true, nativeOriginVersion: 2, initialEnrollmentBaseline, runtimeStatus: () => ({ ...identity }), onQualificationLost })
     adapter.diagnostics()
     const selectedPort = portOf(adapter.url)
     if (port && selectedPort !== port) throw new Error('helper changed its configured endpoint')
     if (config.port === undefined) await writePrivateJson(configPath, { ...config, port: selectedPort })
-    await mkdir(join(pluginDir, '.codex-plugin'), { recursive: true, mode: 0o700 })
-    await writePrivateJson(join(pluginDir, '.codex-plugin/plugin.json'), { name: 'ghost-sentinel', version: HELPER_VERSION, description: 'ChatGPT.app 本机主会话只读检查', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查', shortDescription: '本机主会话 · 只读检查' } })
-    await writePrivateJson(join(pluginDir, '.mcp.json'), { mcpServers: { sentinel: { url: adapter.url + '/mcp', http_headers: { Authorization: 'Bearer ' + config.token } } } })
+    if (ownership === 'helper') {
+      await mkdir(join(pluginDir, '.codex-plugin'), { recursive: true, mode: 0o700 })
+      await writePrivateJson(join(pluginDir, '.codex-plugin/plugin.json'), { name: 'ghost-sentinel', version: HELPER_VERSION, description: 'ChatGPT.app 本机主会话只读检查', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查', shortDescription: '本机主会话 · 只读检查' } })
+      await writePrivateJson(join(pluginDir, '.mcp.json'), { mcpServers: { sentinel: { url: adapter.url + '/mcp', http_headers: { Authorization: 'Bearer ' + config.token } } } })
+    }
     const value = { format: 1, ...identity, url: adapter.url, startedAt: Date.now() }
     await writePrivateJson(join(config.dataDir, 'runtime.json'), value)
-    return { ...value, reused: false, pluginDir, refresh: adapter.refresh, maintainRetention, diagnostics: () => ({ ...adapter.diagnostics(), retention: { timers: retentionTimer ? 1 : 0, pending: retentionPending ? 1 : 0, nextAt: retentionNextAt, errorCode: retentionError } }), close }
-  } catch (error) { await close(); throw error }
+    readyResolve()
+    return { ...value, reused: false, pluginDir, refresh: adapter.refresh, maintainRetention, diagnostics: () => ({ ...adapter.diagnostics(), retention: { timers: retentionTimer ? 1 : 0, pending: retentionPending ? 1 : 0, nextAt: retentionNextAt, errorCode: retentionError } }), closed, close }
+  } catch (error) { readyResolve(); await close(); throw error }
 }
