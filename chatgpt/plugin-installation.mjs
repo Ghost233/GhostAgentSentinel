@@ -196,7 +196,7 @@ export async function applyPluginChange(plan, io = {}) {
   }
   paths.lockDirectoryIdentity = directoryIdentity(await lstat(lock))
   await verifyDirectoryChain({ ...paths.directoryAnchors, [lock]: paths.lockDirectoryIdentity }, lock)
-  let transaction, config, result, primaryError = null
+  let transaction, config, result, primaryError = null, resumingAppActivation = false
   try {
     const owner = await save(join(lock, 'owner.json'), { operationId, pid: process.pid })
     paths.lockOwnerIdentity = owner.identity; paths.lockOwnerDigest = owner.digest
@@ -211,35 +211,42 @@ export async function applyPluginChange(plan, io = {}) {
     if (transaction.kind !== kind || transaction.configIdentity !== configIdentity(config)) fail('plugin_transaction_identity_unconfirmed')
     transaction.lockProof = { identity: paths.lockOwnerIdentity, digest: paths.lockOwnerDigest, directory: paths.lockDirectoryIdentity }
     delete transaction.releasedLock
+    // Lock recovery can change phase after the App checkpoint was saved.
+    const pendingAppActivation = transaction.appActivation !== undefined
+    resumingAppActivation = pendingAppActivation && request.operation !== 'uninstall'
     transaction.hostRevision = fresh.host.revision
     if (request.operation === 'uninstall') transaction.operation = 'uninstall'
-    await journal(paths, transaction, 'prepared')
+    await journal(paths, transaction, pendingAppActivation && request.operation !== 'uninstall' ? 'awaiting-app-activation' : 'prepared')
     if (request.operation === 'uninstall') result = await removeInstallation(fresh, config, transaction, io)
+    else if (pendingAppActivation) result = await resumeAppActivation(fresh, config, transaction, io)
     else result = await installRelease(fresh, config, transaction, io)
     if (result.status === 'complete' && request.operation !== 'uninstall') {
       await journal(paths, transaction, 'complete'); await rm(paths.operation)
     }
+    if (result.status === 'rolled-back') { await journal(paths, transaction, 'rolled-back'); await rm(paths.operation) }
     return result
   } catch (error) {
     primaryError = error
-    if (!transaction) throw error
-    transaction.errorCode = safeCode(error)
+    if (!transaction || !config || transaction.kind !== kind || transaction.configIdentity !== configIdentity(config)) throw error
+    const currentErrorCode = safeCode(error)
+    if (resumingAppActivation) transaction.appActivationErrorCode = currentErrorCode
+    else transaction.errorCode = currentErrorCode
     let rollback = null
-    if (request.operation === 'upgrade' && transaction.previous.receipt && transaction.phase !== 'complete') {
+    if (!resumingAppActivation && request.operation === 'upgrade' && transaction.previous.receipt && transaction.phase !== 'complete') {
       try { rollback = await restoreRelease(fresh, config, transaction, io) }
       catch (error) { rollback = { status: 'incomplete', errorCode: safeCode(error) } }
-    } else if (!transaction.removal) {
+    } else if (!resumingAppActivation && !transaction.removal) {
       try { transaction.failureCleanup = await stopInstallation(fresh, (await record(paths.configPath)).value, transaction, io) }
       catch (error) { transaction.failureCleanup = { status: 'incomplete', errorCode: safeCode(error) } }
     }
     let recoveryJournalErrorCode = null
     try {
-      await journal(paths, transaction, rollback?.status === 'complete' ? 'rolled-back' : 'recovery-required')
+      await journal(paths, transaction, resumingAppActivation || rollback?.errorCode === 'plugin_app_activation_required' ? 'awaiting-app-activation' : rollback?.status === 'complete' ? 'rolled-back' : 'recovery-required')
       if (rollback?.status === 'complete') await rm(paths.operation)
     } catch (error) { recoveryJournalErrorCode = safeCode(error) }
     let recoveryConfigurationRetained = false
     try { const persisted = (await record(paths.operation, 8388608))?.value; recoveryConfigurationRetained = persisted?.operationId === operationId && Boolean(recoveryConfig(persisted)) } catch {}
-    result = { status: error.code === 'plugin_trust_required' || error.code === 'plugin_activation_not_observed' ? 'needs-user-action' : 'recovery-required', operationId, errorCode: transaction.errorCode, rollback, ...(transaction.failureCleanup ? { failureCleanup: transaction.failureCleanup } : {}), ...(recoveryJournalErrorCode ? { recoveryJournalErrorCode } : {}), ...(error.temporaryCleanupErrorCode ? { temporaryCleanupErrorCode: error.temporaryCleanupErrorCode } : {}), ...(error.stageCleanupErrorCode ? { stageCleanupErrorCode: error.stageCleanupErrorCode } : {}), configurationRetained: Boolean(await optional(paths.configPath)), recoveryConfigurationRetained }
+    result = { status: rollback?.errorCode === 'plugin_app_activation_required' || error.code === 'plugin_trust_required' || error.code === 'plugin_activation_not_observed' ? 'needs-user-action' : 'recovery-required', operationId, errorCode: rollback?.errorCode === 'plugin_app_activation_required' ? 'plugin_app_activation_required' : currentErrorCode, ...(rollback?.errorCode === 'plugin_app_activation_required' ? { originalErrorCode: transaction.errorCode, action: 'enable-in-app' } : {}), ...(resumingAppActivation ? { action: 'retry-app-activation-check', ...(transaction.errorCode ? { originalErrorCode: transaction.errorCode } : {}) } : {}), rollback, ...(transaction.failureCleanup ? { failureCleanup: transaction.failureCleanup } : {}), ...(recoveryJournalErrorCode ? { recoveryJournalErrorCode } : {}), ...(error.temporaryCleanupErrorCode ? { temporaryCleanupErrorCode: error.temporaryCleanupErrorCode } : {}), ...(error.stageCleanupErrorCode ? { stageCleanupErrorCode: error.stageCleanupErrorCode } : {}), configurationRetained: Boolean(await optional(paths.configPath)), recoveryConfigurationRetained }
     return result
   } finally {
     try {
@@ -464,6 +471,42 @@ async function installedOwner(plan, release, io) {
   } while (Date.now() < deadline)
   fail('plugin_activation_not_observed')
 }
+function appActivationPending(transaction, receipt) {
+  return { status: 'needs-user-action', operationId: transaction.operationId, operation: transaction.operation, installationId: transaction.installationId, digest: receipt.activeDigest, errorCode: 'plugin_app_activation_required', action: 'enable-in-app', configurationRetained: true, appActivationVerified: false }
+}
+async function stageAppActivation(plan, config, transaction, io, receipt, rollback = false) {
+  await stopInstallation(plan, (await record(plan.paths.configPath)).value, transaction, io)
+  await ungate(plan.paths, config, transaction)
+  await save(plan.paths.receipt, { ...receipt, status: 'staged' })
+  transaction.appActivation = { digest: receipt.activeDigest, rollback }
+  await journal(plan.paths, transaction, 'awaiting-app-activation')
+  return appActivationPending(transaction, receipt)
+}
+async function resumeAppActivation(plan, config, transaction, io) {
+  const { paths } = plan, receipt = (await record(paths.receipt))?.value, pending = transaction.appActivation
+  if (!pending || !digest(pending.digest) || typeof pending.rollback !== 'boolean' || !['staged', 'installed'].includes(receipt?.status) || receipt.activeDigest !== pending.digest || pending.digest !== (pending.rollback ? transaction.previous.receipt?.activeDigest : transaction.candidateDigest)) fail('plugin_app_activation_state_unconfirmed')
+  const release = await packageAt(join(paths.releases, pending.digest), io, pending.digest)
+  const files = Object.fromEntries(descriptorNames.map(name => [name, { digest: receipt.files[name] }]))
+  await requireWrittenDescriptors(paths, files)
+  const before = checkedHost(await io.host.inspect(), config.pluginId)
+  if (before.revision !== transaction.hostRevision || !before.installed || before.pluginPath !== paths.pluginDir) fail('plugin_app_activation_qualification_changed')
+  const waiting = () => appActivationPending(transaction, receipt)
+  if (before.enabled !== 'enabled') return waiting()
+  const scope = { nodePath: release.nodePath, bridgePath: release.bridgePath, configPath: paths.configPath }
+  const witness = await io.host.appActivationWitness?.(scope)
+  if (!witness) return waiting()
+  const valid = value => value && typeof value.appHostRunId === 'string' && value.appHostRunId.length > 0 && value.appHostRunId.length <= 256 && Number.isSafeInteger(value.appHostStartedAt) && value.appHostStartedAt > 0 && Number.isSafeInteger(value.bridgePid) && value.bridgePid > 0 && value.bridgeEntry === release.bridgePath
+  if (!valid(witness)) fail('plugin_app_activation_witness_unconfirmed')
+  const activation = await installedOwner(plan, release, io), current = await io.host.appActivationWitness(scope)
+  if (!valid(current) || ['appHostRunId', 'appHostStartedAt', 'bridgePid', 'bridgeEntry'].some(key => current[key] !== witness[key])) return waiting()
+  const after = checkedHost(await io.host.inspect(), config.pluginId)
+  if (after.revision !== transaction.hostRevision || after.enabled !== 'enabled' || !after.installed || after.pluginPath !== paths.pluginDir) fail('plugin_app_activation_qualification_changed')
+  await requireWrittenDescriptors(paths, files)
+  await save(paths.receipt, { ...receipt, status: 'installed' })
+  const verified = { ...activation, appConnectionVerified: true, appHostRunId: witness.appHostRunId, appHostStartedAt: witness.appHostStartedAt, bridgePid: witness.bridgePid }
+  if (pending.rollback) return { status: 'rolled-back', operationId: transaction.operationId, operation: transaction.operation, installationId: config.installationId, errorCode: transaction.errorCode, restoredDigest: receipt.activeDigest, rollback: { status: 'complete', activation: verified } }
+  return { status: 'complete', operationId: transaction.operationId, operation: transaction.operation, installationId: config.installationId, digest: receipt.activeDigest, version: release.manifest.version, activation: verified }
+}
 async function notificationCleanup(config, io, uninstall) {
   if (!config.notificationBundlePath) return { status: 'not-configured' }
   const native = io.notifications ?? (await import('./native-notifications.mjs')).createNativeNotificationIO({ bundlePath: config.notificationBundlePath, installationId: config.installationId })
@@ -538,7 +581,9 @@ async function installRelease(plan, config, transaction, io) {
   if (!before.installed || before.enabled !== 'disabled' || before.pluginPath !== paths.pluginDir) fail('plugin_enablement_unconfirmed')
   transaction.hostRevision = checkedHost(await io.host.setEnabled(true, before.revision), config.pluginId).revision
   await journal(paths, transaction, 'awaiting-activation')
-  await io.host.initializeConnection(transaction.hostRevision)
+  const initialization = await io.host.initializeConnection(transaction.hostRevision)
+  if (initialization?.appActivationRequired === true) return stageAppActivation(plan, config, transaction, io, receipt)
+  if (initialization?.connectionScope !== 'app') fail('plugin_app_activation_scope_unconfirmed')
   const activation = await installedOwner(plan, release, io)
   await requireWrittenDescriptors(paths, written)
   await save(paths.receipt, { ...receipt, status: 'installed' })
@@ -564,7 +609,9 @@ async function restoreRelease(plan, config, transaction, io) {
   if (host.revision !== transaction.hostRevision) fail('plugin_host_concurrently_changed')
   transaction.hostRevision = checkedHost(await io.host.setEnabled(true, host.revision), config.pluginId).revision
   await journal(plan.paths, transaction, 'restoring-activation')
-  await io.host.initializeConnection(transaction.hostRevision)
+  const initialization = await io.host.initializeConnection(transaction.hostRevision)
+  if (initialization?.appActivationRequired === true) return stageAppActivation(plan, config, transaction, io, receipt, true)
+  if (initialization?.connectionScope !== 'app') fail('plugin_app_activation_scope_unconfirmed')
   const release = await packageAt(join(plan.paths.releases, receipt.activeDigest), io, receipt.activeDigest)
   return { status: 'complete', activation: await installedOwner(plan, release, io), restoredDigest: receipt.activeDigest }
 }

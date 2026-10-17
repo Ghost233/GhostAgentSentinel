@@ -12,6 +12,18 @@ import { fileURLToPath } from 'node:url'
 import { once } from 'node:events'
 import fs from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
+import { resolvePluginOwner } from '../chatgpt/runtime.mjs'
+import { setTimeout as delay } from 'node:timers/promises'
+
+async function enableInTestApp(world, initialize, configPath) {
+  await world.host.setEnabled(true, world.host.state.revision)
+  await initialize(world.host.state.revision)
+  const deadline = Date.now() + 5000
+  while (!await resolvePluginOwner({ configPath })) {
+    assert.ok(Date.now() < deadline, 'the simulated App must finish observation startup before it reports activation')
+    await delay(25)
+  }
+}
 
 async function fixture(t) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'sentinel-plugin-management-'))), installRoot = join(dir, 'install'), packageRoot = join(dir, 'package')
@@ -143,6 +155,260 @@ test('connection initialization failure after a confirmed enable preserves the r
   assert.equal(result.failureCleanup?.naturalExit, true, JSON.stringify(result))
   assert.equal(result.failureCleanup.remaining, 0)
   assert.equal(f.host.state.enabled, 'disabled')
+})
+
+test('a configuration-only host leaves a recoverable App activation step without warming or undoing the installation', async t => {
+  const f = await unlaunchedWorld(t)
+  f.host.initializeConnection = async () => ({ appActivationRequired: true, connectionScope: 'configuration-only' })
+  const result = await applyPluginChange(await previewPluginChange(f.options, f.io), f.io)
+  assert.equal(result.status, 'needs-user-action', JSON.stringify(result))
+  assert.equal(result.errorCode, 'plugin_app_activation_required')
+  assert.equal(result.action, 'enable-in-app')
+  assert.equal(result.configurationRetained, true)
+  assert.equal(result.failureCleanup, undefined)
+  assert.equal(f.host.state.installed, true)
+  assert.equal(f.host.state.enabled, 'disabled')
+  const transaction = JSON.parse(await readFile(join(f.installRoot, 'operation.json'), 'utf8'))
+  assert.equal(transaction.phase, 'awaiting-app-activation')
+  assert.equal(transaction.appActivation.digest, JSON.parse(await readFile(join(f.installRoot, 'installation-receipt.json'), 'utf8')).activeDigest)
+  await assert.rejects(stat(join(f.installRoot, 'state/maintenance.json')), { code: 'ENOENT' })
+  const revision = f.host.state.revision
+  const resumed = await applyPluginChange(await previewPluginChange({ ...f.options, resumeOperationId: result.operationId }, f.io), f.io)
+  assert.equal(resumed.status, 'needs-user-action')
+  assert.equal(resumed.operationId, result.operationId)
+  assert.equal(f.host.state.revision, revision, 'resume cannot toggle or reinstall while waiting for the native App')
+  const removed = await applyPluginChange(await previewPluginChange({ ...f.options, operation: 'uninstall', resumeOperationId: result.operationId }, f.io), f.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed))
+})
+
+test('a pending App activation survives final lock cleanup failure without registering the plugin again', async t => {
+  const f = await unlaunchedWorld(t), originalRm = fs.rm, register = f.host.register.bind(f.host)
+  f.host.initializeConnection = async () => ({ appActivationRequired: true, connectionScope: 'configuration-only' })
+  let registrations = 0, injected = false, result
+  f.host.register = async () => { registrations++; return register() }
+  fs.rm = async (path, ...args) => {
+    if (!injected && path === join(f.installRoot, '.operation.lock/owner.json')) { injected = true; throw Object.assign(new Error('Owned final lock failure'), { code: 'EROFS' }) }
+    return originalRm(path, ...args)
+  }
+  syncBuiltinESMExports()
+  try { result = await applyPluginChange(await previewPluginChange(f.options, f.io), f.io) }
+  finally { fs.rm = originalRm; syncBuiltinESMExports() }
+  assert.equal(result.status, 'recovery-required')
+  assert.equal(result.lockCleanupErrorCode, 'EROFS')
+  const revision = f.host.state.revision, resume = { ...f.options, resumeOperationId: result.operationId }
+  const retried = await applyPluginChange(await previewPluginChange(resume, f.io), f.io)
+  assert.equal(retried.errorCode, 'plugin_app_activation_required')
+  assert.equal(registrations, 1)
+  assert.equal(f.host.state.revision, revision)
+  const removed = await applyPluginChange(await previewPluginChange({ ...resume, operation: 'uninstall' }, f.io), f.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed))
+})
+
+test('an unconfirmed App activation transaction is rejected without changing the plugin or its saved evidence', async t => {
+  const f = await unlaunchedWorld(t)
+  f.host.initializeConnection = async () => ({ appActivationRequired: true, connectionScope: 'configuration-only' })
+  const pending = await applyPluginChange(await previewPluginChange(f.options, f.io), f.io)
+  const path = join(f.installRoot, 'operation.json'), transaction = JSON.parse(await readFile(path, 'utf8'))
+  transaction.configIdentity = '0'.repeat(64)
+  const evidence = JSON.stringify(transaction, null, 2) + '\n'
+  await writeFile(path, evidence, { mode: 0o600 })
+  await writeFile(join(f.installRoot, 'transactions', pending.operationId + '.json'), evidence, { mode: 0o600 })
+  const before = await f.host.inspect(), plan = await previewPluginChange({ ...f.options, resumeOperationId: pending.operationId }, f.io)
+  await assert.rejects(applyPluginChange(plan, f.io), { code: 'plugin_transaction_identity_unconfirmed' })
+  assert.deepEqual(await f.host.inspect(), before)
+  assert.equal(await readFile(path, 'utf8'), evidence)
+  await assert.rejects(stat(join(f.installRoot, 'state/maintenance.json')), { code: 'ENOENT' })
+})
+
+test('native App activation resumes the staged release without repeating registration or overwriting the user toggle', { timeout: 30000 }, async t => {
+  const f = await installationWorld(t), packageRoot = await f.packageFixture('0.2.0-dev.1')
+  const initialize = f.host.initializeConnection.bind(f.host)
+  f.host.initializeConnection = async () => ({ appActivationRequired: true, connectionScope: 'configuration-only' })
+  const staged = await applyPluginChange(await previewPluginChange({ ...f.options, packageRoot }, f.io), f.io)
+  assert.equal(staged.errorCode, 'plugin_app_activation_required')
+  const configPath = join(f.installRoot, 'state/installation.json'), before = JSON.parse(await readFile(configPath, 'utf8'))
+  await enableInTestApp(f, initialize, configPath)
+  const calls = f.host.calls.slice(), revision = f.host.state.revision
+  const resumeOptions = { ...f.options, packageRoot, resumeOperationId: staged.operationId }
+  const ownerOnly = await applyPluginChange(await previewPluginChange(resumeOptions, f.io), f.io)
+  assert.equal(ownerOnly.errorCode, 'plugin_app_activation_required', 'a running observation alone cannot prove an App connection')
+  const witness = bridgePath => ({ appHostRunId: 'owned-app-instance', appHostStartedAt: 1, bridgePid: f.children.at(-1).pid, bridgeEntry: bridgePath })
+  let witnessed = 0
+  f.host.appActivationWitness = async ({ bridgePath }) => ++witnessed === 1 ? witness(bridgePath) : null
+  const disappeared = await applyPluginChange(await previewPluginChange(resumeOptions, f.io), f.io)
+  assert.equal(disappeared.errorCode, 'plugin_app_activation_required', 'a late-lost App connection cannot complete the receipt')
+  assert.equal(JSON.parse(await readFile(join(f.installRoot, 'installation-receipt.json'), 'utf8')).status, 'staged')
+  f.host.appActivationWitness = async ({ bridgePath }) => witness(bridgePath)
+  const resumed = await applyPluginChange(await previewPluginChange(resumeOptions, f.io), f.io)
+  assert.equal(resumed.status, 'complete', JSON.stringify(resumed))
+  assert.equal(resumed.activation.appConnectionVerified, true)
+  assert.deepEqual(f.host.calls, calls)
+  assert.equal(f.host.state.revision, revision)
+  const after = JSON.parse(await readFile(configPath, 'utf8'))
+  for (const key of ['installationId', 'token']) assert.equal(after[key], before[key])
+  assert.equal(after.initialEnrollmentBaseline.id, before.initialEnrollmentBaseline.id)
+  assert.equal(after.initialEnrollmentBaseline.claimable, false, 'the first real observation consumes the original enrollment claim once')
+  await assert.rejects(stat(join(f.installRoot, 'operation.json')), { code: 'ENOENT' })
+  const removed = await applyPluginChange(await previewPluginChange({ ...f.options, operation: 'uninstall' }, f.io), f.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed))
+  await f.core.heartbeat(f.peer)
+})
+
+test('a failed upgrade can restore an old release pending native App activation without retrying the failed candidate', { timeout: 30000 }, async t => {
+  const f = await installationWorld(t), first = await f.packageFixture('0.2.0-dev.1'), second = await f.packageFixture('0.2.0-dev.2')
+  const installed = await applyPluginChange(await previewPluginChange({ ...f.options, packageRoot: first }, f.io), f.io)
+  assert.equal(installed.status, 'complete', JSON.stringify(installed))
+  const configPath = join(f.installRoot, 'state/installation.json'), original = JSON.parse(await readFile(configPath, 'utf8'))
+  const task = (await f.core.snapshot()).tasks.find(row => row.id === 'resource-main'), firstCapture = task.events.find(row => row.kind === 'input').capturedAt
+  const scope = { registrationId: 'chatgpt:' + original.installationId, taskId: task.id }, monitoring = await f.core.conversationMonitoring(scope)
+  await f.core.setConversationMonitoring({ ...scope, paused: true, revision: monitoring.revision })
+  const initialize = f.host.initializeConnection.bind(f.host)
+  let firstAttempt = true
+  f.host.initializeConnection = async () => {
+    if (firstAttempt) { firstAttempt = false; throw Object.assign(new Error('Owned candidate failure'), { code: 'owned_candidate_failed' }) }
+    return { appActivationRequired: true, connectionScope: 'configuration-only' }
+  }
+  const options = { ...f.options, operation: 'upgrade', packageRoot: second }
+  const waiting = await applyPluginChange(await previewPluginChange(options, f.io), f.io)
+  assert.equal(waiting.status, 'needs-user-action', JSON.stringify(waiting))
+  assert.equal(waiting.errorCode, 'plugin_app_activation_required')
+  assert.equal(waiting.originalErrorCode, 'owned_candidate_failed')
+  assert.equal(JSON.parse(await readFile(join(f.installRoot, 'installation-receipt.json'), 'utf8')).activeDigest, installed.digest)
+  assert.equal(JSON.parse(await readFile(join(f.installRoot, 'operation.json'), 'utf8')).phase, 'awaiting-app-activation')
+  await f.host.setEnabled(true, f.host.state.revision)
+  f.host.appActivationWitness = async ({ bridgePath }) => ({ appHostRunId: 'owned-app-instance', appHostStartedAt: 1, bridgePid: process.pid, bridgeEntry: bridgePath })
+  f.io.timeoutMs = 1
+  const resumeOptions = { ...options, resumeOperationId: waiting.operationId }, failedCheck = await applyPluginChange(await previewPluginChange(resumeOptions, f.io), f.io)
+  assert.equal(failedCheck.errorCode, 'plugin_activation_not_observed')
+  assert.equal(failedCheck.originalErrorCode, 'owned_candidate_failed')
+  assert.equal(JSON.parse(await readFile(join(f.installRoot, 'operation.json'), 'utf8')).errorCode, 'owned_candidate_failed')
+  f.io.timeoutMs = 15000
+  await enableInTestApp(f, initialize, configPath)
+  f.host.appActivationWitness = async ({ bridgePath }) => ({ appHostRunId: 'owned-app-instance', appHostStartedAt: 1, bridgePid: f.children.at(-1).pid, bridgeEntry: bridgePath })
+  const calls = f.host.calls.slice()
+  const resumed = await applyPluginChange(await previewPluginChange(resumeOptions, f.io), f.io)
+  assert.equal(resumed.status, 'rolled-back', JSON.stringify(resumed))
+  assert.equal(resumed.errorCode, 'owned_candidate_failed')
+  assert.equal(resumed.restoredDigest, installed.digest)
+  assert.equal(resumed.rollback.activation.appConnectionVerified, true)
+  assert.deepEqual(f.host.calls, calls)
+  const saved = JSON.parse(await readFile(configPath, 'utf8'))
+  for (const key of ['installationId', 'token']) assert.equal(saved[key], original[key])
+  assert.equal((await f.core.conversationMonitoring(scope)).paused, true)
+  assert.equal((await f.core.snapshot()).tasks.find(row => row.id === task.id).events.find(row => row.kind === 'input').capturedAt, firstCapture)
+  await assert.rejects(stat(join(f.installRoot, 'operation.json')), { code: 'ENOENT' })
+  const removed = await applyPluginChange(await previewPluginChange({ ...f.options, operation: 'uninstall' }, f.io), f.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed))
+  await f.core.heartbeat(f.peer)
+})
+
+test('an upgrade awaiting native App activation preserves enrollment, pause and first capture until its exact release is resumed', { timeout: 30000 }, async t => {
+  const f = await installationWorld(t), first = await f.packageFixture('0.2.0-dev.1'), second = await f.packageFixture('0.2.0-dev.2')
+  const initial = await applyPluginChange(await previewPluginChange({ ...f.options, packageRoot: first }, f.io), f.io)
+  assert.equal(initial.status, 'complete', JSON.stringify(initial))
+  const configPath = join(f.installRoot, 'state/installation.json'), before = JSON.parse(await readFile(configPath, 'utf8'))
+  const task = (await f.core.snapshot()).tasks.find(row => row.id === 'resource-main'), firstCapture = task.events.find(row => row.kind === 'input').capturedAt
+  const scope = { registrationId: 'chatgpt:' + before.installationId, taskId: task.id }, monitoring = await f.core.conversationMonitoring(scope)
+  await f.core.setConversationMonitoring({ ...scope, paused: true, revision: monitoring.revision })
+  const initialize = f.host.initializeConnection.bind(f.host)
+  f.host.initializeConnection = async () => ({ appActivationRequired: true, connectionScope: 'configuration-only' })
+  const options = { ...f.options, operation: 'upgrade', packageRoot: second }
+  const staged = await applyPluginChange(await previewPluginChange(options, f.io), f.io)
+  assert.equal(staged.errorCode, 'plugin_app_activation_required')
+  const receipt = JSON.parse(await readFile(join(f.installRoot, 'installation-receipt.json'), 'utf8'))
+  assert.notEqual(receipt.activeDigest, initial.digest)
+  assert.equal((await f.core.conversationMonitoring(scope)).paused, true)
+  await enableInTestApp(f, initialize, configPath)
+  f.host.appActivationWitness = async ({ bridgePath }) => ({ appHostRunId: 'owned-app-instance', appHostStartedAt: 1, bridgePid: f.children.at(-1).pid, bridgeEntry: bridgePath })
+  const calls = f.host.calls.slice()
+  const resumed = await applyPluginChange(await previewPluginChange({ ...options, resumeOperationId: staged.operationId }, f.io), f.io)
+  assert.equal(resumed.status, 'complete', JSON.stringify(resumed))
+  assert.equal(resumed.digest, receipt.activeDigest)
+  assert.equal(resumed.activation.appConnectionVerified, true)
+  assert.deepEqual(f.host.calls, calls)
+  const after = JSON.parse(await readFile(configPath, 'utf8'))
+  for (const key of ['installationId', 'token', 'initialEnrollmentBaseline']) assert.deepEqual(after[key], before[key])
+  assert.equal((await f.core.conversationMonitoring(scope)).paused, true)
+  assert.equal((await f.core.snapshot()).tasks.find(row => row.id === task.id).events.find(row => row.kind === 'input').capturedAt, firstCapture)
+  const removed = await applyPluginChange(await previewPluginChange({ ...f.options, operation: 'uninstall' }, f.io), f.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed))
+  await f.core.heartbeat(f.peer)
+})
+
+test('an App-verified receipt recovers its final lock without restarting or registering the installation again', { timeout: 30000 }, async t => {
+  const f = await installationWorld(t), packageRoot = await f.packageFixture('0.2.0-dev.1'), initialize = f.host.initializeConnection.bind(f.host)
+  f.host.initializeConnection = async () => ({ appActivationRequired: true, connectionScope: 'configuration-only' })
+  const staged = await applyPluginChange(await previewPluginChange({ ...f.options, packageRoot }, f.io), f.io)
+  assert.equal(staged.errorCode, 'plugin_app_activation_required')
+  const configPath = join(f.installRoot, 'state/installation.json')
+  await enableInTestApp(f, initialize, configPath)
+  f.host.appActivationWitness = async ({ bridgePath }) => ({ appHostRunId: 'owned-app-instance', appHostStartedAt: 1, bridgePid: f.children.at(-1).pid, bridgeEntry: bridgePath })
+  const calls = f.host.calls.slice(), owner = await resolvePluginOwner({ configPath }), options = { ...f.options, packageRoot, resumeOperationId: staged.operationId }, originalRm = fs.rm
+  let injected = false, failed
+  fs.rm = async (path, ...args) => {
+    if (!injected && path === join(f.installRoot, '.operation.lock/owner.json')) { injected = true; throw Object.assign(new Error('Owned final lock failure'), { code: 'EROFS' }) }
+    return originalRm(path, ...args)
+  }
+  syncBuiltinESMExports()
+  try { failed = await applyPluginChange(await previewPluginChange(options, f.io), f.io) }
+  finally { fs.rm = originalRm; syncBuiltinESMExports() }
+  assert.equal(failed.status, 'recovery-required')
+  assert.equal(failed.lockCleanupErrorCode, 'EROFS')
+  assert.equal(JSON.parse(await readFile(join(f.installRoot, 'installation-receipt.json'), 'utf8')).status, 'installed')
+  const recovered = await applyPluginChange(await previewPluginChange(options, f.io), f.io)
+  assert.equal(recovered.status, 'complete', JSON.stringify(recovered))
+  assert.equal(recovered.activation.appConnectionVerified, true)
+  assert.deepEqual(f.host.calls, calls)
+  assert.equal((await resolvePluginOwner({ configPath })).runId, owner.runId)
+  const removed = await applyPluginChange(await previewPluginChange({ ...f.options, operation: 'uninstall' }, f.io), f.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed))
+})
+
+for (const operation of ['install', 'upgrade']) test(`resuming native App ${operation} without an authenticated owner never repeats host mutations`, { timeout: 30000 }, async t => {
+  const f = operation === 'install' ? await unlaunchedWorld(t) : await installationWorld(t)
+  let packageRoot = f.options.packageRoot
+  if (operation === 'upgrade') {
+    const first = await f.packageFixture('0.2.0-dev.1')
+    const installed = await applyPluginChange(await previewPluginChange({ ...f.options, packageRoot: first }, f.io), f.io)
+    assert.equal(installed.status, 'complete', JSON.stringify(installed))
+    packageRoot = await f.packageFixture('0.2.0-dev.2')
+  }
+  f.host.initializeConnection = async () => ({ appActivationRequired: true, connectionScope: 'configuration-only' })
+  const options = { ...f.options, operation, packageRoot }, pending = await applyPluginChange(await previewPluginChange(options, f.io), f.io)
+  assert.equal(pending.errorCode, 'plugin_app_activation_required')
+  await f.host.setEnabled(true, f.host.state.revision)
+  f.host.appActivationWitness = async ({ bridgePath }) => ({ appHostRunId: 'owned-app-instance', appHostStartedAt: 1, bridgePid: process.pid, bridgeEntry: bridgePath })
+  f.io.timeoutMs = 1
+  const revision = f.host.state.revision, calls = f.host.calls?.slice()
+  const resumed = await applyPluginChange(await previewPluginChange({ ...options, resumeOperationId: pending.operationId }, f.io), f.io)
+  assert.equal(resumed.errorCode, 'plugin_activation_not_observed', JSON.stringify(resumed))
+  assert.equal(f.host.state.revision, revision)
+  assert.equal(f.host.state.enabled, 'enabled')
+  if (calls) assert.deepEqual(f.host.calls, calls)
+  await assert.rejects(stat(join(f.installRoot, 'state/maintenance.json')), { code: 'ENOENT' })
+  assert.equal(JSON.parse(await readFile(join(f.installRoot, 'operation.json'), 'utf8')).phase, 'awaiting-app-activation')
+  const removed = await applyPluginChange(await previewPluginChange({ ...options, operation: 'uninstall', resumeOperationId: pending.operationId }, f.io), f.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed))
+})
+
+test('resuming a staged upgrade preserves a native App uninstall instead of registering the old release again', { timeout: 30000 }, async t => {
+  const f = await installationWorld(t), first = await f.packageFixture('0.2.0-dev.1'), second = await f.packageFixture('0.2.0-dev.2')
+  const installed = await applyPluginChange(await previewPluginChange({ ...f.options, packageRoot: first }, f.io), f.io)
+  assert.equal(installed.status, 'complete', JSON.stringify(installed))
+  f.host.initializeConnection = async () => ({ appActivationRequired: true, connectionScope: 'configuration-only' })
+  const options = { ...f.options, operation: 'upgrade', packageRoot: second }, staged = await applyPluginChange(await previewPluginChange(options, f.io), f.io)
+  assert.equal(staged.errorCode, 'plugin_app_activation_required')
+  await f.host.unregister()
+  const before = await f.host.inspect(), calls = f.host.calls.slice()
+  const result = await applyPluginChange(await previewPluginChange({ ...options, resumeOperationId: staged.operationId }, f.io), f.io)
+  assert.equal(result.errorCode, 'plugin_app_activation_qualification_changed')
+  assert.equal(result.rollback, null)
+  assert.deepEqual(await f.host.inspect(), before)
+  assert.deepEqual(f.host.calls, calls)
+  await assert.rejects(stat(join(f.installRoot, 'state/maintenance.json')), { code: 'ENOENT' })
+  const removed = await applyPluginChange(await previewPluginChange({ ...options, operation: 'uninstall', resumeOperationId: staged.operationId }, f.io), f.io)
+  assert.equal(removed.status, 'complete', JSON.stringify(removed))
+  await f.core.heartbeat(f.peer)
 })
 
 test('a failed upgrade connection initialization restores the old release without losing pause or first capture', { timeout: 30000 }, async t => {

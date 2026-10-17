@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
-import { mkdtemp, mkdir, writeFile, rm, realpath } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, realpath, lstat, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -10,18 +10,24 @@ import { createPluginHost } from '../chatgpt/plugin-host.mjs'
 
 const { WebSocketServer } = createRequire(new URL('../chatgpt/package.json', import.meta.url))('ws')
 
-async function fixture(t) {
+async function socketBinding(path) {
+  path = await realpath(path)
+  const info = await lstat(path)
+  return { path, identity: [info.dev, info.ino, info.mode, info.uid, info.ctimeMs] }
+}
+
+async function fixture(t, hostOptions = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'sentinel-plugin-host-')))
   const pluginPath = join(root, 'plugin'), marketplacePath = join(root, '.agents/plugins/marketplace.json')
   await mkdir(pluginPath, { mode: 0o700 }); await mkdir(join(root, '.agents/plugins'), { recursive: true, mode: 0o700 })
   await writeFile(marketplacePath, JSON.stringify({ name: 'sentinel-host-test', plugins: [{ name: 'ghost-sentinel', source: { source: 'local', path: './plugin' } }] }), { mode: 0o600 })
   const options = { socketPath: join(tmpdir(), 'gs-ph-' + randomUUID().slice(0, 8) + '.sock'), marketplacePath, marketplaceName: 'sentinel-host-test', pluginName: 'ghost-sentinel', pluginId: 'ghost-sentinel@sentinel-host-test', pluginPath }
   const state = { registered: true, installed: true, enabled: true, revision: 'user-revision-1', otherEnabled: true, race: false, writes: 1, sourcePath: pluginPath }
-  const calls = [], websocket = new WebSocketServer({ noServer: true }), server = createServer()
-  server.on('upgrade', (req, socket, head) => websocket.handleUpgrade(req, socket, head, ws => websocket.emit('connection', ws, req)))
+  const calls = [], endpoints = [], websocket = new WebSocketServer({ noServer: true }), server = createServer()
+  server.on('upgrade', (req, socket, head) => websocket.handleUpgrade(req, socket, head, ws => { ws.fixtureEndpoint = 'original'; websocket.emit('connection', ws, req) }))
   const summary = () => ({ id: options.pluginId, name: options.pluginName, installed: state.installed, enabled: state.enabled, localVersion: '0.1.0-dev.2', source: { type: 'local', path: state.sourcePath } })
   websocket.on('connection', ws => ws.on('message', bytes => {
-    const message = JSON.parse(bytes); calls.push(message)
+    const message = JSON.parse(bytes); calls.push(message); endpoints.push({ endpoint: ws.fixtureEndpoint, method: message.method })
     if (!message.id) return
     if (state.disconnectOn === message.method) { ws.terminate(); return }
     if (state.holdMethod === message.method) { state.onHeld?.(); return }
@@ -67,9 +73,17 @@ async function fixture(t) {
     ws.send(JSON.stringify({ id: message.id, result }))
   }))
   await new Promise(resolve => server.listen(options.socketPath, resolve))
-  const host = createPluginHost(options)
+  const host = createPluginHost({ ...options, connectionContext: async () => ({ scope: 'app', appHostRunId: 'owned-test-app', socketBinding: await socketBinding(options.socketPath) }), ...hostOptions })
   t.after(async () => { await host.close(); for (const ws of websocket.clients) ws.terminate(); await new Promise(resolve => websocket.close(resolve)); await new Promise(resolve => server.close(resolve)); await rm(options.socketPath, { force: true }); await rm(root, { recursive: true, force: true }) })
-  return { host, calls, options, state, connections: () => websocket.clients.size }
+  return { host, calls, options, state, endpoints, websocket, connections: () => websocket.clients.size }
+}
+
+async function secondEndpoint(t, f, path = join(tmpdir(), 'gs-ph-' + randomUUID().slice(0, 8) + '.sock')) {
+  const server = createServer()
+  server.on('upgrade', (req, socket, head) => f.websocket.handleUpgrade(req, socket, head, ws => { ws.fixtureEndpoint = 'replacement'; f.websocket.emit('connection', ws, req) }))
+  await new Promise(resolve => server.listen(path, resolve))
+  t.after(async () => { await new Promise(resolve => server.close(resolve)); await rm(path, { force: true }) })
+  return path
 }
 
 test('installation preview reads an authenticated local registration and enablement without changing the host', async t => {
@@ -105,11 +119,124 @@ test('the installer initializes only the managed MCP connection after confirmed 
   const f = await fixture(t); f.state.enabled = false
   const enabled = await f.host.setEnabled(true, (await f.host.inspect()).revision)
   assert.equal(f.state.discovered, undefined, 'the write revision is returned before connection initialization can fail')
-  await f.host.initializeConnection(enabled.revision)
+  const initialized = await f.host.initializeConnection(enabled.revision)
+  assert.equal(initialized.appActivationRequired, false)
+  assert.equal(initialized.connectionScope, 'app')
   assert.equal(f.state.discovered, true, 'persisted enablement alone does not initialize the plugin connection')
   assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 1)
   assert.ok(!f.calls.some(call => ['mcpServer/tool/call', 'config/mcpServer/reload', 'plugin/reconcile', 'thread/resume'].includes(call.method)))
   assert.equal(f.state.otherEnabled, true)
+})
+
+test('a separate configuration daemon never becomes an App activation witness or starts a replacement MCP connection', async t => {
+  const f = await fixture(t, { connectionContext: async () => ({ scope: 'configuration-only', reason: 'different-process', appHostRunId: 'owned-test-app' }) })
+  const before = await f.host.inspect(), result = await f.host.initializeConnection(before.revision)
+  assert.equal(result.appActivationRequired, true)
+  assert.equal(result.connectionScope, 'configuration-only')
+  assert.equal(f.calls.some(call => call.method === 'mcpServerStatus/list'), false)
+  assert.equal(f.state.enabled, true)
+  assert.equal(f.state.otherEnabled, true)
+})
+
+test('an App socket alias that flips back cannot label an existing daemon WebSocket as App activation', async t => {
+  const f = await fixture(t), appSocket = await secondEndpoint(t, f)
+  const alias = join(tmpdir(), 'gs-al-' + randomUUID().slice(0, 8) + '.sock')
+  await symlink(f.options.socketPath, alias)
+  const host = createPluginHost({ ...f.options, socketPath: alias, connectionContext: async () => {
+    await rm(alias); await symlink(appSocket, alias)
+    const context = { scope: 'app', appHostRunId: 'owned-test-app', socketBinding: await socketBinding(alias) }
+    await rm(alias); await symlink(f.options.socketPath, alias)
+    return context
+  } })
+  t.after(async () => { await host.close(); await rm(alias, { force: true }) })
+  const before = await host.inspect(), result = await host.initializeConnection(before.revision)
+  assert.equal(f.endpoints.some(call => call.endpoint === 'original' && call.method === 'mcpServerStatus/list'), false, 'the still-open daemon connection must not be warmed by proof of the other endpoint')
+  assert.equal(result.appActivationRequired, true)
+  assert.equal(result.connectionScope, 'unknown')
+})
+
+test('replacing a live socket pathname cannot transfer the old RPC connection to the new App listener', async t => {
+  const f = await fixture(t), before = await f.host.inspect(), original = await socketBinding(f.options.socketPath)
+  await rm(f.options.socketPath)
+  await secondEndpoint(t, f, f.options.socketPath)
+  const replacement = await socketBinding(f.options.socketPath)
+  assert.notDeepEqual(original.identity, replacement.identity)
+  const result = await f.host.initializeConnection(before.revision)
+  assert.equal(result.appActivationRequired, true)
+  assert.equal(result.connectionScope, 'unknown')
+  assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 0)
+})
+
+test('reconnecting the same exact endpoint between App proof and discovery requires a fresh proof', async t => {
+  let f
+  f = await fixture(t, { connectionContext: async () => {
+    const context = { scope: 'app', appHostRunId: 'owned-test-app', socketBinding: await socketBinding(f.options.socketPath) }
+    await Promise.all([...f.websocket.clients].map(ws => new Promise(resolve => { ws.once('close', resolve); ws.close() })))
+    await f.host.inspect()
+    return context
+  } })
+  const before = await f.host.inspect(), result = await f.host.initializeConnection(before.revision)
+  assert.equal(result.appActivationRequired, true)
+  assert.equal(result.connectionScope, 'unknown')
+  assert.equal(f.calls.filter(call => call.method === 'initialize').length, 2, 'the fixture actually opened another RPC connection to the unchanged socket')
+  assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 0)
+})
+
+test('a connection replacement during final App sampling cannot complete or warm the replacement connection', async t => {
+  let f, samples = 0
+  f = await fixture(t, { connectionContext: async () => {
+    if (++samples === 2) {
+      await rm(f.options.socketPath)
+      await secondEndpoint(t, f, f.options.socketPath)
+      await Promise.all([...f.websocket.clients].map(ws => new Promise(resolve => { ws.once('close', resolve); ws.close() })))
+      await f.host.inspect()
+    }
+    return { scope: 'app', appHostRunId: 'owned-test-app', socketBinding: await socketBinding(f.options.socketPath) }
+  } })
+  const result = await f.host.initializeConnection((await f.host.inspect()).revision)
+  assert.equal(result.appActivationRequired, true)
+  assert.equal(result.connectionScope, 'unknown')
+  assert.equal(f.endpoints.filter(call => call.endpoint === 'original' && call.method === 'mcpServerStatus/list').length, 1)
+  assert.equal(f.endpoints.filter(call => call.endpoint === 'replacement' && call.method === 'mcpServerStatus/list').length, 0)
+})
+
+test('App scope without an actual matching socket binding never initializes MCP', async t => {
+  const f = await fixture(t, { connectionContext: async () => ({ scope: 'app', appHostRunId: 'owned-test-app' }) })
+  const result = await f.host.initializeConnection((await f.host.inspect()).revision)
+  assert.equal(result.appActivationRequired, true)
+  assert.equal(result.connectionScope, 'unknown')
+  assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 0)
+})
+
+test('unknown connection facts require native App activation without discovering MCP', async t => {
+  for (const context of [null, { scope: 'unknown' }, { scope: 'daemon', reason: 'Bearer MUST_NOT_APPEAR' }]) {
+    const f = await fixture(t, { connectionContext: async () => context })
+    const result = await f.host.initializeConnection((await f.host.inspect()).revision)
+    assert.equal(result.appActivationRequired, true)
+    assert.equal(result.connectionScope, 'unknown')
+    assert.equal(JSON.stringify(result).includes('MUST_NOT_APPEAR'), false)
+    assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 0)
+  }
+})
+
+test('configuration-only activation rechecks revision and qualification after connection sampling', async t => {
+  for (const mutation of ['revision', 'enabled', 'staticServer']) {
+    let state
+    const f = await fixture(t, { connectionContext: async () => { state[mutation] = mutation === 'revision' ? 'new-user-choice' : mutation === 'staticServer'; return { scope: 'configuration-only' } } })
+    state = f.state
+    await assert.rejects(f.host.initializeConnection((await f.host.inspect()).revision), { code: mutation === 'revision' ? 'plugin_host_revision_conflict' : 'plugin_host_activation_qualification_changed' })
+    assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 0)
+    assert.equal(f.calls.filter(call => call.method === 'config/batchWrite').length, 0)
+  }
+})
+
+test('an App generation change during discovery cannot be reported as App activation', async t => {
+  let samples = 0
+  const f = await fixture(t, { connectionContext: async () => ({ scope: 'app', appHostRunId: ++samples === 1 ? 'old-app' : 'new-app', socketBinding: await socketBinding(f.options.socketPath) }) })
+  const result = await f.host.initializeConnection((await f.host.inspect()).revision)
+  assert.equal(result.appActivationRequired, true)
+  assert.equal(result.connectionScope, 'unknown')
+  assert.equal(f.calls.filter(call => call.method === 'mcpServerStatus/list').length, 1)
 })
 
 test('an existing static server with the same name blocks activation before any configuration write or connection', async t => {

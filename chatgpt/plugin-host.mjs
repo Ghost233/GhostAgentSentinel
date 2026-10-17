@@ -4,6 +4,7 @@ import { realpath, lstat, open } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
+import { createAppActivation, readSocketBinding } from './app-activation.mjs'
 
 const failure = code => Object.assign(new Error(code), { code })
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -14,7 +15,7 @@ const editable = (config, id) => object(config) && (!Object.hasOwn(config, 'plug
 // Installation control is deliberately separate from the observation-only client.
 // It connects to the existing App; it cannot launch an App or operate a chat.
 function hostConnection(socketPath) {
-  let socket = null, opening = null, closed = false, sequence = 0
+  let socket = null, opening = null, closed = false, sequence = 0, generation = 0, connection = null
   const pending = new Map()
   const rejectAll = code => { for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(failure(code)) }; pending.clear() }
   async function dispose(ws) {
@@ -36,10 +37,13 @@ function hostConnection(socketPath) {
     if (opening) return opening
     if (socket?.readyState === WebSocket.OPEN) return
     opening = (async () => {
-      const ws = new WebSocket(`ws+unix://${socketPath}:/`, { handshakeTimeout: 3000, maxPayload: 2097152 })
-      socket = ws
+      let endpoint
+      try { endpoint = await readSocketBinding(socketPath) } catch { throw failure('plugin_host_unavailable') }
+      if (closed) throw failure('plugin_host_closed')
+      const ws = new WebSocket(`ws+unix://${endpoint.path}:/`, { handshakeTimeout: 3000, maxPayload: 2097152 })
+      socket = ws; connection = null
       ws.on('error', () => { if (socket === ws) rejectAll('plugin_host_unavailable') })
-      ws.on('close', () => { if (socket === ws) { rejectAll('plugin_host_unavailable'); socket = null } })
+      ws.on('close', () => { if (socket === ws) { rejectAll('plugin_host_unavailable'); socket = null; connection = null } })
       ws.on('message', bytes => {
         let response
         try { response = JSON.parse(bytes) } catch { rejectAll('plugin_host_invalid_response'); ws.terminate(); return }
@@ -51,26 +55,43 @@ function hostConnection(socketPath) {
       })
       try {
         await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', () => reject(failure('plugin_host_unavailable'))) })
+        let current
+        try { current = await readSocketBinding(endpoint.path) } catch { throw failure('plugin_host_connection_changed') }
+        if (!isDeepStrictEqual(endpoint, current)) throw failure('plugin_host_connection_changed')
+        connection = Object.freeze({ generation: ++generation, socketBinding: Object.freeze({ path: endpoint.path, identity: Object.freeze([...endpoint.identity]) }) })
         await wire('initialize', { clientInfo: { name: 'ghost_sentinel_plugin_installer', version: '0.1.0-dev.1' }, capabilities: { experimentalApi: true } })
         if (closed || socket !== ws) throw failure('plugin_host_closed')
         ws.send(JSON.stringify({ method: 'initialized' }))
-      } catch (error) { if (socket === ws) { rejectAll('plugin_host_unavailable'); socket = null }; await dispose(ws); throw error }
+      } catch (error) { if (socket === ws) { rejectAll('plugin_host_unavailable'); socket = null; connection = null }; await dispose(ws); throw error }
     })().finally(() => { opening = null })
     return opening
   }
+  const currentConnection = () => !closed && socket?.readyState === WebSocket.OPEN ? connection : null
+  async function verifyConnection(expected) {
+    if (closed) throw failure('plugin_host_closed')
+    if (!expected || currentConnection() !== expected) throw failure('plugin_host_connection_changed')
+    let current
+    try { current = await readSocketBinding(expected.socketBinding.path) } catch { throw failure('plugin_host_connection_changed') }
+    if (currentConnection() !== expected || !isDeepStrictEqual(current, expected.socketBinding)) throw failure('plugin_host_connection_changed')
+  }
   return {
     async request(method, params) { await connect(); return wire(method, params) },
-    async close() { closed = true; rejectAll('plugin_host_closed'); const ws = socket; socket = null; await dispose(ws); await opening?.catch(() => {}) },
+    connection: currentConnection,
+    async requestOn(expected, method, params) { await verifyConnection(expected); const result = await wire(method, params); await verifyConnection(expected); return result },
+    async close() { closed = true; rejectAll('plugin_host_closed'); const ws = socket; socket = null; connection = null; await dispose(ws); await opening?.catch(() => {}) },
   }
 }
 
-export function createPluginHost({ socketPath, marketplacePath, marketplaceName, pluginName, pluginId, pluginPath } = {}) {
+export function createPluginHost({ socketPath, marketplacePath, marketplaceName, pluginName, pluginId, pluginPath, connectionContext } = {}) {
   if (![socketPath, marketplacePath, pluginPath].every(absolute) || ![marketplaceName, pluginName].every(value => typeof value === 'string' && /^[a-z0-9][a-z0-9._-]{0,127}$/.test(value)) || pluginId !== pluginName + '@' + marketplaceName) throw failure('plugin_host_binding_invalid')
   const marketplaceRoot = dirname(dirname(dirname(marketplacePath)))
   if (marketplacePath !== join(marketplaceRoot, '.agents/plugins/marketplace.json') || pluginPath !== join(marketplaceRoot, 'plugin')) throw failure('plugin_host_binding_invalid')
   const rpc = hostConnection(socketPath)
-  async function readState() {
-    const list = await rpc.request('plugin/list', { forceRefetch: false, marketplaceKinds: ['local'] })
+  const activation = createAppActivation({ pluginId, socketPath })
+  connectionContext ??= activation.connectionContext
+  async function readState(connection = null) {
+    const request = (method, params) => connection ? rpc.requestOn(connection, method, params) : rpc.request(method, params)
+    const list = await request('plugin/list', { forceRefetch: false, marketplaceKinds: ['local'] })
     if (!Array.isArray(list?.marketplaces)) throw failure('plugin_host_catalog_unconfirmed')
     if (list.marketplaceLoadErrors?.some(error => error.marketplacePath === marketplacePath)) throw failure('plugin_host_catalog_unconfirmed')
     const matches = list.marketplaces.filter(market => market.name === marketplaceName)
@@ -78,11 +99,11 @@ export function createPluginHost({ socketPath, marketplacePath, marketplaceName,
     let summary = null
     if (matches.length) {
       if (matches[0].plugins?.length !== 1 || matches[0].plugins[0].id !== pluginId) throw failure('plugin_host_registration_conflict')
-      const detail = (await rpc.request('plugin/read', { marketplacePath, pluginName }))?.plugin
+      const detail = (await request('plugin/read', { marketplacePath, pluginName }))?.plugin
       summary = detail?.summary
       if (detail?.marketplaceName !== marketplaceName || detail.marketplacePath !== marketplacePath || summary?.id !== pluginId || summary.name !== pluginName || summary.source?.type !== 'local' || summary.source.path !== pluginPath || typeof summary.installed !== 'boolean' || typeof summary.enabled !== 'boolean' || await realpath(pluginPath) !== pluginPath) throw failure('plugin_host_registration_conflict')
     }
-    const config = await rpc.request('config/read', { cwd: null, includeLayers: true })
+    const config = await request('config/read', { cwd: null, includeLayers: true })
     const users = Array.isArray(config?.layers) ? config.layers.filter(layer => layer.name?.type === 'user' && !layer.disabledReason) : []
     const user = users.length === 1 && typeof users[0].version === 'string' && users[0].version.length > 0 && absolute(users[0].name.file) ? users[0] : null
     const own = user ? setting(user.config, pluginId) : null, effective = setting(config?.config, pluginId)
@@ -172,12 +193,30 @@ export function createPluginHost({ socketPath, marketplacePath, marketplaceName,
     if (before.view.revision !== expectedRevision) throw failure('plugin_host_revision_conflict')
     if (!before.view.installed || before.view.enabled !== 'enabled') throw failure('plugin_host_activation_qualification_changed')
     if (before.staticServerConfigured) throw failure('plugin_host_server_name_conflict')
-    const discovery = await rpc.request('mcpServerStatus/list', { serverName: 'sentinel', detail: 'toolsAndAuthOnly', limit: 1 })
+    const connection = rpc.connection()
+    async function pending(scope) {
+      const after = await readState()
+      if (after.view.revision !== expectedRevision) throw failure('plugin_host_revision_conflict')
+      if (!after.view.installed || after.view.enabled !== 'enabled' || after.staticServerConfigured) throw failure('plugin_host_activation_qualification_changed')
+      return { ...after.view, appActivationRequired: true, connectionScope: scope }
+    }
+    let context
+    try { context = await connectionContext() } catch { context = null }
+    if (context?.scope !== 'app') return pending(context?.scope === 'configuration-only' ? 'configuration-only' : 'unknown')
+    if (!connection || rpc.connection() !== connection || !isDeepStrictEqual(context.socketBinding, connection.socketBinding)) return pending('unknown')
+    let discovery
+    try { discovery = await rpc.requestOn(connection, 'mcpServerStatus/list', { serverName: 'sentinel', detail: 'toolsAndAuthOnly', limit: 1 }) }
+    catch (error) { if (error.code === 'plugin_host_connection_changed') return pending('unknown'); throw error }
     if (!Array.isArray(discovery?.data) || discovery.data.length !== 1 || discovery.data[0]?.name !== 'sentinel' || discovery.data[0].pluginId !== pluginId) throw failure('plugin_host_discovery_unconfirmed')
-    const after = await readState()
+    let currentContext
+    try { currentContext = await connectionContext() } catch { currentContext = null }
+    let after
+    try { after = await readState(connection) }
+    catch (error) { if (error.code === 'plugin_host_connection_changed') return pending('unknown'); throw error }
     if (after.view.revision !== expectedRevision) throw failure('plugin_host_revision_conflict')
     if (!after.view.installed || after.view.enabled !== 'enabled' || after.staticServerConfigured) throw failure('plugin_host_activation_qualification_changed')
-    return after.view
+    if (rpc.connection() !== connection || currentContext?.scope !== 'app' || !isDeepStrictEqual(context, currentContext)) return { ...after.view, appActivationRequired: true, connectionScope: 'unknown' }
+    return { ...after.view, appActivationRequired: false, connectionScope: 'app' }
   }
-  return { inspect, register, setEnabled, initializeConnection, unregister, close: () => rpc.close() }
+  return { inspect, register, setEnabled, initializeConnection, unregister, appActivationWitness: activation.appActivationWitness, async close() { await rpc.close(); await activation.close() } }
 }
