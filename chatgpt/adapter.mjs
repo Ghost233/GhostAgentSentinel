@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import { BoundedReader, supportedProfile } from './bounded-reader.mjs'
+import { BoundedReader } from './bounded-reader.mjs'
+import { supportsHostProfile } from './storage-compatibility.mjs'
 import { ForkHistoryReader } from './fork-history.mjs'
 import { startPanelServer } from './panel-server.mjs'
 import { loadCursor, saveCursor } from './cursor-store.mjs'
@@ -13,7 +14,6 @@ import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATU
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
-const profileKey = value => JSON.stringify([value?.appVersion, value?.appBuild, value?.cliVersion])
 const phaseStatus = phase => phase === 'started' ? 'running' : ['completed', 'aborted'].includes(phase) ? 'idle' : 'unknown'
 const nativeEvidence = (entry, event, offset) => event.data?.nativeRecordId || event.nativeRecordId ? 'chatgpt-native-record:' + (event.data?.nativeRecordId ?? event.nativeRecordId) : 'chatgpt-record:' + entry.cursorKey + ':' + offset
 const collectionFailures = new Set(['record-source-unavailable', 'record-identity-changed', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'cursor-anchor-changed', 'record-malformed-or-over-limit', 'invalid-lifecycle-record', 'cursor-invalid', 'cursor-retains-gap', 'unsupported-record-type', 'unsupported-event-type', 'compressed-data-invalid', 'native_origin_prefix_changed', 'native_origin_header_changed'])
@@ -240,7 +240,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const enabledGap = user?.user !== 'enabled' || user?.effective !== 'enabled' ? user?.user === 'disabled' || user?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed' : null
     if (enabledGap) { qualificationLost(enabledGap); return { host, gap: enabledGap } }
     if (onQualificationLost && !qualifiedHost) qualifiedHost = { hostRunId: host.hostRunId, hostStartedAt: host.hostStartedAt }
-    return { host, gap: profileKey(host.profile) !== profileKey(supportedProfile) ? 'unsupported-host-version' : null }
+    return { host, gap: supportsHostProfile(host.profile) ? null : 'unsupported-host-version' }
   }
   async function projectSetting(context, cwd) {
     if (!context.projects.has(cwd)) context.projects.set(cwd, Promise.resolve().then(() => native.readEnablement(cwd)).then(setting => ({ setting }), () => ({ unavailable: true })))

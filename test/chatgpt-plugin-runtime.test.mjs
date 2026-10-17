@@ -342,7 +342,7 @@ for (const loss of ['disabled', 'unknown', 'enablement-failed', 'host-lost', 'ge
   const native = {
     async sampleHost() {
       if (changed && loss === 'host-lost') return { available: false, reason: 'execution-source-unavailable' }
-      return { available: true, hostRunId: changed && loss === 'identity-unconfirmed' ? null : changed && loss === 'generation-changed' ? 'different-host' : 'host', hostStartedAt: changed && loss === 'start-time-unconfirmed' ? null : 1, profile: { appVersion: '26.1013.31256', appBuild: '20586', cliVersion: '0.163.0-alpha.10.2' } }
+      return { available: true, hostRunId: changed && loss === 'identity-unconfirmed' ? null : changed && loss === 'generation-changed' ? 'different-host' : 'host', hostStartedAt: changed && loss === 'start-time-unconfirmed' ? null : 1, profile: { appVersion: '26.1013.31256', appBuild: '20587', cliVersion: '0.163.0-alpha.10.2' } }
     },
     async readEnablement(cwd) { enablementReads++; assert.equal(cwd, null); if (changed && loss === 'enablement-failed') throw new Error('owned global configuration unavailable'); return { user: changed && ['disabled', 'unknown'].includes(loss) ? loss : 'enabled', effective: changed && ['disabled', 'unknown'].includes(loss) ? loss : 'enabled' } },
     async listThreads() { materialReads++; assert.fail('an unsupported material profile cannot read the chat directory') },
@@ -401,7 +401,7 @@ for (const notificationFailure of [false, true]) test(`an unsupported profile re
   const before = await client.snapshot(), task = before.tasks.find(task => task.id === 'main'), readCount = materialReads
   assert.equal(task.analysis.state, 'analyzing')
   failNotifications = notificationFailure
-  profile = { appVersion: '26.1013.31256', appBuild: '20586', cliVersion: '0.163.0-alpha.10.2' }
+  profile = { appVersion: '26.1013.31256', appBuild: '20587', cliVersion: '0.163.0-alpha.10.2' }
   await runtime.refresh()
   assert.equal(runtime.diagnostics().closed, false); assert.equal(runtime.diagnostics().openReaders, 0)
   for (let n = 0; !modelConnectionClosed && n < 100; n++) await delay(2)

@@ -347,7 +347,7 @@ test('strict material gaps reach the real Core HTTP chain and cannot let a known
     const retained = (await f.core.diagnostics()).retained.nativeCaptureProgress.records
     f.advance()
     const unsupported = kind === 'array-output'
-      ? row(4, 'response_item', { type: 'custom_tool_call_output', call_id: 'unverified', output: [{ type: 'input_text', text: 'Do not retain this body' }] })
+      ? row(4, 'response_item', { type: 'custom_tool_call_output', call_id: 'unverified', output: [{ type: 'input_text', text: 'Do not retain this body' }, { type: 'input_image', image_url: 'unverified-image-body' }] })
       : row(4, 'event_msg', { type: kind === 'unknown-item' ? 'item_completed' : 'item_started', thread_id: owner, turn_id: 'turn', item: { ...(kind === 'missing-started-type' ? {} : { type: 'SyntheticOpaqueItem' }), query: 'Do not retain this body' } })
     await fs.appendFile(f.path, unsupported + row(5, 'event_msg', { type: 'task_complete', turn_id: 'turn' }))
     let view

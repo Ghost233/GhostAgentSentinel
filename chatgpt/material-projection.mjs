@@ -5,8 +5,16 @@ import { sanitizeObservation } from '../src/privacy.mjs'
 const values = value => value === none ? [] : isMany(value) ? value.values : [value]
 const metadata = new Set(['type', 'timestamp', 'ordinal', 'payload.originator', 'payload.source', 'payload.cli_version', 'payload.cwd', 'payload.history_mode', 'payload.forked_from_id', 'payload.forked_from_ordinal_exclusive', 'payload.history_base.thread_id', 'payload.history_base.end_ordinal_exclusive', 'payload.history_base.end_byte_offset', 'payload.type', 'payload.id', 'payload.role', 'payload.turn_id', 'payload.root_turn_id', 'payload.thread_id', 'payload.call_id', 'payload.name', 'payload.item.type', 'payload.item.id', 'payload.item.exit_code', 'payload.turn_attribution.turn_id', 'payload.turn_attribution.turn_trigger', 'payload.internal_chat_message_metadata_passthrough.turn_id'])
 const bodies = new Set(['payload.message', 'payload.arguments', 'payload.input', 'payload.output', 'payload.item.aggregated_output'])
+const metadataContainers = new Set(['payload', 'payload.item', 'payload.history_base', 'payload.turn_attribution', 'payload.internal_chat_message_metadata_passthrough'])
+// Literal dotted or empty keys never introduce structural path segments.
+const fieldPath = (parent, key) => {
+  const segment = typeof key === 'string' && (!key || key.includes('.')) ? '\0unselected-key' : key
+  return parent ? parent + '.' + segment : String(segment)
+}
 const contentType = /^payload\.(?:item\.)?content\.\d+\.type$/
 const contentText = /^payload\.(?:item\.)?content\.\d+\.text$/
+const toolType = /^payload\.output\.\d+\.type$/
+const toolText = /^payload\.output\.\d+\.text$/
 
 function append(target, capture) {
   if (target.text && capture.text) target.text += '\n'
@@ -25,26 +33,46 @@ export class MaterialProjection {
     this.fields = {}
     this.body = { text: '', truncated: false, redacted: false }
     this.agentBody = { text: '', truncated: false, redacted: false }
+    this.toolBody = { text: '', truncated: false, redacted: false }
+    this.toolArray = null
+    this.outputValues = 0
+    this.recordType = null; this.recordTypeCount = 0
+    this.payloadType = null; this.payloadTypeCount = 0
+    this.structureAmbiguous = false
     this.peakProjectionBytes = 0
   }
 
   path() {
+    this.rootOutputValue = false
+    this.kindField = null
     const parent = this.stack.at(-1)
     if (!parent) return ''
     const child = parent.type === 'array' ? parent.index++ : parent.key
     if (parent.type === 'object') parent.key = null
-    return parent.path ? parent.path + '.' + child : String(child)
+    const path = fieldPath(parent.path, child)
+    if (parent.type === 'object' && child === 'type') {
+      this.kindField = this.stack.length === 1 ? 'recordType' : this.stack.length === 2 && parent.path === 'payload' ? 'payloadType' : null
+      if (this.kindField) { this[this.kindField] = null; this[this.kindField + 'Count']++ }
+    }
+    this.rootOutputValue = this.stack.length === 2 && parent.type === 'object' && parent.path === 'payload' && child === 'output'
+    if (this.rootOutputValue) this.outputValues++
+    return path
   }
 
-  selected(path) { return metadata.has(path) || bodies.has(path) || contentType.test(path) || contentText.test(path) }
+  selected(path) { return metadata.has(path) || bodies.has(path) || contentType.test(path) || contentText.test(path) || toolType.test(path) || toolText.test(path) }
 
-  accept(path, capture) {
-    if (contentType.test(path) || contentText.test(path)) {
+  accept(path, capture, toolField = null) {
+    if (toolType.test(path) || toolText.test(path)) {
+      const item = this.stack.at(-1)
+      if (!item?.toolElement || !toolField) return
+      if (toolField === 'type') item.toolType = capture.text
+      else item.toolText = capture
+    } else if (contentType.test(path) || contentText.test(path)) {
       const item = this.stack.at(-1)
       if (contentType.test(path)) item.contentType = capture.text
       else item.contentText = capture
     } else this.fields[path] = capture
-    const bytes = Buffer.byteLength(JSON.stringify(this.fields)) + Buffer.byteLength(this.body.text) + Buffer.byteLength(this.agentBody.text) + Buffer.byteLength(this.stack.at(-1)?.contentText?.text ?? '')
+    const bytes = Buffer.byteLength(JSON.stringify(this.fields)) + Buffer.byteLength(this.body.text) + Buffer.byteLength(this.agentBody.text) + Buffer.byteLength(this.toolBody.text) + Buffer.byteLength(this.stack.at(-1)?.contentText?.text ?? '') + Buffer.byteLength(this.stack.at(-1)?.toolText?.text ?? '')
     this.peakProjectionBytes = Math.max(this.peakProjectionBytes, bytes)
     if (bytes > 16384) throw new Error('material projection limit exceeded')
   }
@@ -52,14 +80,35 @@ export class MaterialProjection {
   tokens(result) {
     for (const token of values(result)) {
       if (token.name === 'startKey') { this.key = ''; continue }
-      if (token.name === 'endKey') { this.stack.at(-1).key = this.key; this.key = null; continue }
+      if (token.name === 'endKey') {
+        const item = this.stack.at(-1)
+        const path = fieldPath(item.path, this.key)
+        if (metadata.has(path) || bodies.has(path) || metadataContainers.has(path)) {
+          item.projectedKeys ??= new Set()
+          if (item.projectedKeys.has(this.key)) this.structureAmbiguous = true
+          item.projectedKeys.add(this.key)
+        }
+        if (this.toolArray && item.toolElement) {
+          if (!['type', 'text'].includes(this.key)) this.toolArray.valid = false
+          else { const seen = this.key === 'type' ? 'toolTypeSeen' : 'toolTextSeen'; if (item[seen]) this.toolArray.valid = false; item[seen] = true }
+        }
+        item.key = this.key; this.key = null; continue
+      }
       if (token.name === 'stringChunk' && this.key != null) { this.key = (this.key + token.value).slice(0, 129); continue }
       if (token.name === 'startObject' || token.name === 'startArray') {
+        const parent = this.stack.at(-1), element = parent?.toolRoot === true, field = parent?.toolElement && ['type', 'text'].includes(parent.key)
         const path = this.path()
-        this.stack.push({ path, type: token.name === 'startObject' ? 'object' : 'array', index: 0, key: null })
+        if (this.rootOutputValue && token.name === 'startArray') this.toolArray = { valid: true, elements: 0 }
+        if (this.toolArray && element) { this.toolArray.elements++; if (token.name !== 'startObject') this.toolArray.valid = false }
+        if (this.toolArray && field) this.toolArray.valid = false
+        this.stack.push({ path, type: token.name === 'startObject' ? 'object' : 'array', index: 0, key: null, toolRoot: this.rootOutputValue && token.name === 'startArray', toolElement: element })
         if (this.stack.length > 64) throw new Error('JSON depth limit exceeded')
       } else if (token.name === 'endObject' || token.name === 'endArray') {
         const item = this.stack.pop()
+        if (this.toolArray && item.toolElement) {
+          if (item.type !== 'object' || item.toolType !== 'input_text' || !item.toolText) this.toolArray.valid = false
+          else append(this.toolBody, item.toolText)
+        }
         if (/^payload\.(?:item\.)?content\.\d+$/.test(item.path)) {
           if (['input_text', 'output_text', 'text'].includes(item.contentType) && item.contentText) append(this.body, item.contentText)
           else this.body.truncated = true
@@ -67,12 +116,14 @@ export class MaterialProjection {
           else { this.agentBody.truncated = true; this.agentBody.omitted = true }
         }
       } else if (token.name === 'startString' || token.name === 'startNumber') {
+        const parent = this.stack.at(-1), field = parent?.toolElement && ['type', 'text'].includes(parent.key) ? parent.key : null
         const path = this.path()
-        this.scalar = { path, selected: this.selected(path), text: '', scan: '', length: 0, truncated: false, redacted: false }
+        if (this.toolArray && (parent?.toolRoot || token.name !== 'startString' && field)) this.toolArray.valid = false
+        this.scalar = { path, toolField: field, kindField: this.kindField, selected: this.selected(path) && (!(toolType.test(path) || toolText.test(path)) || field !== null), text: '', scan: '', length: 0, truncated: false, redacted: false }
       } else if (token.name === 'stringChunk' || token.name === 'numberChunk') {
         const scalar = this.scalar
         if (!scalar?.selected) continue
-        const limit = scalar.path === 'payload.cwd' ? 1024 : scalar.path === 'payload.arguments' ? 4096 : metadata.has(scalar.path) || contentType.test(scalar.path) ? 256 : 240
+        const limit = scalar.path === 'payload.cwd' ? 1024 : scalar.path === 'payload.arguments' ? 4096 : metadata.has(scalar.path) || contentType.test(scalar.path) || toolType.test(scalar.path) ? 256 : 240
         scalar.length += token.value.length
         const scan = scalar.scan + token.value
         scalar.redacted ||= sanitizeObservation(scan).redacted
@@ -82,11 +133,16 @@ export class MaterialProjection {
       } else if (token.name === 'endString' || token.name === 'endNumber') {
         if (this.scalar?.selected) {
           const { path, text, truncated, redacted } = this.scalar
-          if ((metadata.has(path) || contentType.test(path)) && truncated) throw new Error('material metadata field exceeds limit')
-          this.accept(path, { text: redacted ? '认证材料已省略，当前证据不完整' : text, truncated, redacted })
+          if ((metadata.has(path) || contentType.test(path) || toolType.test(path)) && truncated) throw new Error('material metadata field exceeds limit')
+          if (this.scalar.kindField) this[this.scalar.kindField] = text
+          this.accept(path, { text: redacted ? '认证材料已省略，当前证据不完整' : text, truncated, redacted }, this.scalar.toolField)
         }
         this.scalar = null
-      } else if (['nullValue', 'trueValue', 'falseValue'].includes(token.name)) this.path()
+      } else if (['nullValue', 'trueValue', 'falseValue'].includes(token.name)) {
+        const parent = this.stack.at(-1), field = parent?.toolElement && ['type', 'text'].includes(parent.key)
+        this.path()
+        if (this.toolArray && (parent?.toolRoot || field)) this.toolArray.valid = false
+      }
     }
   }
 
@@ -98,7 +154,14 @@ export class MaterialProjection {
     this.tokens(this.parse(this.decode.decode()))
     this.tokens(this.parse(none))
     if (this.stack.length) throw new Error('incomplete JSON record')
+    if (this.structureAmbiguous) throw new Error('ambiguous material structure')
     const scalar = path => this.fields[path]?.text
+    // Only the observed custom-tool array form is admitted. One streaming
+    // element and one total 240-character excerpt are retained, never N bodies.
+    if (this.toolArray) {
+      delete this.fields['payload.output']
+      if (this.outputValues === 1 && this.toolArray.valid && this.toolArray.elements > 0 && this.recordTypeCount === 1 && this.payloadTypeCount === 1 && this.recordType === 'response_item' && this.payloadType === 'custom_tool_call_output' && scalar('type') === this.recordType && scalar('payload.type') === this.payloadType) this.fields['payload.output'] = { ...this.toolBody, text: this.toolBody.redacted ? '认证材料已省略，当前证据不完整' : this.toolBody.text }
+    }
     return { ordinal: scalar('ordinal') === undefined ? undefined : Number(scalar('ordinal')), type: scalar('type'), timestamp: scalar('timestamp'), payload: Object.fromEntries(['type', 'id', 'role', 'turn_id', 'root_turn_id', 'thread_id', 'call_id', 'name', 'originator', 'source', 'cli_version', 'cwd', 'history_mode', 'forked_from_id', 'forked_from_ordinal_exclusive'].map(key => [key, scalar('payload.' + key)]).concat([['history_base', scalar('payload.history_base.thread_id') ? { thread_id: scalar('payload.history_base.thread_id'), end_ordinal_exclusive: Number(scalar('payload.history_base.end_ordinal_exclusive')), end_byte_offset: Number(scalar('payload.history_base.end_byte_offset')) } : undefined]])), material: { fields: this.fields, body: this.body, agentBody: this.agentBody, turnId: scalar('payload.internal_chat_message_metadata_passthrough.turn_id'), turnTrigger: scalar('payload.turn_attribution.turn_trigger') } }
   }
 }
