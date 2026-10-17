@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
+import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { setTimeout as delay } from 'node:timers/promises'
 
@@ -92,4 +93,69 @@ for (const [anchored, guard] of [[true, null], [false, null], [false, 'recovered
     assert.equal(page.records.length, 1, 'the same chat can inspect its original pre-anchor health notice')
     assert.equal(page.records[0].mainId, 'main'); assert.equal(page.records[0].lifecycleId, null)
   }
+})
+
+// Uses fixed notification IO and the real fresh-install runtime path.
+test('six verified never-monitored main chats keep six ENOENT receipts and submit one immediate initial-enrollment summary', { timeout: 10_000 }, async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-initial-enrollment-red-'))
+  const sessionsRoot = join(dir, 'sessions'), archiveRoot = join(dir, 'archived_sessions'), coreDataDir = join(dir, 'core')
+  let server, client, runtime, primary
+  const submissions = [], clock = Date.now(), hostStartedAt = clock - 10_000
+  try {
+    await fs.mkdir(sessionsRoot); await fs.mkdir(archiveRoot)
+    const threads = Array.from({ length: 6 }, (_, i) => ({ id: 'owned-initial-' + i, path: join(archiveRoot, i + '.jsonl'), cwd: dir, source: 'vscode', originator: 'Codex Desktop', parentThreadId: null, forkedFromId: null, archived: true }))
+    const native = {
+      async sampleHost() { return { available: true, hostRunId: 'owned-initial-host', hostStartedAt, profile: supportedProfile } },
+      async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
+      async listThreads({ archived }) { return { data: archived ? threads : [], nextCursor: null } },
+      async readThread(id) { return { thread: threads.find(thread => thread.id === id), anchorTurnId: null } },
+      async close() {},
+    }
+    const notificationIO = {
+      async settings() { return { authorization: 'authorized', alertSetting: 'enabled', notificationCenterSetting: 'enabled', observedAt: Date.now() } },
+      async snapshot() { return { pending: [], delivered: [], actions: [], observedAt: Date.now(), historyGap: false, pendingHasMore: false, deliveredHasMore: false } },
+      async submit(value) { submissions.push(value); return { requestId: value.requestId, accepted: true, authorization: 'authorized', observedAt: Date.now() } },
+      async cancel() { return { pendingIds: [], observedAt: Date.now() } },
+      close() {},
+    }
+    server = await startServer({ dataDir: coreDataDir })
+    client = await connectCore({ dataDir: coreDataDir })
+    const { configPath } = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir, sessionsRoot, metadataSocket: join(dir, 'unused-owned-metadata.sock'), pluginId: 'owned-initial-rollup@sentinel-test' })
+    runtime = await startFromInstallation({ configPath, pollMs: 0, native, notificationIO })
+    assert.equal(runtime.reused, false)
+    await runtime.refresh()
+    const deadline = performance.now() + 2000
+    while (runtime.diagnostics().pendingOperations) {
+      assert.ok(performance.now() < deadline, 'the owned first refresh settles without a new notification delay')
+      await delay(2)
+    }
+    const snapshot = await client.snapshot(), source = snapshot.sources.find(value => value.descriptor.policy === 'chatgpt-main/1')
+    assert.ok(source, 'the production adapter registered its real test source')
+    const first = await client.failureReceipts({ sourceKey: source.key }), notices = await client.nativeNotificationRecords({ sourceKey: source.key })
+    assert.equal(first.hasMore, false); assert.equal(first.historyGap, false)
+    assert.equal(first.receipts.length, 6)
+    assert.equal(new Set(first.receipts.map(value => value.mainId)).size, 6)
+    assert.ok(first.receipts.every(value => value.domain === 'collection' && value.error.code === 'ENOENT' && value.state === 'active' && value.lifecycleId === null && value.recoveredAt === null))
+    assert.equal(snapshot.tasks.length, 0, 'no nonexistent execution was fabricated')
+    assert.equal(submissions.length, 1, 'the first eligible failure submits immediately; five other initial failures only join the summary')
+    assert.ok(submissions.every(value => value.metadata.mainId !== null), 'aggregation must retain a real main scope')
+    assert.equal(new Set(notices.records.flatMap(value => value.receiptIds)).size, 6)
+    const originalIds = first.receipts.map(value => value.id).sort()
+    for (let round = 0; round < 3; round++) await runtime.refresh()
+    const end = performance.now() + 2000
+    while (runtime.diagnostics().pendingOperations) {
+      assert.ok(performance.now() < end, 'the owned repeated refresh settles')
+      await delay(2)
+    }
+    const after = await client.failureReceipts({ sourceKey: source.key })
+    assert.deepEqual(after.receipts.map(value => value.id).sort(), originalIds)
+    assert.equal(submissions.length, 1, 'repeated polls do not resubmit the summary')
+    t.diagnostic(JSON.stringify({ syntheticOnly: true, mainChats: 6, independentFailures: 6, notificationSubmissions: submissions.length, rounds: 4, nativeIO: 'fixed-no-OS', actualModelCalls: 0 }))
+  } catch (error) { primary = error }
+  const cleanup = []
+  for (const [label, close] of [['runtime', () => runtime?.close()], ['client', () => client?.close()], ['server', () => server?.close()], ['directory', () => fs.rm(dir, { recursive: true, force: true })]]) {
+    try { await close() } catch (error) { cleanup.push(Object.assign(new Error('owned fixture cleanup: ' + label, { cause: error }), { code: error.code })) }
+  }
+  t.diagnostic(JSON.stringify({ cleanupErrors: cleanup.map(error => error.code ?? error.name), primaryFailurePreserved: Boolean(primary), cleanupCount: cleanup.length }))
+  if (primary || cleanup.length) throw new AggregateError([...(primary ? [primary] : []), ...cleanup], primary ? primary.message : 'Owned fixture cleanup failed')
 })

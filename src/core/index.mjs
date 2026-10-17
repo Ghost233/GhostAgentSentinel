@@ -129,7 +129,7 @@ export async function createCore({
     if (!scoped) throw new Error('Unknown ChatGPT conversation scope');
     return conversationFor(scoped);
   };
-  nativeNotifications = createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused: () => paused,
+  nativeNotifications = createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, readReceipt: id => failureStore.read(id), monitoringPaused: () => paused,
     chatPaused: (sourceKey, mainId) => conversationSettings.get(identity(sources.get(sourceKey)?.descriptor.registrationId, mainId))?.paused === true,
     taskNoticeEligible: notification => notificationMembers(notification).some(member => memberAlerts(member).length > 0),
     accepted: notification => {
@@ -996,6 +996,11 @@ export async function createCore({
     async registerSource(descriptor) {
       ensureOpen();
       if (descriptor.policy === 'chatgpt-main/1') nativeOrigins.checkVersion(descriptor.registrationId, descriptor.nativeOriginVersion ?? 1);
+      if (descriptor.policy === 'chatgpt-main/1' && descriptor.initialEnrollmentBaseline) {
+        const registrationId = descriptor.registrationId;
+        const pristine = ![...sources.values()].some(value => value.descriptor.registrationId === registrationId) && ![...conversationSettings.values()].some(value => value.registrationId === registrationId) && !enrollment.entries.some(value => value.registrationId === registrationId) && [nativeProgress.prepareClearRegistration(registrationId), nativeOrigins.prepareClearRegistration(registrationId)].every(plan => Object.values(plan.removed).every(value => value === 0));
+        nativeNotifications.registerEnrollment(descriptor, pristine);
+      }
       enrollEnabledAdapter(descriptor);
       let source = Array.from(sources.values()).find(value => identity(value.descriptor.registrationId, value.descriptor.hostRunId) === identity(descriptor.registrationId, descriptor.hostRunId));
       if (!source) {
@@ -1279,6 +1284,7 @@ export async function createCore({
           save('sources', source); counts.hierarchyContext = { schemaVersion: 1, acceptedRevision: incoming.revision };
         }
         if (transaction) { db.exec('RELEASE native_ingest'); nativeJournal = null; transaction = null; applyNativeProgress?.(); applyNativeOrigins?.(); }
+        if (source.descriptor.policy === 'chatgpt-main/1') for (const descriptor of batch.tasks ?? []) nativeNotifications.markMonitored(source.descriptor.registrationId, descriptor.id);
         if (batch.nativeOrigins) counts.nativeOrigins = batch.nativeOrigins.map(proof => nativeOrigins.read(source.descriptor.registrationId, proof.key));
         tick();
         return counts;
@@ -1318,7 +1324,7 @@ export async function createCore({
       const sharedEnrollment = [...sources.values()].some(source => source.descriptor.registrationId === registrationId && source.descriptor.policy !== 'chatgpt-main/1');
       const nextEnrollment = { ...enrollment, entries: enrollment.entries.filter(entry => entry.registrationId !== registrationId || sharedEnrollment) };
       const failurePlan = failureStore.prepareClearSources(sourceKeys);
-      const plans = [nativeProgress.prepareClearRegistration(registrationId), nativeOrigins.prepareClearRegistration(registrationId), failurePlan, nativeNotifications.prepareClearSources(sourceKeys, new Set(selected.notifications.map(([id]) => id)), failurePlan.receiptIds)];
+      const plans = [nativeProgress.prepareClearRegistration(registrationId), nativeOrigins.prepareClearRegistration(registrationId), failurePlan, nativeNotifications.prepareClearSources(sourceKeys, new Set(selected.notifications.map(([id]) => id)), failurePlan.receiptIds, registrationId)];
       const counts = { ...Object.fromEntries(Object.entries(selected).map(([name, entries]) => [name, entries.length])), summaries: selectedTasks.filter(([, task]) => task.analysis.summary).length, enrollmentEntries: enrollment.entries.length - nextEnrollment.entries.length, ...Object.assign({}, ...plans.map(plan => plan.removed)) };
       const empty = Object.fromEntries(Object.keys(counts).map(name => [name, 0]));
       const errorInfo = (stage, error) => ({ stage, code: String(error.code ?? 'sqlite_error').slice(0, 100), message: String(error.message ?? 'SQLite operation failed').slice(0, 500) });
@@ -1470,8 +1476,12 @@ export async function createCore({
       const outcome = normalizeCollectionOutcome(value), source = sources.get(outcome.sourceKey);
       if (source?.descriptor.policy !== 'chatgpt-main/1') throw new Error('Collection outcomes require a known ChatGPT source');
       if (outcome.mainId !== null && outcome.lifecycleId !== null && ![...tasks.values()].some(task => task.sourceKey === outcome.sourceKey && task.id === outcome.mainId && task.lifecycleId === outcome.lifecycleId)) throw new Error('Collection outcome scope is not a verified task');
+      const hasMonitored = outcome.mainId !== null && [...tasks.values()].some(task => task.id === outcome.mainId && sources.get(task.sourceKey)?.descriptor.registrationId === source.descriptor.registrationId && sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1');
+      outcome.enrollmentPhase = nativeNotifications.enrollmentPhase(source, outcome, hasMonitored);
       const settled = failureStore.settle({ ...outcome, domain: 'collection', attempted: true, settled: true });
+      if (outcome.mainId !== null && (outcome.outcome === 'succeeded' || outcome.enrollmentPhase === 'established')) nativeNotifications.markMonitored(source.descriptor.registrationId, outcome.mainId);
       nativeNotifications.observeFailure(settled.receipt);
+      nativeNotifications.reconcile();
       return settled;
     },
     async setConversationMonitoring(value) {

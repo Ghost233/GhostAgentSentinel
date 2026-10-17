@@ -20,7 +20,7 @@ const fail = code => { throw Object.assign(new Error(code), { code }) }
 const absolute = value => typeof value === 'string' && isAbsolute(value) && value === resolve(value) && !/[\x00-\x1f\x7f]/.test(value)
 const uid = () => process.getuid()
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value)
-const configIdentity = config => hash(JSON.stringify(['installationId', 'dataDir', 'coreDataDir', 'sessionsRoot', 'metadataSocket', 'pluginId', 'notificationBundlePath', 'token'].map(key => config[key] ?? null)))
+const configIdentity = config => hash(JSON.stringify([...['installationId', 'dataDir', 'coreDataDir', 'sessionsRoot', 'metadataSocket', 'pluginId', 'notificationBundlePath', 'token'].map(key => config[key] ?? null), ...(config.initialEnrollmentBaseline ? [config.initialEnrollmentBaseline.id] : [])]))
 const sameFile = stat => JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs, stat.mode, stat.uid])
 const defaultIO = {
   connectCore,
@@ -90,6 +90,10 @@ async function filesUnder(directory, prefix = '') {
 async function configuration(path) {
   if (!absolute(path)) fail('absolute-config-required')
   const config = await json(path)
+  if (config.initialEnrollmentBaseline !== undefined) {
+    const baseline = config.initialEnrollmentBaseline
+    if (!baseline || Object.keys(baseline).length !== 2 || !uuid(baseline.id) || typeof baseline.claimable !== 'boolean') fail('installation-baseline-invalid')
+  }
   if (config.format !== 1 || !digest(config.token) || typeof config.installationId !== 'string' || !config.installationId.trim() || typeof config.pluginId !== 'string' || !config.pluginId.trim() || !['dataDir', 'coreDataDir', 'sessionsRoot', 'metadataSocket'].every(key => absolute(config[key])) || config.port !== undefined && (!Number.isSafeInteger(config.port) || config.port < 1 || config.port > 65535) || config.notificationBundlePath !== undefined && (!absolute(config.notificationBundlePath) || !config.notificationBundlePath.endsWith('.app'))) fail('installation-config-invalid')
   await privateDirectory(config.dataDir)
   if (path !== join(config.dataDir, 'installation.json') || await realpath(path) !== path) fail('installation-config-location-mismatch')

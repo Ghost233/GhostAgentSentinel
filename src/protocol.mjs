@@ -7,6 +7,7 @@ export const CHATGPT_MAIN_FEATURE = 'chatgpt-main/1'
 export const CONVERSATION_MONITORING_FEATURE = 'conversation-monitoring/1'
 export const MONITORING_FAILURES_FEATURE = 'monitoring-failures/1'
 export const MONITORING_NOTIFICATIONS_FEATURE = 'monitoring-notifications/1'
+export const INITIAL_ENROLLMENT_ROLLUP_FEATURE = 'monitoring-initial-enrollment-rollup/1'
 export const CHATGPT_INSTALLATION_PURGE_FEATURE = 'chatgpt-installation-purge/1'
 export const CHATGPT_RETENTION_MAINTENANCE_FEATURE = 'chatgpt-retention-maintenance/1'
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000
@@ -64,7 +65,7 @@ export function normalizeFailureScope(value) {
 
 export function normalizeCollectionOutcome(value) {
   const input = object(value, 'collection outcome')
-  if (Object.keys(input).some(key => !['sourceKey', 'mainId', 'lifecycleId', 'roundId', 'channel', 'outcome', 'settledAt', 'error'].includes(key))) throw new Error('unsupported collection outcome field')
+  if (Object.keys(input).some(key => !['sourceKey', 'mainId', 'lifecycleId', 'roundId', 'channel', 'outcome', 'settledAt', 'error', 'enrollmentPhase'].includes(key))) throw new Error('unsupported collection outcome field')
   if (!['failed', 'succeeded'].includes(input.outcome)) throw new Error('invalid collection outcome')
   const result = { sourceKey: string(input.sourceKey, 'sourceKey', 256), roundId: string(input.roundId, 'roundId', 256), outcome: input.outcome, settledAt: time(input.settledAt, 'settledAt') }
   for (const key of ['mainId', 'lifecycleId']) result[key] = input[key] === null ? null : string(input[key], key, 256)
@@ -73,6 +74,11 @@ export function normalizeCollectionOutcome(value) {
     const channel = string(input.channel, 'channel', 200)
     if (!/^(default|directory|main:[a-f0-9]{64})$/.test(channel)) throw new Error('invalid collection channel')
     result.channel = channel
+  }
+  if (input.enrollmentPhase !== undefined) {
+    if (!['initial-unanchored', 'established', 'unknown'].includes(input.enrollmentPhase)) throw new Error('invalid collection enrollment phase')
+    if (input.enrollmentPhase === 'initial-unanchored' && (result.mainId === null || result.lifecycleId !== null)) throw new Error('initial enrollment requires an unanchored main scope')
+    result.enrollmentPhase = input.enrollmentPhase
   }
   if (input.outcome === 'failed') result.error = input.error === undefined ? { code: 'collection_failed' } : object(input.error, 'collection error')
   return result
@@ -103,7 +109,7 @@ export function normalizeNativeNotificationQuery(value) {
 
 export function normalizeNativeNotificationResult(value) {
   const input = object(value, 'native notification result')
-  const fields = { authorization: ['authorization'], submitting: [], accepted: [], 'submission-failed': ['errorCode'], 'submission-unknown': ['errorCode'], suppressed: ['reason'], 'pending-cancelled': ['pending'], 'delivered-snapshot': ['present', 'deliveryDate'], 'user-action': ['action'] }
+  const fields = { authorization: ['authorization'], submitting: [], 'not-submitted': [], accepted: [], 'submission-failed': ['errorCode'], 'submission-unknown': ['errorCode'], suppressed: ['reason'], 'pending-cancelled': ['pending'], 'delivered-snapshot': ['present', 'deliveryDate'], 'user-action': ['action'] }
   if (!Object.hasOwn(fields, input.event)) throw new Error('unsupported native notification event')
   const allowed = ['notificationId', 'attemptId', 'nativeRequestId', 'bundleId', 'event', 'observedAt', ...fields[input.event]]
   if (Object.keys(input).some(key => !allowed.includes(key))) throw new Error('unsupported native notification result field')
@@ -146,6 +152,11 @@ export function normalizeSource(value) {
     result.policy = input.policy
   }
   if (input.nativeOriginVersion !== undefined) { if (input.policy !== CHATGPT_MAIN_FEATURE || input.nativeOriginVersion !== 2) throw new Error('invalid native origin version'); result.nativeOriginVersion = 2 }
+  if (input.initialEnrollmentBaseline !== undefined) {
+    const baseline = object(input.initialEnrollmentBaseline, 'initial enrollment baseline')
+    if (input.policy !== CHATGPT_MAIN_FEATURE || Object.keys(baseline).length !== 2 || typeof baseline.initialize !== 'boolean' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(baseline.id ?? '')) throw new Error('invalid initial enrollment baseline')
+    result.initialEnrollmentBaseline = { id: baseline.id, initialize: baseline.initialize }
+  }
   if (input.profile !== undefined) result.profile = string(input.profile, 'profile', 2000)
   if (input.enroll !== undefined) {
     if (typeof input.enroll !== 'boolean') throw new Error('enroll must be boolean')

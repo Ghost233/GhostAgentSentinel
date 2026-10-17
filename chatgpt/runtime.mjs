@@ -18,6 +18,10 @@ async function readPrivateConfig(path) {
   if (value.format !== 1 || !/^[a-f0-9]{64}$/.test(value.token ?? '') || typeof value.installationId !== 'string' || !value.installationId || typeof value.pluginId !== 'string' || !value.pluginId || !['dataDir', 'coreDataDir', 'sessionsRoot', 'metadataSocket'].every(key => typeof value[key] === 'string' && isAbsolute(value[key]))) throw new Error('invalid installation configuration')
   if (value.port !== undefined && (!Number.isSafeInteger(value.port) || value.port < 1 || value.port > 65535)) throw new Error('invalid installation port')
   if (value.notificationBundlePath !== undefined && (typeof value.notificationBundlePath !== 'string' || !isAbsolute(value.notificationBundlePath) || !value.notificationBundlePath.endsWith('.app'))) throw new Error('invalid notification bundle configuration')
+  if (value.initialEnrollmentBaseline !== undefined) {
+    const baseline = value.initialEnrollmentBaseline
+    if (!baseline || Object.keys(baseline).length !== 2 || typeof baseline.claimable !== 'boolean' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(baseline.id ?? '')) throw new Error('invalid initial enrollment baseline configuration')
+  }
   return value
 }
 
@@ -32,7 +36,7 @@ export async function prepareInstallation({ dataDir, coreDataDir, sessionsRoot =
   const configPath = join(dataDir, 'installation.json'), pluginDir = join(dataDir, 'plugin')
   try {
     const file = await open(configPath, 'wx', 0o600)
-    try { await file.writeFile(JSON.stringify({ format: 1, installationId: randomUUID(), dataDir, coreDataDir: resolve(coreDataDir), sessionsRoot: resolve(sessionsRoot), metadataSocket, pluginId, ...(notificationBundlePath === undefined ? {} : { notificationBundlePath }), token: randomBytes(32).toString('hex') }) + '\n') } finally { await file.close() }
+    try { await file.writeFile(JSON.stringify({ format: 1, installationId: randomUUID(), initialEnrollmentBaseline: { id: randomUUID(), claimable: true }, dataDir, coreDataDir: resolve(coreDataDir), sessionsRoot: resolve(sessionsRoot), metadataSocket, pluginId, ...(notificationBundlePath === undefined ? {} : { notificationBundlePath }), token: randomBytes(32).toString('hex') }) + '\n') } finally { await file.close() }
   } catch (error) { if (error.code !== 'EEXIST') throw error }
   const saved = await readPrivateConfig(configPath)
   if (['dataDir', 'coreDataDir', 'sessionsRoot', 'metadataSocket', 'pluginId'].some(key => saved[key] !== ({ dataDir, coreDataDir: resolve(coreDataDir), sessionsRoot: resolve(sessionsRoot), metadataSocket, pluginId })[key])) throw new Error('installation configuration already exists with different settings')
@@ -182,8 +186,14 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     await maintainRetention(true)
     const rawHostIO = native ?? createNativeIO({ pluginId: config.pluginId, socketPath: config.metadataSocket })
     const hostIO = { ...rawHostIO, async sampleHost() { const reason = await maintenance(config); return reason ? { available: false, reason } : rawHostIO.sampleHost() } }
+    const initialEnrollmentBaseline = config.initialEnrollmentBaseline ? { id: config.initialEnrollmentBaseline.id, initialize: config.initialEnrollmentBaseline.claimable } : undefined
+    if (initialEnrollmentBaseline?.initialize) {
+      // Consume locally before any source registration; crashes never reissue it.
+      config.initialEnrollmentBaseline = { id: initialEnrollmentBaseline.id, claimable: false }
+      await writePrivateJson(configPath, config)
+    }
     const notifier = notificationIO ?? (config.notificationBundlePath ? createNativeNotificationIO({ bundlePath: config.notificationBundlePath, installationId: config.installationId }) : undefined)
-    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, collectMaterials: true, nativeOriginVersion: 2, runtimeStatus: () => ({ ...identity }) })
+    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, collectMaterials: true, nativeOriginVersion: 2, initialEnrollmentBaseline, runtimeStatus: () => ({ ...identity }) })
     adapter.diagnostics()
     const selectedPort = portOf(adapter.url)
     if (port && selectedPort !== port) throw new Error('helper changed its configured endpoint')

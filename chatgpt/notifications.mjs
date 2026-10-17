@@ -51,7 +51,7 @@ export function createNotificationDelivery({ core, native, installationId, quali
     if (ids.length > 1100) summary.historyGap = true
   }
   async function refreshSource(sourceKey) {
-    const summary = { submitted: 0, suppressed: 0, failed: 0, cancelled: 0, historyGap: false, errorCode: null, stopped }
+    const summary = { submitted: 0, grouped: 0, suppressed: 0, failed: 0, cancelled: 0, historyGap: false, errorCode: null, stopped }
     if (stopped) return summary
     const state = sources.get(sourceKey), facts = state.facts, revision = state.revision
     const current = () => !stopped && sources.get(sourceKey)?.revision === revision
@@ -80,8 +80,13 @@ export function createNotificationDelivery({ core, native, installationId, quali
       await record(notice, { event: 'authorization', authorization: authorization.authorization, observedAt: authorization.lastCheckedAt }, summary)
       const intent = await record(notice, { event: 'submitting' }, summary)
       if (!intent?.maySubmit || !current()) {
-        if (!current()) await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary)
-        summary.suppressed++; continue
+        if (!current()) {
+          await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary)
+          if (intent?.maySubmit) await record(notice, { event: 'not-submitted' }, summary)
+        }
+        if (intent?.record?.status === 'grouped') summary.grouped++
+        else summary.suppressed++
+        continue
       }
       try {
         const result = await native.submit({ requestId: packet(notice, {}).nativeRequestId, title: notice.title, body: notice.body, metadata: { notificationId: notice.id, attemptId: notice.native.attemptId, sourceKey: notice.sourceKey, hostRunId: notice.hostRunId, mainId: notice.mainId, lifecycleId: notice.lifecycleId } })

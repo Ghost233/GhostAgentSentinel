@@ -86,12 +86,14 @@ function materialView(view, task, { historical = false } = {}) {
 
 // Native is the read-only host IO boundary; all qualification and lifecycle
 // decisions remain in this adapter and the shared core.
-export async function startChatGPTAdapter({ core, native, notificationIO, runtimeStatus, sessionsRoot, dataDir, installationId, token, pollMs = 1500, port = 0, now = Date.now, collectMaterials = false, nativeOriginVersion = 1 }) {
+export async function startChatGPTAdapter({ core, native, notificationIO, runtimeStatus, sessionsRoot, dataDir, installationId, token, pollMs = 1500, port = 0, now = Date.now, collectMaterials = false, nativeOriginVersion = 1, initialEnrollmentBaseline }) {
   if (!core || !native || !sessionsRoot || !dataDir || typeof installationId !== 'string' || !installationId.trim()) throw new Error('adapter installation and source IO are required')
   if (!Number.isSafeInteger(pollMs) || pollMs < 0) throw new Error('invalid polling interval')
   if (![1, 2].includes(nativeOriginVersion)) throw new Error('invalid native origin version')
   if (typeof collectMaterials !== 'boolean') throw new Error('invalid material collection mode')
   if (notificationIO && !collectMaterials) throw new Error('native notifications require material monitoring')
+  if (initialEnrollmentBaseline !== undefined && (!initialEnrollmentBaseline || typeof initialEnrollmentBaseline.initialize !== 'boolean' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(initialEnrollmentBaseline.id ?? ''))) throw new Error('invalid initial enrollment baseline')
+  let baselineInitializationAvailable = initialEnrollmentBaseline?.initialize === true, baselineCoreInstanceId = null
   const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
   await mkdir(join(dataDir, 'cursors'), { recursive: true, mode: 0o700 })
   const healthOutbox = collectMaterials ? await openHealthOutbox({ dataDir, now }) : null
@@ -108,8 +110,12 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const health = await core.health(), features = health.features
     const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
     required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
+    if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
     if (delivery) required.push('monitoring-notifications/1')
-    return { available: Array.isArray(features) && required.every(feature => features.includes(feature)), instanceId: health.instanceId }
+    const available = Array.isArray(features) && required.every(feature => features.includes(feature))
+    if (available && baselineCoreInstanceId === null) baselineCoreInstanceId = health.instanceId
+    else if (available && baselineCoreInstanceId !== health.instanceId) baselineInitializationAvailable = false
+    return { available, instanceId: health.instanceId }
   }
 
   async function qualifyNotification(notice) {
@@ -130,9 +136,10 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   async function collectionOutcome(entry, outcome, error, roundId, channel = entry ? 'main:' + fingerprint(entry.id) : 'directory') {
     if (!healthOutbox || !source || closed) return
     const scope = entry?.lifecycleVerified && entry.hostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: entry.lifecycleId } : entry?.qualifiedHostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: null } : { mainId: null, lifecycleId: null }
-    const value = { sourceKey: source.key, ...scope, channel, roundId, outcome, settledAt: now(), ...(error ? { error: failureErrorInfo({ code: error.code ?? 'collection_failed', codeHash: error.codeHash, stage: error.stage ?? 'collection', status: error.status, details: error.details }) } : {}) }
+    const value = { sourceKey: source.key, ...scope, channel, roundId, outcome, settledAt: now(), ...(scope.mainId !== null ? { enrollmentPhase: scope.lifecycleId !== null ? 'established' : entry?.enrollmentPhase ?? 'unknown' } : {}), ...(error ? { error: failureErrorInfo({ code: error.code ?? 'collection_failed', codeHash: error.codeHash, stage: error.stage ?? 'collection', status: error.status, details: error.details }) } : {}) }
     try {
       healthOutbox.push(value)
+      if (entry && outcome === 'succeeded') entry.enrollmentPhase = 'established'
       if (entry && outcome === 'succeeded' && scope.mainId !== null) {
         if (scope.lifecycleId !== null) healthOutbox.push({ ...value, lifecycleId: null })
         healthOutbox.push({ ...value, mainId: null, lifecycleId: null })
@@ -193,7 +200,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (source) return source.hostRunId === host.hostRunId ? source : null
     if (!registration) {
       registration = (async () => {
-        const key = await core.registerSource({ registrationId: 'chatgpt:' + installationId, hostRunId: host.hostRunId, name: 'ChatGPT · 本机执行域', ...(collectMaterials ? { policy: 'chatgpt-main/1', ...(nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), capabilities: ['main-lifecycle/1', 'main-material/1'] } : { mode: 'observation-only', capabilities: ['main-lifecycle/1'] }) })
+        const enrollment = initialEnrollmentBaseline ? { id: initialEnrollmentBaseline.id, initialize: baselineInitializationAvailable } : undefined
+        baselineInitializationAvailable = false
+        const key = await core.registerSource({ ...(enrollment ? { initialEnrollmentBaseline: enrollment } : {}), registrationId: 'chatgpt:' + installationId, hostRunId: host.hostRunId, name: 'ChatGPT · 本机执行域', ...(collectMaterials ? { policy: 'chatgpt-main/1', ...(nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), capabilities: ['main-lifecycle/1', 'main-material/1'] } : { mode: 'observation-only', capabilities: ['main-lifecycle/1'] }) })
         if (closed || epoch !== sourceEpoch) { await core.unregisterSource(key, 'source-generation-superseded'); return null }
         source = { key, hostRunId: host.hostRunId }
         return source
@@ -217,7 +226,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
   function entryFor(id) {
     let entry = threads.get(id)
-    if (!entry && threads.size < 256) { entry = { id, cursorKey: fingerprint(collectMaterials ? [installationId, id, 'material/1'] : [installationId, id]), generation: 0, captured: new Map(), captureThroughOffset: -1, deliveryThrough: { current: -1, history: -1 }, lastViewedAt: now(), view: gapView('not-observed', id) }; threads.set(id, entry) }
+    if (!entry && threads.size < 256) { entry = { id, cursorKey: fingerprint(collectMaterials ? [installationId, id, 'material/1'] : [installationId, id]), generation: 0, captured: new Map(), captureThroughOffset: -1, deliveryThrough: { current: -1, history: -1 }, lastViewedAt: now(), view: gapView('not-observed', id), enrollmentPhase: 'unknown' }; threads.set(id, entry) }
     return entry
   }
   async function qualify(id, expected = null, context) {
@@ -258,6 +267,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
           const oldKey = fingerprint([installationId, entry.id, before.source.forkedFromId ? 'fork-material/1' : 'material/1'])
           if (await loadCursor(join(dataDir, 'cursors', oldKey + '.json'), { fork: Boolean(before.source.forkedFromId) })) { await stop(entry, 'origin-upgrade-unverified'); return null }
         }
+        entry.enrollmentPhase = cursor ? 'established' : entry.enrollmentPhase === 'established' ? 'established' : initialEnrollmentBaseline ? 'initial-unanchored' : 'unknown'
         if (cursor) { entry.captured = new Map(cursor.captures.map(item => [item.offset, item.capturedAt])); entry.captureThroughOffset = cursor.captureThroughOffset; entry.deliveryThrough = cursor.deliveryThrough ?? { current: cursor.captureThroughOffset, history: cursor.captureThroughOffset } }
         entry.reader = before.source.forkedFromId ? new ForkHistoryReader(before.source, cursor?.reader, { native, sessionsRoot, mode: 'material', origins }) : new BoundedReader(before.source, cursor?.reader, { mode: collectMaterials ? 'material' : 'metadata', origins })
       }

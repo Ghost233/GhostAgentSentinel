@@ -245,3 +245,28 @@ test('the formal helper refuses a stage01 dev0 owner before any endpoint or Nati
   assert.equal(requests, 0)
   assert.deepEqual(JSON.parse(await readFile(join(lock, 'owner.json'), 'utf8')), old)
 })
+
+
+test('only a new private installation receives a one-shot initial enrollment nonce and port writes keep it consumed', async t => {
+  const f = await installation(t), before = JSON.parse(await readFile(f.prepared.configPath, 'utf8'));
+  assert.match(before.initialEnrollmentBaseline.id, /^[a-f0-9-]{36}$/);
+  assert.equal(before.initialEnrollmentBaseline.claimable, true);
+  const first = await f.start(), consumed = JSON.parse(await readFile(f.prepared.configPath, 'utf8'));
+  assert.deepEqual(consumed.initialEnrollmentBaseline, { id: before.initialEnrollmentBaseline.id, claimable: false });
+  assert.equal(consumed.port, Number(new URL(first.url).port));
+  await first.close();
+  await f.start();
+  assert.deepEqual(JSON.parse(await readFile(f.prepared.configPath, 'utf8')).initialEnrollmentBaseline, consumed.initialEnrollmentBaseline);
+});
+
+test('re-preparing a legacy installation never manufactures a complete initial enrollment baseline', async t => {
+  const f = await installation(t), original = JSON.parse(await readFile(f.prepared.configPath, 'utf8'));
+  delete original.initialEnrollmentBaseline;
+  await writeFile(f.prepared.configPath, JSON.stringify(original), { mode: 0o600 });
+  await prepareInstallation({ dataDir: original.dataDir, coreDataDir: original.coreDataDir, sessionsRoot: original.sessionsRoot, metadataSocket: original.metadataSocket, pluginId: original.pluginId });
+  const prepared = JSON.parse(await readFile(f.prepared.configPath, 'utf8'));
+  assert.equal(Object.hasOwn(prepared, 'initialEnrollmentBaseline'), false);
+  assert.equal(prepared.installationId, original.installationId);
+  await f.start();
+  assert.equal(Object.hasOwn(JSON.parse(await readFile(f.prepared.configPath, 'utf8')), 'initialEnrollmentBaseline'), false);
+});
