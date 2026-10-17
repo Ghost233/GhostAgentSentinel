@@ -79,7 +79,10 @@ export function createFailureReceipts({ db, now = Date.now }) {
   }
   const matches = (value, scope) => ['sourceKey', 'mainId', 'lifecycleId'].every(field => scope[field] === undefined || value[field] === scope[field]);
   const sameScope = (value, input) => matches(value, input) && value.domain === input.domain && (value.channel ?? 'default') === (input.channel ?? 'default');
-  const stats = () => ({ closed, receipts: receipts.size, states: states.size, activeStates: [...states.values()].filter(value => value.active).length, recoveryWatermarks: [...states.values()].filter(value => value.kind === 'recovery').length, recoveryWatermarkEvictions, orderingGap: recoveryWatermarkEvictions > 0, maximumReceipts: LIMIT, maximumStates: LIMIT, retentionMs: DAY, latestSequence: sequence, prunedThroughSequence: prunedThrough });
+  const stats = () => {
+    const expiry = Math.min(Infinity, ...[...receipts.values()].map(value => value.firstFailedAt + DAY), ...[...states.values()].map(value => value.updatedAt + DAY));
+    return { nextExpiryAt: expiry === Infinity ? null : expiry, closed, receipts: receipts.size, states: states.size, activeStates: [...states.values()].filter(value => value.active).length, recoveryWatermarks: [...states.values()].filter(value => value.kind === 'recovery').length, recoveryWatermarkEvictions, orderingGap: recoveryWatermarkEvictions > 0, maximumReceipts: LIMIT, maximumStates: LIMIT, retentionMs: DAY, latestSequence: sequence, prunedThroughSequence: prunedThrough };
+  };
   function health(scope, at) {
     if (!identifier(scope?.sourceKey) || !identifier(scope.mainId) && scope.mainId !== null || !identifier(scope.lifecycleId) && scope.lifecycleId !== null || scope.mainId === null && scope.lifecycleId !== null) throw new Error('Failure health scope identity is incomplete');
     maintain(at);
@@ -92,10 +95,19 @@ export function createFailureReceipts({ db, now = Date.now }) {
   }
   maintain();
   return {
+    prepareClearSources(sourceKeys) {
+      const selectedReceipts = [...receipts].filter(([, receipt]) => sourceKeys.has(receipt.sourceKey)), selectedStates = [...states].filter(([, state]) => sourceKeys.has(state.sourceKey));
+      return { receiptIds: new Set(selectedReceipts.map(([id]) => id)), removed: { failureReceipts: selectedReceipts.length, failureReceiptStates: selectedStates.length }, stage() {
+        for (const [id] of selectedReceipts) remove.run(COLLECTION, id);
+        for (const [key] of selectedStates) remove.run(STATES, key);
+        return () => { for (const [id] of selectedReceipts) receipts.delete(id); for (const [key] of selectedStates) states.delete(key); };
+      } };
+    },
     settle(input) {
       if (closed) throw new Error('Failure receipt store is closed');
       if (input.attempted !== true || input.settled !== true || !['failed', 'succeeded'].includes(input.outcome) || ['cancelled', 'analyzer_unconfigured'].includes(input.error?.code)) return { created: false, receipt: null };
       if (!['analysis', 'collection'].includes(input.domain) || !identifier(input.sourceKey) || !identifier(input.roundId) || !identifier(input.mainId) && !(input.domain === 'collection' && input.mainId === null) || !identifier(input.lifecycleId) && !(input.domain === 'collection' && input.lifecycleId === null) || input.mainId === null && input.lifecycleId !== null) throw new Error('Failure receipt identity is incomplete');
+      if (input.enrollmentPhase !== undefined && !['initial-unanchored', 'established', 'unknown'].includes(input.enrollmentPhase)) throw new Error('Failure enrollment phase is invalid');
       const channel = input.channel ?? 'default';
       if (!/^(default|directory|main:[a-f0-9]{64})$/.test(channel) || input.domain === 'analysis' && channel !== 'default') throw new Error('Failure receipt channel is invalid');
       const current = now();
@@ -142,7 +154,7 @@ export function createFailureReceipts({ db, now = Date.now }) {
           const receipt = receipts.get(state.episodeId);
           return { created: false, receipt: receipt ? publicReceipt(receipt) : null };
         }
-        const receipt = { id: randomUUID(), sequence: ++sequence, sourceKey, mainId, lifecycleId, domain, channel, firstRoundId: roundId, firstFailedAt: at, recoveredAt, state: recoveredAt === null ? 'active' : 'recovered', error, causeKey };
+        const receipt = { id: randomUUID(), sequence: ++sequence, sourceKey, mainId, lifecycleId, domain, channel, ...(input.enrollmentPhase !== undefined ? { enrollmentPhase: input.enrollmentPhase } : {}), firstRoundId: roundId, firstFailedAt: at, recoveredAt, state: recoveredAt === null ? 'active' : 'recovered', error, causeKey };
         const next = { key: causeKey, sourceKey, mainId, lifecycleId, domain, channel, episodeId: receipt.id, updatedAt: recoveredAt ?? at, active: recoveredAt === null, lastRoundId: roundId, error };
         save(COLLECTION, receipt.id, receipt);
         receipts.set(receipt.id, receipt);
@@ -160,6 +172,7 @@ export function createFailureReceipts({ db, now = Date.now }) {
       return { receipts: page.map(publicReceipt), nextSequence: page.at(-1)?.sequence ?? afterSequence, hasMore: values.length > page.length, historyGap: afterSequence < prunedThrough || recoveryWatermarkEvictions > 0, orderingGap: recoveryWatermarkEvictions > 0, ...(mainId !== undefined && lifecycleId !== undefined ? { health: health({ sourceKey, mainId, lifecycleId }, current) } : {}) };
     },
     health,
+    read(id) { const value = receipts.get(id); return value ? publicReceipt(value) : null; },
     prune(current) { maintain(current); return stats(); },
     clearSource(sourceKey, current) {
       if (!identifier(sourceKey)) throw new Error('Failure receipt source identity is invalid');

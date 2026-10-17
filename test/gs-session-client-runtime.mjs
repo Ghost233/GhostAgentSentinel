@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { runInNewContext } from 'node:vm'
-import { req, clientRequire } from './dsh-native-runtime.mjs'
+import { req, clientRequire, resolveGatewayBrowserClientPath } from './dsh-native-runtime.mjs'
 import descriptors from '../dsh/remote.cjs'
 
 const { Context, Service } = req('@deepseek-ai/cordis')
@@ -39,7 +39,7 @@ export async function mountGS(t, service, sessionId = 'root', surface) {
     },
   } })
   let remoteFactory
-  runInNewContext(await readFile(req.resolve('@deepseek-ai/dsh-api-gateway/client'), 'utf8'), { window: { crypto: globalThis.crypto, __ModuleLoader__: { load(value) { remoteFactory = value.factory } } }, crypto: globalThis.crypto, setTimeout, clearTimeout, AbortController, AbortSignal, console })
+  runInNewContext(await readFile(await resolveGatewayBrowserClientPath(), 'utf8'), { window: { crypto: globalThis.crypto, __ModuleLoader__: { load(value) { remoteFactory = value.factory } } }, crypto: globalThis.crypto, setTimeout, clearTimeout, AbortController, AbortSignal, console })
   const remote = remoteFactory(req); await ctx.plugin({ inject: remote.inject, apply: remote.apply })
   class Notification { static permission = 'granted'; constructor(title, options) { delivered.push({ title, options, instance: this }) } }
   runInNewContext(await readFile(new URL('../dsh/client.js', import.meta.url), 'utf8'), { window: { __ModuleLoader__: { load(value) { factory = value.factory } } }, document: dom.window.document, Notification,

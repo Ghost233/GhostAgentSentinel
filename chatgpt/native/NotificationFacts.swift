@@ -68,4 +68,14 @@ final class NotificationActionJournal {
             try write(stored)
         }
     }
+    func purge(prefix: String) throws -> Int {
+        guard prefix.range(of: "^ghostsentinel:[a-f0-9]{24}:$", options: .regularExpression) != nil else { throw NSError(domain: "com.ghostsentinel.notifications", code: 8) }
+        return try withJournalLock {
+            var stored = try readUnlocked()
+            let before = stored.events.count
+            stored.events.removeAll { ($0["requestId"] as? String)?.hasPrefix(prefix) == true }
+            if stored.events.count != before { try write(stored) }
+            return before - stored.events.count
+        }
+    }
 }

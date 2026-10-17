@@ -54,6 +54,8 @@ export function createNativeNotificationIO({ bundlePath, installationId, run = r
       if (result.requestId !== fields.requestId || typeof result.accepted !== 'boolean' || !auth.has(result.authorization)) throw protocol()
     } else if (operation === 'cancel') {
       if (!Array.isArray(result.pendingIds) || result.pendingIds.length > 100 || result.pendingIds.some(value => !owned(value))) throw protocol()
+    } else if (operation === 'purge-installation') {
+      if (!Number.isSafeInteger(result.requestedCancellations) || result.requestedCancellations < 0 || result.requestedCancellations > 100 || !Number.isSafeInteger(result.remainingPending) || result.remainingPending < 0 || !Number.isSafeInteger(result.clearedActions) || result.clearedActions < 0 || result.clearedActions > 256 || result.deliveredPreserved !== true || result.complete !== (result.remainingPending === 0)) throw protocol()
     } else {
       if (!['pending', 'delivered', 'actions'].every(key => Array.isArray(result[key]) && result[key].length <= 100)) throw protocol()
       for (const value of result.pending) if (!owned(value.requestId)) throw protocol()
@@ -75,6 +77,7 @@ export function createNativeNotificationIO({ bundlePath, installationId, run = r
       return invoke('cancel', { requestIds: [...new Set(requestIds)] })
     },
     snapshot: () => invoke('snapshot'),
+    purgeInstallation: () => invoke('purge-installation'),
     cancelPendingOperations: () => active?.abort(),
     close: () => { closed = true; active?.abort() },
   }

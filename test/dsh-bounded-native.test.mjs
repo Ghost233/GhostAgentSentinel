@@ -39,10 +39,13 @@ zlib.zstdDecompress = (...args) => {
   })
 }
 syncBuiltinESMExports()
+const boundedPagingSupported = ['observeSessionPage', 'releaseObservationPageCursor'].every(name => typeof req('@deepseek-ai/dsh-session-query').default.prototype[name] === 'function')
+const extendedPaging = { skip: boundedPagingSupported ? false : 'unsupported: stock SDK has no bounded cold page / cursor-release API; extended SDK scenario retained' }
 const { Context } = req('@deepseek-ai/cordis')
 const { SESSION_FORMAT_VERSION } = req('@deepseek-ai/dsh-session')
 const { createUserMessage, freezeMessage } = req('@deepseek-ai/dsh-llm')
-const Jsonl = req('@deepseek-ai/dsh-session-persistence-jsonl').default
+const jsonlModule = req('@deepseek-ai/dsh-session-persistence-jsonl')
+const Jsonl = jsonlModule.default ?? jsonlModule
 const modules = ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop', 'dsh-fs-local', 'dsh-working-directory', 'dsh-subagent', 'dsh-session-query'].map(name => { const module = req(`@deepseek-ai/${name}`); return module.default ?? module })
 const zero = { activeReads: 0, openFiles: 0, activeDecodes: 0, cursors: 0, retainedBytes: 0 }
 const until = async (predicate, label) => {
@@ -90,9 +93,9 @@ async function fixture(t, { compression = 'zstd', expectedShutdown = 'closed', c
   parent = await ctx.agents.create({ sessionId: 'built-page-root', agentOptions: { provider: 'unused', model: 'unused' } })
   await writer.plugin(Jsonl, { root: storageDir, compression })
   await ctx.plugin(Jsonl, { root: storageDir, compression })
-  assert.equal(ctx.sessionPersistence.observationPageSupported, true)
-  const publicPage = ctx.sessionQuery.observeSessionPage.bind(ctx.sessionQuery)
-  ctx.sessionQuery.observeSessionPage = async (id, request) => {
+  const publicPage = ctx.sessionQuery.observeSessionPage?.bind(ctx.sessionQuery)
+  if (publicPage) assert.equal(ctx.sessionPersistence.observationPageSupported, true)
+  if (publicPage) ctx.sessionQuery.observeSessionPage = async (id, request) => {
     record.pageRequests.push({ id, budget: request.budget, resources: { ...ctx.sessionPersistence.observationPageResources } })
     try { return await publicPage(id, request) }
     catch (error) { record.pageErrors.push({ id, code: error.code ?? null, stage: error.stage ?? null, message: error.message, usage: error.usage ?? null }); throw error }
@@ -121,7 +124,7 @@ async function fixture(t, { compression = 'zstd', expectedShutdown = 'closed', c
   return { ctx, writer, parent, record, store, start, catalog, keeper, keeperKey, get adapter() { return adapter } }
 }
 
-test('built compressed cold pages and nested seeded rewind reach public Core without promoting ancestor material or restoring an Agent', async t => {
+test('built compressed cold pages and nested seeded rewind reach public Core without promoting ancestor material or restoring an Agent', extendedPaging, async t => {
   let releaseSeed
   t.after(() => releaseSeed?.())
   const f = await fixture(t), at = Date.now() - 2000
@@ -216,13 +219,20 @@ for (const metadataKnown of [true, false]) test(`built legacy SDK refuses cold o
   assert.ok(!snapshot.tasks.some(task => task.id === 'legacy-unread-descendant'))
   assert.ok(!JSON.stringify(snapshot).includes('LEGACY-COLD-BODY-MUST-STAY-UNREAD'))
   assert.equal(f.ctx.agents.get(id), undefined); assert.equal(f.ctx.sessions.get(id), undefined)
-  assert.deepEqual(persistence.observationPageResources, zero)
+  if (persistence.observationPageResources !== undefined) assert.deepEqual(persistence.observationPageResources, zero)
+  else assert.equal(typeof query.observeSessionPage, 'undefined', 'stock SDK cannot report an extended paging resource counter')
+  assert.equal(service.diagnostics().hierarchyReader.activeLeases, 0)
+  assert.equal(service.diagnostics().hierarchyReader.pendingColdReads, 0)
   for (let index = 0; index < 20; index++) await service.snapshot()
   assert.deepEqual(calls, { observe: 0, stat: 0, open: 0, read: 0, prepare: 0 })
   assert.equal((await f.keeper.snapshot()).sources.find(source => source.key === f.keeperKey).status, 'connected')
+  assert.equal((await service.close()).status, 'closed')
+  assert.equal(service.diagnostics().adapter.activeRequests, 0)
+  assert.equal(service.diagnostics().hierarchyReader.pending, 0)
+  assert.equal(f.parent.agent.status, 'idle', 'unsupported observation never controls its native actor')
 })
 
-test('a built seeded read that exceeds its deadline remains unfinished without delivering a cut or disconnecting its source', async t => {
+test('a built seeded read that exceeds its deadline remains unfinished without delivering a cut or disconnecting its source', extendedPaging, async t => {
   const f = await fixture(t, { compression: 'none' }), id = 'cold-seed-deadline', at = Date.now() - 2000
   await f.store(id, [...turnLog('UNCONFIRMED-ANCESTOR', { at }),
     { type: 'session/end-seed', seq: 6, time: at + 6, data: { inherited: true } },
@@ -259,7 +269,7 @@ test('a built seeded read that exceeds its deadline remains unfinished without d
   f.record.resources.push({ stage: 'seed-deadline-settled', io: ioRecord(), sdk: { ...f.ctx.sessionPersistence.observationPageResources }, reader: service.diagnostics().hierarchyReader })
 })
 
-for (const mode of ['read', 'decode']) test(`built ${mode} cancellation keeps the actual operation visible until native completion delivery and releases only the observer`, async t => {
+for (const mode of ['read', 'decode']) test(`built ${mode} cancellation keeps the actual operation visible until native completion delivery and releases only the observer`, extendedPaging, async t => {
   const compression = mode === 'read' ? 'none' : 'zstd', f = await fixture(t, { compression, expectedShutdown: 'incomplete', closeTimeoutMs: 25 })
   await f.store(`cold-${mode}`, turnLog('owned-cancellation-request'))
   const service = f.start()

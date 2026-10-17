@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile, rename, chmod, rm, stat } from 'node:fs/pro
 import { join } from 'node:path'
 import { createCore } from './core/index.mjs'
 import { createAnalyzer } from './analysis/index.mjs'
-import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig } from './protocol.mjs'
+import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig } from './protocol.mjs'
 import { normalizeEnrollment } from './enrollment-config.mjs'
 import { HIERARCHY_FEATURE } from './hierarchy.mjs'
 import { GS_FEATURE } from './gs-status.mjs'
@@ -134,7 +134,7 @@ export async function startServer({ dataDir, onIdle, ...options }) {
     if (request.headers.host !== expectedHost || !authorized(request, token)) return send(401, { error: 'private connection required' })
     if (stopping) return send(503, { error: 'core shutting down' })
     try {
-      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: [FORK_COMPRESSION_FEATURE, FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE] })
+      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: [FORK_COMPRESSION_FEATURE, FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE] })
       if (request.method === 'GET' && request.url.startsWith('/v1/notifications/native')) {
         const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
         if (url.pathname !== '/v1/notifications/native') return send(404, { error: 'unknown endpoint' })
@@ -184,6 +184,7 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         case '/v1/source/heartbeat': result = await core.heartbeat(identifier(body.sourceKey)); break
         case '/v1/source/native-origin': result = await core.nativeOriginFence(identifier(body.sourceKey), identifier(body.key)); break;
         case '/v1/source/ingest': result = await core.ingest(identifier(body.sourceKey), normalizeBatch(body.batch)); break
+        case '/v1/chatgpt/installation/purge': result = await core.purgeChatGPTInstallation(body); break
         case '/v1/source/unregister': result = await core.unregisterSource(identifier(body.sourceKey), typeof body.reason === 'string' ? body.reason.slice(0, 500) : 'adapter stopped'); break
         case '/v1/monitoring/pause': result = await core.pause(); break
         case '/v1/monitoring/resume': result = await core.resume(); break
@@ -206,7 +207,7 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         default: return send(404, { error: 'unknown endpoint' })
       }
       send(200, result ?? null)
-    } catch (error) { send(['analysis_config_conflict', 'hierarchy_version_unsupported', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : error.code === 'analysis_config_unconfirmed' ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
+    } catch (error) { send(['chatgpt_installation_connected', 'analysis_config_conflict', 'hierarchy_version_unsupported', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : error.code === 'analysis_config_unconfirmed' ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['chatgpt_installation_connected', 'analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
     } finally { counts.activeRequests--; await flushIdle() }
   })
   server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)) })

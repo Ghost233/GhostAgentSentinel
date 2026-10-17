@@ -29,3 +29,25 @@ test('the native bridge rejects foreign installation cancellation, wrong bundle 
   const big = createNativeNotificationIO({ bundlePath: '/private/tmp/GhostSentinel.app', installationId: 'own', run: async () => ({ stdout: 'x'.repeat(262145) }) })
   await assert.rejects(big.settings(), error => error.code === 'native_protocol')
 })
+
+test('uninstall clears only its installation and preserves delivered OS history without requesting permission', async () => {
+  const calls = [], prefix = notificationPrefix('own-uninstall')
+  const io = createNativeNotificationIO({ bundlePath: '/private/tmp/Owned Notifications.app', installationId: 'own-uninstall', run: async (file, args, input) => {
+    const value = JSON.parse(input); calls.push(value)
+    return packet('purge-installation', { complete: false, requestedCancellations: 100, remainingPending: 2, clearedActions: 3, deliveredPreserved: true, observedAt: 1200 })
+  } })
+  const result = await io.purgeInstallation()
+  assert.deepEqual(calls, [{ schemaVersion: 1, operation: 'purge-installation', ownerPrefix: prefix }])
+  assert.equal(result.complete, false)
+  assert.equal(result.remainingPending, 2)
+  assert.equal(result.clearedActions, 3)
+  assert.equal(result.deliveredPreserved, true)
+})
+
+test('uninstall never treats contradictory or unbounded cancellation results as completed cleanup', async () => {
+  for (const change of [{ complete: true }, { requestedCancellations: 101 }, { remainingPending: -1 }, { clearedActions: 257 }, { deliveredPreserved: false }]) {
+    const io = createNativeNotificationIO({ bundlePath: '/private/tmp/Owned Notifications.app', installationId: 'own-uninstall', run: async () => packet('purge-installation', { complete: false, requestedCancellations: 100, remainingPending: 2, clearedActions: 3, deliveredPreserved: true, observedAt: 1200, ...change }) })
+    await assert.rejects(io.purgeInstallation(), error => error.code === 'native_protocol')
+    io.close()
+  }
+})

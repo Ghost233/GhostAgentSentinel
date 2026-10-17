@@ -35,7 +35,7 @@ async function request(runtime, path, body, signal, tracking) {
       kind: requestSignal.aborted ? requestSignal.reason === deadline.signal.reason ? 'timeout' : 'cancelled' : kind,
       name: ['Error', 'TypeError', 'SyntaxError', 'AbortError', 'TimeoutError'].includes(error.name) ? error.name : 'Error',
       ...(response ? { status: response.status } : {}),
-      ...(['analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'gs_summary_unsupported', 'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT', 'UND_ERR_SOCKET'].includes(code) ? { code } : {}) })
+      ...(['chatgpt_installation_connected', 'analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'gs_summary_unsupported', 'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT', 'UND_ERR_SOCKET'].includes(code) ? { code } : {}) })
     throw error
   } finally { clearTimeout(timer); if (tracking) tracking.deadlineTimers-- }
 }
@@ -126,6 +126,7 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
     nativeOriginFence: (sourceKey, key) => call('/v1/source/native-origin', { sourceKey, key }),
     ingest: (sourceKey, batch, requestSignal) => call('/v1/source/ingest', { sourceKey, batch }, requestSignal),
     unregisterSource: (sourceKey, reason, requestSignal) => call('/v1/source/unregister', { sourceKey, reason }, requestSignal),
+    purgeChatGPTInstallation: (scope, requestSignal) => call('/v1/chatgpt/installation/purge', scope, requestSignal),
     snapshot: requestSignal => call('/v1/snapshot', undefined, requestSignal),
     gsSummary: (sourceKey, sessionId, requestSignal) => call(`/v1/gs/summary?sourceKey=${encodeURIComponent(sourceKey)}&sessionId=${encodeURIComponent(sessionId)}`, undefined, requestSignal).catch(error => { if (error.status === 404) error.code = 'gs_summary_unsupported'; throw error }),
     diagnostics: requestSignal => call('/v1/diagnostics', undefined, requestSignal),

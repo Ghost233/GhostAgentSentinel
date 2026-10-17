@@ -72,6 +72,7 @@ function renderNotificationScope(view){
   element('notification-log').hidden=false;
 }
 function notificationState(record){
+  if(record.status==='grouped')return '已汇入初次接入故障摘要 · 本条未单独提交';
   const submitted=record.native?.submission?.state==='accepted'||record.delivery==='system-accepted';
   if(record.status==='cancelled')return '已取消'+(submitted?' · 系统曾接受':'');
   if(submitted)return '系统已接受';
@@ -85,6 +86,11 @@ function renderNotificationRecords(page){
   for(const record of notificationRecords){
     const article=node('article',null,'check'),native=record.native??{},kind=record.kind==='monitoring-failure'?'监控状态提醒':'任务告警';
     article.append(node('h2',kind+(record.mainId===null?' · 来源级':record.lifecycleId===null?' · 聊天级':'')),node('p',notificationState(record),'muted'));
+    if(record.rollup){
+      const count=Number.isSafeInteger(record.rollup.retainedMembers)?record.rollup.retainedMembers:0,active=Number.isSafeInteger(record.rollup.knownActiveMembers)?record.rollup.knownActiveMembers:0;
+      article.append(node('p','初次接入故障：保留 '+count+' 个对象 · '+(record.rollup.incomplete?'至少 ':'')+active+' 个在此来源代次仍失败'+(record.rollup.incomplete?' · 成员详情已到期或有缺口':''),'evidence'));
+      if(record.status==='grouped')article.append(node('p','关联摘要只证明此前的提交尝试，本聊天没有独立的系统接受事实。','muted'));
+    }
     if(text(record.body,180))article.append(node('p',text(record.body,180),'evidence'));
     const permission=({'not-determined':'尚未决定',denied:'未允许',authorized:'已允许',provisional:'临时允许'})[native.authorization?.state]??'未确认';
     const delivered=native.deliveredSnapshot?.present===true?'快照中存在':native.deliveredSnapshot?.present===false?'本次快照未见（不代表此前未展示）':'尚无送达快照';
@@ -278,6 +284,6 @@ element('history-more').onclick=()=>nextHistoryCursor?selectExecution(selectedEx
 function visibility(){clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void refresh();}
 function teardown(){stopped=true;generation++;clearTimeout(timer);timer=null;clearNotificationLog();for(const p of pending.values()){clearTimeout(p.timeout);p.reject(new Error('页面已销毁'));}pending.clear();removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
-(async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.0'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');await refresh();}catch(error){clearView('宿主初始化未完成');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}})();
+(async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');await refresh();}catch(error){clearView('宿主初始化未完成');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}})();
 </script>
 </html>

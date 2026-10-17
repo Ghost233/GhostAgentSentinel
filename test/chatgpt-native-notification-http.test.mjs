@@ -282,3 +282,140 @@ test('a burst of distinct recovered failure episodes has bounded per-notice iden
   assert.equal(new Set(page.records.flatMap(value => value.receiptIds)).size, 101)
   assert.equal(page.records.length, 2)
 })
+
+
+async function initialEnrollment(f, hostRunId = 'initial-host', initialize = true) {
+  return f.core.registerSource({ registrationId: 'chatgpt:initial-boundary', hostRunId, name: 'Owned fresh source', policy: 'chatgpt-main/1', initialEnrollmentBaseline: { id: '8c172ad9-b47a-4b21-a897-d77db897d57e', initialize } });
+}
+const initialFailure = (f, sourceKey, mainId, roundId = 'failure-' + mainId) => f.core.recordCollectionOutcome({ sourceKey, mainId, lifecycleId: null, roundId, channel: 'default', outcome: 'failed', settledAt: f.now(), enrollmentPhase: 'initial-unanchored', error: { code: 'ENOENT', stage: 'collection' } });
+async function initialClaim(f, sourceKey, hostRunId = 'initial-host') {
+  await f.core.setNativeNotificationEligibility({ sourceKey, hostRunId, appRunning: true, pluginEnabled: true });
+  return f.core.claimNotifications(sourceKey);
+}
+function initialPacket(f, notice, fields) {
+  return { notificationId: notice.id, attemptId: notice.native.attemptId, nativeRequestId: 'ghostsentinel:0123456789abcdef01234567:' + notice.native.attemptId, bundleId: 'com.ghostsentinel.notifications', observedAt: f.now(), ...fields };
+}
+async function initialIntent(f, notice) {
+  await f.core.recordNativeNotificationResult(initialPacket(f, notice, { event: 'authorization', authorization: 'authorized' }));
+  return f.core.recordNativeNotificationResult(initialPacket(f, notice, { event: 'submitting' }));
+}
+for (const outcome of ['accepted', 'submission-failed', 'submission-unknown']) test(`initial enrollment summary ${outcome} consumes one attempt without turning later members into accepted notifications`, async t => {
+  const f = await fixture(t), sourceKey = await initialEnrollment(f);
+  for (const id of ['A', 'B', 'C']) await initialFailure(f, sourceKey, id);
+  const claims = await initialClaim(f, sourceKey);
+  assert.equal(claims.length, 3);
+  assert.equal((await initialIntent(f, claims[0])).maySubmit, true);
+  await f.core.recordNativeNotificationResult(initialPacket(f, claims[0], { event: outcome, ...(outcome === 'submission-failed' ? { errorCode: 'native_submission' } : outcome === 'submission-unknown' ? { errorCode: 'native_timeout' } : {}) }));
+  for (const notice of claims.slice(1)) {
+    const grouped = await initialIntent(f, notice);
+    assert.equal(grouped.maySubmit, false);
+    assert.equal(grouped.record.status, 'grouped');
+    assert.equal(grouped.record.native.submission.state, 'not-attempted');
+    assert.notEqual(grouped.record.delivery, 'system-accepted');
+    assert.equal(grouped.record.mainId, notice.mainId);
+  }
+  const receipts = await f.core.failureReceipts({ sourceKey });
+  assert.equal(receipts.receipts.length, 3);
+  assert.ok(receipts.receipts.every(value => value.enrollmentPhase === 'initial-unanchored'));
+  const records = await f.core.nativeNotificationRecords({ sourceKey });
+  assert.equal(new Set(records.records.map(value => value.rollup.id)).size, 1);
+  assert.equal(records.records[0].rollup.firstAttemptConsumed, true);
+});
+
+test('known successful monitoring permanently prevents a later unanchored failure from entering initial enrollment summary', async t => {
+  const f = await fixture(t), sourceKey = await initialEnrollment(f);
+  await initialFailure(f, sourceKey, 'initial');
+  const [notice] = await initialClaim(f, sourceKey);
+  assert.equal((await initialIntent(f, notice)).maySubmit, true);
+  await f.core.recordNativeNotificationResult(initialPacket(f, notice, { event: 'accepted' }));
+  await f.core.recordCollectionOutcome({ sourceKey, mainId: 'established', lifecycleId: null, roundId: 'successful-monitoring', outcome: 'succeeded', settledAt: f.now() });
+  await initialFailure(f, sourceKey, 'established');
+  const [independent] = await initialClaim(f, sourceKey);
+  assert.equal(independent.mainId, 'established');
+  assert.equal(independent.rollupId, undefined);
+  assert.equal((await initialIntent(f, independent)).maySubmit, true);
+  const receipts = await f.core.failureReceipts({ sourceKey, mainId: 'established' });
+  assert.equal(receipts.receipts[0].enrollmentPhase, 'established');
+});
+
+test('summary detail expiry leaves an incomplete consumed marker and never invents recovery or a second first attempt', async t => {
+  const f = await fixture(t, { leaseMs: 1e9 }), sourceKey = await initialEnrollment(f);
+  await initialFailure(f, sourceKey, 'expired');
+  const [notice] = await initialClaim(f, sourceKey);
+  assert.equal((await initialIntent(f, notice)).maySubmit, true);
+  await f.core.recordNativeNotificationResult(initialPacket(f, notice, { event: 'accepted' }));
+  f.advance(86400001);
+  await initialFailure(f, sourceKey, 'new-member');
+  const [newMember] = await initialClaim(f, sourceKey);
+  const grouped = await initialIntent(f, newMember);
+  assert.equal(grouped.maySubmit, false);
+  assert.equal(grouped.record.status, 'grouped');
+  assert.equal(grouped.record.rollup.incomplete, true);
+  assert.equal(grouped.record.rollup.state, 'incomplete');
+  assert.equal((await f.core.failureReceipts({ sourceKey })).receipts.length, 1);
+});
+
+test('a new source generation inherits only the stable summary consumed marker and requalifies its own members', async t => {
+  const f = await fixture(t), oldKey = await initialEnrollment(f);
+  await initialFailure(f, oldKey, 'old-main');
+  const [notice] = await initialClaim(f, oldKey);
+  assert.equal((await initialIntent(f, notice)).maySubmit, true);
+  await f.core.recordNativeNotificationResult(initialPacket(f, notice, { event: 'accepted' }));
+  await f.core.setNativeNotificationEligibility({ sourceKey: oldKey, hostRunId: 'initial-host', appRunning: false, pluginEnabled: null });
+  await f.core.unregisterSource(oldKey);
+  const newKey = await initialEnrollment(f, 'new-host', false);
+  await initialFailure(f, newKey, 'new-main');
+  assert.deepEqual(await f.core.claimNotifications(newKey), []);
+  const [member] = await initialClaim(f, newKey, 'new-host');
+  const grouped = await initialIntent(f, member);
+  assert.equal(grouped.maySubmit, false);
+  assert.equal(grouped.record.hostRunId, 'new-host');
+  assert.equal(grouped.record.rollup.knownActiveMembers, 1);
+  assert.equal(grouped.record.native.submission.state, 'not-attempted');
+  assert.equal(grouped.record.rollup.incomplete, true);
+});
+
+test('baseline capacity falls back to unknown with a public classification gap and keeps independent first failures', async t => {
+  const f = await fixture(t);
+  let sourceKey;
+  for (let index = 0; index < 257; index++) sourceKey = await f.core.registerSource({ registrationId: 'chatgpt:capacity-' + index, hostRunId: 'capacity-host', name: 'Owned baseline capacity', policy: 'chatgpt-main/1', initialEnrollmentBaseline: { id: '8c172ad9-b47a-4b21-a897-d77db897d57e', initialize: true } });
+  await initialFailure(f, sourceKey, 'capacity-main');
+  const [notice] = await initialClaim(f, sourceKey, 'capacity-host');
+  assert.equal((await initialIntent(f, notice)).maySubmit, true);
+  assert.equal(notice.rollup, undefined);
+  assert.equal((await f.core.failureReceipts({ sourceKey })).receipts[0].enrollmentPhase, 'unknown');
+  const initial = (await f.core.diagnostics()).nativeNotifications.initialEnrollment;
+  assert.equal(initial.baselines, 256);
+  assert.equal(initial.classificationGap, true);
+});
+
+test('a cancelled summary transfers its first attempt only with explicit not-submitted proof', async t => {
+  const f = await fixture(t), sourceKey = await initialEnrollment(f);
+  await initialFailure(f, sourceKey, 'cancelled-main');
+  await initialFailure(f, sourceKey, 'eligible-main');
+  const claims = await initialClaim(f, sourceKey), first = claims.find(value => value.mainId === 'cancelled-main'), second = claims.find(value => value.mainId === 'eligible-main');
+  assert.equal((await initialIntent(f, first)).maySubmit, true);
+  await f.core.recordNativeNotificationResult(initialPacket(f, first, { event: 'suppressed', reason: 'project-disabled' }));
+  assert.equal((await initialIntent(f, second)).maySubmit, false, 'an ambiguous cancellation cannot create a second native request');
+  await f.core.recordNativeNotificationResult(initialPacket(f, first, { event: 'not-submitted' }));
+  const [reclaimed] = await f.core.claimNotifications(sourceKey);
+  assert.equal(reclaimed.mainId, 'eligible-main');
+  assert.equal((await initialIntent(f, reclaimed)).maySubmit, true);
+  await f.core.recordNativeNotificationResult(initialPacket(f, reclaimed, { event: 'accepted' }));
+  const previous = (await f.core.nativeNotificationRecords({ sourceKey })).records.find(value => value.mainId === 'cancelled-main');
+  assert.equal(previous.status, 'cancelled');
+  assert.equal(previous.native.submission.state, 'not-submitted');
+});
+
+test('consumed local baseline without matching Core history never fabricates initial enrollment eligibility', async t => {
+  const f = await fixture(t), sourceKey = await initialEnrollment(f, 'initial-host', false);
+  await initialFailure(f, sourceKey, 'unknown-A');
+  await initialFailure(f, sourceKey, 'unknown-B');
+  const claims = await initialClaim(f, sourceKey);
+  assert.equal(claims.length, 2);
+  for (const notice of claims) {
+    assert.equal(notice.rollup, undefined);
+    assert.equal((await initialIntent(f, notice)).maySubmit, true);
+  }
+  assert.ok((await f.core.failureReceipts({ sourceKey })).receipts.every(value => value.enrollmentPhase === 'unknown'));
+});

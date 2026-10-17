@@ -28,14 +28,15 @@ export async function openHealthOutbox({ dataDir, now = Date.now }) {
     if (closed) throw new Error('health outbox closed')
     const channel = value.channel ?? 'default'
     if (!/^(default|directory|main:[a-f0-9]{64})$/.test(channel) || !identifier(value.sourceKey) || !identifier(value.roundId) || !['failed', 'succeeded'].includes(value.outcome) || !Number.isSafeInteger(value.settledAt) || value.settledAt < 0 || value.settledAt > now() || !(value.mainId === null && value.lifecycleId === null || identifier(value.mainId) && (value.lifecycleId === null || identifier(value.lifecycleId)))) throw new Error('invalid collection settlement')
+    if (value.enrollmentPhase !== undefined && !['initial-unanchored', 'established', 'unknown'].includes(value.enrollmentPhase)) throw new Error('invalid collection enrollment phase')
     prune()
     if (value.settledAt <= now() - DAY) return
-    const body = { sourceKey: value.sourceKey, mainId: value.mainId, lifecycleId: value.lifecycleId, channel, roundId: value.roundId, outcome: value.outcome, settledAt: value.settledAt, ...(value.outcome === 'failed' ? { error: failureErrorInfo(value.error) } : {}) }
+    const body = { sourceKey: value.sourceKey, mainId: value.mainId, lifecycleId: value.lifecycleId, channel, roundId: value.roundId, outcome: value.outcome, settledAt: value.settledAt, ...(value.enrollmentPhase !== undefined ? { enrollmentPhase: value.enrollmentPhase } : {}), ...(value.outcome === 'failed' ? { error: failureErrorInfo(value.error) } : {}) }
     const scope = JSON.stringify([body.sourceKey, body.mainId, body.lifecycleId, channel]), pending = rows()
     const previous = pending.findLast(row => row.scope === scope)
     if (previous) {
       const last = JSON.parse(previous.body)
-      if (last.roundId === body.roundId || last.outcome === body.outcome && JSON.stringify(last.error) === JSON.stringify(body.error)) return
+      if (last.roundId === body.roundId || last.outcome === body.outcome && JSON.stringify(last.error) === JSON.stringify(body.error) && last.enrollmentPhase === body.enrollmentPhase) return
     }
     if (pending.length >= LIMIT) {
       db.prepare("INSERT INTO counters(key,value) VALUES('rejected',1) ON CONFLICT(key) DO UPDATE SET value=value+1").run()

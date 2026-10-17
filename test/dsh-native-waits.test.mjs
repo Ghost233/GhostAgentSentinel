@@ -19,6 +19,18 @@ const until = async (predicate, label) => {
   while (!await predicate()) { assert.ok(performance.now() < deadline, label); await new Promise(resolve => setTimeout(resolve, 2)) }
 }
 
+async function requiresParentWaitAudit(t) {
+  const ctx = new Context()
+  try {
+    await ctx.plugin(req('@deepseek-ai/dsh-llm').default)
+    for (const module of modules) await ctx.plugin(module, { agents: [] })
+    assert.ok(ctx.get('subagents'), 'real SDK subagent service mounted')
+    if (ctx.subagents.parentWaitAuditVersion === 1 && typeof ctx.subagents.observeWaitCaller === 'function') return true
+    t.skip('stock public SDK has no parentwait audit; unsupported')
+    return false
+  } finally { await ctx.fiber.dispose() }
+}
+
 async function fixture(t, beforeAdapter = () => {}, judgment = 'clear', waitForOutput = true, parentTool = null, deferAnalysis = false) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-native-waits-')), ctx = new Context(), streams = [], handles = [], release = []
   let adapter, server, models, lastSnapshot, config
@@ -267,8 +279,9 @@ test('twenty genuine native questions pair exactly once and never imply a parent
   assert.equal(new Set(starts.map(event => event.data.waitId)).size, 20)
   assert.equal(row.gs.waiting, null)
   const snapshot = await f.adapter.snapshot()
-  assert.deepEqual(snapshot.adapter.parentWaitAudit, { supported: true, version: 1 })
-  assert.ok(snapshot.adapter.gaps.some(gap => gap.includes('join 审计不提供豁免')))
+  const supported = f.ctx.subagents.parentWaitAuditVersion === 1
+  assert.deepEqual(snapshot.adapter.parentWaitAudit, { supported, version: supported ? 1 : null })
+  assert.ok(snapshot.adapter.gaps.some(gap => gap.includes(supported ? 'join 审计不提供豁免' : '不能证明父级正在等待子代理')))
   assert.ok(!snapshot.tasks.flatMap(task => task.events).some(event => event.data.nativeType === 'execution/wait-start'))
 })
 
@@ -307,6 +320,7 @@ test('native ApprovalService cancellation and a throwing provider produce their 
 })
 
 for (const mode of ['await', 'fire-and-forget', 'await-close', 'await-lateattach', 'await-prompt-fidelity']) test(`real native parent ${mode} distinguishes join operation from a correlated blocking tool caller`, async t => {
+  if (!await requiresParentWaitAudit(t)) return
   let activation, pending, joined, waitId, callerExecution, parent, audits = []
   const childModel = randomUUID()
   const f = await fixture(t, (ctx, release) => {
@@ -403,6 +417,7 @@ for (const mode of ['await', 'fire-and-forget', 'await-close', 'await-lateattach
 })
 
 test('an actual idle parent join does not promote the parent to running or create a caller exemption', async t => {
+  if (!await requiresParentWaitAudit(t)) return
   const f = await fixture(t), childModel = randomUUID(), nativeAudits = []
   for (const stream of f.streams) { stream.done = true; stream.wake?.() }
   await f.agent.whenIdle()
@@ -424,4 +439,32 @@ test('an actual idle parent join does not promote the parent to running or creat
   f.observations.push({ phase: 'idle-parent-join-not-running', row: structuredClone(row) })
   const stream = f.streams.find(stream => stream.model === childModel); stream.done = true; stream.wake?.()
   await until(() => joined === true, 'original idle parent join result unchanged')
+})
+
+test('stock SDK preserves real child lifecycle and tree while parent wait audit remains an explicit public gap', async t => {
+  const f = await fixture(t, () => {}, 'unknown', false, null, true), native = []
+  assert.ok(f.ctx.get('subagents'), 'real SDK subagent service mounted')
+  assert.notEqual(f.ctx.subagents.parentWaitAuditVersion, 1)
+  assert.notEqual(typeof f.ctx.subagents.observeWaitCaller, 'function')
+  for (const type of ['subagent/start', 'subagent/end']) f.ctx.on(type, info => native.push({ type, id: info.id, runId: info.runId }))
+  const childModel = randomUUID()
+  const activation = await f.ctx.subagents.startActivation({ provider: 'spawn', label: 'Stock child', delivery: 'caller', signal: new AbortController().signal,
+    request: { parent: f.agent, prompt: [{ type: 'text', text: 'Inspect delegated data only.' }], maxDepth: 4, agentOptions: { model: childModel } } })
+  t.after(() => activation.dispose())
+  let snapshot, child
+  await until(async () => { snapshot = await f.adapter.snapshot(); child = snapshot.tasks.find(task => task.id === activation.childId); return child?.status === 'running' && child.hierarchy?.parentSessionId === f.agent.session.id }, 'stock child and parent relation reach production Core')
+  assert.deepEqual(snapshot.adapter.parentWaitAudit, { supported: false, version: null })
+  assert.ok(snapshot.adapter.gaps.some(gap => gap.includes('不能证明父级正在等待子代理')))
+  assert.ok(native.some(event => event.type === 'subagent/start' && event.id === activation.childId))
+  const assertNoWait = view => {
+    assert.ok(view.tasks.every(task => task.gs?.waiting?.kind !== 'children'))
+    assert.ok(!view.tasks.flatMap(task => task.events).some(event => /^(subagent\/wait-|execution\/wait-)/.test(event.data?.nativeType ?? '')))
+  }
+  assertNoWait(snapshot)
+  const stream = f.streams.find(stream => stream.model === childModel)
+  assert.ok(stream); stream.done = true; stream.wake?.()
+  await until(() => native.some(event => event.type === 'subagent/end' && event.id === activation.childId), 'stock child publishes natural end')
+  await until(async () => { snapshot = await f.adapter.snapshot(); return snapshot.tasks.flatMap(task => task.events).some(event => event.data?.nativeType === 'subagent/end') }, 'stock child end reaches production Core')
+  assertNoWait(snapshot)
+  assert.equal(native.find(event => event.type === 'subagent/start').runId, native.find(event => event.type === 'subagent/end').runId)
 })

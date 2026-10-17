@@ -13,7 +13,7 @@ test('the compiled production Swift notification policy and action journal enfor
   t.after(() => rm(dir, { recursive: true, force: true }))
   await mkdir(cache)
   await run('/usr/bin/xcrun', ['swiftc', '-swift-version', '5', '-parse-as-library', '-module-cache-path', cache, 'chatgpt/native/NotificationFacts.swift', 'test/helpers/notification-facts.swift', '-o', binary], { timeout: 60000, maxBuffer: 1048576 })
-  for (const mode of ['inventory', 'journal', 'journal-boundaries', 'journal-concurrency', 'journal-errors']) await t.test(mode, async () => {
+  for (const mode of ['inventory', 'journal', 'journal-uninstall', 'journal-boundaries', 'journal-concurrency', 'journal-errors']) await t.test(mode, async () => {
     const owned = join(dir, mode); await mkdir(owned, { mode: 0o700 })
     const result = await run(binary, [mode, owned], { timeout: 5000, maxBuffer: 65536 })
     assert.match(result.stdout, new RegExp('PASS ' + mode))

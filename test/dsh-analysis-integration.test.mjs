@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:http'
 import { runInNewContext } from 'node:vm'
-import { req, clientRequire } from './dsh-native-runtime.mjs'
+import { req, clientRequire, resolveGatewayBrowserClientPath } from './dsh-native-runtime.mjs'
 import { createAdapter } from '../dsh/host.mjs'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
@@ -71,6 +71,7 @@ async function fixture(t, faults = {}) {
   for (const module of modules) await ctx.plugin(module, { agents: [] })
   ctx.sessionProjections.register({ key: 'title', stateVersion: 1, stateSchema: { parse: value => value }, init: () => 'Same task title', apply: value => value, wire: { viewSchema: { parse: value => value }, view: value => value } })
   await ctx.plugin(req('@deepseek-ai/dsh-typert-registry').default)
+  await ctx.plugin(req('@deepseek-ai/dsh-api-remote-access').default)
   await ctx.plugin(req('@deepseek-ai/dsh-api-gateway').default)
   ctx.llm.registerAdapter(['fixture'], new Actor())
   adapter = createAdapter(ctx, { dataDir, registrationId: 'combined-host' }, { flushMs: 5, heartbeatMs: 25 })
@@ -126,13 +127,16 @@ async function frontend(t, host, faults = {}) {
   ctx.provide('slots', { inject(_, install) { install(); return () => {} }, register(_, component) { Panel = component; return () => {} } })
   ctx.provide('sidebarRightTabs', { register() { return () => {} } })
   await ctx.plugin(req('@deepseek-ai/dsh-typert-registry').default)
+  const { Peer } = req('@deepseek-ai/dsh-client-connection')
+  const peer = new Peer(host.ctx, { principal: { kind: 'owner' }, interactions: 'none' })
+  ctx.effect(() => () => peer.dispose())
   ctx.provide('connection', { registerGenerationSource: () => () => {}, start: () => ({ stop() {} }), rpc: { open: async function *() {}, call: async (_, endpoint, payload) => {
     const method = endpoint.split('/')[1]; if (method === 'snapshot') snapshotCalls++
-    const value = await host.ctx.typertGateway.invoke({ namespace: 'sentinel', method, args: JSON.parse(JSON.stringify(payload.args)) })
+    const value = await host.ctx.typertGateway.invoke({ namespace: 'sentinel', method, args: JSON.parse(JSON.stringify(payload.args)), peer })
     return { ok: true, value: JSON.parse(JSON.stringify(value)) }
   } } })
   let remoteFactory
-  runInNewContext(await readFile(req.resolve('@deepseek-ai/dsh-api-gateway/client'), 'utf8'), { window: { crypto: globalThis.crypto, __ModuleLoader__: { load(value) { remoteFactory = value.factory } } }, crypto: globalThis.crypto, setTimeout, clearTimeout, AbortController, AbortSignal, console })
+  runInNewContext(await readFile(await resolveGatewayBrowserClientPath(), 'utf8'), { window: { crypto: globalThis.crypto, __ModuleLoader__: { load(value) { remoteFactory = value.factory } } }, crypto: globalThis.crypto, setTimeout, clearTimeout, AbortController, AbortSignal, console })
   const remote = remoteFactory(req); await ctx.plugin({ inject: remote.inject, apply: remote.apply })
   class Notification { static permission = 'granted'; constructor(title, options) { notices.push({ title, options }) } }
   runInNewContext(await readFile(new URL('../dsh/client.js', import.meta.url), 'utf8'), { window: { __ModuleLoader__: { load(value) { factory = value.factory } } }, document: dom.window.document, Notification, setInterval(callback) { intervals.set(++id, callback); return id }, clearInterval(key) { intervals.delete(key) }, setTimeout, clearTimeout, AbortController, Date, console })

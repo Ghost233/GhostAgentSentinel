@@ -146,6 +146,34 @@ test('the current-chat pause button uses its displayed identity and revision and
   assert.equal([...page.timers.values()].filter(value => value.delay === 1500).length, 1)
 })
 
+test('an unconfirmed pause is not replayed and a fresh read restores the explicit resume control', async t => {
+  const page = await harness(t), view = material('main-a')
+  view.monitoring = { registrationId: 'chatgpt:installation', taskId: 'main-a', paused: false, revision: 'before-pause' }
+  await page.deliver(view)
+  const operation = page.element('#pause').onclick()
+  await page.flush()
+  const sent = page.sent.findLast(row => row.params?.name === 'sentinel_set_chat_analysis')
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', id: sent.id, error: { code: -32603, message: 'Observation temporarily unconfirmed; request outcome may be unknown' } } })
+  await operation
+  assert.match(page.element('#summary').textContent, /暂停状态未确认/)
+  assert.equal(page.element('#pause').hidden, true)
+  await page.refresh()
+  assert.equal(page.sent.findLast(row => row.method === 'tools/call').params.name, 'sentinel_current_chat')
+  const paused = { ...view, monitoring: { ...view.monitoring, paused: true, revision: 'after-pause' }, analysis: { ...view.analysis, state: 'paused' } }
+  await page.deliver(paused)
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_set_chat_analysis').length, 1)
+  assert.equal(page.element('#pause').hidden, false)
+  assert.equal(page.element('#pause').textContent, '恢复本聊天分析')
+  const resume = page.element('#pause').onclick()
+  await page.flush()
+  const change = page.sent.findLast(row => row.params?.name === 'sentinel_set_chat_analysis')
+  assert.equal(change.params.arguments.paused, false)
+  assert.equal(change.params.arguments.revision, 'after-pause')
+  page.reply(change.id, { structuredContent: { ...view, monitoring: { ...view.monitoring, revision: 'after-resume' } } })
+  await resume
+  assert.equal(page.element('#pause').textContent, '暂停本聊天分析')
+})
+
 test('a pause response from the previous chat cannot overwrite the new chat or leave a control exposed', async t => {
   const page = await harness(t), view = material('main-a')
   view.monitoring = { registrationId: 'chatgpt:installation', taskId: 'main-a', paused: false, revision: 'revision-a' }

@@ -6,7 +6,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
 import { z } from 'zod'
 
-export async function startPanelServer({ read, control, requestNotifications, notificationRecords, token, port = 0 }) {
+export async function startPanelServer({ read, control, requestNotifications, notificationRecords, runtimeStatus, token, port = 0 }) {
   if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) throw new Error('installation authentication is required')
   const html = await readFile(new URL('./panel.html', import.meta.url), 'utf8'), sockets = new Set(), cleanups = new Set()
   let closed = false, activeRequests = 0, transports = 0
@@ -16,10 +16,18 @@ export async function startPanelServer({ read, control, requestNotifications, no
     const expected = Buffer.from('Bearer ' + token), credentialBytes = Buffer.from(credential)
     if (req.headers.host !== host || credentialBytes.length !== expected.length || !timingSafeEqual(credentialBytes, expected)) return res.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"Unauthorized"}')
     if (req.headers.origin && !['https://chatgpt.com', 'https://chat.openai.com'].includes(req.headers.origin)) return res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"Origin rejected"}')
+    if (req.method === 'GET' && req.url === '/health' && typeof runtimeStatus === 'function') {
+      try {
+        const { installationId, runId, pid, version, ownership } = await runtimeStatus()
+        if ([installationId, runId, version].some(value => typeof value !== 'string' || !value || value.length > 256) || !Number.isSafeInteger(pid) || pid < 1) throw new Error('invalid helper identity')
+        if (ownership !== undefined && ownership !== 'plugin') throw new Error('invalid observation ownership')
+        return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ protocol: 'ghost-sentinel-chatgpt-helper/1', installationId, runId, pid, version, ...(ownership ? { ownership } : {}) }))
+      } catch { return res.writeHead(503, { 'content-type': 'application/json' }).end('{"error":"Helper status unavailable"}') }
+    }
     if (req.url !== '/mcp') return res.writeHead(404, { 'content-type': 'application/json' }).end('{"error":"Not found"}')
     if (closed) return res.writeHead(503).end()
     activeRequests++
-    const mcp = new McpServer({ name: 'ghost-sentinel-chatgpt', version: '0.1.0-dev.0' })
+    const mcp = new McpServer({ name: 'ghost-sentinel-chatgpt', version: '0.1.0-dev.1' })
     const uri = 'ui://ghost-sentinel/current-chat.html'
     registerAppResource(mcp, 'sentinel-current-chat', uri, {}, async () => ({ contents: [{ uri, mimeType: RESOURCE_MIME_TYPE, text: html }] }))
     registerAppTool(mcp, 'sentinel_current_chat', {

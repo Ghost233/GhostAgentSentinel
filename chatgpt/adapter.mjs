@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import { BoundedReader, supportedProfile } from './bounded-reader.mjs'
+import { BoundedReader } from './bounded-reader.mjs'
+import { supportsHostProfile } from './storage-compatibility.mjs'
 import { ForkHistoryReader } from './fork-history.mjs'
 import { startPanelServer } from './panel-server.mjs'
 import { loadCursor, saveCursor } from './cursor-store.mjs'
@@ -9,10 +10,10 @@ import { classifyThread, createDiscovery, nativeStorageRoot } from './discovery.
 import { openHealthOutbox } from './health-outbox.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
-const profileKey = value => JSON.stringify([value?.appVersion, value?.appBuild, value?.cliVersion])
 const phaseStatus = phase => phase === 'started' ? 'running' : ['completed', 'aborted'].includes(phase) ? 'idle' : 'unknown'
 const nativeEvidence = (entry, event, offset) => event.data?.nativeRecordId || event.nativeRecordId ? 'chatgpt-native-record:' + (event.data?.nativeRecordId ?? event.nativeRecordId) : 'chatgpt-record:' + entry.cursorKey + ':' + offset
 const collectionFailures = new Set(['record-source-unavailable', 'record-identity-changed', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'cursor-anchor-changed', 'record-malformed-or-over-limit', 'invalid-lifecycle-record', 'cursor-invalid', 'cursor-retains-gap', 'unsupported-record-type', 'unsupported-event-type', 'compressed-data-invalid', 'native_origin_prefix_changed', 'native_origin_header_changed'])
@@ -85,18 +86,22 @@ function materialView(view, task, { historical = false } = {}) {
 
 // Native is the read-only host IO boundary; all qualification and lifecycle
 // decisions remain in this adapter and the shared core.
-export async function startChatGPTAdapter({ core, native, notificationIO, sessionsRoot, dataDir, installationId, token, pollMs = 1500, port = 0, now = Date.now, collectMaterials = false, nativeOriginVersion = 1 }) {
+export async function startChatGPTAdapter({ core, native, notificationIO, runtimeStatus, sessionsRoot, dataDir, installationId, token, pollMs = 1500, port = 0, now = Date.now, collectMaterials = false, nativeOriginVersion = 1, initialEnrollmentBaseline, onQualificationLost }) {
   if (!core || !native || !sessionsRoot || !dataDir || typeof installationId !== 'string' || !installationId.trim()) throw new Error('adapter installation and source IO are required')
   if (!Number.isSafeInteger(pollMs) || pollMs < 0) throw new Error('invalid polling interval')
   if (![1, 2].includes(nativeOriginVersion)) throw new Error('invalid native origin version')
   if (typeof collectMaterials !== 'boolean') throw new Error('invalid material collection mode')
   if (notificationIO && !collectMaterials) throw new Error('native notifications require material monitoring')
-  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
+  if (onQualificationLost !== undefined && typeof onQualificationLost !== 'function') throw new Error('invalid qualification loss handler')
+  if (initialEnrollmentBaseline !== undefined && (!initialEnrollmentBaseline || typeof initialEnrollmentBaseline.initialize !== 'boolean' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(initialEnrollmentBaseline.id ?? ''))) throw new Error('invalid initial enrollment baseline')
+  let baselineInitializationAvailable = initialEnrollmentBaseline?.initialize === true, baselineCoreInstanceId = null
+  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (reason === 'unsupported-host-version') view.summary = '当前 App 版本尚未适配，材料采集已停止'; if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
   await mkdir(join(dataDir, 'cursors'), { recursive: true, mode: 0o700 })
   const healthOutbox = collectMaterials ? await openHealthOutbox({ dataDir, now }) : null
-  let closed = false, timer = null, refreshPending = null, source = null, sourceEpoch = 0, registration = null
-  let sourceHealth = null, outboxError = null
+  let closed = false, closing = null, timer = null, refreshPending = null, source = null, sourceEpoch = 0, registration = null
+  let sourceHealth = null, outboxError = null, coreInstanceId = null
   let notificationPending = null, notificationError = null
+  let qualifiedHost = null
   const threads = new Map(), operations = new Set()
   const delivery = notificationIO ? createNotificationDelivery({ core, native: notificationIO, installationId, qualify: qualifyNotification, now }) : null
   const storageVersion = collectMaterials && nativeOriginVersion === 2 ? 2 : 1
@@ -104,15 +109,20 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
   let queue = Promise.resolve(), queuedBatches = 0, rotation = 0
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
   const capability = async () => {
-    const features = (await core.health()).features
+    const health = await core.health(), features = health.features
     const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
+    required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
+    if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
     if (delivery) required.push('monitoring-notifications/1')
-    return Array.isArray(features) && required.every(feature => features.includes(feature))
+    const available = Array.isArray(features) && required.every(feature => features.includes(feature))
+    if (available && baselineCoreInstanceId === null) baselineCoreInstanceId = health.instanceId
+    else if (available && baselineCoreInstanceId !== health.instanceId) baselineInitializationAvailable = false
+    return { available, instanceId: health.instanceId }
   }
 
   async function qualifyNotification(notice) {
-    const host = await native.sampleHost(), user = await native.readEnablement(null)
-    const facts = { hostRunId: host?.hostRunId ?? null, appRunning: !closed && !hostGap(host), pluginEnabled: user?.user === 'enabled' && user?.effective === 'enabled', projectEnabled: null }
+    const epoch = sourceEpoch, { host, gap } = await qualification()
+    const facts = { hostRunId: host?.hostRunId ?? null, appRunning: !closed && epoch === sourceEpoch && !hostGap(host), pluginEnabled: !closed && epoch === sourceEpoch && !gap, projectEnabled: null }
     if (!facts.appRunning || !facts.pluginEnabled || host.hostRunId !== notice.hostRunId || notice.mainId === null) return facts
     const proof = await qualify(notice.mainId, null, { host, projects: new Map() })
     return { ...facts, projectEnabled: proof.source ? true : proof.gap === 'plugin-disabled' ? false : null }
@@ -128,12 +138,15 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
   async function collectionOutcome(entry, outcome, error, roundId, channel = entry ? 'main:' + fingerprint(entry.id) : 'directory') {
     if (!healthOutbox || !source || closed) return
     const scope = entry?.lifecycleVerified && entry.hostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: entry.lifecycleId } : entry?.qualifiedHostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: null } : { mainId: null, lifecycleId: null }
-    const value = { sourceKey: source.key, ...scope, channel, roundId, outcome, settledAt: now(), ...(error ? { error: failureErrorInfo({ code: error.code ?? 'collection_failed', codeHash: error.codeHash, stage: error.stage ?? 'collection', status: error.status, details: error.details }) } : {}) }
+    const value = { sourceKey: source.key, ...scope, channel, roundId, outcome, settledAt: now(), ...(scope.mainId !== null ? { enrollmentPhase: scope.lifecycleId !== null ? 'established' : entry?.enrollmentPhase ?? 'unknown' } : {}), ...(error ? { error: failureErrorInfo({ code: error.code ?? 'collection_failed', codeHash: error.codeHash, stage: error.stage ?? 'collection', status: error.status, details: error.details }) } : {}) }
     try {
       healthOutbox.push(value)
+      if (entry && outcome === 'succeeded') entry.enrollmentPhase = 'established'
       if (entry && outcome === 'succeeded' && scope.mainId !== null) {
         if (scope.lifecycleId !== null) healthOutbox.push({ ...value, lifecycleId: null })
-        healthOutbox.push({ ...value, mainId: null, lifecycleId: null })
+        const sourceRecovery = { ...value, mainId: null, lifecycleId: null }
+        delete sourceRecovery.enrollmentPhase
+        healthOutbox.push(sourceRecovery)
       }
       if (healthOutbox.diagnostics().pending < 256) outboxError = null
     } catch (failure) { outboxError = { state: 'failed', failures: [{ domain: 'collection', error: failureErrorInfo(failure) }] } }
@@ -169,28 +182,35 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
     sourceEpoch++
     const previous = source
     source = null
+    const metadataClosing = native.disconnectMetadata?.()
+    const unregistering = previous && onQualificationLost ? core.unregisterSource(previous.key, reason) : null
+    unregistering?.catch(() => {})
     if (previous && delivery) {
       const facts = { sourceKey: previous.key, hostRunId: previous.hostRunId, appRunning: null, pluginEnabled: reason === 'plugin-disabled' ? false : null }
       await core.setNativeNotificationEligibility(facts).catch(() => { notificationError = 'native_unavailable' })
       refreshNotifications(facts)
     }
     if (reason !== 'observation-unavailable') { sourceHealth = null; outboxError = null; for (const entry of threads.values()) entry.health = null }
-    await Promise.all([...threads.values()].map(entry => stop(entry, reason, false)))
+    await Promise.all([unregistering, metadataClosing, ...[...threads.values()].map(entry => stop(entry, reason, false))])
     for (const [id, entry] of threads) if (!entry.lifecycleId && !entry.blocked) threads.delete(id)
-    if (previous) await core.unregisterSource(previous.key, reason)
+    if (previous && !onQualificationLost) await core.unregisterSource(previous.key, reason)
   }
 
   async function fail(entry, gap, scope = 'task') {
+    if (scope === 'source' && onQualificationLost && ['plugin-disabled', 'plugin-enablement-unconfirmed'].includes(gap)) await qualificationLost(gap)
     if (scope === 'source') await stopSource(gap)
     else await stop(entry, gap)
     return entry.view
   }
 
   async function sourceFor(host, epoch) {
+    if (closed || epoch !== sourceEpoch) return null
     if (source) return source.hostRunId === host.hostRunId ? source : null
     if (!registration) {
       registration = (async () => {
-        const key = await core.registerSource({ registrationId: 'chatgpt:' + installationId, hostRunId: host.hostRunId, name: 'ChatGPT · 本机执行域', ...(collectMaterials ? { policy: 'chatgpt-main/1', ...(nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), capabilities: ['main-lifecycle/1', 'main-material/1'] } : { mode: 'observation-only', capabilities: ['main-lifecycle/1'] }) })
+        const enrollment = initialEnrollmentBaseline ? { id: initialEnrollmentBaseline.id, initialize: baselineInitializationAvailable } : undefined
+        baselineInitializationAvailable = false
+        const key = await core.registerSource({ ...(enrollment ? { initialEnrollmentBaseline: enrollment } : {}), registrationId: 'chatgpt:' + installationId, hostRunId: host.hostRunId, name: 'ChatGPT · 本机执行域', ...(collectMaterials ? { policy: 'chatgpt-main/1', ...(nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), capabilities: ['main-lifecycle/1', 'main-material/1'] } : { mode: 'observation-only', capabilities: ['main-lifecycle/1'] }) })
         if (closed || epoch !== sourceEpoch) { await core.unregisterSource(key, 'source-generation-superseded'); return null }
         source = { key, hostRunId: host.hostRunId }
         return source
@@ -200,14 +220,37 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
     return registered?.hostRunId === host.hostRunId ? registered : null
   }
 
-  const hostGap = host => !host?.available ? host?.reason ?? 'source-unavailable' : profileKey(host.profile) !== profileKey(supportedProfile) ? 'unsupported-host-version' : typeof host.hostRunId !== 'string' || !host.hostRunId || !Number.isSafeInteger(host.hostStartedAt) ? 'source-generation-unverified' : null
+  const hostGap = host => host?.available !== true ? host?.reason ?? 'source-unavailable' : typeof host.hostRunId !== 'string' || !host.hostRunId || !Number.isSafeInteger(host.hostStartedAt) ? 'source-generation-unverified' : null
+  let qualificationLoss, qualificationError
+  function qualificationLost(reason) {
+    if (!onQualificationLost || closed) return qualificationLoss
+    return qualificationLoss ??= (async () => {
+      // Await only endpoint withdrawal. Full close waits for this operation.
+      try { await onQualificationLost(reason) } catch (error) { qualificationError = error }
+      void close(reason).catch(() => {})
+    })()
+  }
+  async function qualification(expected = null) {
+    let host, user
+    try { host = await native.sampleHost() }
+    catch (error) { if (!onQualificationLost) throw error; const gap = 'host-verification-unavailable'; await qualificationLost(gap); return { host: null, gap } }
+    const previous = expected ?? qualifiedHost
+    const gap = hostGap(host) ?? (previous && (host.hostRunId !== previous.hostRunId || host.hostStartedAt !== previous.hostStartedAt) ? 'source-generation-changed' : null)
+    if (gap) { await qualificationLost(gap); return { host, gap } }
+    try { user = await native.readEnablement(null) }
+    catch (error) { if (!onQualificationLost) throw error; const gap = 'plugin-enablement-unconfirmed'; await qualificationLost(gap); return { host, gap } }
+    const enabledGap = user?.user !== 'enabled' || user?.effective !== 'enabled' ? user?.user === 'disabled' || user?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed' : null
+    if (enabledGap) { await qualificationLost(enabledGap); return { host, gap: enabledGap } }
+    if (onQualificationLost && !qualifiedHost) qualifiedHost = { hostRunId: host.hostRunId, hostStartedAt: host.hostStartedAt }
+    return { host, gap: supportsHostProfile(host.profile) ? null : 'unsupported-host-version' }
+  }
   async function projectSetting(context, cwd) {
-    if (!context.projects.has(cwd)) context.projects.set(cwd, Promise.resolve().then(() => native.readEnablement(cwd)).catch(() => ({ user: 'unknown', effective: 'unknown' })))
+    if (!context.projects.has(cwd)) context.projects.set(cwd, Promise.resolve().then(() => native.readEnablement(cwd)).then(setting => ({ setting }), () => ({ unavailable: true })))
     return context.projects.get(cwd)
   }
   function entryFor(id) {
     let entry = threads.get(id)
-    if (!entry && threads.size < 256) { entry = { id, cursorKey: fingerprint(collectMaterials ? [installationId, id, 'material/1'] : [installationId, id]), generation: 0, captured: new Map(), captureThroughOffset: -1, deliveryThrough: { current: -1, history: -1 }, lastViewedAt: now(), view: gapView('not-observed', id) }; threads.set(id, entry) }
+    if (!entry && threads.size < 256) { entry = { id, cursorKey: fingerprint(collectMaterials ? [installationId, id, 'material/1'] : [installationId, id]), generation: 0, captured: new Map(), captureThroughOffset: -1, deliveryThrough: { current: -1, history: -1 }, lastViewedAt: now(), view: gapView('not-observed', id), enrollmentPhase: 'unknown' }; threads.set(id, entry) }
     return entry
   }
   async function qualify(id, expected = null, context) {
@@ -216,7 +259,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
     const kind = classifyThread(thread, sessionsRoot, storageVersion)
     if (!thread || thread.id !== id || kind !== 'main' && !(collectMaterials && kind === 'fork')) return { gap: kind === 'fork' ? 'fork-provenance-unverified' : 'main-identity-unverified' }
     const host = context.host
-    const enabled = await projectSetting(context, thread.cwd)
+    const project = await projectSetting(context, thread.cwd)
+    if (project.unavailable) return { gap: 'plugin-enablement-unconfirmed', scope: 'task' }
+    const enabled = project.setting
     if (enabled?.user !== 'enabled' || enabled?.effective !== 'enabled') return { gap: enabled?.user === 'disabled' || enabled?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed', scope: enabled?.user !== 'enabled' ? 'source' : 'task' }
     const source = { ...(collectMaterials && nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), path: thread.path, allowedRoot: nativeStorageRoot(thread.path, sessionsRoot, storageVersion), threadId: id, parentId: null, sourceKind: thread.source, originator: thread.originator, cwd: thread.cwd, forkedFromId: thread.forkedFromId ?? null, anchorTurnId: metadata.anchorTurnId ?? null, hostRunId: host.hostRunId, hostStartedAt: host.hostStartedAt, profile: host.profile }
     if (expected && fingerprint([source.path, source.cwd, source.sourceKind, source.originator, source.forkedFromId, source.hostRunId, source.hostStartedAt, source.profile]) !== fingerprint([expected.path, expected.cwd, expected.sourceKind, expected.originator, expected.forkedFromId, expected.hostRunId, expected.hostStartedAt, expected.profile])) return { gap: 'source-generation-changed', scope: source.hostRunId !== expected.hostRunId ? 'source' : 'task' }
@@ -248,6 +293,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
           const oldKey = fingerprint([installationId, entry.id, before.source.forkedFromId ? 'fork-material/1' : 'material/1'])
           if (await loadCursor(join(dataDir, 'cursors', oldKey + '.json'), { fork: Boolean(before.source.forkedFromId) })) { await stop(entry, 'origin-upgrade-unverified'); return null }
         }
+        entry.enrollmentPhase = cursor ? 'established' : entry.enrollmentPhase === 'established' ? 'established' : initialEnrollmentBaseline ? 'initial-unanchored' : 'unknown'
         if (cursor) { entry.captured = new Map(cursor.captures.map(item => [item.offset, item.capturedAt])); entry.captureThroughOffset = cursor.captureThroughOffset; entry.deliveryThrough = cursor.deliveryThrough ?? { current: cursor.captureThroughOffset, history: cursor.captureThroughOffset } }
         entry.reader = before.source.forkedFromId ? new ForkHistoryReader(before.source, cursor?.reader, { native, sessionsRoot, mode: 'material', origins }) : new BoundedReader(before.source, cursor?.reader, { mode: collectMaterials ? 'material' : 'metadata', origins })
       }
@@ -261,7 +307,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
         await fail(entry, observed.gap); await updateHealth(entry); return null
       }
       return { source: before.source, previousCheckpoint, observed, epoch, generation, roundId }
-    } catch (error) { await collectionOutcome(entry, 'failed', error, roundId); await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {}); await updateHealth(entry); return null }
+    } catch (error) { if (closed || epoch !== sourceEpoch) return null; await collectionOutcome(entry, 'failed', error, roundId); await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {}); await updateHealth(entry); return null }
   }
 
   async function publish(entry, prepared) {
@@ -316,8 +362,8 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
         batch.hierarchyContext = materialContext(before, connection.key, batch, fork ? { taskId: entry.id, complete: observed.forkProvenance.complete, receiptId: observed.forkProvenance.receiptId, generation: observed.forkProvenance.generation } : null)
       }
       const accepted = await core.ingest(connection.key, batch)
+      if (closed || epoch !== sourceEpoch || generation !== entry.generation) return entry.view
       entry.reader?.acknowledgeOrigins?.(accepted.nativeOrigins)
-      if (closed || epoch !== sourceEpoch || generation !== entry.generation) { await stop(entry, 'observation-superseded'); return entry.view }
       await saveCursor(target, checkpoint, entry.captured, entry.captureThroughOffset, { fork, deliveryThrough: entry.deliveryThrough })
       await collectionOutcome(entry, observed.forkProvenance?.error ? 'failed' : 'succeeded', observed.forkProvenance?.error ?? null, prepared.roundId)
       const snapshot = await core.snapshot()
@@ -334,7 +380,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
       }
       await updateHealth(entry, snapshot)
       return entry.view
-    } catch (error) { if (error.code === 'native_origin_revision_conflict') { await stop(entry, 'native-origin-revalidating', false); return entry.view } await collectionOutcome(entry, 'failed', error, prepared.roundId); await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {}); await updateHealth(entry); return entry.view }
+    } catch (error) { if (closed || prepared.epoch !== sourceEpoch || prepared.generation !== entry.generation) return entry.view; if (error.code === 'native_origin_revision_conflict') { await stop(entry, 'native-origin-revalidating', false); return entry.view } await collectionOutcome(entry, 'failed', error, prepared.roundId); await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {}); await updateHealth(entry); return entry.view }
   }
 
   function rememberCapture(entry, offset) { const at = now(); if (!Number.isSafeInteger(at) || at < 0) throw new Error('invalid capture clock'); entry.captured.set(offset, at); if (entry.captured.size > 16) entry.captured.delete(entry.captured.keys().next().value); return at }
@@ -353,12 +399,20 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
   }
 
   async function collect(requested = [], discover = false) {
-    const epoch = sourceEpoch
+    let epoch = sourceEpoch
     try {
-      if (!await capability()) { await stopSource('core-capability-unavailable'); return }
-      const host = await native.sampleHost(), user = await native.readEnablement(null)
-      const gap = hostGap(host) ?? (user?.user !== 'enabled' || user?.effective !== 'enabled' ? user?.user === 'disabled' || user?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed' : null)
+      const { host, gap } = await qualification()
+      if (closed || epoch !== sourceEpoch) return
       if (gap) { await stopSource(gap); return }
+      const supported = await capability()
+      if (closed || epoch !== sourceEpoch) return
+      if (!supported.available) { await stopSource('core-capability-unavailable'); return }
+      if (coreInstanceId && supported.instanceId && coreInstanceId !== supported.instanceId) {
+        try { await stopSource('core-generation-changed') } catch (error) { if (error.status !== 400) throw error }
+        if (closed) return
+        epoch = sourceEpoch
+      }
+      coreInstanceId = supported.instanceId ?? null
       if (collectMaterials) await sourceFor(host, epoch)
       if (discover) {
         const roundId = randomUUID(), result = await discovery.refresh()
@@ -391,8 +445,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
       }
       if (closed || epoch !== sourceEpoch) return
       // A separate fresh sample follows every reader operation in the batch.
-      const afterHost = await native.sampleHost(), afterUser = await native.readEnablement(null)
-      const afterGap = hostGap(afterHost) ?? (afterHost.hostRunId !== host.hostRunId || afterHost.hostStartedAt !== host.hostStartedAt ? 'source-generation-changed' : null) ?? (afterUser?.user !== 'enabled' || afterUser?.effective !== 'enabled' ? afterUser?.user === 'disabled' || afterUser?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed' : null)
+      const { host: afterHost, gap: afterGap } = await qualification(host)
       if (afterGap) { await stopSource(afterGap); return }
       const after = { host: afterHost, projects: new Map() }, valid = new Map()
       for (const [entry, value] of prepared) {
@@ -407,11 +460,10 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
       }
       if (source && !closed && epoch === sourceEpoch) await core.heartbeat(source.key)
       if (discover && source && !closed && epoch === sourceEpoch) refreshNotifications({ sourceKey: source.key, hostRunId: source.hostRunId, appRunning: true, pluginEnabled: true })
-    } catch (error) { await collectionOutcome(null, 'failed', error, randomUUID()); await updateHealth(); await stopSource('observation-unavailable').catch(() => {}) }
+    } catch (error) { if (closed || epoch !== sourceEpoch) return; await collectionOutcome(null, 'failed', error, randomUUID()); await updateHealth(); await stopSource('observation-unavailable').catch(() => {}) }
   }
   async function historyProof(entry, expected = null) {
-    const host = await native.sampleHost(), enabled = await native.readEnablement(null)
-    const gap = hostGap(host) ?? (enabled?.user !== 'enabled' || enabled?.effective !== 'enabled' ? 'plugin-enablement-unconfirmed' : null)
+    const { host, gap } = await qualification()
     if (gap) return { gap, scope: 'source' }
     return qualify(entry.id, expected, { host, projects: new Map() })
   }
@@ -465,9 +517,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
     if (!entry) return decorate(gapView('observation-capacity-reached'))
     entry.lastViewedAt = now()
     if (queuedBatches) {
-      const user = await native.readEnablement(null).catch(() => ({ user: 'unknown', effective: 'unknown' }))
+      const { gap } = await qualification().catch(() => ({ gap: 'plugin-enablement-unconfirmed' }))
       if (closed) return decorate(gapView('adapter-closed'))
-      if (user?.user !== 'enabled' || user?.effective !== 'enabled') { await stopSource(user?.user === 'disabled' || user?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed'); return decorate(entry.view) }
+      if (gap) { await stopSource(gap); return decorate(entry.view) }
     }
     const pending = enqueue(async () => { await collect([id]); return closed ? gapView('adapter-closed') : observedView(entry, selection) })
     if (!pending) return decorate(gapView(closed ? 'adapter-closed' : 'collection-queue-capacity'))
@@ -531,10 +583,31 @@ export async function startChatGPTAdapter({ core, native, notificationIO, sessio
   }
   async function refresh() { if (closed) return; if (refreshPending) return refreshPending; const pending = enqueue(() => collect([], true)); if (!pending) return; refreshPending = pending.finally(() => { refreshPending = null }); return refreshPending }
   let panel
-  try { panel = await startPanelServer({ read, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), token, port }) }
+  try { panel = await startPanelServer({ read, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, token, port }) }
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }
+  if (onQualificationLost) await qualification()
   const schedule = () => { if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(); schedule() }, pollMs) }
   if (pollMs && typeof native.listThreads === 'function') void refresh()
   schedule()
-  return { url: panel.url, read, refresh, discovery: () => decorate(gapView('not-observed')).discovery, diagnostics: () => ({ closed, trackedThreads: threads.size, openReaders: [...threads.values()].reduce((total, entry) => total + (entry.reader?.diagnostics?.().readers ?? Number(Boolean(entry.reader?.handle))), 0), pendingOperations: operations.size, refreshTimers: timer === null ? 0 : 1, queuedBatches, ...(healthOutbox ? { healthOutbox: healthOutbox.diagnostics() } : {}), ...discovery.diagnostics(), ...panel.diagnostics() }), async close() { if (closed) return; closed = true; clearTimeout(timer); timer = null; const notificationClosing = delivery?.stop(), directoryClosing = discovery.close(); await native.close?.(); await panel.close(); await Promise.allSettled([...operations]); await notificationClosing; await directoryClosing; await stopSource('adapter-closed').catch(() => {}); threads.clear(); await healthOutbox?.close() } }
+  function close(reason = 'adapter-closed') {
+    return closing ??= (async () => {
+      closed = true; clearTimeout(timer); timer = null
+      const cancelling = onQualificationLost ? core.cancelPending?.() : null
+      const notificationClosing = delivery?.stop().then(result => {
+        if (result.errorCode || result.remainingPending !== 0) throw Object.assign(new Error('Native notification cleanup incomplete'), { code: 'notification_cleanup_failed', errorCode: result.errorCode, remainingPending: result.remainingPending })
+        return result
+      }), directoryClosing = discovery.close()
+      const sourceClosing = onQualificationLost ? stopSource(reason) : null
+      sourceClosing?.catch(() => {})
+      const cleanup = await Promise.allSettled([cancelling, notificationClosing, directoryClosing, sourceClosing, Promise.resolve().then(() => native.close?.()), panel.close()])
+      await Promise.allSettled([...operations])
+      if (!onQualificationLost) await stopSource(reason).catch(() => {})
+      threads.clear()
+      try { await healthOutbox?.close() } catch (reason) { cleanup.push({ status: 'rejected', reason }) }
+      const failures = cleanup.filter(value => value.status === 'rejected').map(value => value.reason)
+      if (qualificationError) failures.unshift(qualificationError)
+      if (failures.length) throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'Observation cleanup failed')
+    })()
+  }
+  return { url: panel.url, read, refresh, discovery: () => decorate(gapView('not-observed')).discovery, diagnostics: () => ({ closed, trackedThreads: threads.size, openReaders: [...threads.values()].reduce((total, entry) => total + (entry.reader?.diagnostics?.().readers ?? Number(Boolean(entry.reader?.handle))), 0), pendingOperations: operations.size, refreshTimers: timer === null ? 0 : 1, queuedBatches, ...(healthOutbox ? { healthOutbox: healthOutbox.diagnostics() } : {}), ...discovery.diagnostics(), ...panel.diagnostics() }), close }
 }

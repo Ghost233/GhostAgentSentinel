@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto';
 import { NativeJsonlSource, nativeStorageKey } from './native-jsonl-source.mjs';
 import { nativeRecordIdentity } from '../src/fork-proof.mjs';
 import { normalizeNativePrefix } from '../src/native-origin.mjs';
+import { supportedProfile, supportsHostProfile, supportsStorageProducer, hostProfileKey as profileKey } from './storage-compatibility.mjs';
 
 const values = value => value === none ? [] : isMany(value) ? value.values : [value];
 const fields = /^(?:type|timestamp|ordinal|payload\.(?:type|turn_id|root_turn_id|thread_id|id|originator|source|cli_version|cwd|history_mode|forked_from_id|forked_from_ordinal_exclusive)|payload\.history_base\.(?:thread_id|end_ordinal_exclusive|end_byte_offset))$/;
@@ -75,16 +76,17 @@ export class Projection {
   }
 }
 
-export const supportedProfile = Object.freeze({ appVersion: '26.1007.71326', appBuild: '20398', cliVersion: '0.162.0-alpha.17.2' });
-const profileKey = p => [p?.appVersion, p?.appBuild, p?.cliVersion].join('|');
+export { supportedProfile } from './storage-compatibility.mjs';
 const digest = value => createHash('sha256').update(value).digest('hex');
 const emptyState = () => ({ header: false, anchored: false, phase: 'unknown', turnId: null, at: null, orphan: false });
 const otherRecords = new Set(['response_item', 'turn_context', 'compacted', 'token_usage_record', 'inter_agent_communication_metadata', 'world_state']);
 const otherEvents = new Set(['item_started', 'item_completed', 'token_count', 'agent_message', 'agent_reasoning', 'user_message', 'context_compacted', 'thread_settings_applied', 'thread_goal_updated']);
 const lifecycle = new Set(['task_started', 'task_complete', 'turn_aborted']);
+const materialItems = new Set(['UserMessage', 'AgentMessage', 'CommandExecution', 'McpToolCall', 'Reasoning']);
 const sourceIoCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'EIO', 'ENOTDIR', 'ELOOP', 'EMFILE', 'ENFILE', 'EBADF']);
 
 const nativeHeader = row => ({ threadId: row.payload.id, ordinal: row.ordinal, originator: row.payload.originator, sourceKind: row.payload.source, cliVersion: row.payload.cli_version, historyMode: row.payload.history_mode, cwd: row.payload.cwd, creationSourceThreadId: row.payload.forked_from_id ?? null, historyBase: row.payload.history_base ? { sourceThreadId: row.payload.history_base.thread_id, endOrdinalExclusive: row.payload.history_base.end_ordinal_exclusive, endByteOffset: row.payload.history_base.end_byte_offset } : null });
+const producerAllowed = (source, version) => supportsStorageProducer(version) || version === undefined && (source.nativeOriginVersion ?? 1) === 1 && profileKey(source.profile) === profileKey(supportedProfile);
 
 export class BoundedReader {
   constructor(source, cursor = null, { mode = 'metadata', forkSuffix = false, origins = null, scanOnly = false, terminalProof = cursor?.terminalProof ?? null, successorProof = cursor?.successorProof ?? null } = {}) {
@@ -92,6 +94,7 @@ export class BoundedReader {
     this.origins = origins; this.mode = mode; this.materialMode = ['material', 'history'].includes(mode); this.historyMode = ['history', 'history-metadata'].includes(mode); this.ordinalMode = this.historyMode || forkSuffix;
     this.historyRange = this.historyMode ? source.historyRange : null; this.nextOrdinal = null; this.forkProvenance = null;
     this.source = source; this.nativeOriginVersion = source.nativeOriginVersion ?? 1;
+    this.hostProfileKey = profileKey(source.profile);
     this.scanOnly = scanOnly; this.scanStart = null; this.coldScan = null; this.coldCheckpoint = null; this.terminalProof = terminalProof; this.successorProof = successorProof;
     this.originIdentity = this.nativeOriginVersion === 2 ? 'native-storage/2:' + nativeStorageKey(source.path) : null;
     this.scope = digest(JSON.stringify([this.nativeOriginVersion === 2 ? this.originIdentity : typeof source.path === 'string' ? resolve(source.path) : '', source.threadId, source.hostRunId, profileKey(source.profile), ...(this.ordinalMode ? [mode, source.forkedFromId ?? null, this.historyRange, this.nativeOriginVersion === 2 ? null : source.expectedFileId ?? null, source.expectedHeader ?? null] : [])]));
@@ -107,11 +110,12 @@ export class BoundedReader {
     this.turnTrigger = this.materialMode && typeof cursor?.turnTrigger === 'string' && cursor.turnTrigger.length <= 256 ? cursor.turnTrigger : null;
     if (typeof source.threadId !== 'string' || !source.threadId || source.threadId.length > 128 || source.parentId !== null || !source.hostRunId || !Number.isFinite(source.hostStartedAt) || !['vscode', 'cli', 'appServer'].includes(source.sourceKind) || source.originator !== 'Codex Desktop') this.gap = 'main-identity-unverified';
     else if (source.forkedFromId && !forkSuffix && !this.historyMode) this.gap = 'fork-provenance-unverified';
-    else if (profileKey(source.profile) !== profileKey(supportedProfile)) this.gap = 'unsupported-host-version';
+    else if (!supportsHostProfile(source.profile)) this.gap = 'unsupported-host-version';
     else if (this.historyMode && (!Number.isSafeInteger(this.historyRange?.endOrdinalExclusive) || this.historyRange.endOrdinalExclusive < 1 || !Number.isSafeInteger(this.historyRange?.endByteOffset) || this.historyRange.endByteOffset < 1)) this.gap = 'history-boundary-unverified';
     else if (cursor && this.materialMode && cursor.projectionMode !== this.mode) this.gap = 'material-cursor-baseline-missing';
     else if (cursor && this.materialMode && cursor.nativeOriginVersion !== this.nativeOriginVersion) this.gap = 'cursor-invalid';
     else if (cursor && this.materialMode && cursor.state?.header && cursor.header?.threadId !== source.threadId) this.gap = 'cursor-invalid';
+    else if (cursor?.state?.header && cursor.header && !producerAllowed(source, cursor.header.cliVersion)) this.gap = 'cursor-invalid';
     const pristineV2 = cursor && this.nativeOriginVersion === 2 && cursor.format === 3 && cursor.scope === this.scope && cursor.offset === 0 && cursor.fileId === null && cursor.knownSize === null && cursor.attachSize === null && cursor.state?.header === false && cursor.state?.anchored === false && cursor.state?.phase === 'unknown' && cursor.state?.turnId === null && cursor.gap === null;
     if (cursor && !this.gap && !pristineV2) {
       const s = cursor.state;
@@ -165,7 +169,9 @@ export class BoundedReader {
         if (this.state.header) this.gap = 'record-identity-changed';
         return;
       }
-      this.header = nativeHeader(row); if (this.nativeOriginVersion === 2) this.io?.header(this.header);
+      this.header = nativeHeader(row);
+      if (!producerAllowed(this.source, this.header.cliVersion)) { this.gap = 'record-producer-unverified'; return; }
+      if (this.nativeOriginVersion === 2) this.io?.header(this.header);
       if (this.source.expectedHeader && JSON.stringify(this.header) !== JSON.stringify(this.source.expectedHeader)) { this.gap = 'history-source-generation-changed'; return; }
       if (this.historyMode && row.ordinal >= this.historyRange.endOrdinalExclusive) { this.gap = 'history-generation-range-unverified'; return; }
       if (this.ordinalMode) {
@@ -182,7 +188,12 @@ export class BoundedReader {
     const historyProducer = this.materialMode && this.historyMode && row.type === 'event_msg' && row.payload?.type === 'item_completed' && row.material.fields['payload.item.type']?.text === 'UserMessage';
     if (this.materialMode && (this.state.anchored && this.state.turnId || historyProducer)) {
       const turnId = historyProducer ? row.payload.turn_id : this.state.turnId;
+      const itemType = row.material.fields['payload.item.type']?.text;
+      if (row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type) && row.payload.turn_id === turnId && !materialItems.has(itemType)) { this.gap = 'unsupported-item-type:' + digest(JSON.stringify(itemType ?? null)); return; }
       const material = materialRecord(row, turnId, recordStart, this.offset + 1, turnId === this.state.turnId ? this.turnTrigger : null);
+      // Do not reserve a native body identity for a temporary omission: later
+      // fixed-field support must not conflict with an already captured body.
+      if (material?.turnId === turnId && material.kind === 'tool-result' && row.type === 'response_item' && ['function_call_output', 'custom_tool_call_output'].includes(row.payload.type) && !row.material.fields['payload.output']) { this.gap = 'unsupported-tool-result-shape'; return; }
       if (material && (material.turnId === this.state.turnId || historyProducer)) {
         if (this.nativeOriginVersion === 2) Object.assign(material.data, { nativeGenerationKey: nativeStorageKey(this.source.path), nativeRecordStart: recordStart, nativeRecordEnd: this.offset + 1 });
         material.data.nativeRecordId = nativeRecordIdentity(this.originIdentity ?? this.fileId, this.header, recordStart, material.data.nativeType);
@@ -251,7 +262,7 @@ export class BoundedReader {
     if (this.materialMode && !this.busy) { this.recentLifecycle = []; this.materials = []; }
     if (this.closed) return { ...this.view('reader-closed'), readBytes: 0 };
     if (this.gap) return { ...this.view(), readBytes: 0 };
-    if (profileKey(profile) !== profileKey(supportedProfile)) { this.gap = 'unsupported-host-version'; return { ...this.view(), readBytes: 0 }; }
+    if (!supportsHostProfile(profile) || profileKey(profile) !== this.hostProfileKey || profileKey(this.source.profile) !== this.hostProfileKey) { this.gap = 'unsupported-host-version'; return { ...this.view(), readBytes: 0 }; }
     if (hostRunId !== this.source.hostRunId) { this.gap = 'source-generation-changed'; return { ...this.view(), readBytes: 0 }; }
     this.available = available;
     if (!available) { this.needsGuard = true; return { ...this.view('source-unavailable'), readBytes: 0 }; }
@@ -338,7 +349,7 @@ export class BoundedReader {
         }
         return { ...this.view(), readBytes, decodedBytes, nativeOrigins: [] };
       }
-      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins: this.origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); return nativeHeader(row); } });
+      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins: this.origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); const header = nativeHeader(row); if (!producerAllowed(this.source, header.cliVersion)) throw Object.assign(new Error('unverified native producer'), { code: 'record-producer-unverified' }); return header; } });
       const value = await this.io.pump({ physicalBudget: budgetBytes, decodedBudget: decodedBudgetBytes, limit: this.historyRange?.endByteOffset ?? Infinity, verifyOnly }, bytes => {
         this.attachSize ??= this.io.decodedSize;
         const before = this.offset; this.consume(bytes); return this.offset - before;
@@ -362,7 +373,7 @@ export class BoundedReader {
         this.coldCheckpoint = previous;
         this.coldScan = scan;
       }
-    } catch (error) { this.handle = this.io?.handle ?? null; readBytes = error.physicalBytes ?? readBytes; decodedBytes = error.decodedBytes ?? decodedBytes; this.gap = ['native_origin_prefix_changed', 'native_origin_header_changed', 'record-path-unverified', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'compressed-frame-unverified', 'compressed-window-unverified', 'compressed-data-invalid', 'decoded-budget-exceeded', 'decoded-buffer-exceeded'].includes(error.code) ? error.code : 'record-source-unavailable'; if (sourceIoCodes.has(error?.code)) this.error = { code: error.code }; }
+    } catch (error) { this.handle = this.io?.handle ?? null; readBytes = error.physicalBytes ?? readBytes; decodedBytes = error.decodedBytes ?? decodedBytes; this.gap = ['native_origin_prefix_changed', 'native_origin_header_changed', 'record-path-unverified', 'record-producer-unverified', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'compressed-frame-unverified', 'compressed-window-unverified', 'compressed-data-invalid', 'decoded-budget-exceeded', 'decoded-buffer-exceeded'].includes(error.code) ? error.code : 'record-source-unavailable'; if (sourceIoCodes.has(error?.code)) this.error = { code: error.code }; }
     finally { this.busy = false; this.metrics.physicalBytes += readBytes; this.metrics.decodedBytes = (this.metrics.decodedBytes ?? 0) + decodedBytes; this.metrics.maximumReadBytes = Math.max(this.metrics.maximumReadBytes, readBytes); finishPump(); this.pumpComplete = null; }
     return { ...this.view(), readBytes, decodedBytes, nativeOrigins: this.io?.proof() ? [this.io.proof()] : [], nativeRangeProof: this.io?.rangeProof() ?? null };
   }

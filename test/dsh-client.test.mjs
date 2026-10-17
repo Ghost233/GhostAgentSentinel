@@ -1,4 +1,4 @@
-import { req, clientRequire } from './dsh-native-runtime.mjs'
+import { req, clientRequire, resolveGatewayBrowserClientPath } from './dsh-native-runtime.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile, mkdtemp, rm } from 'node:fs/promises'
@@ -101,7 +101,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
       } },
     })
     let remoteFactory
-    runInNewContext(await readFile(req.resolve('@deepseek-ai/dsh-api-gateway/client'), 'utf8'), {
+    runInNewContext(await readFile(await resolveGatewayBrowserClientPath(), 'utf8'), {
       window: { crypto: globalThis.crypto, __ModuleLoader__: { load(value) { remoteFactory = value.factory } } },
       crypto: globalThis.crypto, setTimeout, clearTimeout, AbortController, AbortSignal, console,
     })

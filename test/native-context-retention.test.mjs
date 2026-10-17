@@ -9,6 +9,8 @@ import { createObservation, hostIdentity } from '../dsh/observation.mjs'
 import { createAdapter } from '../dsh/host.mjs'
 import { startServer } from '../src/server.mjs'
 
+const boundedPagingSupported = ['observeSessionPage', 'releaseObservationPageCursor'].every(name => typeof req('@deepseek-ai/dsh-session-query').default.prototype[name] === 'function')
+const extendedPaging = { skip: boundedPagingSupported ? false : 'unsupported: stock SDK has no bounded cold page / cursor-release API; extended SDK scenario retained' }
 const { Context } = req('@deepseek-ai/cordis')
 const modules = ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop', 'dsh-fs-local', 'dsh-working-directory', 'dsh-subagent', 'dsh-session-query'].map(name => { const module = req(`@deepseek-ai/${name}`); return module.default ?? module })
 async function until(predicate, label) {
@@ -53,7 +55,7 @@ test('the long-lived native observer bounds and expires watermarks when read-onl
   assert.equal(f.adapter.diagnostics().collector.hierarchyObservedSessions, 0)
 })
 
-test('a no-Agent cold native title is sanitized before the adapter memory transport sees either its head or a credential after character 240', async t => {
+test('a no-Agent cold native title is sanitized before the adapter memory transport sees either its head or a credential after character 240', extendedPaging, async t => {
   const f = await fixture(t), parent = await f.create('private-title-root')
   const headers = new Map()
   let pageReads = 0, legacyReads = 0
@@ -214,4 +216,33 @@ test('three genuine native external runs retain a non-null budget gap accepted b
   assert.equal(plainRegistered.status, 200)
   assert.equal((await request('source/ingest', { sourceKey: plainRegistered.body, batch: plainBatch })).status, 200)
   assert.ok(plainBatch.hierarchyContext.coverage.branchGaps.some(gap => gap.sessionId === 'plain-gap-0'))
+})
+
+test('stock cold observation stays unknown without reading a private title or claiming that unread data was sanitized', { skip: boundedPagingSupported ? 'stock-only refusal contract; bounded paging is available' : false }, async t => {
+  const f = await fixture(t), parent = await f.create('stock-private-title-root')
+  assert.equal(typeof f.ctx.sessionQuery.observeSessionPage, 'undefined')
+  assert.equal(typeof f.ctx.sessionQuery.releaseObservationPageCursor, 'undefined')
+  const calls = { stat: 0, open: 0, observe: 0 }, secret = 'Authorization: Bearer stock-private-unread-secret'
+  const observe = f.ctx.sessionQuery.observeSession.bind(f.ctx.sessionQuery)
+  f.ctx.sessionQuery.observeSession = (...args) => { calls.observe++; return observe(...args) }
+  f.ctx.provide('sessionPersistence', { identity: 'stock-private-title-store',
+    async stat(id) { calls.stat++; return { header: { ...parent.agent.session.header, id, title: secret }, revision: 'one' } },
+    async open() { calls.open++; throw new Error('stock cold observation must not attempt an unbounded open') },
+  })
+  parent.agent.session.append('subagent/catalog', { version: 0, childId: 'stock-private-cold', childCreatedAt: Date.now(), mode: 'one-shot' })
+  let row
+  await until(() => { row = f.batches.flatMap(batch => batch.tasks).findLast(task => task.sessionId === 'stock-private-cold'); return row && JSON.stringify(f.batches).includes('有预算的只读会话分页') && !f.adapter.diagnostics().hierarchyReader.pending }, 'stock unknown cold branch reaches the production adapter transport')
+  assert.equal(row.status, 'unknown')
+  assert.ok(JSON.stringify(f.batches).includes('有预算的只读会话分页'))
+  assert.ok(!row.gaps.includes('任务名称中认证材料已省略'), 'unread title cannot claim successful sanitization')
+  assert.ok(!JSON.stringify(f.batches).includes('stock-private-unread-secret'))
+  assert.deepEqual(calls, { stat: 0, open: 0, observe: 0 })
+  assert.equal(f.ctx.agents.get('stock-private-cold'), undefined)
+  assert.equal(f.ctx.sessions.get('stock-private-cold'), undefined)
+  assert.equal((await f.adapter.close()).status, 'closed')
+  const diagnostics = f.adapter.diagnostics()
+  assert.equal(diagnostics.adapter.activeRequests, 0)
+  assert.equal(diagnostics.hierarchyReader.activeLeases, 0)
+  assert.equal(diagnostics.hierarchyReader.pendingColdReads, 0)
+  assert.equal(parent.agent.status, 'idle')
 })

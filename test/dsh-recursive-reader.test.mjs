@@ -7,6 +7,8 @@ import { req } from './dsh-native-runtime.mjs'
 import { startServer } from '../src/server.mjs'
 import { createAdapter } from '../dsh/host.mjs'
 import { HIERARCHY_FEATURE } from '../src/hierarchy.mjs'
+const boundedPagingSupported = ['observeSessionPage', 'releaseObservationPageCursor'].every(name => typeof req('@deepseek-ai/dsh-session-query').default.prototype[name] === 'function')
+const extendedPaging = { skip: boundedPagingSupported ? false : 'unsupported: stock SDK has no bounded cold page / cursor-release API; extended SDK scenario retained' }
 const { Context } = req('@deepseek-ai/cordis')
 const modules = ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop', 'dsh-fs-local', 'dsh-working-directory', 'dsh-subagent', 'dsh-session-query'].map(name => { const module = req(`@deepseek-ai/${name}`); return module.default ?? module })
 const until = async (predicate, label) => { const deadline = Date.now() + 2500; while (!await predicate()) { assert.ok(Date.now() < deadline, label); await new Promise(resolve => setTimeout(resolve, 10)) } }
@@ -248,7 +250,7 @@ test('closing a legacy observer has no cold IO or leases to leave pending and pr
   assert.equal(f.parent.agent.status, 'idle')
 })
 
-test('a public page method backed by an unsupported provider never falls back to legacy storage or restoration', async t => {
+test('a public page method backed by an unsupported provider never falls back to legacy storage or restoration', extendedPaging, async t => {
   const f = await fixture(t, { unsupportedPages: true })
   await until(() => f.adapter.connected && !f.adapter.diagnostics().hierarchyReader.pending, 'provider capability refusal settled')
   const snapshot = await f.adapter.snapshot()
@@ -260,7 +262,7 @@ test('a public page method backed by an unsupported provider never falls back to
   assert.equal(f.parent.agent.status, 'idle')
 })
 
-test('public SDK cold pages keep an unknown seed outside own facts and share continued directory reads across viewers', async t => {
+test('public SDK cold pages keep an unknown seed outside own facts and share continued directory reads across viewers', extendedPaging, async t => {
   const f = await fixture(t, { boundedPages: true })
   await until(() => f.counters.pageReads === 2, 'second bounded native page pending')
   const first = await f.adapter.snapshot()
@@ -280,7 +282,7 @@ test('public SDK cold pages keep an unknown seed outside own facts and share con
   assert.equal(f.parent.agent.status, 'idle')
 })
 
-test('closing a source releases its bounded continuation and a late SDK page cannot register a replacement cursor or publish', async t => {
+test('closing a source releases its bounded continuation and a late SDK page cannot register a replacement cursor or publish', extendedPaging, async t => {
   const f = await fixture(t, { boundedPages: true, closeTimeoutMs: 25, expectedCloseStatus: 'incomplete' })
   await until(() => f.counters.pageReads === 2, 'second bounded page in flight')
   const result = await f.adapter.close()
