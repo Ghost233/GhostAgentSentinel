@@ -159,7 +159,7 @@ export function createPluginHost({ socketPath, marketplacePath, marketplaceName,
     if (setting(before.user.config, pluginId) === value) return before.view
     let result
     try {
-      result = await rpc.request('config/batchWrite', { edits: [{ keyPath: 'plugins.' + JSON.stringify(pluginId) + '.enabled', value, mergeStrategy: 'replace' }], expectedVersion: expectedRevision, filePath: before.user.name.file, reloadUserConfig: false })
+      result = await rpc.request('config/batchWrite', { edits: [{ keyPath: 'plugins.' + JSON.stringify(pluginId) + '.enabled', value, mergeStrategy: 'replace' }], expectedVersion: expectedRevision, filePath: before.user.name.file, reloadUserConfig: true })
     } catch (error) { if (error.rpcCode === undefined) error.mutationOutcome = 'unknown'; throw error }
     const after = await readState()
     if (typeof result?.version !== 'string' || result.filePath !== before.user.name.file || after.view.revision !== result.version || setting(after.user?.config, pluginId) !== value) throw failure('plugin_host_write_unconfirmed')

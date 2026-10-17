@@ -82,7 +82,16 @@ test('stopping one plugin writes only its enabled key with a configuration revis
   assert.equal(f.state.otherEnabled, true)
   const writes = f.calls.filter(call => call.method === 'config/batchWrite')
   assert.equal(writes.length, 1)
-  assert.deepEqual(writes[0].params, { edits: [{ keyPath: 'plugins."' + f.options.pluginId + '".enabled', value: false, mergeStrategy: 'replace' }], expectedVersion: 'user-revision-1', filePath: join(f.options.pluginPath, '../config.toml'), reloadUserConfig: false })
+  assert.deepEqual(writes[0].params, { edits: [{ keyPath: 'plugins."' + f.options.pluginId + '".enabled', value: false, mergeStrategy: 'replace' }], expectedVersion: 'user-revision-1', filePath: join(f.options.pluginPath, '../config.toml'), reloadUserConfig: true })
+})
+
+test('enabling the managed plugin applies only its own revision-protected setting to loaded chats', async t => {
+  const f = await fixture(t); f.state.enabled = false
+  const before = await f.host.inspect(), after = await f.host.setEnabled(true, before.revision)
+  assert.equal(after.enabled, 'enabled'); assert.equal(f.state.otherEnabled, true)
+  const writes = f.calls.filter(call => call.method === 'config/batchWrite')
+  assert.deepEqual(writes.map(call => call.params), [{ edits: [{ keyPath: 'plugins.' + JSON.stringify(f.options.pluginId) + '.enabled', value: true, mergeStrategy: 'replace' }], expectedVersion: before.revision, filePath: join(f.options.pluginPath, '../config.toml'), reloadUserConfig: true }])
+  assert.ok(f.calls.every(call => ['initialize', 'initialized', 'plugin/list', 'plugin/read', 'config/read', 'config/batchWrite'].includes(call.method)))
 })
 
 test('a concurrent user write is preserved rather than retried or reported as a completed toggle', async t => {
