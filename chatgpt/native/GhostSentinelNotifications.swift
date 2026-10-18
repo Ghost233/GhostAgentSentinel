@@ -92,7 +92,11 @@ private func execute(_ request: [String: Any]) {
     case "status":
         do { _ = try actionJournal.read() } catch { reply(operation, error: "native_unavailable"); return }
         settings { reply(operation, result: $0) }
-    case "authorize": center.requestAuthorization(options: [.alert, .sound]) { _, error in if error != nil { reply(operation, error: "native_unavailable") } else { settings { reply(operation, result: $0) } } }
+    case "authorize":
+        settings { current in
+            if current["authorization"] as? String == "denied" { reply(operation, result: current); return }
+            center.requestAuthorization(options: [.alert, .sound]) { _, error in if error != nil { reply(operation, error: "native_unavailable") } else { settings { reply(operation, result: $0) } } }
+        }
     case "snapshot": snapshot(prefix) { reply(operation, result: $0) }
     case "cancel":
         guard let ids = request["requestIds"] as? [String], ids.count <= 100, ids.allSatisfy({ owned($0, prefix) }) else { reply(operation, error: "native_protocol"); return }
