@@ -224,11 +224,14 @@ test('polling and authenticated reads fail closed for unconfirmed maintenance ma
     // Absence permits Native qualification, so polling must always see a marker.
     const temporary = path + '.' + randomUUID() + '.tmp'
     await create(temporary); await rename(temporary, path)
+    // Drain any poll that sampled the previous marker before asserting this one.
+    await runtime.refresh()
     assert.equal((await read()).observation.gap, 'installation-maintenance-unconfirmed', name)
     assert.equal(hostReads, 0, name + ' must not sample Native')
     await assert.rejects(stat(join(f.dir, 'core/runtime.json')), { code: 'ENOENT' })
   }
   await rm(path)
+  await runtime.refresh()
   assert.equal((await read()).observation.gap, 'execution-source-unavailable')
   assert.ok(hostReads > 0)
 })
