@@ -14,10 +14,12 @@ import { createServer } from 'node:http'
 import { connectCore } from '../src/core-client.mjs'
 import { resourceMaterial } from './fixtures/chatgpt-plugin-lazy/resource-material.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
+import { Client } from '../chatgpt/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js'
+import { StdioClientTransport } from '../chatgpt/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js'
 
-async function bounded(promise, label) {
+async function bounded(promise, label, timeoutMs = 5000) {
   const controller = new AbortController()
-  try { return await Promise.race([promise, delay(5000, null, { signal: controller.signal }).then(() => assert.fail(label))]) }
+  try { return await Promise.race([promise, delay(timeoutMs, null, { signal: controller.signal }).then(() => assert.fail(label))]) }
   finally { controller.abort() }
 }
 
@@ -62,6 +64,66 @@ async function setup(t) {
   }
   return { ...prepared, dir, statePath, callsPath, pidsPath, faultPath, auditPath, owner, bridge }
 }
+
+for (const kind of ['control', 'health-timeout', 'health-network', 'health-expired-success', 'health-identity', 'health-401', 'health-403', 'health-404', 'health-503']) test(`initial handshake with ${kind} never launches a second healthy owner`, async t => {
+  const env = await setup(t), owner = await env.owner()
+  assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
+  await writeFile(env.faultPath, JSON.stringify({ startup: kind === 'control' ? null : kind }))
+  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url).pathname, env.configPath, env.faultPath, env.auditPath], stderr: 'pipe' })
+  transport.stderr.on('data', () => {})
+  const client = new Client({ name: 'initial-handshake-feedback', version: '1' })
+  const started = performance.now(), soft = ['control', 'health-timeout', 'health-network'].includes(kind)
+  try {
+    const connecting = bounded(client.connect(transport), 'initial handshake exceeded its original five-second startup budget')
+    if (soft) {
+      await connecting
+      assert.ok(performance.now() - started < 5000)
+      assert.ok((await client.listTools()).tools.some(tool => tool.name === 'sentinel_current_chat'))
+    } else await assert.rejects(connecting, /Connection closed/)
+    const facts = (await readFile(env.auditPath, 'utf8')).trim().split('\n').map(JSON.parse)
+    assert.equal(facts.filter(fact => fact.event === 'unexpected-owner-launch').length, 0)
+    assert.equal(facts.filter(fact => fact.event === 'mcp-request' && fact.method === 'initialize').length, soft ? 1 : 0, 'the handshake request is sent once, only after owner qualification')
+    assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
+    assert.equal(owner.child.exitCode, null)
+    if (!soft) {
+      assert.ok(facts.some(fact => fact.event === 'bridge-start-failed'))
+      assert.equal(facts.filter(fact => fact.event === 'bridge-ready').length, 0, 'an inadmissible owner cannot open stdio')
+    }
+    if (kind === 'health-expired-success') assert.ok(facts.some(fact => fact.event === 'healthy-owner-returned-after-budget'))
+  } finally {
+    await client.close()
+    await bounded((async () => { while (transport.pid !== null) await delay(10) })(), 'initial handshake bridge did not exit')
+    await writeFile(env.statePath, 'false')
+    assert.deepEqual(await bounded(owner.child.ended, 'initial handshake fixture owner did not exit'), [0, null], owner.child.errors)
+  }
+})
+
+for (const fault of [{ kind: 'persistent-health-network' }, { kind: 'persistent-health-timeout' }, { startup: ['health-network', 'health-503'] }]) test(`initial handshake bounds ${JSON.stringify(fault)} without launching or sending initialize`, async t => {
+  const env = await setup(t), owner = await env.owner()
+  assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
+  await writeFile(env.faultPath, JSON.stringify(fault))
+  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url).pathname, env.configPath, env.faultPath, env.auditPath], stderr: 'pipe' })
+  transport.stderr.on('data', () => {})
+  const client = new Client({ name: 'initial-handshake-budget', version: '1' })
+  try {
+    // Process spawning is outside the bridge's measured five-second budget.
+    await assert.rejects(bounded(client.connect(transport), 'unavailable initial handshake failed to close', 8000), /Connection closed/)
+    const facts = (await readFile(env.auditPath, 'utf8')).trim().split('\n').map(JSON.parse)
+    const failure = facts.find(fact => fact.event === 'bridge-start-failed')
+    assert.ok(failure.elapsedMs <= 5000, 'the startup health wait keeps the original five-second ceiling')
+    assert.equal(facts.filter(fact => fact.event === 'unexpected-owner-launch').length, 0)
+    assert.equal(facts.filter(fact => fact.event === 'mcp-request').length, 0, 'initialize has not been forwarded or replayed')
+    if (fault.startup) { assert.equal(facts.filter(fact => fact.event === 'health-fault').length, 2); assert.ok(failure.elapsedMs < 2000, 'a hard status after a soft failure is not retried') }
+    else assert.ok(facts.filter(fact => fact.event === 'health-fault').length > 1)
+    assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
+    assert.equal(owner.child.exitCode, null)
+  } finally {
+    await client.close()
+    await bounded((async () => { while (transport.pid !== null) await delay(10) })(), 'failed initial bridge did not exit')
+    await writeFile(env.statePath, 'false')
+    assert.deepEqual(await bounded(owner.child.ended, 'startup budget fixture owner did not exit'), [0, null], owner.child.errors)
+  }
+})
 
 for (const kind of ['health-timeout', 'health-network', 'http-503', 'http-close']) test(`a committed pause survives ${kind} as an explicit unknown followed by a fresh read and explicit resume`, async t => {
   const env = await setup(t), owner = await env.owner(), bridge = env.bridge({ faults: true }), core = await connectCore({ dataDir: join(env.dir, 'core') })

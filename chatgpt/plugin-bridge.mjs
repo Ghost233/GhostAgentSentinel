@@ -14,12 +14,20 @@ async function startOwner(configPath) {
 
 // A per-chat protocol connection only; collection belongs to plugin-main.
 export async function startPluginBridge({ configPath, input = process.stdin, output = process.stdout, startOwner: launch = startOwner } = {}) {
-  let owner = await resolvePluginOwner({ configPath })
-  if (!owner) {
-    await launch(configPath)
-    const deadline = Date.now() + 5000
-    while (!owner && Date.now() < deadline) { await delay(25); owner = await resolvePluginOwner({ configPath }) }
-    if (!owner) throw new Error('plugin observation did not start')
+  const deadline = Date.now() + 5000
+  let owner, launched = false, unavailable
+  while (!owner) {
+    // Do not start another fixed 750 ms health probe beyond the startup budget.
+    if (Date.now() + 750 > deadline) throw unavailable ?? new Error('plugin observation did not start')
+    try { owner = await resolvePluginOwner({ configPath }) }
+    catch (error) {
+      if (error.code !== 'plugin_owner_health_unavailable') throw error
+      unavailable = error
+    }
+    if (Date.now() > deadline) throw unavailable ?? new Error('plugin observation did not start')
+    if (owner) break
+    if (!unavailable && !launched) { await launch(configPath); launched = true }
+    await delay(25)
   }
   const stdio = new StdioServerTransport(input, output, { maxBufferSize: 1024 * 1024 })
   const requests = new Map(), clientIds = new Set()
