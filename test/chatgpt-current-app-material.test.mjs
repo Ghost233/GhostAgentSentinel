@@ -78,6 +78,20 @@ test('verified custom tool input_text arrays become one bounded result without b
   assert.equal(task.events.filter(event => event.kind === 'input').length, 1)
 })
 
+test('observed function tool input_text arrays reach Core as bounded results without input or verification authority', async t => {
+  const f = await fixture(t, { suffix: row(4, 'response_item', { type: 'function_call_output', call_id: 'function-array', output: [{ type: 'input_text', text: 'Synthetic function result' }, { text: 'A second fixed result segment', type: 'input_text' }] }) })
+  const view = await f.caughtUp()
+  assert.equal(view.observation.coverage, 'caught-up')
+  const task = (await f.core.snapshot()).tasks[0], result = task.events.find(event => event.data?.callId === 'function-array')
+  assert.equal(result.kind, 'tool-result'); assert.equal(result.text, 'Synthetic function result\nA second fixed result segment')
+  assert.equal(result.data.nativeType, 'response_item/function_call_output')
+  assert.notEqual(result.authorizationEligible, true)
+  for (const key of ['inputOrigin', 'inputPhase', 'exitCode', 'sourceVersion', 'validationScope', 'command']) assert.equal(result.data[key], undefined)
+  assert.equal(task.currentRequest, 'Inspect only the synthetic log')
+  assert.equal(task.coverage.complete, true)
+  assert.equal(task.events.filter(event => event.kind === 'input').length, 1)
+})
+
 test('dotted property names cannot impersonate structural array elements or the payload output field', async t => {
   await t.test('sibling-with-dotted-name', async t => {
     const f = await fixture(t, { suffix: row(4, 'response_item', { type: 'custom_tool_call_output', call_id: 'real-array', output: [{ type: 'input_text', text: 'Actual structural text' }], 'output.1': { type: 'input_text', text: 'PHANTOM-SIBLING-BODY' } }) })
@@ -93,10 +107,15 @@ test('dotted property names cannot impersonate structural array elements or the 
     assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).some(event => event.data?.callId === 'phantom-array'), false)
   })
   await t.test('payload-kind-alias', async t => {
-    const suffix = JSON.stringify({ ordinal: 4, type: 'response_item', timestamp: new Date(at).toISOString(), payload: { type: 'function_call_output', call_id: 'phantom-kind', output: [{ type: 'input_text', text: 'UNOBSERVED-KIND-BODY' }] }, 'payload.type': 'custom_tool_call_output' }) + '\n'
+    const suffix = JSON.stringify({ ordinal: 4, type: 'response_item', timestamp: new Date(at).toISOString(), payload: { type: 'future_tool_call_output', call_id: 'phantom-kind', output: [{ type: 'input_text', text: 'UNOBSERVED-KIND-BODY' }] }, 'payload.type': 'custom_tool_call_output' }) + '\n'
     const f = await fixture(t, { suffix }), view = await f.caughtUp()
-    assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'unsupported-tool-result-shape')
-    assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).some(event => event.data?.callId === 'phantom-kind'), false)
+    assert.equal(view.signal, 'gray'); assert.equal(view.observation.coverage, 'caught-up')
+    const task = (await f.core.snapshot()).tasks[0], gap = task.events.find(event => event.data?.nativeType === 'response_item/future_tool_call_output')
+    assert.equal(gap.kind, 'gap'); assert.equal(task.coverage.complete, false)
+    assert.equal(task.events.some(event => event.data?.callId === 'phantom-kind'), false)
+    assert.doesNotMatch(JSON.stringify(task.events), /UNOBSERVED-KIND-BODY/)
+    const projection = new MaterialProjection(); projection.write(Buffer.from(suffix))
+    assert.equal(projection.finish().material.fields['payload.output'], undefined)
   })
   await t.test('root-kind-alias', async t => {
     const suffix = JSON.stringify({ ordinal: 4, type: 'world_state', timestamp: new Date(at).toISOString(), payload: { type: 'custom_tool_call_output', call_id: 'phantom-root-kind', output: [{ type: 'input_text', text: 'UNOBSERVED-RECORD-BODY' }] }, '': { type: 'response_item' } }) + '\n'
@@ -153,10 +172,10 @@ test('unverified and malformed tool arrays stay gray across later completion and
     ['unverified-image', [{ type: 'input_image', image_url: 'unverified-body' }]], ['mixed', [{ type: 'input_text', text: 'unverified-body' }, { type: 'input_audio', audio_url: 'unverified-body' }]],
     ['extra-field', [{ type: 'input_text', text: 'unverified-body', extra: { authorization: 'Bearer PRIVATE-UNVERIFIED' } }]],
   ]
-  for (const [name, output] of cases) await t.test(name, async t => {
+  for (const type of ['function_call_output', 'custom_tool_call_output']) for (const [name, output] of cases) await t.test(type + '/' + name, async t => {
     const f = await fixture(t); await f.caughtUp()
     const before = (await f.core.snapshot()).tasks[0], old = before.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence]), progress = (await f.core.diagnostics()).retained.nativeCaptureProgress.records
-    f.advance(); await fs.appendFile(f.path, row(4, 'response_item', { type: 'custom_tool_call_output', call_id: 'bad-array', output }) + row(5, 'event_msg', { type: 'task_complete', turn_id: 'turn' }))
+    f.advance(); await fs.appendFile(f.path, row(4, 'response_item', { type, call_id: 'bad-array', output }) + row(5, 'event_msg', { type: 'task_complete', turn_id: 'turn' }))
     let view = await f.caughtUp(), after = (await f.core.snapshot()).tasks[0]
     assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'unsupported-tool-result-shape')
     assert.equal(after.coverage.complete, false); assert.equal(after.status, 'unknown'); assert.equal(after.lastActivity, before.lastActivity)
@@ -169,21 +188,22 @@ test('unverified and malformed tool arrays stay gray across later completion and
   })
 })
 
-test('only observed custom-tool arrays are admitted while scalar function and custom results retain their old contracts', async t => {
+test('observed function arrays coexist with scalar function and custom results without replacing earlier material', async t => {
   const f = await fixture(t, { suffix: row(4, 'response_item', { type: 'function_call_output', call_id: 'function-scalar', output: 'Function scalar result' }) + row(5, 'response_item', { type: 'custom_tool_call_output', call_id: 'custom-scalar', output: 'Custom scalar result' }) })
   assert.equal((await f.caughtUp()).observation.coverage, 'caught-up')
   const first = (await f.core.snapshot()).tasks[0], results = first.events.filter(event => event.kind === 'tool-result')
   assert.deepEqual(results.map(event => event.text), ['Function scalar result', 'Custom scalar result'])
-  await fs.appendFile(f.path, row(6, 'response_item', { type: 'function_call_output', call_id: 'unobserved-array', output: [{ type: 'input_text', text: 'Unverified function array body' }] }))
+  await fs.appendFile(f.path, row(6, 'response_item', { type: 'function_call_output', call_id: 'observed-array', output: [{ type: 'input_text', text: 'Function array result' }] }))
   const view = await f.caughtUp(), after = (await f.core.snapshot()).tasks[0]
-  assert.equal(view.observation.gap, 'unsupported-tool-result-shape'); assert.equal(view.signal, 'gray')
-  assert.deepEqual(after.events.filter(event => event.kind === 'tool-result').map(event => event.text), results.map(event => event.text))
+  assert.equal(view.observation.gap, null); assert.equal(view.observation.coverage, 'caught-up')
+  assert.equal(after.coverage.complete, true)
+  assert.deepEqual(after.events.filter(event => event.kind === 'tool-result').map(event => event.text), [...results.map(event => event.text), 'Function array result'])
 })
 
 test('array excerpts share one hard text budget and late authentication fields redact the whole output with an explicit coverage gap', async t => {
-  for (const mode of ['many-elements', 'late-authentication']) await t.test(mode, async t => {
+  for (const type of ['function_call_output', 'custom_tool_call_output']) for (const mode of ['many-elements', 'late-authentication']) await t.test(type + '/' + mode, async t => {
     const output = mode === 'many-elements' ? Array.from({ length: 5000 }, () => ({ type: 'input_text', text: 'A bounded excerpt segment' })) : [{ type: 'input_text', text: 'Prefix before a later sensitive element' }, { type: 'input_text', text: 'x'.repeat(400000) + ' Authorization: Bearer PRIVATE-LATE-ARRAY-TOKEN' }]
-    const f = await fixture(t, { suffix: row(4, 'response_item', { type: 'custom_tool_call_output', call_id: 'bounded-array', output }) + row(5, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) }), view = await f.caughtUp(), task = (await f.core.snapshot()).tasks[0], result = task.events.find(event => event.data?.callId === 'bounded-array')
+    const f = await fixture(t, { suffix: row(4, 'response_item', { type, call_id: 'bounded-array', output }) + row(5, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) }), view = await f.caughtUp(), task = (await f.core.snapshot()).tasks[0], result = task.events.find(event => event.data?.callId === 'bounded-array')
     assert.ok(['caught-up', 'retained-history'].includes(view.observation.coverage)); assert.equal(task.coverage.complete, false)
     assert.equal(result.kind, 'tool-result'); assert.ok(result.text.length <= 240); assert.equal(result.data.truncated, true)
     assert.notEqual(result.authorizationEligible, true)
@@ -199,8 +219,8 @@ test('duplicate array fields cannot fall back to an earlier scalar or manufactur
     '"output":"earlier-scalar","output":[{"type":"input_text"}]',
     '"output":[{"type":"input_text","text":"earlier-array"}],"output":"later-scalar"',
   ]
-  for (const [index, output] of outputs.entries()) await t.test(String(index), async t => {
-    const suffix = '{"ordinal":4,"type":"response_item","timestamp":"' + new Date(at).toISOString() + '","payload":{"type":"custom_tool_call_output","call_id":"duplicate-output",' + output + '}}\n'
+  for (const type of ['function_call_output', 'custom_tool_call_output']) for (const [index, output] of outputs.entries()) await t.test(type + '/' + index, async t => {
+    const suffix = '{"ordinal":4,"type":"response_item","timestamp":"' + new Date(at).toISOString() + '","payload":{"type":"' + type + '","call_id":"duplicate-output",' + output + '}}\n'
     const f = await fixture(t, { suffix }), view = await f.caughtUp()
     assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, index < 2 ? 'unsupported-tool-result-shape' : 'record-malformed-or-over-limit')
     assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).some(event => event.data?.callId === 'duplicate-output'), false)

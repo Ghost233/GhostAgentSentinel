@@ -156,11 +156,11 @@ export class MaterialProjection {
     if (this.stack.length) throw new Error('incomplete JSON record')
     if (this.structureAmbiguous) throw new Error('ambiguous material structure')
     const scalar = path => this.fields[path]?.text
-    // Only the observed custom-tool array form is admitted. One streaming
+    // Only the observed function/custom-tool array forms are admitted. One streaming
     // element and one total 240-character excerpt are retained, never N bodies.
     if (this.toolArray) {
       delete this.fields['payload.output']
-      if (this.outputValues === 1 && this.toolArray.valid && this.toolArray.elements > 0 && this.recordTypeCount === 1 && this.payloadTypeCount === 1 && this.recordType === 'response_item' && this.payloadType === 'custom_tool_call_output' && scalar('type') === this.recordType && scalar('payload.type') === this.payloadType) this.fields['payload.output'] = { ...this.toolBody, text: this.toolBody.redacted ? '认证材料已省略，当前证据不完整' : this.toolBody.text }
+      if (this.outputValues === 1 && this.toolArray.valid && this.toolArray.elements > 0 && this.recordTypeCount === 1 && this.payloadTypeCount === 1 && this.recordType === 'response_item' && ['function_call_output', 'custom_tool_call_output'].includes(this.payloadType) && scalar('type') === this.recordType && scalar('payload.type') === this.payloadType) this.fields['payload.output'] = { ...this.toolBody, text: this.toolBody.redacted ? '认证材料已省略，当前证据不完整' : this.toolBody.text }
     }
     return { ordinal: scalar('ordinal') === undefined ? undefined : Number(scalar('ordinal')), type: scalar('type'), timestamp: scalar('timestamp'), payload: Object.fromEntries(['type', 'id', 'role', 'turn_id', 'root_turn_id', 'thread_id', 'call_id', 'name', 'originator', 'source', 'cli_version', 'cwd', 'history_mode', 'forked_from_id', 'forked_from_ordinal_exclusive'].map(key => [key, scalar('payload.' + key)]).concat([['history_base', scalar('payload.history_base.thread_id') ? { thread_id: scalar('payload.history_base.thread_id'), end_ordinal_exclusive: Number(scalar('payload.history_base.end_ordinal_exclusive')), end_byte_offset: Number(scalar('payload.history_base.end_byte_offset')) } : undefined]])), material: { fields: this.fields, body: this.body, agentBody: this.agentBody, turnId: scalar('payload.internal_chat_message_metadata_passthrough.turn_id'), turnTrigger: scalar('payload.turn_attribution.turn_trigger') } }
   }
