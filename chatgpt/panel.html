@@ -165,6 +165,7 @@ function render(view){
     if(gaps.length)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
     if(view.observation?.failureStage)element('observation').textContent='采集失败环节：'+(view.observation.failureStage==='core-connection'?'共享核心连接':text(view.observation.failureStage,120));
     renderHealth(view.health);
+    renderNotifications(view.notifications);element('notification-permission').hidden=true;
     return;
   }
   if(scopeThreadId&&scopeThreadId!==identity){selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;}

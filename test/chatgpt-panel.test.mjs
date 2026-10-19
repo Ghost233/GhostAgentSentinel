@@ -47,10 +47,14 @@ test('a failed new round keeps the prior successful summary only in collapsed hi
 
 test('an unconfirmed chat explains the actual collection boundary while keeping settings reachable', async t => {
   const page = await harness(t)
-  await page.deliver({ ...result(null), observation: { gap: 'observation-unavailable', failureStage: 'core-connection' }, health: { state: 'failed', failures: [{ domain: 'collection', error: { code: 'ECONNREFUSED', stage: 'core' } }] } })
+  await page.deliver({ ...result(null), observation: { gap: 'observation-unavailable', failureStage: 'core-connection' }, health: { state: 'failed', failures: [{ domain: 'collection', error: { code: 'ECONNREFUSED', stage: 'core' } }] }, notifications: { permission: { authorization: 'denied' } } })
   assert.match(page.element('#observation').textContent, /共享核心连接/)
   assert.match(page.element('#health').textContent, /ECONNREFUSED/)
   assert.equal(typeof page.element('#settings-toggle').onclick, 'function')
+  assert.match(page.element('#notification-status').textContent, /未允许/)
+  assert.equal(page.element('#notification-permission').hidden, true)
+  await page.element('#notification-permission').onclick()
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_request_notification_permission').length, 0)
 })
 
 
