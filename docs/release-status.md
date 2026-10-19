@@ -25,7 +25,7 @@
 
 ## DSH 0.1.2 发布准备
 
-已发布版本继续保持 0.1.1。DSH 0.1.2 须先补原版客户端回归、DSH／Codex 共用核心、来源与通知隔离，以及双向停用、升级和卸载验收。具体范围和当前进度见 [DSH 0.1.2 兼容验证与发布准备](dsh-0.1.2-compatibility.md)。
+已发布版本继续保持 0.1.1。DSH 0.1.2 须先补原版客户端回归、DSH／Codex 共用核心、来源与通知隔离，以及双向停用、升级和卸载验收。具体范围和当前进度见仓库中的 [DSH 0.1.2 兼容验证与发布准备](https://github.com/Ghost233/GhostAgentSentinel/blob/test/docs/dsh-0.1.2-compatibility.md)。
 
 Codex GitHub 插件继续使用 `0.1.2-preview.2`，App 退出／重开等实机门槛单独保留。版本号接近不表示两方功能或验收范围相同。
 
