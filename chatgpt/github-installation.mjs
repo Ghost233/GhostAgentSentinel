@@ -107,11 +107,15 @@ async function checkedConfig(paths) {
 }
 const ownerFields = ['protocol', 'installationId', 'version', 'pid', 'runId', 'ownership', 'releaseId']
 async function ownerRecords(paths, releaseId, installationId) {
-  const lockPath = join(paths.dataDir, 'runtime.lock'), lock = await directory(lockPath), owner = (await record(join(lockPath, 'owner.json')))?.value, published = (await record(join(paths.dataDir, 'runtime.json')))?.value
-  if (lock && (await readdir(lockPath)).some(name => name !== 'owner.json')) fail('github_owner_unconfirmed')
-  if (owner && (owner.protocol !== HELPER_PROTOCOL || owner.version !== HELPER_VERSION || owner.ownership !== 'plugin' || owner.releaseId !== releaseId || owner.installationId !== installationId || !uuid(owner.runId) || !Number.isSafeInteger(owner.pid) || owner.pid < 1)) fail('github_owner_unconfirmed')
-  if (published && (!owner || ownerFields.some(key => published[key] !== owner[key]))) fail('github_owner_unconfirmed')
-  return { lockPath, lock, owner, published }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const lockPath = join(paths.dataDir, 'runtime.lock'), lock = await directory(lockPath), owner = (await record(join(lockPath, 'owner.json')))?.value, published = (await record(join(paths.dataDir, 'runtime.json')))?.value
+      if (lock && (await readdir(lockPath)).some(name => name !== 'owner.json')) fail('github_owner_unconfirmed')
+      if (owner && (owner.protocol !== HELPER_PROTOCOL || owner.version !== HELPER_VERSION || owner.ownership !== 'plugin' || owner.releaseId !== releaseId || owner.installationId !== installationId || !uuid(owner.runId) || !Number.isSafeInteger(owner.pid) || owner.pid < 1)) fail('github_owner_unconfirmed')
+      if (published && (!owner || ownerFields.some(key => published[key] !== owner[key]))) fail('github_owner_unconfirmed')
+      return { lockPath, lock, owner, published }
+    } catch (error) { if (error.code !== 'ENOENT' || attempt === 2) throw error }
+  }
 }
 function nextReceipt(paths, config, packet, previous) {
   const entry = { archiveSHA256: packet.archiveSHA256, releaseId: packet.releaseId, releaseRoot: packet.releaseRoot, notificationBundlePath: packet.notificationBundlePath }

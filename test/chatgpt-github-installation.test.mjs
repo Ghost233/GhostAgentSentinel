@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, writeFile, rm, mkdir, realpath, chmod } from 'node:fs/promises'
+import fs from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createServer } from 'node:http'
@@ -110,6 +112,72 @@ test('real owners hand off naturally, retain failed upgrade recovery and isolate
   assert.equal((await core.conversationMonitoring(preference)).paused, true)
   assert.equal((await core.health()).instanceId, coreId); await core.heartbeat(dshSource)
 })
+
+for (const point of ['lock-realpath', 'owner-realpath', 'owner-open', 'publication-realpath', 'publication-open', 'lock-readdir']) {
+  test('an owner snapshot retries a disappearing ' + point + ' through the public upgrade', async t => {
+    const f = await githubFixture(t), first = await f.packet('stable', 'a'.repeat(64))
+    const { prepareGitHubInstallation } = await import('../chatgpt/github-installation.mjs')
+    const initial = await prepareGitHubInstallation(first, f.io), config = await runtime.loadInstallationConfig(initial.configPath)
+    const lock = join(config.dataDir, 'runtime.lock'), owner = join(lock, 'owner.json'), publication = join(config.dataDir, 'runtime.json')
+    const identity = { protocol: runtime.HELPER_PROTOCOL, version: runtime.HELPER_VERSION, installationId: config.installationId, releaseId: config.releaseId, ownership: 'plugin', runId: '3412cf54-6353-4d67-95af-0e43873fcaad', pid: process.pid }
+    await mkdir(lock, { mode: 0o700 }); await writeFile(owner, JSON.stringify(identity), { mode: 0o600 }); await writeFile(publication, JSON.stringify(identity), { mode: 0o600 })
+    const next = await f.packet('stable', 'b'.repeat(64), 'next')
+    const [which, method] = point.split('-'), path = { lock, owner, publication }[which], original = fs[method]
+    let hits = 0
+    fs[method] = async (target, ...args) => {
+      if (target === path && hits++ === 0) { await rm(publication); await rm(lock, { recursive: true }) }
+      return original(target, ...args)
+    }
+    syncBuiltinESMExports()
+    let upgraded
+    try { upgraded = await prepareGitHubInstallation(next, f.io) }
+    finally { fs[method] = original; syncBuiltinESMExports() }
+    assert.ok(hits > 0)
+    assert.notEqual(upgraded.releaseId, initial.releaseId)
+    assert.equal((await runtime.loadInstallationConfig(initial.configPath)).releaseId, upgraded.releaseId)
+    await assert.rejects(readFile(join(config.dataDir, 'maintenance.json')), { code: 'ENOENT' })
+  })
+}
+
+test('an owner snapshot bounds repeated ENOENT instead of inventing an absent owner', async t => {
+  const f = await githubFixture(t), first = await f.packet('stable', 'c'.repeat(64))
+  const { prepareGitHubInstallation } = await import('../chatgpt/github-installation.mjs')
+  const initial = await prepareGitHubInstallation(first, f.io), config = await runtime.loadInstallationConfig(initial.configPath)
+  const lock = join(config.dataDir, 'runtime.lock'), next = await f.packet('stable', 'd'.repeat(64), 'next'), original = fs.realpath
+  await mkdir(lock, { mode: 0o700 })
+  let hits = 0
+  fs.realpath = async (target, ...args) => { if (target === lock) { hits++; throw Object.assign(new Error('fixture missing owner directory'), { code: 'ENOENT' }) }; return original(target, ...args) }
+  syncBuiltinESMExports()
+  try { await assert.rejects(prepareGitHubInstallation(next, f.io), { code: 'ENOENT' }) }
+  finally { fs.realpath = original; syncBuiltinESMExports() }
+  assert.equal(hits, 3)
+  assert.equal((await runtime.loadInstallationConfig(initial.configPath)).releaseId, initial.releaseId)
+  await assert.rejects(readFile(join(first.stateRoot, 'github-operation.json')), { code: 'ENOENT' })
+})
+
+for (const kind of ['permissions', 'symlink', 'foreign-owner']) {
+  test('an owner snapshot still refuses ' + kind + ' without retrying a security failure', async t => {
+    const f = await githubFixture(t), first = await f.packet('stable', 'e'.repeat(64))
+    const { prepareGitHubInstallation } = await import('../chatgpt/github-installation.mjs')
+    const initial = await prepareGitHubInstallation(first, f.io), config = await runtime.loadInstallationConfig(initial.configPath)
+    const lock = join(config.dataDir, 'runtime.lock'), owner = join(lock, 'owner.json'), next = await f.packet('stable', 'f'.repeat(64), 'next'), original = fs.realpath
+    await mkdir(lock, { mode: 0o700 })
+    let hits = 0
+    fs.realpath = async (target, ...args) => {
+      if (target === lock && hits++ === 0) {
+        if (kind === 'permissions') await chmod(lock, 0o755)
+        else if (kind === 'symlink') { const other = join(config.dataDir, 'other'); await mkdir(other, { mode: 0o700 }); await rm(lock, { recursive: true }); await fs.symlink(other, lock) }
+        else await writeFile(owner, JSON.stringify({ protocol: runtime.HELPER_PROTOCOL, version: runtime.HELPER_VERSION, ownership: 'plugin', installationId: 'foreign', releaseId: config.releaseId, runId: '3412cf54-6353-4d67-95af-0e43873fcaad', pid: process.pid }), { mode: 0o600 })
+      }
+      return original(target, ...args)
+    }
+    syncBuiltinESMExports()
+    try { await assert.rejects(prepareGitHubInstallation(next, f.io), { code: { permissions: 'github_private_directory_required', symlink: 'github_symlink_path_rejected', 'foreign-owner': 'github_owner_unconfirmed' }[kind] }) }
+    finally { fs.realpath = original; syncBuiltinESMExports() }
+    assert.equal(hits, kind === 'foreign-owner' ? 2 : 1)
+    assert.equal((await runtime.loadInstallationConfig(initial.configPath)).releaseId, initial.releaseId)
+  })
+}
 
 test('a channel upgrade keeps credentials, enrollment, cursors and the shared Core path while switching release', async t => {
   const f = await githubFixture(t), first = await f.packet('stable', 'd'.repeat(64))

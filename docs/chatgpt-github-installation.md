@@ -23,7 +23,7 @@ https://github.com/Ghost233/GhostAgentSentinel
 
 ## 当前版本与范围
 
-GitHub 安装包为 `0.1.2-preview.1`。`GhostSentinel` 是日常安装身份；该软件版本仍是开发预览，App 冷启动和退出／重开验收尚未完成。
+GitHub 安装包为 `0.1.2-preview.2`。`GhostSentinel` 是日常安装身份；该软件版本仍是开发预览，App 冷启动和退出／重开验收尚未完成。
 
 仅支持 macOS Apple Silicon，以及下列已核实宿主组合：
 
