@@ -51,6 +51,7 @@ test('GitHub catalog ships two isolated, self-contained plugin sources with test
   for (const [channel, name] of [['stable', 'ghost-sentinel'], ['test', 'ghost-sentinel-test']]) {
     const actual = await readFile(join(root, 'plugins', name, 'bin/launch-mcp'), 'utf8')
     assert.equal(actual, (await readFile(join(root, 'scripts/templates/github-launch.sh'), 'utf8')).replaceAll('@CHANNEL@', channel).replaceAll('@NODE_SHA256@', PLUGIN_NODE_SHA256))
+    assert.deepEqual(await readFile(join(root, 'plugins', name, 'bin/verify-payload.mjs')), await readFile(join(root, 'scripts/templates/verify-github-payload.mjs')))
   }
 })
 
@@ -66,6 +67,20 @@ test('installed GitHub launchers unpack and verify without Node/npm or the devel
     assert.equal(JSON.parse(again.stdout).manifestSHA256, value.manifestSHA256)
     assert.equal((await readdir(join(stateRoot, 'payloads'))).length, 1, 'repeated connections reuse the same private release')
     await assert.rejects(stat(join(stateRoot, 'state/installation.json')), { code: 'ENOENT' })
+    if (channel === 'stable') {
+      const release = join(stateRoot, 'payloads', (await readdir(join(stateRoot, 'payloads')))[0])
+      for (const [file, mode, replacement] of [
+        ['chatgpt/github-plugin-bridge.mjs', [], 'process.stdout.write("UNVERIFIED_CACHE_EXECUTED");process.exit(73)'],
+        ['chatgpt/plugin-package.mjs', ['--verify'], 'process.stdout.write("UNVERIFIED_CACHE_EXECUTED");process.exit(74)'],
+        ['chatgpt/node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js', [], 'export class StdioServerTransport{};process.stdout.write("UNVERIFIED_CACHE_EXECUTED");process.exit(75)'],
+      ]) {
+        const path = join(release, file), original = await readFile(path)
+        try {
+          await writeFile(path, replacement)
+          await assert.rejects(execute(join(root, 'plugins', name, 'bin/launch-mcp'), [...mode, '--state-root', stateRoot], { timeout: 60000 }), error => error.code === 1 && /github_payload_integrity_failed/.test(error.stderr) && !error.stdout.includes('UNVERIFIED_CACHE_EXECUTED'), 'unverified cached code must never execute: ' + file)
+        } finally { await writeFile(path, original) }
+      }
+    }
   }
   const corrupt = join(directory, 'corrupt')
   await mkdir(join(corrupt, 'bin'), { recursive: true })

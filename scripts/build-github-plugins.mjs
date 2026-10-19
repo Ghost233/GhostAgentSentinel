@@ -19,7 +19,7 @@ export async function buildGitHubPlugins({ packageRoot, outputRoot } = {}) {
   const template = await readFile(new URL('./templates/github-launch.sh', import.meta.url), 'utf8')
   const nodeLicense = await readFile(join(dirname(dirname(PLUGIN_NODE)), 'LICENSE'))
   const archive = join(outputRoot, 'payload.tar.gz')
-  await execute('/usr/bin/tar', ['-czf', archive, '-C', payload.root, '.'], { timeout: 60000, maxBuffer: 1048576, env: { ...process.env, COPYFILE_DISABLE: '1' } })
+  await execute('/usr/bin/tar', ['--format=ustar', '--uid', '0', '--gid', '0', '--uname', 'root', '--gname', 'wheel', '-czf', archive, '-C', payload.root, '.'], { timeout: 60000, maxBuffer: 1048576, env: { ...process.env, COPYFILE_DISABLE: '1' } })
   const bytes = await readFile(archive), archiveSHA256 = hash(bytes)
   if (bytes.length >= 100 * 1024 * 1024) throw new Error('GitHub archive exceeds normal Git file budget')
   const plugins = []
@@ -35,6 +35,7 @@ export async function buildGitHubPlugins({ packageRoot, outputRoot } = {}) {
     await writeFile(join(pluginRoot, '.codex-plugin/plugin.json'), JSON.stringify(manifest, null, 2) + '\n')
     await writeFile(join(pluginRoot, '.mcp.json'), JSON.stringify(mcp, null, 2) + '\n')
     await writeFile(join(pluginRoot, 'bin/launch-mcp'), template.replaceAll('@CHANNEL@', channel).replaceAll('@NODE_SHA256@', payload.manifest.node.sha256), { mode: 0o755 })
+    await copyFile(new URL('./templates/verify-github-payload.mjs', import.meta.url), join(pluginRoot, 'bin/verify-payload.mjs'))
     await chmod(join(pluginRoot, 'bin/launch-mcp'), 0o755)
     await copyFile(archive, join(pluginRoot, 'payload.tar.gz'))
     await writeFile(join(pluginRoot, 'payload.sha256'), archiveSHA256 + '\n')
