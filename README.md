@@ -1,12 +1,12 @@
 # GhostAgentSentinel
 
-面向 AI agent 的本机只读执行监控工具。共享核心连接 DSH 与 Codex：DSH 观察主代理及多级子代理，Codex 观察本机主聊天及分叉主会话。本轮统一正式发布目标为 0.1.2，当前仍是待验收候选；已发布的正式版本为 v0.1.1。
+面向 AI agent 的本机只读执行监控工具。共享核心连接 DSH 与 Codex：DSH 观察主代理及多级子代理，Codex 观察本机主聊天及分叉主会话。当前源码及两端安装版本统一为 0.1.3，按用户要求从仓库 0.1.2 累加一个补丁版本。
 
-Codex 适配器只保留会话侧面板。候选包含主聊天发现、原生请求证明、六项检查、单聊天暂停、故障回执及 24 小时已监控历史，也加入安装级模型设置与附依据的执行短总结。紧凑面板把依据放在每条问题下，通知记录区分提交、送达快照和用户动作。最终候选、完整本地门禁、实机及交付复核尚未完成，当前状态见 [发布验证范围](docs/release-status.md)。
+Codex 适配器只保留会话侧面板。本版包含主聊天发现、原生请求证明、六项检查、单聊天暂停、故障回执及 24 小时已监控历史，也加入安装级模型设置与附依据的执行短总结。紧凑面板把依据放在每条问题下，通知记录区分提交、送达快照和用户动作。完整自动检查与已取得的原版 DSH 证据见 [发布验证范围](docs/release-status.md)。新版真实 App 面板、部分双端通知与 App 退出重开仍有未验项，不能将本次发布当作这些项目已通过。
 
 ## 安装
 
-0.1.2 正式发布后，DSH 安装包为 `ghost-agent-sentinel-0.1.2.tgz`，从 [GitHub 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases) 下载并解压到长期保留的目录。在 DSH 的“插件 → 安装第三方插件”中选择解压后的 `package` 目录，安装并启用 `ghost-agent-sentinel`。发布完成前，可用正式包仍为 [v0.1.1](https://github.com/Ghost233/GhostAgentSentinel/releases/tag/v0.1.1)。
+DSH 0.1.3 安装包为 `ghost-agent-sentinel-0.1.3.tgz`，从 [GitHub 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases) 下载并解压到长期保留的目录。在 DSH 的“插件 → 安装第三方插件”中选择解压后的 `package` 目录，安装并启用 `ghost-agent-sentinel`。此前正式基线为 [v0.1.1](https://github.com/Ghost233/GhostAgentSentinel/releases/tag/v0.1.1)。
 
 Codex 通过 [GitHub 仓库市场安装](docs/chatgpt-github-installation.md)。正式安装与名称以小写 `test` 结尾的测试安装可并存，模型配置和暂停状态各自保存。
 
