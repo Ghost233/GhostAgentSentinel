@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ghost_sentinel": {
+      "command": "./bin/launch-mcp",
+      "args": [],
+      "cwd": "."
+    }
+  }
+}

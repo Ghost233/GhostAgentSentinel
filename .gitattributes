@@ -1,0 +1,2 @@
+# Preserve the upstream Node license verbatim, including its original indentation.
+plugins/*/licenses/node-LICENSE -whitespace

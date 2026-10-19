@@ -1,0 +1,18 @@
+{
+  "name": "ghost-sentinel-test",
+  "version": "0.1.2-preview.1",
+  "description": "ChatGPT.app 本机主聊天及分叉的只读检查（开发预览）",
+  "author": {
+    "name": "Ghost233",
+    "url": "https://github.com/Ghost233/GhostAgentSentinel"
+  },
+  "homepage": "https://github.com/Ghost233/GhostAgentSentinel",
+  "repository": "https://github.com/Ghost233/GhostAgentSentinel",
+  "license": "UNLICENSED",
+  "requires_local_executor": true,
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "GhostSentinel test",
+    "shortDescription": "本机主会话 · 只读检查 · macOS Apple Silicon"
+  }
+}

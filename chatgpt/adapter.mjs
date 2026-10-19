@@ -86,8 +86,9 @@ function materialView(view, task, { historical = false } = {}) {
 
 // Native is the read-only host IO boundary; all qualification and lifecycle
 // decisions remain in this adapter and the shared core.
-export async function startChatGPTAdapter({ core, native, notificationIO, runtimeStatus, sessionsRoot, dataDir, installationId, token, pollMs = 1500, port = 0, now = Date.now, collectMaterials = false, nativeOriginVersion = 1, initialEnrollmentBaseline, onQualificationLost }) {
+export async function startChatGPTAdapter({ core, native, notificationIO, runtimeStatus, displayName = 'Sentinel', sessionsRoot, dataDir, installationId, token, pollMs = 1500, port = 0, now = Date.now, collectMaterials = false, nativeOriginVersion = 1, initialEnrollmentBaseline, onQualificationLost }) {
   if (!core || !native || !sessionsRoot || !dataDir || typeof installationId !== 'string' || !installationId.trim()) throw new Error('adapter installation and source IO are required')
+  if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid adapter display name')
   if (!Number.isSafeInteger(pollMs) || pollMs < 0) throw new Error('invalid polling interval')
   if (![1, 2].includes(nativeOriginVersion)) throw new Error('invalid native origin version')
   if (typeof collectMaterials !== 'boolean') throw new Error('invalid material collection mode')
@@ -210,7 +211,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       registration = (async () => {
         const enrollment = initialEnrollmentBaseline ? { id: initialEnrollmentBaseline.id, initialize: baselineInitializationAvailable } : undefined
         baselineInitializationAvailable = false
-        const key = await core.registerSource({ ...(enrollment ? { initialEnrollmentBaseline: enrollment } : {}), registrationId: 'chatgpt:' + installationId, hostRunId: host.hostRunId, name: 'ChatGPT · 本机执行域', ...(collectMaterials ? { policy: 'chatgpt-main/1', ...(nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), capabilities: ['main-lifecycle/1', 'main-material/1'] } : { mode: 'observation-only', capabilities: ['main-lifecycle/1'] }) })
+        const key = await core.registerSource({ ...(enrollment ? { initialEnrollmentBaseline: enrollment } : {}), registrationId: 'chatgpt:' + installationId, hostRunId: host.hostRunId, name: (displayName === 'Sentinel' ? '' : displayName + ' · ') + 'ChatGPT · 本机执行域', ...(collectMaterials ? { policy: 'chatgpt-main/1', ...(nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), capabilities: ['main-lifecycle/1', 'main-material/1'] } : { mode: 'observation-only', capabilities: ['main-lifecycle/1'] }) })
         if (closed || epoch !== sourceEpoch) { await core.unregisterSource(key, 'source-generation-superseded'); return null }
         source = { key, hostRunId: host.hostRunId }
         return source
@@ -583,7 +584,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
   async function refresh() { if (closed) return; if (refreshPending) return refreshPending; const pending = enqueue(() => collect([], true)); if (!pending) return; refreshPending = pending.finally(() => { refreshPending = null }); return refreshPending }
   let panel
-  try { panel = await startPanelServer({ read, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, token, port }) }
+  try { panel = await startPanelServer({ read, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }
   if (onQualificationLost) await qualification()
   const schedule = () => { if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(); schedule() }, pollMs) }

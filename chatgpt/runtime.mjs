@@ -14,6 +14,7 @@ async function readPrivateConfig(path) {
   if (value.format !== 1 || !/^[a-f0-9]{64}$/.test(value.token ?? '') || typeof value.installationId !== 'string' || !value.installationId || typeof value.pluginId !== 'string' || !value.pluginId || !['dataDir', 'coreDataDir', 'sessionsRoot', 'metadataSocket'].every(key => typeof value[key] === 'string' && isAbsolute(value[key]))) throw new Error('invalid installation configuration')
   if (value.port !== undefined && (!Number.isSafeInteger(value.port) || value.port < 1 || value.port > 65535)) throw new Error('invalid installation port')
   if (value.notificationBundlePath !== undefined && (typeof value.notificationBundlePath !== 'string' || !isAbsolute(value.notificationBundlePath) || !value.notificationBundlePath.endsWith('.app'))) throw new Error('invalid notification bundle configuration')
+  if (value.releaseId !== undefined && !/^[a-f0-9]{64}$/.test(value.releaseId)) throw new Error('invalid installation release identity')
   if (value.initialEnrollmentBaseline !== undefined) {
     const baseline = value.initialEnrollmentBaseline
     if (!baseline || Object.keys(baseline).length !== 2 || typeof baseline.claimable !== 'boolean' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(baseline.id ?? '')) throw new Error('invalid initial enrollment baseline configuration')
@@ -21,9 +22,12 @@ async function readPrivateConfig(path) {
   return value
 }
 
-export async function prepareInstallation({ dataDir, coreDataDir, sessionsRoot = join(homedir(), '.codex/sessions'), metadataSocket = join(homedir(), '.codex/app-server-control/app-server-control.sock'), pluginId, notificationBundlePath } = {}) {
+export { readPrivateConfig as loadInstallationConfig }
+
+export async function prepareInstallation({ dataDir, coreDataDir, sessionsRoot = join(homedir(), '.codex/sessions'), metadataSocket = join(homedir(), '.codex/app-server-control/app-server-control.sock'), pluginId, notificationBundlePath, releaseId } = {}) {
   if (typeof dataDir !== 'string' || typeof coreDataDir !== 'string' || !isAbsolute(dataDir) || !isAbsolute(coreDataDir) || !isAbsolute(sessionsRoot) || !isAbsolute(metadataSocket) || typeof pluginId !== 'string' || !pluginId.trim()) throw new Error('explicit installation paths and plugin identity required')
   if (notificationBundlePath !== undefined && (typeof notificationBundlePath !== 'string' || !isAbsolute(notificationBundlePath) || !notificationBundlePath.endsWith('.app'))) throw new Error('explicit notification bundle path required')
+  if (releaseId !== undefined && !/^[a-f0-9]{64}$/.test(releaseId)) throw new Error('explicit release identity required')
   if (notificationBundlePath !== undefined) notificationBundlePath = resolve(notificationBundlePath)
   dataDir = resolve(dataDir)
   await mkdir(dataDir, { recursive: true, mode: 0o700 })
@@ -32,11 +36,12 @@ export async function prepareInstallation({ dataDir, coreDataDir, sessionsRoot =
   const configPath = join(dataDir, 'installation.json'), pluginDir = join(dataDir, 'plugin')
   try {
     const file = await open(configPath, 'wx', 0o600)
-    try { await file.writeFile(JSON.stringify({ format: 1, installationId: randomUUID(), initialEnrollmentBaseline: { id: randomUUID(), claimable: true }, dataDir, coreDataDir: resolve(coreDataDir), sessionsRoot: resolve(sessionsRoot), metadataSocket, pluginId, ...(notificationBundlePath === undefined ? {} : { notificationBundlePath }), token: randomBytes(32).toString('hex') }) + '\n') } finally { await file.close() }
+    try { await file.writeFile(JSON.stringify({ format: 1, installationId: randomUUID(), initialEnrollmentBaseline: { id: randomUUID(), claimable: true }, dataDir, coreDataDir: resolve(coreDataDir), sessionsRoot: resolve(sessionsRoot), metadataSocket, pluginId, ...(notificationBundlePath === undefined ? {} : { notificationBundlePath }), ...(releaseId === undefined ? {} : { releaseId }), token: randomBytes(32).toString('hex') }) + '\n') } finally { await file.close() }
   } catch (error) { if (error.code !== 'EEXIST') throw error }
   const saved = await readPrivateConfig(configPath)
   if (['dataDir', 'coreDataDir', 'sessionsRoot', 'metadataSocket', 'pluginId'].some(key => saved[key] !== ({ dataDir, coreDataDir: resolve(coreDataDir), sessionsRoot: resolve(sessionsRoot), metadataSocket, pluginId })[key])) throw new Error('installation configuration already exists with different settings')
   if (notificationBundlePath !== undefined && saved.notificationBundlePath !== notificationBundlePath) throw new Error('installation configuration already exists with different settings')
+  if (releaseId !== undefined && saved.releaseId !== releaseId) throw new Error('installation configuration already exists with different settings')
   await mkdir(join(pluginDir, '.codex-plugin'), { recursive: true, mode: 0o700 })
   return { configPath, pluginDir }
 }
@@ -76,8 +81,8 @@ async function record(path) {
     finally { await file.close() }
   } catch (error) { if (error.code === 'ENOENT') return null; throw error }
 }
-const ownIdentity = (value, config) => value?.protocol === HELPER_PROTOCOL && value.installationId === config.installationId && value.version === HELPER_VERSION && Number.isSafeInteger(value.pid) && value.pid > 0 && typeof value.runId === 'string' && /^[a-f0-9-]{36}$/.test(value.runId)
-const identityMatches = (a, b) => ['protocol', 'installationId', 'version', 'pid', 'runId', 'ownership'].every(key => a[key] === b[key])
+const ownIdentity = (value, config) => value?.protocol === HELPER_PROTOCOL && value.installationId === config.installationId && value.version === HELPER_VERSION && (config.releaseId === undefined || value.releaseId === config.releaseId) && Number.isSafeInteger(value.pid) && value.pid > 0 && typeof value.runId === 'string' && /^[a-f0-9-]{36}$/.test(value.runId)
+const identityMatches = (a, b) => ['protocol', 'installationId', 'version', 'pid', 'runId', 'ownership', 'releaseId'].every(key => a[key] === b[key])
 const portOf = url => { const parsed = new URL(url); if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1' || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash || !parsed.port) throw new Error('untrusted helper endpoint'); return Number(parsed.port) }
 async function stablePort(config) {
   const connection = await record(join(config.dataDir, 'plugin/.mcp.json'))
@@ -127,14 +132,15 @@ export async function resolvePluginOwner({ configPath } = {}) {
   return runtime && !runtime.dead ? { ...runtime, token: config.token } : null
 }
 
-export async function startFromInstallation({ configPath, pollMs = 1500, native, notificationIO, ownership = 'helper' } = {}) {
+export async function startFromInstallation({ configPath, pollMs = 1500, native, notificationIO, ownership = 'helper', displayName, expectedReleaseId } = {}) {
   if (typeof configPath !== 'string' || !isAbsolute(configPath)) throw new Error('explicit private configuration path required')
   if (!['helper', 'plugin'].includes(ownership)) throw new Error('invalid observation ownership')
   const config = await readPrivateConfig(configPath), pluginDir = join(config.dataDir, 'plugin')
+  if (expectedReleaseId !== undefined && (!/^[a-f0-9]{64}$/.test(expectedReleaseId) || config.releaseId !== expectedReleaseId)) throw Object.assign(new Error('installation release differs from executable'), { code: 'plugin_release_mismatch' })
   const info = await lstat(config.dataDir)
   if (!info.isDirectory() || info.mode & 0o077 || typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('private installation directory required')
   const lock = join(config.dataDir, 'runtime.lock'), port = ownership === 'plugin' ? config.port ?? 0 : await stablePort(config), runId = randomUUID()
-  const identity = { protocol: HELPER_PROTOCOL, installationId: config.installationId, runId, pid: process.pid, version: HELPER_VERSION, ...(ownership === 'plugin' ? { ownership } : {}) }
+  const identity = { protocol: HELPER_PROTOCOL, installationId: config.installationId, runId, pid: process.pid, version: HELPER_VERSION, ...(ownership === 'plugin' ? { ownership } : {}), ...(config.releaseId === undefined ? {} : { releaseId: config.releaseId }) }
   const deadline = Date.now() + 2500
   while (true) {
     try { await mkdir(lock, { mode: 0o700 }); break }
@@ -228,7 +234,15 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     core = coreIO.createLazyCore({ dataDir: config.coreDataDir, onRetention: retentionObserved })
     await maintainRetention(true)
     const rawHostIO = native ?? createNativeIO({ pluginId: config.pluginId, socketPath: config.metadataSocket })
-    const hostIO = { ...rawHostIO, async sampleHost() { const reason = await maintenance(config); return reason ? { available: false, reason } : rawHostIO.sampleHost() } }
+    const hostIO = { ...rawHostIO, async sampleHost() {
+      const reason = await maintenance(config)
+      if (reason) return { available: false, reason }
+      if (config.releaseId !== undefined) {
+        try { if ((await readPrivateConfig(configPath)).releaseId !== config.releaseId) return { available: false, reason: 'plugin-release-superseded' } }
+        catch { return { available: false, reason: 'plugin-release-unconfirmed' } }
+      }
+      return rawHostIO.sampleHost()
+    } }
     const initialEnrollmentBaseline = config.initialEnrollmentBaseline ? { id: config.initialEnrollmentBaseline.id, initialize: config.initialEnrollmentBaseline.claimable } : undefined
     if (initialEnrollmentBaseline?.initialize) {
       // Consume locally before any source registration; crashes never reissue it.
@@ -237,7 +251,7 @@ export async function startFromInstallation({ configPath, pollMs = 1500, native,
     }
     const notifier = notificationIO ?? (config.notificationBundlePath ? createNativeNotificationIO({ bundlePath: config.notificationBundlePath, installationId: config.installationId }) : undefined)
     const onQualificationLost = ownership === 'plugin' ? reason => { qualificationRevoked = true; stopReason = reason; const revoked = revokePublication(); void ready.then(close).catch(() => {}); return revoked } : undefined
-    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, collectMaterials: true, nativeOriginVersion: 2, initialEnrollmentBaseline, runtimeStatus: () => { if (ownership === 'plugin' && (qualificationRevoked || stopping)) throw new Error('plugin observation is stopping'); return { ...identity } }, onQualificationLost })
+    adapter = await startChatGPTAdapter({ core, native: hostIO, notificationIO: notifier, sessionsRoot: config.sessionsRoot, dataDir: config.dataDir, installationId: config.installationId, token: config.token, port, pollMs, displayName, collectMaterials: true, nativeOriginVersion: 2, initialEnrollmentBaseline, runtimeStatus: () => { if (ownership === 'plugin' && (qualificationRevoked || stopping)) throw new Error('plugin observation is stopping'); return { ...identity } }, onQualificationLost })
     if (qualificationRevoked || adapter.diagnostics().closed) throw Object.assign(new Error('plugin startup qualification was revoked'), { code: 'plugin_startup_qualification_revoked' })
     const selectedPort = portOf(adapter.url)
     if (port && selectedPort !== port) throw new Error('helper changed its configured endpoint')

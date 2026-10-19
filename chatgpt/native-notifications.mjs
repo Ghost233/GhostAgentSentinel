@@ -26,8 +26,9 @@ function runNativeProcess(executable, args, input, { timeoutMs, maxBuffer, signa
 }
 
 // Only this installation's identifiers cross the fixed stdin/stdout protocol.
-export function createNativeNotificationIO({ bundlePath, installationId, run = runNativeProcess }) {
+export function createNativeNotificationIO({ bundlePath, installationId, testMode = false, run = runNativeProcess }) {
   if (typeof bundlePath !== 'string' || !isAbsolute(bundlePath) || !bundlePath.endsWith('.app') || !id(installationId)) throw new Error('native notification bundle and installation identity are required')
+  if (typeof testMode !== 'boolean') throw new Error('invalid notification test mode')
   const executable = join(bundlePath, 'Contents/MacOS/GhostSentinelNotifications'), ownerPrefix = notificationPrefix(installationId)
   let active = null, closed = false
   const owned = value => id(value) && value.length <= 200 && value.startsWith(ownerPrefix) && value.length > ownerPrefix.length
@@ -70,7 +71,9 @@ export function createNativeNotificationIO({ bundlePath, installationId, run = r
     submit(value) {
       if (!owned(value?.requestId)) return Promise.reject(new Error('notification request belongs to another installation'))
       if (typeof value.title !== 'string' || !value.title.trim() || value.title.length > 200 || typeof value.body !== 'string' || value.body.length > 1200) return Promise.reject(protocol())
-      return invoke('submit', { requestId: value.requestId, title: value.title, body: value.body, metadata: metadata(value.metadata) })
+      const title = !testMode || /^GhostSentinel test(?:[ ·]|$)/.test(value.title) ? value.title : /^GhostSentinel(?:[ ·]|$)/.test(value.title) ? value.title.replace(/^GhostSentinel/, 'GhostSentinel test') : 'GhostSentinel test · ' + value.title
+      if (title.length > 200) return Promise.reject(protocol())
+      return invoke('submit', { requestId: value.requestId, title, body: value.body, metadata: metadata(value.metadata) })
     },
     cancel(requestIds) {
       if (!Array.isArray(requestIds) || requestIds.length > 100 || requestIds.some(value => !owned(value))) return Promise.reject(new Error('notification cancellation belongs to another installation or exceeds its budget'))

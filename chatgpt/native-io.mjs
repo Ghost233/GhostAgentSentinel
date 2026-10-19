@@ -7,7 +7,8 @@ import { join } from 'node:path'
 
 const execute = promisify(execFile)
 const appPath = '/Applications/ChatGPT.app'
-const nativePath = appPath + '/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
+export const NATIVE_EXECUTABLE = appPath + '/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
+const nativePath = NATIVE_EXECUTABLE
 const appExecutable = appPath + '/Contents/MacOS/ChatGPT'
 const readonlyMethods = new Set(['thread/read', 'thread/turns/list', 'thread/list', 'config/read'])
 const metadataMessages = {
@@ -136,9 +137,9 @@ export function createMetadataClient({ socketPath = join(homedir(), '.codex/app-
   }
 }
 
-export function createNativeIO({ pluginId, socketPath, processSample, profileSample } = {}) {
+export function createNativeIO({ pluginId, socketPath, processSample, profileSample, metadataClient } = {}) {
   if (typeof pluginId !== 'string' || !pluginId) throw new Error('plugin identity required')
-  const rpc = createMetadataClient({ socketPath })
+  const rpc = metadataClient ?? createMetadataClient({ socketPath })
   let profileCache = null, profileSampling = null, closed = false
   async function sampleProfile() {
     if (profileSample) return profileSample()

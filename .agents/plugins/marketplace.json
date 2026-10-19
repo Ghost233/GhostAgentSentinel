@@ -1,0 +1,32 @@
+{
+  "name": "ghostsentinel",
+  "interface": {
+    "displayName": "GhostSentinel"
+  },
+  "plugins": [
+    {
+      "name": "ghost-sentinel",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ghost-sentinel"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "ghost-sentinel-test",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ghost-sentinel-test"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

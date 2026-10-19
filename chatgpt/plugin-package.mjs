@@ -8,7 +8,8 @@ import { promisify } from 'node:util'
 import { HELPER_VERSION } from './runtime.mjs'
 
 export const PLUGIN_NODE = '/Applications/DSH Workflow.app/Contents/Resources/desktop/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node'
-export const PLUGIN_NODE_SHA256 = '738852ca4f83d6a0485e4ae25e04b84243ae1d331e5f003b7cd0291cdf4b6821'
+export const PLUGIN_NODE_SHA256 = '43aa9baf363e1e1ede7f7e4dd16e175793312d8ef0abd7b10868ba2ba3fe27f1'
+const acceptedNodeHashes = new Set([PLUGIN_NODE_SHA256, '738852ca4f83d6a0485e4ae25e04b84243ae1d331e5f003b7cd0291cdf4b6821'])
 const root = fileURLToPath(new URL('../', import.meta.url)), manifestName = 'plugin-package.json'
 const maxFiles = 20000, maxSourceBytes = 100 * 1024 * 1024, maxBytes = 256 * 1024 * 1024, maxManifestBytes = 8 * 1024 * 1024
 const hash = bytes => createHash('sha256').update(bytes).digest('hex'), execute = promisify(execFile)
@@ -101,7 +102,7 @@ export async function inspectPluginPackage(directory, { digest } = {}) {
   const manifestFile = await regular(join(directory, manifestName), maxManifestBytes), actualDigest = hash(manifestFile.bytes)
   if (digest !== undefined && (!/^[a-f0-9]{64}$/.test(digest) || digest !== actualDigest)) throw new Error('package manifest digest mismatch')
   const manifest = JSON.parse(manifestFile.bytes)
-  if (!manifest || Object.keys(manifest).sort().join(',') !== 'files,format,kind,node,notificationPath,runtimeVersion,sourceSetSHA256,version' || manifest.format !== 1 || manifest.kind !== 'ghost-sentinel-plugin-payload' || !validVersion(manifest.version) || manifest.runtimeVersion !== HELPER_VERSION || manifest.node?.path !== 'runtime/node' || manifest.node.version !== 'v24.21.0' || manifest.node.sha256 !== PLUGIN_NODE_SHA256 || Object.keys(manifest.node).sort().join(',') !== 'path,sha256,version' || ![null, 'notification/GhostSentinelNotifications.app'].includes(manifest.notificationPath)) throw new Error('invalid package manifest')
+  if (!manifest || Object.keys(manifest).sort().join(',') !== 'files,format,kind,node,notificationPath,runtimeVersion,sourceSetSHA256,version' || manifest.format !== 1 || manifest.kind !== 'ghost-sentinel-plugin-payload' || !validVersion(manifest.version) || manifest.runtimeVersion !== HELPER_VERSION || manifest.node?.path !== 'runtime/node' || manifest.node.version !== 'v24.21.0' || !acceptedNodeHashes.has(manifest.node.sha256) || Object.keys(manifest.node).sort().join(',') !== 'path,sha256,version' || ![null, 'notification/GhostSentinelNotifications.app'].includes(manifest.notificationPath)) throw new Error('invalid package manifest')
   if (!manifest.files || Array.isArray(manifest.files) || typeof manifest.files !== 'object' || Object.keys(manifest.files).length > maxFiles) throw new Error('invalid package file set')
   let total = 0, sourceTotal = 0
   for (const [path, value] of Object.entries(manifest.files)) {
@@ -112,7 +113,7 @@ export async function inspectPluginPackage(directory, { digest } = {}) {
     if (path !== 'runtime/node' && !path.startsWith('notification/') && (sourceTotal += value.size) > maxSourceBytes) throw new Error('package source bytes over budget')
   }
   for (const path of [...required, 'runtime/node']) if (!manifest.files[path]) throw new Error('missing production runtime file: ' + path)
-  if (manifest.files['runtime/node'].sha256 !== PLUGIN_NODE_SHA256 || manifest.files['runtime/node'].mode !== 0o700) throw new Error('pinned executable Node required')
+  if (manifest.files['runtime/node'].sha256 !== manifest.node.sha256 || manifest.files['runtime/node'].mode !== 0o700) throw new Error('pinned executable Node required')
   if (manifest.notificationPath && !manifest.files[manifest.notificationPath + '/Contents/MacOS/GhostSentinelNotifications']) throw new Error('missing notification executable')
   if (Object.keys(manifest.files).some(path => path.startsWith('notification/')) !== Boolean(manifest.notificationPath)) throw new Error('unexpected notification file set')
   if (hash(JSON.stringify(sourceEntries(manifest.files))) !== manifest.sourceSetSHA256) throw new Error('package source set hash mismatch')

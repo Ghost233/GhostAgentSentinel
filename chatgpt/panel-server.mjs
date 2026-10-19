@@ -6,9 +6,11 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
 import { z } from 'zod'
 
-export async function startPanelServer({ read, control, requestNotifications, notificationRecords, runtimeStatus, token, port = 0 }) {
+export async function startPanelServer({ read, control, requestNotifications, notificationRecords, runtimeStatus, displayName = 'Sentinel', token, port = 0 }) {
   if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) throw new Error('installation authentication is required')
-  const html = await readFile(new URL('./panel.html', import.meta.url), 'utf8'), sockets = new Set(), cleanups = new Set()
+  if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid panel display name')
+  const title = displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查'
+  const html = (await readFile(new URL('./panel.html', import.meta.url), 'utf8')).replace('<title>Sentinel 会话检查</title>', '<title>' + title + '</title>').replace('<h1>Sentinel · 当前会话</h1>', '<h1>' + displayName + ' · 当前会话</h1>'), sockets = new Set(), cleanups = new Set()
   let closed = false, activeRequests = 0, transports = 0
   const server = createServer(async (req, res) => {
     const host = '127.0.0.1:' + server.address().port
@@ -18,10 +20,11 @@ export async function startPanelServer({ read, control, requestNotifications, no
     if (req.headers.origin && !['https://chatgpt.com', 'https://chat.openai.com'].includes(req.headers.origin)) return res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"Origin rejected"}')
     if (req.method === 'GET' && req.url === '/health' && typeof runtimeStatus === 'function') {
       try {
-        const { installationId, runId, pid, version, ownership } = await runtimeStatus()
+        const { installationId, runId, pid, version, ownership, releaseId } = await runtimeStatus()
         if ([installationId, runId, version].some(value => typeof value !== 'string' || !value || value.length > 256) || !Number.isSafeInteger(pid) || pid < 1) throw new Error('invalid helper identity')
         if (ownership !== undefined && ownership !== 'plugin') throw new Error('invalid observation ownership')
-        return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ protocol: 'ghost-sentinel-chatgpt-helper/1', installationId, runId, pid, version, ...(ownership ? { ownership } : {}) }))
+        if (releaseId !== undefined && (typeof releaseId !== 'string' || !/^[a-f0-9]{64}$/.test(releaseId))) throw new Error('invalid release identity')
+        return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ protocol: 'ghost-sentinel-chatgpt-helper/1', installationId, runId, pid, version, ...(ownership ? { ownership } : {}), ...(releaseId ? { releaseId } : {}) }))
       } catch { return res.writeHead(503, { 'content-type': 'application/json' }).end('{"error":"Helper status unavailable"}') }
     }
     if (req.url !== '/mcp') return res.writeHead(404, { 'content-type': 'application/json' }).end('{"error":"Not found"}')
@@ -31,7 +34,7 @@ export async function startPanelServer({ read, control, requestNotifications, no
     const uri = 'ui://ghost-sentinel/current-chat.html'
     registerAppResource(mcp, 'sentinel-current-chat', uri, {}, async () => ({ contents: [{ uri, mimeType: RESOURCE_MIME_TYPE, text: html }] }))
     registerAppTool(mcp, 'sentinel_current_chat', {
-      title: 'Sentinel 会话检查', description: '只读查看当前本机主会话及24小时内已监控执行的检查结果。',
+      title, description: '只读查看当前本机主会话及24小时内已监控执行的检查结果。',
       inputSchema: { executionKey: z.string().min(1).max(256).optional(), historyCursor: z.string().min(1).max(256).optional(), expectedThreadId: z.string().min(1).max(128).optional() },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       _meta: { ui: { resourceUri: uri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'thread' }] } },
