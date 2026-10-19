@@ -15,7 +15,7 @@ import { buildGitHubPlugins } from '../scripts/build-github-plugins.mjs'
 const root = fileURLToPath(new URL('../', import.meta.url)), execute = promisify(execFile)
 const hash = bytes => createHash('sha256').update(bytes).digest('hex')
 
-test('GitHub distribution preserves the pinned official Node license without reading mutable App files', async t => {
+test('GitHub distribution preserves the pinned official Node license without reading mutable App files', { skip: process.platform !== 'darwin' && 'GitHub archive build uses the macOS BSD tar toolchain' }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'sentinel-independent-license-')), payload = join(directory, 'payload')
   t.after(() => rm(directory, { recursive: true, force: true }))
   await mkdir(payload, { mode: 0o700 })
