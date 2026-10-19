@@ -45,7 +45,7 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
   if (profile?.dir || profile?.name) descriptor.profile = profile.dir || profile.name
   if (!config.registrationId && !profile?.dir) capabilityGaps.push('未配置稳定 registrationId；仅当前宿主运行身份可核对')
   const dataDir = config.dataDir || join(homedir(), '.ghost-agent-sentinel')
-  const lifetime = new AbortController(), handlers = [], activeRequests = new Set()
+  const lifetime = new AbortController(), handlers = [], activeRequests = new Set(), settingsClients = new Set()
   let client, connectingClient, sourceKey, closed = false, nextRetry = 0, lastHeartbeat = 0, error = '正在连接共享核心'
   let communicationFailure
   let shutdownStatus = 'active', shutdownTimedOut = false, shutdownFailures = 0, shutdownFinalized = false, shutdownTimers = 0, lateSettledRequests = 0
@@ -158,7 +158,6 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
         sentHierarchyRevision = -1
         sentTasks = new Map(); sentGaps = new Set(); baselineSent = false
         baseline()
-        if (config.llm || config.jev) await call(client, 'configureAnalysis', { llm: config.llm, jev: config.jev }, lifetime.signal)
         if (closed) return
         lastHeartbeat = 0
       }
@@ -204,11 +203,33 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
     if (closed || !client || !sourceKey) throw new Error(error || '共享核心未连接')
     const requested = args.pop()
     const signal = requested ? AbortSignal.any([lifetime.signal, requested]) : lifetime.signal
-    try { return await call(client, method, ...args, signal) }
-    catch (error) {
-      if (['analysis_config_conflict', 'analysis_config_unconfirmed'].includes(error?.code) || (['analysisConfig', 'analysisConfigState', 'configureAnalysis', 'configureAnalysisIfCurrent'].includes(method) && Array.isArray(error?.causes))) { error.code ??= 'gateway/internal'; error.isDSHRemoteError = true; error.details = error.causes ? { causes: error.causes } : {} }
+    return call(client, method, ...args, signal)
+  }
+  async function installationCall(method, args, requested) {
+    if (closed) throw new Error('观察连接已关闭')
+    if (!descriptor.enroll) throw new Error('未配置稳定 registrationId；本安装配置身份未确认')
+    const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(10000), ...(requested ? [requested] : [])])
+    let target = client, temporary = false, failure
+    try {
+      if (!target) { target = await track(connect({ dataDir, signal })); temporary = true; settingsClients.add(target) }
+      signal.throwIfAborted()
+      if (typeof target[method] !== 'function') throw new Error('共享核心尚不支持本安装设置')
+      return await track(target[method](descriptor.registrationId, ...args, signal))
+    } catch (error) {
+      failure = error
+      if (['analysis_config_conflict', 'analysis_config_unconfirmed', 'installation_monitoring_conflict'].includes(error?.code) || Array.isArray(error?.causes)) { error.code ??= 'gateway/internal'; error.isDSHRemoteError = true; error.details = error.causes ? { causes: error.causes } : {} }
       throw error
+    } finally {
+      if (temporary) {
+        try { await waitForShutdown(track(target.close()), closeTimeoutMs) }
+        catch (cleanup) { throw failure ? new AggregateError([failure, cleanup], failure.message) : cleanup }
+        finally { settingsClients.delete(target) }
+      }
     }
+  }
+  async function setInstallationPaused(paused, signal) {
+    const current = await installationCall('installationMonitoring', [], signal)
+    return installationCall('setInstallationMonitoring', [paused, current.revision], signal)
   }
   const service = {
     get connected() { return !closed && !!sourceKey && !error },
@@ -227,8 +248,11 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
         state = { protocol: 1, generatedAt: Date.now(), monitoring: 'unknown', overview: { coverage: 'unknown' }, sources: [], tasks: [] }
         if (!closed) error = String(err.message || err).slice(0, 200)
       }
+      let monitoring = null
+      if (descriptor.enroll) try { monitoring = await installationCall('installationMonitoring', [], signal) } catch (error) { if (signal?.aborted) throw error }
       const batch = collector.batch()
       return { ...state, adapter: { connected: service.connected, hostRunId: identity.hostRunId, sourceKey: sourceKey ?? null,
+        registrationId: descriptor.enroll ? descriptor.registrationId : null, monitoring,
         error: error || null, hierarchyContext: { supported: hierarchySupported, acceptedRevision: sentHierarchyRevision >= 0 ? sentHierarchyRevision : null, code: hierarchySupported ? null : 'hierarchy_context_unsupported' }, gsStatus: { supported: gsStatusSupported, code: gsStatusSupported ? null : 'gs_status_unsupported' }, parentWaitAudit: parentWaitAudit(), bufferedEvents: batch.events.length, gaps: [...capabilityGaps, parentWaitAudit().supported ? '原生父等待需逐次核对实际 await 调用者和开闭；join 审计不提供豁免' : '原生等待子代理开闭审计不可观察；不能证明父级正在等待子代理', ...batch.gaps, ...(hierarchySupported ? [] : ['共享核心未支持层级上下文；当前仅平铺观察']), ...(gsStatusSupported ? [] : ['共享核心未支持GS状态与等待规则；不能声明相关检查已覆盖'])] } }
     },
     gsSummary(sessionId, signal) {
@@ -238,10 +262,10 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
         counts: { green: 0, yellow: 0, red: 0, gray: 0 }, coverage: { complete: false, gaps: ['共享核心未支持 GS 计数摘要；当前计数不可判断'] }, gsStatus: { supported: false } })
       return invoke('gsSummary', sourceKey, sessionId, signal)
     },
-    pause(signal) { return invoke('pause', signal) }, resume(signal) { return invoke('resume', signal) },
-    analysisConfigState(signal) { return invoke('analysisConfigState', signal) },
-    configureAnalysisIfCurrent(value, revision, signal) { return invoke('configureAnalysisIfCurrent', value, revision, signal) },
-    analysisConfig(signal) { return invoke('analysisConfig', signal) }, configureAnalysis(value, signal) { return invoke('configureAnalysis', value, signal) },
+    pause(signal) { return setInstallationPaused(true, signal) }, resume(signal) { return setInstallationPaused(false, signal) },
+    analysisConfigState(signal) { return installationCall('installationAnalysisConfig', [], signal) },
+    configureAnalysisIfCurrent(value, revision, signal) { return installationCall('configureInstallationAnalysis', [value, revision], signal) },
+    async analysisConfig(signal) { return (await service.analysisConfigState(signal)).config },
     sourcePlan(signal) { return invoke('sourcePlan', signal) }, configureSources(value, signal) { return invoke('configureSources', value, signal) },
     claimNotifications(signal) { return invoke('claimNotifications', sourceKey, signal) },
     ackNotification(id, result, signal) { return invoke('ackNotification', id, result, signal) },
@@ -253,7 +277,7 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       const disposedProvider = provideDispose?.(); provideDispose = undefined
       const disposedRemote = remoteFiber?.dispose(); remoteFiber = undefined
       closeEffectDispose?.(); closeEffectDispose = undefined
-      const currentClients = () => [...new Set([client, connectingClient].filter(Boolean))]
+      const currentClients = () => [...new Set([client, connectingClient, ...settingsClients].filter(Boolean))]
       const cancelled = currentClients().map(target => target.cancelPending ? track(target.cancelPending()) : undefined)
       pendingClose = (async () => {
         const deadline = Date.now() + closeTimeoutMs * 2

@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -25,7 +26,7 @@ async function fixture(t) {
     res.setHeader('content-type', 'application/json')
     if (decision === 'fail') { res.statusCode = 500; res.end(JSON.stringify({ error: { message: 'Controlled inference failure' } })); return }
     const finish = () => res.end(JSON.stringify(req.url === '/v1/chat/completions'
-      ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }
+      ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }
       : { model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: decision }])) }))
     if (holding && req.url === '/v1/chat/completions') held.push(finish)
     else finish()
@@ -162,7 +163,7 @@ test('a new capture gap or request cannot extend an old normal judgment while th
   }
 })
 
-test('actual failed inference retries only after each independent completed-failure cooldown while collection continues', async t => {
+test('actual failed inference retries only after each independent failure backoff while collection continues', async t => {
   const f = await fixture(t); f.decision('fail')
   await f.core.ingest(f.source, { tasks: [{ id: 'actor', lifecycleId: 'life', status: 'running', title: 'Own actor' }], events: [f.event('request', 'input'), f.event('output', 'output')] })
   await until(async () => (await f.actor()).analysis.state === 'failed', 'first actual HTTP failure completed')
@@ -176,7 +177,7 @@ test('actual failed inference retries only after each independent completed-fail
   f.advance(1); await f.core.snapshot()
   await until(async () => f.requests.length === 2 && (await f.actor()).analysis.state === 'failed', 'second HTTP failure retried at sixty seconds')
   const secondEligibility = (await f.actor()).analysis.nextEligibleAt
-  f.decision('clear'); f.advance(59_999); await f.core.snapshot()
+  f.decision('clear'); f.advance(119_999); await f.core.snapshot()
   assert.equal(f.requests.length, 2)
   f.advance(1)
   await f.core.ingest(f.source, { events: [f.event('recovery-output', 'output'), f.event('recovery-result', 'tool-result', f.now(), { callId: 'recovery', exitCode: 0 })] })

@@ -136,6 +136,8 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
     resume: requestSignal => call('/v1/monitoring/resume', {}, requestSignal),
     conversationMonitoring: (scope, requestSignal) => call('/v1/conversation/monitoring?' + new URLSearchParams(scope), undefined, requestSignal),
     setConversationMonitoring: (control, requestSignal) => call('/v1/conversation/monitoring', control, requestSignal),
+    installationMonitoring: (registrationId, requestSignal) => call('/v1/monitoring/installations?' + new URLSearchParams({ registrationId }), undefined, requestSignal),
+    setInstallationMonitoring: (registrationId, paused, revision, requestSignal) => call('/v1/monitoring/installations', { registrationId, paused, revision }, requestSignal),
     // Identifiers cannot be empty: only an explicit null uses the empty query
     // value. Literal "null" stays a string, and undefined fields are omitted.
     failureReceipts: async (scope, requestSignal) => call('/v1/monitoring/failures?' + new URLSearchParams(Object.entries(normalizeFailureScope(scope)).map(([key, value]) => [key, value === null ? '' : String(value)])), undefined, requestSignal),
@@ -144,6 +146,8 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
     analysisConfig: requestSignal => call('/v1/analysis/config', undefined, requestSignal),
     analysisConfigState: requestSignal => call('/v1/analysis/config/state', undefined, requestSignal),
     configureAnalysisIfCurrent: (config, revision, requestSignal) => call('/v1/analysis/config/compare', { config, revision }, requestSignal),
+    installationAnalysisConfig: (registrationId, requestSignal) => call('/v1/analysis/installations/config?' + new URLSearchParams({ registrationId }), undefined, requestSignal),
+    configureInstallationAnalysis: (registrationId, config, revision, requestSignal) => call('/v1/analysis/installations/config', { registrationId, config, revision }, requestSignal),
     claimNotifications: (sourceKey, requestSignal) => call('/v1/notifications/claim', { sourceKey }, requestSignal),
     setNativeNotificationEligibility: (facts, requestSignal) => call('/v1/notifications/native/eligibility', facts, requestSignal),
     nativeNotificationRecords: (query, requestSignal) => call('/v1/notifications/native?' + new URLSearchParams(query), undefined, requestSignal),

@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -26,7 +27,7 @@ test('an actual settled model HTTP failure remains readable after the next round
     let body = ''; for await (const chunk of req) body += chunk
     res.setHeader('content-type', 'application/json')
     if (++calls === 1) { res.writeHead(503).end('{"error":{"code":"controlled"}}'); return }
-    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] }))
     else res.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(decodeJevRequest(JSON.parse(body)).questions).map(id => [id, { type: 'choice', choice: 'clear' }])) }))
   })
   await new Promise(resolve => model.listen(0, '127.0.0.1', resolve))

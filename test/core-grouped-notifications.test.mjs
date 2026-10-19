@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -8,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 
 const ref = (taskId, eventId) => ({ taskId, lifecycleId: 'life', eventId })
 async function until(predicate, label) {
@@ -26,7 +28,7 @@ async function fixture(t) {
       const wire = JSON.parse(raw), body = request.url === '/v1/systemone' ? decodeJevRequest(wire) : wire; requests.push({ path: request.url, body })
       response.setHeader('content-type', 'application/json')
       if (request.url === '/v1/chat/completions') {
-        response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+        response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }))
       } else {
         response.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? decision(body.state) : 'unknown' }])) }))
       }
@@ -56,8 +58,9 @@ async function fixture(t) {
   server = await startServer({ dataDir, now: () => clock, leaseMs: 172_800_000 })
   client = await connectCore({ dataDir })
   const baseUrl = `http://127.0.0.1:${models.address().port}`
-  await client.configureAnalysis({ llm: { baseUrl, model: 'notification-extractor' }, jev: { baseUrl, model: 'notification-judge' } })
+  const config = { llm: { baseUrl, model: 'notification-extractor' }, jev: { baseUrl, model: 'notification-judge' } }
   const register = async (registrationId = 'grouped-source') => {
+    await configureInstallationModels(client, registrationId, config)
     const sourceKey = await client.registerSource({ registrationId, hostRunId: 'host', name: '同名来源' })
     sourceKeys.push(sourceKey); return sourceKey
   }
@@ -82,7 +85,7 @@ async function fixture(t) {
     batch.events.push(event(taskId, `${taskId}-request`, 'input', 'Inspect only.', { nativeType: 'user/message', inputPhase: 'consumed', sourceKind: 'user', inputOrigin: 'delegated', inherited: false, messageId: `${taskId}-message` }, offset), event(taskId, `${taskId}-action`, 'output', `Modified unrelated storage for ${taskId}.`, {}, offset))
     batch.hierarchyContext.instructionBindings.push({ taskId, lifecycleId: 'life', inputRef: ref(taskId, `${taskId}-request`), phase: 'consumed', origin: 'delegated', originRefs: [ref('root', `${taskId}-catalog`)], ancestorLimitRefs: [ref('root', 'root-request')] })
   }
-  return { client, batch, requests, register, addProblem, event, decide(value) { decision = value }, advance(value) { clock += value }, ingest(sourceKey) { return client.ingest(sourceKey, batch) } }
+  return { client, batch, requests, register, addProblem, event, decide(value) { decision = value }, advance(value) { clock += value; return clock }, ingest(sourceKey) { return client.ingest(sourceKey, batch) } }
 }
 
 test('same-conversation alerts update the panel immediately and share a non-sliding three-second notification window', async t => {
@@ -336,7 +339,8 @@ test('repeat grouping is due ten minutes after successful submission rather than
   const [first] = await f.client.claimNotifications(source)
   f.advance(7000)
   await f.client.ackNotification(first.id, { status: 'submitted' })
-  f.advance(599_999)
+  const activeAt = f.advance(599_999)
+  await f.client.ingest(source, { events: ['one', 'two'].map(id => ({ ...f.event(id, `${id}-continuing`, 'output', `Modified unrelated storage for ${id}.`), capturedAt: activeAt })) })
   assert.deepEqual(await f.client.claimNotifications(source), [], 'ten minutes from candidate or claim is still too early')
   await until(async () => (await f.client.snapshot()).tasks.filter(task => ['one', 'two'].includes(task.id)).every(task => ['idle', 'cooldown'].includes(task.analysis.state)), 'any crossed analysis time condition completes independently')
   const calls = f.requests.length

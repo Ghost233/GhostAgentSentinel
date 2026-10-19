@@ -6,7 +6,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
 import { z } from 'zod'
 
-export async function startPanelServer({ read, control, requestNotifications, notificationRecords, runtimeStatus, displayName = 'Sentinel', token, port = 0 }) {
+export async function startPanelServer({ read, control, modelSettings, requestNotifications, notificationRecords, runtimeStatus, displayName = 'Sentinel', token, port = 0 }) {
   if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) throw new Error('installation authentication is required')
   if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid panel display name')
   const title = displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查'
@@ -42,6 +42,22 @@ export async function startPanelServer({ read, control, requestNotifications, no
       const view = await read(extra._meta, selection)
       return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
     })
+    if (modelSettings) {
+      const model = z.object({ baseUrl: z.string().min(1).max(2000), model: z.string().min(1).max(2000) }).strict()
+      registerAppTool(mcp, 'sentinel_model_settings', {
+        title: '本安装模型设置', description: '读取本安装的总结模型和 JEV 配置，不依赖当前聊天采集。', inputSchema: {},
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+      }, async () => ({ content: [{ type: 'text', text: '本安装模型设置' }], structuredContent: await modelSettings.read() }))
+      registerAppTool(mcp, 'sentinel_save_model_settings', {
+        title: '保存本安装模型设置', description: '按读取的配置版本保存，仅影响本安装的分析。',
+        inputSchema: { revision: z.string().min(1).max(2000), config: z.object({ llm: model.optional(), jev: model.optional() }).strict() },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false }, _meta: { ui: { visibility: ['app'] } },
+      }, async change => ({ content: [{ type: 'text', text: '模型设置已保存' }], structuredContent: await modelSettings.save(change) }))
+      if (typeof modelSettings.directory === 'function') registerAppTool(mcp, 'sentinel_model_directory', {
+        title: '读取本机模型列表', description: '仅检查服务在线及模型名称，不调用生成或 JEV 推理。', inputSchema: { baseUrl: z.string().min(1).max(2000) },
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+      }, async (selection, extra) => ({ content: [{ type: 'text', text: '模型目录与在线状态' }], structuredContent: await modelSettings.directory(selection, { signal: extra.signal }) }))
+    }
     if (typeof control === 'function') registerAppTool(mcp, 'sentinel_set_chat_analysis', {
       title: '设置本聊天分析', description: '仅暂停或恢复当前聊天的监控分析，继续只读采集。',
       inputSchema: { paused: z.boolean(), expectedThreadId: z.string().min(1).max(128), revision: z.string().min(1).max(2000) },

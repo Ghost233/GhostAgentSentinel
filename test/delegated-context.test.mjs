@@ -1,11 +1,14 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { req } from './dsh-native-runtime.mjs'
 import { startServer } from '../src/server.mjs'
+import { connectCore } from '../src/core-client.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 import { createAdapter } from '../dsh/host.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
 
@@ -30,7 +33,7 @@ async function nativeFixture(t, { action = 'Inspect HTTP tests without changing 
         const kind = group.options.some(option => option.kind === 'authorization') ? 'authorization' : group.options.some(option => option.kind === 'action') ? 'action' : 'context'
         return group.options.filter(option => option.kind === kind).slice(0, 1).map(option => option.optionId)
       })
-      res.end(JSON.stringify({ model: json.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [] }) } }] }))
+      res.end(JSON.stringify({ model: json.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(json, { selectedOptionIds, gaps: [] })) } }] }))
     } else {
       const hasLimit = json.state.events.some(event => (event.textRef === 'request' ? json.state.request : event.text) === 'Inspect repository. Do not modify files.' && event.authorizationEligible === true)
       const badDelegation = json.state.events.some(event => event.kind === 'tool-start' && event.text === 'Change database files.')
@@ -47,8 +50,9 @@ async function nativeFixture(t, { action = 'Inspect HTTP tests without changing 
     if (failures.length) throw new AggregateError(failures, 'delegated context cleanup failed')
   })
   const baseUrl = `http://127.0.0.1:${models.address().port}`
-  await writeFile(join(dataDir, 'analysis-config.json'), JSON.stringify({ llm: { baseUrl, model: 'controlled-extractor' }, jev: { baseUrl, model: 'controlled-judge' } }))
   server = await startServer({ dataDir, cooldownMs: 1 })
+  const control = await connectCore({ dataDir })
+  try { await configureInstallationModels(control, 'native-context', { llm: { baseUrl, model: 'controlled-extractor' }, jev: { baseUrl, model: 'controlled-judge' } }) } finally { await control.close() }
   ctx = new Context()
   class Actor extends LlmAdapter {
     async resolveModel(provider, id) { return { provider, id, name: id } }

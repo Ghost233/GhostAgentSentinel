@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -11,6 +12,7 @@ import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
 import { panelHarness } from './helpers/chatgpt-panel.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 
 const B = '00000000-0000-4000-8000-000000000101', F = '00000000-0000-4000-8000-000000000102'
 const until = async (predicate, label) => {
@@ -40,7 +42,7 @@ for (const holdPending of [false, true]) test(`a real fork binding transition up
         const kind = group.options.some(option => option.kind === 'authorization') ? 'authorization' : group.options.some(option => option.kind === 'action') ? 'action' : 'context'
         return group.options.filter(option => option.kind === kind).slice(0, 1).map(option => option.optionId)
       })
-      res.end(JSON.stringify({ model: json.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [] }) } }] }))
+      res.end(JSON.stringify({ model: json.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(json, { selectedOptionIds, gaps: [] })) } }] }))
     } else {
       const pending = !Object.hasOwn(json.questions, 'request_drift')
       const late = pending && holdPending
@@ -53,7 +55,6 @@ for (const holdPending of [false, true]) test(`a real fork binding transition up
   await new Promise((resolve, reject) => { models.once('error', reject); models.listen(0, '127.0.0.1', resolve) })
   const baseUrl = 'http://127.0.0.1:' + models.address().port, dataDir = join(dir, 'core'), sessionsRoot = join(dir, 'sessions')
   await mkdir(dataDir); await mkdir(sessionsRoot)
-  await writeFile(join(dataDir, 'analysis-config.json'), JSON.stringify({ llm: { baseUrl, model: 'framework-extractor' }, jev: { baseUrl, model: 'framework-judge' } }))
   const row = (ordinal, type, payload) => JSON.stringify({ ordinal, type, payload, timestamp: new Date(clock - 1000).toISOString() }) + '\n'
   const header = id => ({ id, cwd: '/owned', originator: 'Codex Desktop', source: 'vscode', cli_version: supportedProfile.cliVersion, history_mode: 'paginated' })
   const start = turn => ({ type: 'task_started', turn_id: turn, turn_attribution: { turn_id: turn, turn_trigger: 'composer' } })
@@ -85,6 +86,7 @@ for (const holdPending of [false, true]) test(`a real fork binding transition up
   }
   server = await startServer({ dataDir, now: () => clock, leaseMs: 172800000 })
   core = await connectCore({ dataDir })
+  await configureInstallationModels(core, 'chatgpt:fork-analysis-transition', { llm: { baseUrl, model: 'framework-extractor' }, jev: { baseUrl, model: 'framework-judge' } })
   const token = 'd'.repeat(64)
   adapter = await startChatGPTAdapter({ core, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'fork-analysis-transition', token, collectMaterials: true, nativeOriginVersion: 2, pollMs: 0, now: () => clock })
   const read = async () => {

@@ -9,7 +9,7 @@ const identifier = value => typeof value === 'string' && value.trim().length > 0
 const CATEGORIES = new Map([
   ['timeout', ['deadline', 'timeout', 'ETIMEDOUT']],
   ['transport', ['network', 'http_error', 'metadata-unavailable', 'metadata-send-failed', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN']],
-  ['protocol', ['invalid_json', 'invalid_response', 'invalid_model', 'unexpected_stream', 'incomplete_response', 'invalid_extraction', 'invalid_decision', 'invalid-lifecycle-record', 'unsupported-record-type', 'unsupported-event-type', 'metadata-rpc-error', 'metadata-invalid-response']],
+  ['protocol', ['invalid_json', 'invalid_response', 'invalid_model', 'unexpected_stream', 'incomplete_response', 'invalid_extraction', 'invalid_summary', 'invalid_decision', 'invalid-lifecycle-record', 'unsupported-record-type', 'unsupported-event-type', 'metadata-rpc-error', 'metadata-invalid-response']],
   ['cancelled', ['cancelled']],
   ['evidence', ['invalid_evidence']], ['expired', ['evidence_expired', 'analysis_expired']],
   ['configuration', ['configuration', 'analysis_config_conflict']],

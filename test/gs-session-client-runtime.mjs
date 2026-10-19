@@ -9,6 +9,7 @@ const { createElement: h, act } = clientRequire('react')
 const { createRoot } = clientRequire('react-dom/client')
 const { JSDOM } = clientRequire('jsdom')
 export async function mountGS(t, service, sessionId = 'root', surface) {
+  service.analysisConfigState ??= async () => ({ registrationId: 'gs-fixture', config: {}, revision: 'gs-fixture-revision' })
   const ctx = new Context(), slots = new SlotCore(), intervals = new Map()
   const dom = surface?.dom || new JSDOM('<html><head></head><body><div id="view"></div><input id="draft" value="keep draft"></body></html>', { pretendToBeVisual: true })
   const element = surface?.element || dom.window.document.getElementById('view'), existingStyles = new Set(dom.window.document.head.querySelectorAll('style'))

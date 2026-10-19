@@ -43,7 +43,7 @@ function parameterCodec(name) {
 module.exports = function descriptors() {
   const methods = {
     snapshot: [], gsSummary: ['sessionId'], diagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'],
-    configureAnalysis: ['config'], configureAnalysisIfCurrent: ['config', 'revision'], ackNotification: ['id', 'result'],
+    configureAnalysisIfCurrent: ['config', 'revision'], ackNotification: ['id', 'result'],
   }
   return Object.entries(methods).map(([method, parameters]) => ({
     id: `ghost-agent-sentinel#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,

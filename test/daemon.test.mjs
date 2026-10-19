@@ -7,6 +7,8 @@ import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createServer } from 'node:http'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
+import { withModelSummary } from './helpers/model-summary.mjs'
 
 test('private loopback transport stores capture, hides secrets, supports pause and real server restart', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-server-'))
@@ -87,7 +89,7 @@ test('production HTTP path extracts cited events, judges drift and creates a sou
     if (request.url === '/v1/chat/completions') {
       const evidence = JSON.parse(input.messages.find(message => message.role === 'user').content).evidence
       const selectedOptionIds = [evidence.find(entry => entry.origin === 'output').options.find(option => option.kind === 'action').optionId]
-      response.end(JSON.stringify({ model: input.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [] }) } }] }))
+      response.end(JSON.stringify({ model: input.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(input, { selectedOptionIds, gaps: [] })) } }] }))
     } else {
       response.end(JSON.stringify({ model: input.model, answers: Object.fromEntries(Object.keys(input.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'attention' : 'unknown' }])) }))
     }
@@ -99,7 +101,7 @@ test('production HTTP path extracts cited events, judges drift and creates a sou
   t.after(async () => { await server.close(); models.closeAllConnections(); await new Promise(resolve => models.close(resolve)); await rm(dataDir, { recursive: true, force: true }) })
   const client = await connectCore({ dataDir })
   const baseUrl = `http://127.0.0.1:${models.address().port}`
-  await client.configureAnalysis({ llm: { baseUrl, model: 'extract' }, jev: { baseUrl, model: 'judge' } })
+  await configureInstallationModels(client, 'p', { llm: { baseUrl, model: 'extract' }, jev: { baseUrl, model: 'judge' } })
   const source = await client.registerSource({ registrationId: 'p', hostRunId: 'one', name: 'test' })
   const other = await client.registerSource({ registrationId: 'p', hostRunId: 'two', name: 'other' })
   await client.ingest(source, { tasks: [{ id: 'task', lifecycleId: 'life', status: 'running', title: 'Add a log' }], events: [
@@ -215,6 +217,7 @@ test('Native Host and ClientRemote expose bounded configuration CAS and preserve
   while (!adapter.connected) { assert.ok(Date.now() < end, 'actual Native adapter connected'); await delay(10) }
   const invoke = (method, args = {}) => host.typertGateway.invoke({ namespace: 'sentinel', method, args, peer })
   const initial = await invoke('analysisConfigState')
+  assert.equal(initial.registrationId, 'native-config')
   const configured = await invoke('configureAnalysisIfCurrent', { config: { llm: { model: 'native' } }, revision: initial.revision })
   assert.equal(configured.config.llm.model, 'native')
   const conflict = await host.typertGateway.dispatchRpc('sentinel/configureAnalysisIfCurrent', { args: { config: {}, revision: initial.revision } }, undefined, peer)
@@ -238,49 +241,28 @@ test('Native Host and ClientRemote expose bounded configuration CAS and preserve
   const clientConflict = await api.configureAnalysisIfCurrent({ llm: { model: 'must-not-override' } }, configured.revision)
   assert.equal(clientConflict.ok, false); assert.equal(clientConflict.error.code, 'analysis_config_conflict')
   assert.deepEqual((await api.analysisConfigState()).value, changed.value)
-  control = await connectCore({ dataDir }); await control.pause()
+  control = await connectCore({ dataDir })
+  assert.deepEqual((await control.installationAnalysisConfig('native-config')), changed.value)
+  assert.deepEqual(await control.analysisConfig(), {}, 'Native installation CAS does not write the old shared slot')
   const idle = await host.agents.create({ sessionId: 'config-fault-idle', agentOptions: { provider: 'unused', model: 'unused' } }); t.after(() => idle.dispose())
   while (!(await adapter.snapshot()).tasks.some(task => task.id === 'config-fault-idle')) { assert.ok(Date.now() < end, 'Native idle task captured'); await delay(5) }
   const { DatabaseSync } = await import('node:sqlite')
   blocker = new DatabaseSync(join(dataDir, 'observations.sqlite')); blocker.exec('BEGIN IMMEDIATE')
-  let applicationFailure, lockedSource
+  let applicationFailure
   try {
-    await assert.rejects(control.configureAnalysisIfCurrent({ llm: { model: 'must-stay-unconfirmed' } }, changed.value.revision), error => { applicationFailure = error; return error.code === 'analysis_config_unconfirmed' })
-    assert.ok(applicationFailure.causes.length >= 2 && applicationFailure.causes.every(cause => cause.includes('database is locked')))
-    for (const request of [() => control.analysisConfigState(), () => control.analysisConfig(), () => control.configureAnalysisIfCurrent({}, changed.value.revision)]) await assert.rejects(request(), error => error.code === 'analysis_config_unconfirmed')
-    lockedSource = (await adapter.snapshot()).adapter
-    if (lockedSource.sourceKey === null) {
-      const disconnected = await api.analysisConfigState()
-      assert.equal(lockedSource.connected, false); assert.match(lockedSource.error, /database is locked/)
-      assert.equal(disconnected.ok, false); assert.equal(disconnected.error.code, 'gateway/internal')
-      assert.match(disconnected.error.message, /database is locked|共享核心.*连接/)
-    }
+    applicationFailure = await api.configureAnalysisIfCurrent({ llm: { model: 'must-not-persist' } }, changed.value.revision)
+    assert.equal(applicationFailure.ok, false)
+    assert.match(applicationFailure.error.message, /database is locked/)
+    assert.deepEqual((await api.analysisConfigState()).value, changed.value, 'failed installation persistence retains its readable CAS revision')
   } finally { blocker.exec('ROLLBACK'); blocker.close(); blocker = undefined }
-  while (!adapter.connected) { assert.ok(Date.now() < end, 'Native adapter reconnects within the original configuration fixture deadline'); await delay(10) }
-  const nativeUnconfirmed = []
-  for (const [method, request] of [['analysisConfigState', () => api.analysisConfigState()], ['analysisConfig', () => api.analysisConfig()], ['configureAnalysisIfCurrent', () => api.configureAnalysisIfCurrent({}, changed.value.revision)]]) {
-    const reply = await request(); assert.equal(reply.ok, false); assert.equal(reply.error.code, 'analysis_config_unconfirmed', `${method}: ${reply.error.message}`)
-    nativeUnconfirmed.push({ method, code: reply.error.code, message: reply.error.message })
-  }
-  t.diagnostic(`cas-public: ${JSON.stringify({ applicationFailure: { code: applicationFailure.code, message: applicationFailure.message, causes: applicationFailure.causes }, duringLock: { connected: lockedSource.connected, sourceKey: lockedSource.sourceKey, error: lockedSource.error }, reconnected: adapter.connected, nativeUnconfirmed })}`)
-  assert.equal((await api.configureAnalysis({})).ok, true)
-  assert.equal((await api.analysisConfigState()).ok, true)
-  const { createRequire, syncBuiltinESMExports } = await import('node:module'), filesystem = createRequire(import.meta.url)('node:fs/promises')
-  const originalChmod = filesystem.chmod, originalRm = filesystem.rm, configPath = join(dataDir, 'analysis-config.json')
-  const stable = (await api.analysisConfigState()).value
-  filesystem.chmod = async (path, ...args) => { if (String(path).startsWith(`${configPath}.`)) throw new Error('native precommit chmod failure'); return originalChmod(path, ...args) }
-  filesystem.rm = async (path, ...args) => { if (String(path).startsWith(`${configPath}.`)) throw new Error('native temp cleanup failure'); return originalRm(path, ...args) }
-  syncBuiltinESMExports()
-  let fileFailure
-  try { fileFailure = await api.configureAnalysisIfCurrent({ llm: { model: 'must-not-replace' } }, stable.revision) }
-  finally { filesystem.chmod = originalChmod; filesystem.rm = originalRm; syncBuiltinESMExports() }
-  assert.equal(fileFailure.ok, false); assert.equal(fileFailure.error.code, 'gateway/internal')
-  assert.match(fileFailure.error.message, /native precommit chmod failure/)
-  assert.deepEqual(fileFailure.error.details.causes, ['native precommit chmod failure', 'native temp cleanup failure'])
-  assert.deepEqual((await api.analysisConfigState()).value, stable)
+  const retried = await api.configureAnalysisIfCurrent({ llm: { model: 'native-recovered' } }, changed.value.revision)
+  assert.equal(retried.ok, true); assert.equal(retried.value.config.llm.model, 'native-recovered')
+  assert.deepEqual((await api.analysisConfigState()).value, retried.value)
+  assert.deepEqual((await control.installationAnalysisConfig('native-config')), retried.value)
+  assert.deepEqual(await control.analysisConfig(), {})
 })
 
-test('configuration apply failure restores the file, reports unconfirmed state and requires an explicit successful write before inference', async t => {
+test('an installation configuration storage failure retains its revision and permits retry before actual inference', async t => {
   const { DatabaseSync } = await import('node:sqlite')
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-config-apply-failure-'))
   let server, client, blocker, models
@@ -290,41 +272,36 @@ test('configuration apply failure restores the file, reports unconfirmed state a
     const chunks = []; for await (const chunk of request) chunks.push(chunk)
     const body = JSON.parse(Buffer.concat(chunks)); requests.push({ path: request.url, model: body.model })
     response.setHeader('content-type', 'application/json')
-    response.end(JSON.stringify(request.url === '/v1/chat/completions' ? { choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] } : { answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown', probabilities: { attention: 0, clear: 0, unknown: 1 } }])) }))
+    response.end(JSON.stringify(request.url === '/v1/chat/completions' ? { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] } : { answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown', probabilities: { attention: 0, clear: 0, unknown: 1 } }])) }))
   })
   await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
   server = await startServer({ dataDir }); client = await connectCore({ dataDir }); await client.pause()
   const baseUrl = `http://127.0.0.1:${models.address().port}`, prior = { llm: { baseUrl, model: 'before' }, jev: { baseUrl, model: 'judge' } }
-  await client.configureAnalysis(prior)
+  await configureInstallationModels(client, 'apply-failure', prior)
   const sourceKey = await client.registerSource({ registrationId: 'apply-failure', hostRunId: 'own', name: 'own' })
   await client.ingest(sourceKey, { tasks: [{ id: 'own-task', lifecycleId: 'own-life', title: 'own', status: 'idle' }] })
-  const initial = await client.analysisConfigState()
+  const initial = await client.installationAnalysisConfig('apply-failure')
   // External storage contention only; no private database queries.
   blocker = new DatabaseSync(join(dataDir, 'observations.sqlite')); blocker.exec('BEGIN IMMEDIATE')
-  let failure, disk
+  let failure
   try {
-    try { await client.configureAnalysisIfCurrent({ ...prior, llm: { baseUrl, model: 'after' } }, initial.revision) } catch (error) { failure = error }
-    assert.match(failure.message, /database is locked/); assert.equal(failure.code, 'analysis_config_unconfirmed')
-    assert.ok(failure.causes.length >= 2 && failure.causes.every(cause => cause.includes('database is locked')))
-    for (const read of [() => client.analysisConfigState(), () => client.analysisConfig(), () => client.configureAnalysisIfCurrent(prior, initial.revision)]) await assert.rejects(read(), error => error.code === 'analysis_config_unconfirmed')
-    disk = JSON.parse(await readFile(join(dataDir, 'analysis-config.json'), 'utf8')); assert.deepEqual(disk, initial.config)
+    try { await client.configureInstallationAnalysis('apply-failure', { ...prior, llm: { baseUrl, model: 'after' } }, initial.revision) } catch (error) { failure = error }
+    assert.match(failure.message, /database is locked/)
+    assert.deepEqual(await client.installationAnalysisConfig('apply-failure'), initial)
   } finally { blocker.exec('ROLLBACK'); blocker.close(); blocker = undefined }
-  await client.configureAnalysis(prior)
-  const published = await client.analysisConfigState(); assert.deepEqual(published.config, initial.config); assert.notEqual(published.revision, initial.revision)
+  const published = await client.configureInstallationAnalysis('apply-failure', prior, initial.revision)
+  assert.deepEqual(published.config, initial.config); assert.notEqual(published.revision, initial.revision)
   await client.ingest(sourceKey, { tasks: [{ id: 'own-task', lifecycleId: 'own-life', title: 'own', status: 'running' }], events: [
     { id: 'request', taskId: 'own-task', taskLifecycleId: 'own-life', kind: 'input', text: 'Read project metadata', occurredAt: null, capturedAt: Date.now() },
     { id: 'output', taskId: 'own-task', taskLifecycleId: 'own-life', kind: 'output', text: 'Reading project metadata now', occurredAt: null, capturedAt: Date.now() },
   ] })
   await client.resume()
   const end = Date.now() + 2000; while (!requests.some(request => request.path === '/v1/chat/completions')) { assert.ok(Date.now() < end, 'actual production inference requested'); await delay(5) }
-  await mkdir(new URL('../.scratch/implementation/phase20/config-cas/', import.meta.url), { recursive: true })
-  await import('node:fs/promises').then(({ writeFile }) => writeFile(new URL('../.scratch/implementation/phase20/config-cas/apply-failure-recovered.json', import.meta.url), JSON.stringify({ failure: { message: failure.message, code: failure.code, causes: failure.causes }, initial, published, disk, requests }, null, 2)))
   assert.deepEqual(published.config, initial.config)
-  assert.deepEqual(disk, initial.config)
   assert.equal(requests.find(request => request.path === '/v1/chat/completions').model, 'before')
 })
 
-for (const cleanupAlsoFails of [false, true]) test(`precommit chmod failure ${cleanupAlsoFails ? 'and cleanup failure retain both errors' : 'retains old disk configuration and inference'}`, async t => {
+for (const cleanupAlsoFails of [false, true]) test(`legacy configuration chmod failure ${cleanupAlsoFails ? 'and cleanup failure retain both errors' : 'retains its old disk configuration'} while installation inference remains unchanged`, async t => {
   const { createRequire, syncBuiltinESMExports } = await import('node:module')
   const filesystem = createRequire(import.meta.url)('node:fs/promises'), originalChmod = filesystem.chmod, originalRm = filesystem.rm
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-config-file-io-')), configPath = join(dataDir, 'analysis-config.json')
@@ -336,11 +313,12 @@ for (const cleanupAlsoFails of [false, true]) test(`precommit chmod failure ${cl
     const chunks = []; for await (const chunk of request) chunks.push(chunk)
     const body = JSON.parse(Buffer.concat(chunks)); requests.push({ path: request.url, model: body.model })
     response.setHeader('content-type', 'application/json')
-    response.end(JSON.stringify(request.url === '/v1/chat/completions' ? { choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] } : { answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown', probabilities: { attention: 0, clear: 0, unknown: 1 } }])) }))
+    response.end(JSON.stringify(request.url === '/v1/chat/completions' ? { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] } : { answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown', probabilities: { attention: 0, clear: 0, unknown: 1 } }])) }))
   })
   await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
   server = await startServer({ dataDir }); client = await connectCore({ dataDir }); await client.pause()
   const baseUrl = `http://127.0.0.1:${models.address().port}`, prior = { llm: { baseUrl, model: 'before-chmod-failure' }, jev: { baseUrl, model: 'judge' } }
+  await configureInstallationModels(client, 'file-io', prior)
   await client.configureAnalysis(prior); const initial = await client.analysisConfigState()
   let failure
   filesystem.chmod = async (path, ...args) => { if (String(path) === configPath || String(path).startsWith(`${configPath}.`)) throw new Error('injected config chmod failure'); return originalChmod(path, ...args) }

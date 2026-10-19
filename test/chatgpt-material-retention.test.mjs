@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -9,6 +10,7 @@ import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 
 const DAY = 86_400_000
 const profile = { appVersion: '26.1007.71326', appBuild: '20398', cliVersion: '0.162.0-alpha.17.2' }
@@ -138,7 +140,7 @@ test('the authenticated current-chat panel can select a monitored prior executio
 
 test('monitored history survives core restart without rerunning ended executions and expires with its original evidence', async t => {
   const f = await fixture(t, [{ id: 'main', turn: 'prior', text: 'Read prior.log only' }]), models = await controlledModels(t)
-  await f.core.configureAnalysis(models.config); await f.start(); await f.read('main'); await settled(f, [['main', 'prior']])
+  await configureInstallationModels(f.core, 'chatgpt:material-retention', models.config); await f.start(); await f.read('main'); await settled(f, [['main', 'prior']])
   f.advance(1000)
   await appendFile(f.threads.get('main').path, row('event_msg', { type: 'task_complete', turn_id: 'prior' }, f.now()) + turn('main', 'current', 'Read current.log only', f.now() + 1))
   f.threads.get('main').anchorTurnId = 'current'
@@ -234,7 +236,7 @@ async function controlledModels(t, choice = 'clear') {
     const body = JSON.parse(text), decoded = req.url === '/v1/systemone' ? decodeJevRequest(body) : body
     requests.push({ path: req.url, body: decoded })
     res.setHeader('content-type', 'application/json')
-    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }))
     else res.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(decoded.questions).map(id => [id, { type: 'choice', choice }])) }))
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -253,7 +255,7 @@ async function settled(f, ids) {
 
 test('a historical execution retains the grounded problem and its own inline evidence after task alerts stop', async t => {
   const f = await fixture(t, [{ id: 'main', turn: 'prior-alert', text: 'Read the log only' }]), models = await controlledModels(t, 'attention')
-  await f.core.configureAnalysis(models.config); await f.start(); await f.read('main')
+  await configureInstallationModels(f.core, 'chatgpt:material-retention', models.config); await f.start(); await f.read('main')
   const [original] = await settled(f, [['main', 'prior-alert']])
   assert.ok(original.alerts.some(alert => alert.checkId === 'request_drift' && alert.status === 'attention'))
   f.advance(1000)
@@ -270,7 +272,7 @@ test('a historical execution retains the grounded problem and its own inline evi
 
 test('two main chats keep their source context while completed turns stop analysis and never grant proof to a different current turn', async t => {
   const f = await fixture(t, [{ id: 'alpha', turn: 'alpha-one', text: 'Read alpha.log only' }, { id: 'beta', turn: 'beta-one', text: 'Read beta.log only' }]), models = await controlledModels(t)
-  await f.core.configureAnalysis(models.config)
+  await configureInstallationModels(f.core, 'chatgpt:material-retention', models.config)
   await f.start()
   await f.read('alpha'); await f.read('beta')
   const initial = await settled(f, [['alpha', 'alpha-one'], ['beta', 'beta-one']])

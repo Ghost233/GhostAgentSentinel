@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -62,7 +63,7 @@ async function analysisFixture(t, { hold = true, choice = 'clear' } = {}) {
     const body = JSON.parse(raw); requests.push({ path: req.url, body })
     res.setHeader('content-type', 'application/json')
     if (req.url === '/v1/chat/completions') {
-      const job = { body, done: false, closedEarly: false, reply() { if (job.done) return; job.done = true; if (!res.destroyed) res.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] })) } }
+      const job = { body, done: false, closedEarly: false, reply() { if (job.done) return; job.done = true; if (!res.destroyed) res.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] })) } }
       res.once('close', () => { if (!job.done) job.closedEarly = true })
       held.push(job); if (!holding) job.reply()
     } else res.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: decision }])) }))

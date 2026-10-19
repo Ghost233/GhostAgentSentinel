@@ -7,6 +7,9 @@ import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
+import { controlledModelService } from './helpers/controlled-model-service.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
+import { setTimeout as delay } from 'node:timers/promises'
 
 async function fixture(t, count = 50, options = {}) {
   let clock = Date.now(), turn = 'c', ordinal = 1 + count * 3
@@ -107,13 +110,15 @@ test('an accepted core HTTP receipt lost at the adapter seam replays the same pr
   }
 })
 
-async function imported(f, mutate = () => {}) {
+async function imported(f, mutate = () => {}, config) {
   const snapshot = await f.core.snapshot(), context = structuredClone(snapshot.sources[0].hierarchyContext)
   const batch = { tasks: snapshot.tasks.map(task => ({ id: task.id, sessionId: task.sessionId, lifecycleId: task.lifecycleId, title: task.title, status: task.status })), events: structuredClone(snapshot.tasks.flatMap(task => task.events)), hierarchyContext: context }
   mutate(batch)
-  const source = await f.core.registerSource({ registrationId: 'copy-' + Math.random(), hostRunId: 'h', name: 'Fixture fork', policy: 'chatgpt-main/1' })
+  const registrationId = 'copy-' + Math.random()
+  const source = await f.core.registerSource({ registrationId, hostRunId: 'h', name: 'Fixture fork', policy: 'chatgpt-main/1' })
+  if (config) await configureInstallationModels(f.core, registrationId, config)
   await f.core.ingest(source, batch)
-  return { source, batch, task: async () => (await f.core.snapshot()).tasks.find(task => task.sourceKey === source && task.lifecycleId === 'c') }
+  return { source, registrationId, batch, task: async () => (await f.core.snapshot()).tasks.find(task => task.sourceKey === source && task.lifecycleId === 'c') }
 }
 
 test('compact fork context remains unknown when one or all producers, starts, or its receipt expire', async t => {
@@ -197,9 +202,12 @@ test('two copies of one native producer in a first HTTP batch cannot extend its 
 })
 
 test('expiry of an implicit historical start cannot reuse a previously completed analysis', async t => {
+  const model = await controlledModelService(t)
   const f = await fixture(t, 1), copy = await imported(f, batch => {
     batch.events.find(event => event.data?.history && event.data.nativeType === 'task_started').capturedAt = f.now() - 86400000 + 1000
-  })
+  }, model.config)
+  const deadline = performance.now() + 3000
+  while (!(await copy.task()).analysis.completedAt) { assert.ok(performance.now() < deadline, 'actual configured analysis completes'); await delay(5) }
   const before = await copy.task()
   assert.equal(before.analysis.resultDisposition, 'current', JSON.stringify(before.analysis))
   f.advance(2000)

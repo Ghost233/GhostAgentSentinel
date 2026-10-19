@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { createAnalyzer } from '../src/analysis/index.mjs';
 import { qualityCases } from '../probes/modeldeck/quality-cases.mjs';
 import { decodeJevRequest } from './helpers/jev-wire.mjs';
+import { withModelSummary } from './helpers/model-summary.mjs';
 
 const at = 1_800_000_000_000;
 const task = { id: 'a', lifecycleId: 'life-a', title: 'Add a log', status: 'running' };
@@ -53,7 +54,7 @@ async function withModels(t, extraction, choices = {}, handler) {
         const matching = eligible ? evidence.filter(entry => entry.text === fixtureEvent.text && entry.origin === fixtureEvent.kind && entry.options.some(option => option.kind === fact.kind)) : [];
         return matching.length === 1 ? matching[0].options.find(option => option.kind === fact.kind).optionId : `invalid-fixture:${fact.eventId}:${fact.kind}`;
       });
-      res.end(JSON.stringify({ model: 'extractor', choices: [{ message: { content: JSON.stringify({ selectedOptionIds, gaps: extraction.gaps }) }, finish_reason: 'stop' }], usage: { prompt_tokens: 12, completion_tokens: 8 } }));
+      res.end(JSON.stringify({ model: 'extractor', choices: [{ message: { content: JSON.stringify(withModelSummary(json, { selectedOptionIds, gaps: extraction.gaps })) }, finish_reason: 'stop' }], usage: { prompt_tokens: 12, completion_tokens: 8 } }));
     } else {
       const answers = Object.fromEntries(Object.keys(json.questions).map(id => [id, { type: 'choice', choice: choices[id] ?? 'unknown', confidence: 0.98 }]));
       res.end(JSON.stringify({ model: 'judge', answers, usage: { input_tokens: 20, output_tokens: 0 } }));
@@ -576,7 +577,7 @@ test('finite evidence selection restores original text and source without model-
     const entry = payload.evidence.find(entry => entry.text === action.text);
     const selectedOptionIds = [entry.options.find(option => option.kind === 'action').optionId];
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [] }) } }] }));
+    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds, gaps: [] })) } }] }));
     return true;
   });
   const result = await models.analyzer().analyze({ ...input, events: [...input.events, action] });
@@ -600,7 +601,7 @@ test('model-visible option IDs are unambiguous while internal event references r
     const group = visible.evidence.find(entry => entry.origin === 'output');
     const option = group.options.find(option => option.kind === 'action');
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds: [option.optionId], gaps: [] }) } }] }));
+    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [option.optionId], gaps: [] })) } }] }));
     return true;
   });
   const result = await models.analyzer().analyze({ ...input, events: [...input.events, action] });
@@ -616,7 +617,7 @@ test('finite selection rejects unknown IDs, duplicate IDs and legacy free-form f
       const option = JSON.parse(body.messages[1].content).evidence[0].options.find(option => option.kind === 'context').optionId;
       const output = mode === 'legacy' ? { facts: [{ kind: 'request', eventId: 'request', quote: 'Add a log' }], gaps: [] }
         : mode === 'old-key' ? { selectedEvidenceIds: [option], gaps: [] }
-          : { selectedOptionIds: mode === 'event-id' ? ['request'] : mode === 'unknown' ? ['unavailable-evidence'] : [option, option], gaps: [] };
+          : { selectedOptionIds: mode === 'event-id' ? ['request'] : mode === 'unknown' ? ['unavailable-evidence'] : [option, option], gaps: [], summary: { text: '已观察到当前请求。', evidenceOptionIds: [option] } };
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(output) } }] }));
       return true;
@@ -651,7 +652,7 @@ test('foreign source material is absent from the public directory independently 
     const directory = JSON.parse(body.messages[1].content).evidence;
     assert.ok(!directory.some(entry => entry.text === foreign.text));
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":["foreign-record"],"gaps":[]}' } }] }));
+    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds: ['foreign-record'], gaps: [], summary: { text: '已观察到当前请求。', evidenceOptionIds: [directory[0].options[0].optionId] } }) } }] }));
     return true;
   });
   await assert.rejects(models.analyzer().analyze({ ...input, events: [...input.events, foreign] }), error => error.code === 'invalid_evidence');
@@ -666,7 +667,7 @@ test('same-text current evidence can be selected only by its actual public optio
     assert.equal(directory.filter(entry => entry.text === current.text).length, 1);
     const option = directory.find(entry => entry.text === current.text).options.find(option => option.kind === 'action');
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds: [option.optionId], gaps: [] }) } }] }));
+    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [option.optionId], gaps: [] })) } }] }));
     return true;
   });
   const result = await models.analyzer().analyze({ ...input, task: { ...task, currentRequestId: 'request' }, events: [old, ...input.events, current] });
@@ -711,7 +712,7 @@ test('catalog options enforce source eligibility without predeclaring gate or pe
     assert.ok(resultOptions.some(option => option.kind === 'validation-requirement'));
     assert.ok(!resultOptions.some(option => option.kind === 'authorization'));
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }));
+    res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }));
     return true;
   });
   const result = await models.analyzer().analyze({ ...input, events: [...input.events, start, outcome] });

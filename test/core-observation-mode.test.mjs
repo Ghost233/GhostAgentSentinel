@@ -7,6 +7,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { startServer } from '../src/server.mjs';
 import { connectCore } from '../src/core-client.mjs';
 import { createCore } from '../src/core/index.mjs';
+import { controlledModelService } from './helpers/controlled-model-service.mjs';
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs';
 
 const descriptor = { registrationId: 'chatgpt', hostRunId: 'run', name: 'Current main', mode: 'observation-only' };
 const task = { id: 'main', lifecycleId: 'turn', sessionId: 'main', title: 'Current main', status: 'running' };
@@ -110,6 +112,7 @@ test('an initial ended or unknown task still confirms observation-only mode thro
 });
 
 test('invalid modes are atomic and default sources still analyze independently through HTTP', async t => {
+  const models = await controlledModelService(t);
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-observation-compatibility-'));
   const server = await startServer({ dataDir });
   let client;
@@ -119,10 +122,11 @@ test('invalid modes are atomic and default sources still analyze independently t
   await assert.rejects(client.registerSource({ ...descriptor, mode: 'silent' }), error => error.status === 400);
   assert.equal((await client.snapshot()).sources[0].descriptor.mode, 'observation-only');
   const { mode, ...normal } = descriptor;
+  await configureInstallationModels(client, 'legacy', models.config);
   const peer = await client.registerSource({ ...normal, registrationId: 'legacy' });
   const time = Date.now();
   await client.ingest(observed, { tasks: [task, { ...task, id: 'second' }], events: [event('request', time)] });
-  await client.ingest(peer, { tasks: [task], events: [event('legacy-request', time)] });
+  await client.ingest(peer, { tasks: [task], events: [event('legacy-request', time), event('legacy-output', time, 'output')] });
   let state;
   for (let i = 0; i < 100; i++) {
     state = await client.snapshot();
@@ -131,6 +135,7 @@ test('invalid modes are atomic and default sources still analyze independently t
   }
   const legacy = state.tasks.find(value => value.sourceKey === peer);
   assert.notEqual(legacy.analysis.completedAt, null);
+  assert.equal(legacy.analysis.error, null);
   assert.notEqual(legacy.analysis.state, 'observation-only');
   assert.equal(Object.hasOwn(state.sources.find(value => value.key === peer).descriptor, 'mode'), false);
   assert.equal(state.tasks.find(value => value.sourceKey === observed && value.id === task.id).analysis.completedAt, null);

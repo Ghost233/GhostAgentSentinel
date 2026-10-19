@@ -9,6 +9,9 @@ import { connectCore } from '../src/core-client.mjs'
 import { createLazyCore, retentionProfileSignature } from '../chatgpt/lazy-core.mjs'
 import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.mjs'
 import { openHealthOutbox } from '../chatgpt/health-outbox.mjs'
+import { controlledModelService } from './helpers/controlled-model-service.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const DAY = 86_400_000
 async function fixture(t) {
@@ -34,6 +37,8 @@ test('public retention deadline tracks real evidence and failures without leakin
   assert.equal((await f.client.nativeNotificationRecords({ sourceKey: source })).records[0].native.userAction.action, 'default')
   f.setClock(at + 100)
   const dsh = await f.client.registerSource({ registrationId: 'retention-dsh', hostRunId: 'dsh-host', name: 'DSH' })
+  const monitoring = await f.client.installationMonitoring('retention-dsh')
+  await f.client.setInstallationMonitoring('retention-dsh', true, monitoring.revision)
   await f.client.ingest(dsh, { tasks: [{ id: 'peer', lifecycleId: 'run', title: 'Peer', status: 'running' }], events: [{ id: 'input', taskId: 'peer', taskLifecycleId: 'run', kind: 'input', capturedAt: f.clock, occurredAt: null, text: 'PRIVATE RETENTION REQUEST' }] })
   let diagnostics = await f.client.diagnostics()
   assert.equal(diagnostics.retention?.nextExpiryAt, at + DAY)
@@ -57,10 +62,14 @@ test('public retention deadline tracks real evidence and failures without leakin
 test('a standby helper prunes existing expired bodies on startup before any Native sampling and preserves fresh DSH', async t => {
   t.mock.timers.enable({ apis: ['setInterval'] })
   const f = await fixture(t), at = f.clock
+  const model = await controlledModelService(t)
+  await configureInstallationModels(f.client, 'expired-owned-fixture', model.config)
   const old = await f.client.registerSource({ registrationId: 'expired-owned-fixture', hostRunId: 'old', name: 'Expired' })
   await f.client.ingest(old, { tasks: [{ id: 'old', lifecycleId: 'run', title: 'Old', status: 'running' }], events: [{ id: 'old-input', taskId: 'old', taskLifecycleId: 'run', kind: 'input', capturedAt: at, occurredAt: null, text: 'PRIVATE EXPIRED OWNED BODY' }] })
-  const seeded = (await f.client.snapshot()).tasks.find(task => task.sourceKey === old)
-  assert.equal(seeded.analysis.summary.currentTask, 'PRIVATE EXPIRED OWNED BODY', 'a real unconfigured analysis result still contains retained request text')
+  let seeded
+  const deadline = performance.now() + 3000
+  do { seeded = (await f.client.snapshot()).tasks.find(task => task.sourceKey === old); if (seeded.analysis.completedAt) break; assert.ok(performance.now() < deadline, 'actual configured analysis completes'); await delay(5) } while (true)
+  assert.equal(seeded.analysis.summary.currentTask, 'PRIVATE EXPIRED OWNED BODY', 'a real configured analysis result contains retained request text')
   await f.client.unregisterSource(old)
   f.setClock(at + DAY - 10000)
   const dsh = await f.client.registerSource({ registrationId: 'live-dsh-peer', hostRunId: 'dsh', name: 'DSH' })

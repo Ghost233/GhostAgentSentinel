@@ -22,6 +22,7 @@ const until = async predicate => {
 async function fixture(t, transport = {}) {
   const ctx = new Context(), streams = new Map(), handles = []
   const records = { sources: [], batches: [], unregistered: [] }
+  let settings = { registrationId: 'fixture', config: {}, revision: 'initial' }, monitoring = { registrationId: 'fixture', paused: false, revision: 'initial-monitoring' }
   let fail = false
   const connector = async () => ({
     async registerSource(source) { if (fail) throw new Error('offline'); records.sources.push(source); return `source-${records.sources.length}` },
@@ -30,7 +31,8 @@ async function fixture(t, transport = {}) {
     async unregisterSource(key) { records.unregistered.push(key) },
     async snapshot() { return { protocol: 1, generatedAt: Date.now(), monitoring: 'active', overview: {}, sources: [], tasks: [] } },
     async claimNotifications() { return [] }, async ackNotification() {}, async close() {},
-    async pause() {}, async resume() {}, async configureAnalysis(config) { return config }, async analysisConfig() { return {} },
+    async installationAnalysisConfig() { return settings }, async configureInstallationAnalysis(registrationId, config, revision) { assert.equal(revision, settings.revision); settings = { registrationId, config, revision: 'saved' }; return settings },
+    async installationMonitoring() { return monitoring }, async setInstallationMonitoring(registrationId, paused) { monitoring = { registrationId, paused, revision: 'saved-monitoring' }; return monitoring },
   })
   class Adapter extends LlmAdapter {
     async resolveModel(provider, id) { return { provider, id, name: id } }
@@ -53,10 +55,10 @@ async function fixture(t, transport = {}) {
   let service, pluginHandle
   const install = async () => {
     pluginHandle = await ctx.plugin({ inject: ['agents'], apply(child) {
-      service = createAdapter(child, { registrationId: 'fixture', dataDir: transport.dataDir || '/private/tmp/sentinel-adapter-test' }, { connect: transport.connect || connector, flushMs: 10, heartbeatMs: 25 })
+      service = createAdapter(child, { registrationId: transport.registrationId === undefined ? 'fixture' : transport.registrationId, dataDir: transport.dataDir || '/private/tmp/sentinel-adapter-test' }, { connect: transport.connect || connector, flushMs: 10, heartbeatMs: 25 })
       child.effect(() => () => service.close())
     } })
-    await until(() => service.connected)
+    if (transport.waitForConnection !== false) await until(() => service.connected)
     return service
   }
   t.after(async () => {
@@ -124,11 +126,48 @@ test('native gateway exposes only observer controls and JSON parameters reach an
   const peer = new Peer(f.ctx, { principal: { kind: 'owner' }, interactions: 'none' })
   await f.install()
   const config = { llm: { baseUrl: 'http://127.0.0.1:54841', model: 'fake-model' } }
-  const response = await f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'configureAnalysis', args: { config } })
-  assert.deepEqual(response, config)
+  const current = await f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'analysisConfigState', args: {} })
+  const response = await f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'configureAnalysisIfCurrent', args: { config, revision: current.revision } })
+  assert.deepEqual(response.config, config)
+  await assert.rejects(f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'configureAnalysis', args: { config } }))
   const snapshot = await f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'snapshot', args: {} })
   assert.equal(snapshot.protocol, 1); assert.equal(snapshot.adapter.connected, true)
   await assert.rejects(f.ctx.typertGateway.invoke({ peer, namespace: 'sentinel', method: 'followup', args: {} }))
+})
+
+test('stable DSH installation settings remain available while collection cannot register and never import legacy model values', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-disconnected-settings-')), server = await startServer({ dataDir }), control = await connectCore({ dataDir })
+  const currentInstance = (await control.health()).instanceId
+  await control.configureAnalysis({ llm: { model: 'legacy-must-not-import' } })
+  let activeClients = 0
+  const f = await fixture(t, { dataDir, waitForConnection: false, connect: async options => {
+    const connected = await connectCore(options), close = connected.close.bind(connected)
+    activeClients++
+    let closed = false
+    connected.close = async () => { if (!closed) { closed = true; activeClients-- }; await close() }
+    connected.registerSource = async () => { throw new Error('controlled collection registration unavailable') }
+    return connected
+  } })
+  t.after(async () => { await f.service?.close(); await control.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }) })
+  await f.install()
+  const first = await f.service.analysisConfigState()
+  assert.equal(first.registrationId, 'fixture'); assert.deepEqual(first.config, {})
+  const saved = await f.service.configureAnalysisIfCurrent({ llm: { model: 'installation-only' } }, first.revision)
+  assert.deepEqual(await f.service.analysisConfigState(), saved)
+  assert.equal(f.service.connected, false)
+  assert.deepEqual(await control.installationAnalysisConfig('fixture'), saved)
+  assert.equal((await control.analysisConfig()).llm.model, 'legacy-must-not-import')
+  assert.equal((await control.health()).instanceId, currentInstance, 'settings requests reuse the same shared Core')
+  await f.service.close()
+  assert.equal(activeClients, 0, 'all temporary settings and failed collection clients are closed')
+})
+
+test('a DSH Host without stable installation identity cannot read or save a temporary model scope', async t => {
+  const f = await fixture(t, { registrationId: null })
+  await f.install()
+  await assert.rejects(f.service.analysisConfigState(), /稳定 registrationId.*身份未确认/)
+  await assert.rejects(f.service.configureAnalysisIfCurrent({}, 'revision'), /稳定 registrationId.*身份未确认/)
+  await assert.rejects(f.service.pause(), /稳定 registrationId.*身份未确认/)
 })
 
 test('native GS summary RPC reaches the authenticated shared core with adapter-owned source identity and no full snapshot fallback', async t => {

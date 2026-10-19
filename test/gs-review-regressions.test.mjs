@@ -1,7 +1,8 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { startServer } from '../src/server.mjs'
@@ -10,7 +11,7 @@ const reference = (taskId, eventId) => ({ taskId, lifecycleId: 'life', eventId }
 const until = async (predicate, label) => { const deadline = Date.now() + 3000; while (!await predicate()) { assert.ok(Date.now() < deadline, label); await new Promise(resolve => setTimeout(resolve, 5)) } }
 async function fixture(t, { models = false, hold = false, drift = 'attention' } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-gs-review-')), requests = [], held = [], cleanup = []
-  let server, modelServer, clock = Date.now()
+  let server, modelServer, modelConfig, clock = Date.now()
   t.after(async () => {
     for (const release of [() => { for (const finish of held.splice(0)) finish() }, () => server?.close(), async () => { if (modelServer) { modelServer.closeAllConnections(); await new Promise(resolve => modelServer.close(resolve)) } }, () => rm(dataDir, { recursive: true, force: true })]) { try { await release() } catch (error) { cleanup.push(error) } }
     if (cleanup.length) throw new AggregateError(cleanup, 'GS public fixture cleanup failed')
@@ -21,19 +22,23 @@ async function fixture(t, { models = false, hold = false, drift = 'attention' } 
       const body = JSON.parse(raw); requests.push({ path: req.url, body })
       res.setHeader('content-type', 'application/json')
       const finish = () => res.end(JSON.stringify(req.url === '/v1/chat/completions'
-        ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }
+        ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }
         : { model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? drift : 'unknown' }])) }))
       if (hold && req.url === '/v1/chat/completions') held.push(finish)
       else finish()
     })
     await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve))
     const baseUrl = `http://127.0.0.1:${modelServer.address().port}`
-    await writeFile(join(dataDir, 'analysis-config.json'), JSON.stringify({ llm: { baseUrl, model: 'controlled-extractor' }, jev: { baseUrl, model: 'controlled-judge' } }))
+    modelConfig = { llm: { baseUrl, model: 'controlled-extractor' }, jev: { baseUrl, model: 'controlled-judge' } }
   }
   server = await startServer({ dataDir, now: () => clock, cooldownMs: 60_000, leaseMs: 172_800_000 })
   async function request(path, body) {
     const response = await fetch(`${server.url}/v1/${path}`, { method: body === undefined ? 'GET' : 'POST', headers: { authorization: `Bearer ${server.token}`, 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) })
     const value = await response.json(); assert.equal(response.status, 200, JSON.stringify(value)); return value
+  }
+  if (modelConfig) {
+    const current = await request('analysis/installations/config?registrationId=gs-review')
+    await request('analysis/installations/config', { registrationId: 'gs-review', config: modelConfig, revision: current.revision })
   }
   const sourceKey = await request('source/register', { registrationId: 'gs-review', hostRunId: 'own-run', name: 'Own public regression' })
   return { request, sourceKey, requests, held, now: () => clock, advance: value => clock += value,

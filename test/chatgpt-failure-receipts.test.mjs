@@ -68,7 +68,7 @@ test('recovery stays visible and recurrence forms a new episode without crossing
 
 test('settled errors retain their original safe classification without response bodies or credentials', t => {
   const f = fixture(t);
-  for (const [code, category] of [['network', 'transport'], ['http_error', 'transport'], ['invalid_json', 'protocol'], ['invalid_evidence', 'evidence'], ['evidence_expired', 'expired'], ['configuration', 'configuration']]) {
+  for (const [code, category] of [['network', 'transport'], ['http_error', 'transport'], ['invalid_json', 'protocol'], ['invalid_summary', 'protocol'], ['invalid_evidence', 'evidence'], ['evidence_expired', 'expired'], ['configuration', 'configuration']]) {
     const result = f.store.settle({ ...failure, error: { code, stage: 'jev', message: 'Bearer private-token', details: { status: 503, remoteCode: 'private-token', body: 'private text' } } });
     assert.equal(result.receipt.error.code, code);
     assert.equal(result.receipt.error.category, category);

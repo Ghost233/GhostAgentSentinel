@@ -9,7 +9,7 @@ const DAY = 86_400_000
 const CHECKS = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait']
 const ref = (taskId, eventId, lifecycleId = 'life') => ({ taskId, lifecycleId, eventId })
 const until = async predicate => { const deadline = Date.now() + 3000; while (!await predicate()) { assert.ok(Date.now() < deadline, 'Expected public analysis state'); await new Promise(resolve => setTimeout(resolve, 5)) } }
-async function fixture(t) {
+async function fixture(t, generated) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-citation-ownership-'))
   let clock = 1_001_000, core
   t.after(async () => { try { await core?.close() } finally { await rm(dataDir, { recursive: true, force: true }) } })
@@ -17,7 +17,7 @@ async function fixture(t) {
     const child = input.task.id === 'child', recovered = input.events.some(event => event.id === 'repair')
     const evidenceIds = child ? [recovered ? 'repair' : 'action'] : []
     const evidenceRefs = child ? recovered ? [ref('parent', 'same-input'), ref('child', 'repair')] : [ref('parent', 'same-input'), ref('child', 'same-input'), ref('child', 'action')] : []
-    return { summary: { currentTask: input.task.currentRequest, currentState: 'Observed', recentProgress: '', attention: '' }, checks: CHECKS.map(id => ({ id, status: id === 'request_drift' && child ? recovered ? 'clear' : 'attention' : 'unknown', reason: 'Controlled ownership boundary', evidenceIds: id === 'request_drift' ? evidenceIds : [], evidenceRefs: id === 'request_drift' ? evidenceRefs : [], ...(id === 'request_drift' && recovered && input.task.activeAlerts?.[0] ? { recoveryFor: input.task.activeAlerts[0].id, recoveryEvidenceIds: ['repair'] } : {}) })), coverage: input.coverage, quality: 'unvalidated' }
+    return { summary: { currentTask: input.task.currentRequest, currentState: 'Observed', recentProgress: '', attention: '', ...(generated ? { generated: generated(input) } : {}) }, checks: CHECKS.map(id => ({ id, status: id === 'request_drift' && child ? recovered ? 'clear' : 'attention' : 'unknown', reason: 'Controlled ownership boundary', evidenceIds: id === 'request_drift' ? evidenceIds : [], evidenceRefs: id === 'request_drift' ? evidenceRefs : [], ...(id === 'request_drift' && recovered && input.task.activeAlerts?.[0] ? { recoveryFor: input.task.activeAlerts[0].id, recoveryEvidenceIds: ['repair'] } : {}) })), coverage: input.coverage, quality: 'unvalidated' }
   } } })
   const sourceKey = await core.registerSource({ registrationId: 'citations', hostRunId: 'host', name: 'Same name' })
   const event = (taskId, id, kind, text, data = {}, capturedAt = clock) => ({ id, taskId, taskLifecycleId: 'life', kind, text, occurredAt: null, capturedAt, data })
@@ -63,3 +63,25 @@ test('public alerts and recovery retain verified ancestor owners when local even
   assert.deepEqual(alert.recoveryEvidenceRefs[0], ref('parent', 'same-input'))
   assert.ok(child.instructionContext.gaps.includes('ancestor_limit_origin_or_retention_missing'))
 })
+
+test('the public core rejects a generated summary that borrows an unbound task reference with a colliding local event ID', async t => {
+  const f = await fixture(t, input => ({ text: '受控模型总结。', evidenceIds: ['state'], evidenceRefs: [ref(input.task.id === 'child' ? 'parent' : 'child', 'state')] }));
+  await f.core.ingest(f.sourceKey, f.batch);
+  await until(async () => (await f.child()).analysis.completedAt !== null);
+  const child = await f.child();
+  assert.equal(child.analysis.state, 'failed');
+  assert.equal(child.analysis.error.code, 'invalid_summary');
+  assert.equal(child.analysis.summary?.generated, undefined);
+  assert.equal(child.analysis.lastSuccessfulSummary, undefined);
+});
+
+test('the public core retains generated summaries with matching own and verified inherited references', async t => {
+  const f = await fixture(t, input => input.task.id === 'child'
+    ? { text: '已检查当前动作及继承限制。', evidenceIds: ['action', 'same-input'], evidenceRefs: [ref('child', 'action'), ref('parent', 'same-input')] }
+    : { text: '已观察到原始请求。', evidenceIds: ['same-input'], evidenceRefs: [ref('parent', 'same-input')] });
+  await f.core.ingest(f.sourceKey, f.batch);
+  await until(async () => (await f.child()).analysis.completedAt !== null);
+  const child = await f.child();
+  assert.equal(child.analysis.error, null);
+  assert.deepEqual(child.analysis.summary.generated.evidenceRefs, [ref('child', 'action'), ref('parent', 'same-input')]);
+});

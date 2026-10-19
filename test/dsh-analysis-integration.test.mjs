@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
@@ -10,6 +11,7 @@ import { createAdapter } from '../dsh/host.mjs'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 
 const { Context } = req('@deepseek-ai/cordis')
 const { default: LlmRuntime, LlmAdapter, createUserMessage } = req('@deepseek-ai/dsh-llm')
@@ -84,10 +86,10 @@ async function fixture(t, faults = {}) {
     response.setHeader('content-type', 'application/json')
     if (request.url === '/v1/chat/completions') {
       if (mode === 'hold') {
-        held = response; releaseHeld = () => response.end(JSON.stringify({ model: 'select', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+        held = response; releaseHeld = () => response.end(JSON.stringify({ model: 'select', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(wire, { selectedOptionIds: [], gaps: [] })) } }] }))
         return
       }
-      response.end(JSON.stringify({ model: 'select', choices: [{ finish_reason: 'stop', message: { content: mode === 'invalid' ? '{"selectedOptionIds":["invalid"],"gaps":[]}' : '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+      response.end(JSON.stringify({ model: 'select', choices: [{ finish_reason: 'stop', message: { content: mode === 'invalid' ? '{"selectedOptionIds":["invalid"],"gaps":[]}' : JSON.stringify(withModelSummary(wire, { selectedOptionIds: [], gaps: [] })) } }] }))
     } else {
       const decision = faults.unknownB && body.state.request.includes('request B') ? 'unknown' : mode === 'unknown' ? 'unknown' : body.state.events.some(event => event.text.includes('unrelated-storage')) ? 'attention' : 'clear'
       response.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? decision : 'unknown', probabilities: { attention: decision === 'attention' ? 1 : 0, clear: decision === 'clear' ? 1 : 0, unknown: decision === 'unknown' ? 1 : 0 } }])) }))
@@ -95,7 +97,7 @@ async function fixture(t, faults = {}) {
   })
   await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
   const baseUrl = `http://127.0.0.1:${models.address().port}`
-  await control.configureAnalysis({ llm: { baseUrl, model: 'select' }, jev: { baseUrl, model: 'judge' } })
+  await configureInstallationModels(control, 'combined-host', { llm: { baseUrl, model: 'select' }, jev: { baseUrl, model: 'judge' } })
   ctx.tools.register({ name: 'combined_tool', description: 'fixed read-only output', parameters: {}, output: { schema: { type: 'string' }, render: (_, value) => [{ type: 'text', text: value }] }, execute: () => 'fixed-tool-result' })
   return { ctx, adapter, control, modelCalls,
     advanceNotificationWindow() { notificationOffset += 3_000 },
@@ -198,10 +200,10 @@ test('unknown or failed native analysis does not notify and cancellation seals l
   host.mode('unknown'); await host.control.resume()
   await until(async () => completedUnknown((await host.control.snapshot()).tasks.find(task => task.id === 'task-error'), host.modelCalls), 'unknown analysis complete')
   await view.tick(); assert.equal(view.notices.length, 0)
-  host.mode('invalid'); await host.control.configureAnalysis(await host.control.analysisConfig())
+  host.mode('invalid'); await configureInstallationModels(host.control, 'combined-host', (await host.control.installationAnalysisConfig('combined-host')).config)
   await until(async () => (await host.control.snapshot()).tasks.some(task => task.analysis.state === 'failed'), 'invalid selection rejected')
   await view.tick(); assert.equal(view.notices.length, 0)
-  host.mode('hold'); await host.control.configureAnalysis(await host.control.analysisConfig())
+  host.mode('hold'); await configureInstallationModels(host.control, 'combined-host', (await host.control.installationAnalysisConfig('combined-host')).config)
   await until(() => !!host.held, 'held real analysis request')
   await host.control.pause()
   const sealed = (await host.control.snapshot()).tasks[0].analysis

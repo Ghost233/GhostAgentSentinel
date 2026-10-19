@@ -7,6 +7,11 @@ import { join } from 'node:path'
 import { runInNewContext } from 'node:vm'
 import descriptors from '../dsh/remote.cjs'
 import { createCore } from '../src/core/index.mjs'
+import { startServer } from '../src/server.mjs'
+import { connectCore } from '../src/core-client.mjs'
+import { createAdapter } from '../dsh/host.mjs'
+import { createServer } from 'node:http'
+import { decodeJevRequest } from './helpers/jev-wire.mjs'
 
 const { Context } = req('@deepseek-ai/cordis')
 const { createElement: h, act } = clientRequire('react')
@@ -77,9 +82,11 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     async claimNotifications() { invoked.push('claim'); return { ok: true, value: [{ id: 'notice-one', taskKey: 'task-one', title: '关注任务', body: '有依据的疑点' }] } },
     async ackNotification(id, result) { acknowledged.push({ id, result }); return { ok: true, value: {} } },
     async analysisConfig() { return { ok: true, value: {} } },
+    async analysisConfigState() { return { ok: true, value: { registrationId: 'fixture', config: {}, revision: 'fixture-revision' } } },
     async pause() { invoked.push('pause'); return { ok: true, value: {} } },
     async resume() { invoked.push('resume'); return { ok: true, value: {} } },
     async configureAnalysis() { return { ok: true, value: {} } },
+    async configureAnalysisIfCurrent(config) { return { ok: true, value: { registrationId: 'fixture', config, revision: 'fixture-saved' } } },
     async sourcePlan() { return { ok: true, value: snapshot.enrollment || { entries: [] } } },
     async configureSources(entries) { invoked.push('configureSources'); return { ok: true, value: { entries } } },
     async diagnostics() { return { ok: true, value: {} } },
@@ -95,6 +102,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     ctx.provide('connection', {
       registerGenerationSource: () => () => {}, start: () => ({ stop() {} }),
       rpc: { open: async function *() {}, call: async (_route, endpoint, payload, signal) => {
+        if (overrides.$dispatch) return overrides.$dispatch(endpoint, payload, signal)
         const method = endpoint.split('/')[1]
         const descriptor = descriptors().find(item => item.method === method)
         return methods[method](...descriptor.parameters.map(parameter => payload.args[parameter.wire]), signal)
@@ -123,7 +131,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   await waitUntil(() => plugin.diagnostics().backgroundTimer === 1, 'Actual Remote connection did not start background monitoring')
   if (mountPane) { await mount(); await dataReady() }
   else if (!overrides.claimNotifications) await waitUntil(() => plugin.diagnostics().pendingNotification === 0, 'Initial notification claim did not finish')
-  return { ctx, Panel, mounted, registered, delivered, acknowledged, invoked, Notification, plugin, intervals, dom, mount, unmount, settle, waitUntil, dataReady,
+  return { ctx, Panel, mounted, registered, delivered, acknowledged, invoked, Notification, plugin, intervals, dom, mount, unmount, settle, waitUntil, dataReady, interact: commit,
     async tick() { await commit(async () => { for (const callback of [...intervals.values()]) callback(); await settle() }) },
     async visibility(value) { await commit(async () => { Object.defineProperty(dom.window.document, 'visibilityState', { value, configurable: true }); dom.window.document.dispatchEvent(new dom.window.Event('visibilitychange')); await settle() }) },
     async abortView() { await commit(async () => { tabController.abort(); await settle() }) },
@@ -139,6 +147,100 @@ async function waitForDisplayedTask(fixture, title) {
     await fixture.settle()
   }
 }
+
+test('the actual DSH settings form saves its installation CAS through Native Remote and drives only its selected models', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-installation-ui-')), host = new Context(), requests = []
+  let server, core, adapter, actor, f, clockOffset = 0
+  const models = createServer(async (request, response) => {
+    let raw = ''; for await (const bytes of request) raw += bytes
+    const body = JSON.parse(raw); requests.push({ path: request.url, model: body.model })
+    response.setHeader('content-type', 'application/json')
+    if (request.url === '/v1/chat/completions') {
+      const evidence = JSON.parse(body.messages.find(message => message.role === 'user').content).evidence
+      const option = evidence.find(entry => entry.origin === 'output')?.options.find(option => option.kind === 'action') ?? evidence[0].options[0]
+      const selectedOptionIds = option.kind === 'action' ? [option.optionId] : []
+      response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [], summary: { text: 'The current request has observed execution activity.', evidenceOptionIds: [option.optionId] } }) } }] }))
+    } else {
+      const input = decodeJevRequest(body)
+      response.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(input.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'attention' : 'unknown' }])) }))
+    }
+  })
+  t.after(async () => { await actor?.dispose(); await adapter?.close(); await host.fiber.dispose(); await core?.close(); await server?.close(); models.closeAllConnections(); if (models.listening) await new Promise(resolve => models.close(resolve)); await rm(dataDir, { recursive: true, force: true }) })
+  await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
+  server = await startServer({ dataDir, cooldownMs: 0, now: () => Date.now() + clockOffset }); core = await connectCore({ dataDir })
+  const baseUrl = `http://127.0.0.1:${models.address().port}`
+  const config = name => ({ llm: { baseUrl, model: name + '-summary' }, jev: { baseUrl, model: name + '-judge' } })
+  const formal = await core.configureInstallationAnalysis('chatgpt:formal', config('formal'), (await core.installationAnalysisConfig('chatgpt:formal')).revision)
+  const candidate = await core.configureInstallationAnalysis('chatgpt:test', config('test'), (await core.installationAnalysisConfig('chatgpt:test')).revision)
+  await host.plugin(req('@deepseek-ai/dsh-llm').default)
+  for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop']) await host.plugin(req(`@deepseek-ai/${name}`).default, { agents: [] })
+  for (const name of ['dsh-typert-registry', 'dsh-api-remote-access', 'dsh-api-gateway']) await host.plugin(req(`@deepseek-ai/${name}`).default)
+  const { LlmAdapter, createUserMessage } = req('@deepseek-ai/dsh-llm')
+  class NativeModel extends LlmAdapter {
+    async resolveModel(provider, id) { return { provider, id, name: id } }
+    async *stream({ signal }) { yield { type: 'text-delta', index: 0, text: 'Inspecting the DSH request evidence' }; if (!signal.aborted) await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true })) }
+  }
+  host.llm.registerAdapter(['isolation-fixture'], new NativeModel())
+  adapter = createAdapter(host, { dataDir, registrationId: 'dsh:stable' }, { flushMs: 10, heartbeatMs: 1000 })
+  const { Peer } = req('@deepseek-ai/dsh-client-connection'), peer = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' })
+  f = await client(t, null, 'denied', null, true, true, { $dispatch: (endpoint, payload, signal) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer) })
+  const { Simulate } = clientRequire('react-dom/test-utils'), values = [baseUrl, 'dsh-summary', baseUrl, 'dsh-judge']
+  const inputs = [...f.dom.window.document.querySelectorAll('input')].filter(input => input.type !== 'checkbox')
+  assert.equal(inputs.length, 4)
+  await f.interact(async () => { for (let index = 0; index < inputs.length; index++) { inputs[index].value = values[index]; Simulate.change(inputs[index]) }; await f.settle() })
+  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
+  await f.waitUntil(() => f.plugin.diagnostics().activeRequests === 0, 'the actual settings save finishes')
+  let saved = await core.installationAnalysisConfig('dsh:stable')
+  assert.deepEqual(saved.config, config('dsh'), 'the DSH form must configure its stable installation rather than the shared legacy slot')
+  assert.match(inputs[0].closest('form').textContent, /已保存；下一轮采用新配置/)
+  await core.configureInstallationAnalysis('dsh:stable', config('dsh'), saved.revision)
+  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
+  assert.match(inputs[0].closest('form').textContent, /conflict|changed|变化|冲突/i, 'a stale panel save exposes the conflict and preserves its draft')
+  assert.equal(inputs[1].value, 'dsh-summary')
+  await f.interact(async () => { Simulate.click([...inputs[0].closest('form').querySelectorAll('button')].find(button => button.textContent === '读取当前配置')); await f.settle() })
+  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
+  saved = await core.installationAnalysisConfig('dsh:stable')
+  assert.match(inputs[0].closest('form').textContent, /已保存；下一轮采用新配置/)
+  assert.deepEqual(await core.installationAnalysisConfig('chatgpt:formal'), formal)
+  assert.deepEqual(await core.installationAnalysisConfig('chatgpt:test'), candidate)
+  actor = await host.agents.create({ sessionId: 'dsh-observed', agentOptions: { provider: 'isolation-fixture', model: 'native-agent' } })
+  actor.agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Inspect the DSH log only' }] }))
+  const deadline = Date.now() + 3000
+  while (!requests.some(request => request.model === 'dsh-judge')) { assert.ok(Date.now() < deadline, 'the saved DSH settings reach both actual model HTTP requests'); await f.settle() }
+  assert.ok(requests.some(request => request.path === '/v1/chat/completions' && request.model === 'dsh-summary'))
+  assert.equal(requests.some(request => request.model.startsWith('formal-') || request.model.startsWith('test-')), false)
+  const task = (await core.snapshot()).tasks.find(task => task.id === 'dsh-observed')
+  assert.deepEqual(task.analysis.configScope, { registrationId: 'dsh:stable', revision: saved.revision })
+  await f.tick()
+  await f.interact(async () => { Simulate.click([...f.dom.window.document.querySelectorAll('button')].find(button => button.textContent === '暂停分析')); await f.settle() })
+  assert.equal((await core.installationMonitoring('dsh:stable')).paused, true)
+  assert.equal((await core.snapshot()).monitoring.state, 'active', 'the DSH pause leaves shared monitoring active')
+  const peers = new Map()
+  for (const [registrationId, id] of [['chatgpt:formal', 'formal'], ['chatgpt:test', 'test']]) {
+    const sourceKey = await core.registerSource({ registrationId, hostRunId: id + '-host', name: id }); peers.set(id, sourceKey)
+    await core.ingest(sourceKey, { tasks: [{ id, lifecycleId: 'run', title: id, status: 'running' }], events: [
+      { id: id + '-input', kind: 'input', text: 'Inspect ' + id + ' only' }, { id: id + '-output', kind: 'output', text: 'Inspecting ' + id + ' evidence' },
+    ].map(event => ({ ...event, taskId: id, taskLifecycleId: 'run', capturedAt: Date.now(), occurredAt: null })) })
+  }
+  const peersDeadline = Date.now() + 3000
+  while (!(await core.snapshot()).tasks.filter(task => peers.has(task.id)).every(task => task.analysis.checks.some(check => check.id === 'request_drift' && check.status === 'attention'))) { assert.ok(Date.now() < peersDeadline, 'both Codex installations continue their own model analyses during the DSH pause'); await f.settle() }
+  for (const id of peers.keys()) assert.ok(requests.some(request => request.model === id + '-summary') && requests.some(request => request.model === id + '-judge'))
+  clockOffset = 10000
+  const snapshot = await core.snapshot()
+  for (const [id, sourceKey] of peers) {
+    const notices = await core.claimNotifications(sourceKey)
+    assert.equal(notices.length, 1, id + ' retains its own notification')
+    assert.ok(notices.every(notice => snapshot.tasks.find(task => task.key === notice.taskKey)?.sourceKey === sourceKey))
+  }
+  assert.deepEqual(await adapter.claimNotifications(), [], 'DSH pause suppresses only the DSH installation notices')
+  const sharedInstance = (await core.health()).instanceId
+  await adapter.close()
+  assert.equal(actor.agent.status, 'running')
+  assert.equal((await core.health()).instanceId, sharedInstance)
+  assert.deepEqual(await core.installationAnalysisConfig('chatgpt:formal'), formal)
+  assert.deepEqual(await core.installationAnalysisConfig('chatgpt:test'), candidate)
+  for (const sourceKey of peers.values()) assert.equal((await core.snapshot()).sources.find(source => source.key === sourceKey).status, 'connected')
+})
 
 async function publicNotificationClient(t, memberCount, overflow = false) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-notification-consumer-'))
@@ -808,6 +910,80 @@ test('current observed activity remains visible while analysis is paused, unavai
   assert.ok(rendered.includes('分析覆盖截止：' + new Date(through).toLocaleString()))
   assert.ok(rendered.includes('当前结论尚未覆盖新活动'))
   assert.ok(rendered.includes('证据已到期，原疑点失效'))
+})
+
+test('the actual DSH detail shows the current model short summary with direct owned citations and hides it while new material waits or fails', async t => {
+  const at = Date.now(), task = { key: 'summary-task', sourceKey: 'summary-source', id: 'main', lifecycleId: 'run', title: '总结观察', status: 'running',
+    currentRequest: 'Inspect the current execution', activity: { summary: '工具已返回一个结果', observedAt: at },
+    events: [{ id: 'basis', taskId: 'main', taskLifecycleId: 'run', kind: 'output', capturedAt: at, text: '本轮实际执行依据' }],
+    analysis: { state: 'cooldown', resultDisposition: 'current', completedAt: at, summary: { generated: { text: '已观察到当前执行结果。', evidenceIds: ['basis'], evidenceRefs: [{ taskId: 'main', lifecycleId: 'run', eventId: 'basis' }] } }, checks: [] } }
+  const snapshot = { protocol: 1, generatedAt: at, monitoring: { state: 'active' }, overview: {}, sources: [{ key: 'summary-source', status: 'connected', descriptor: { name: '本安装' } }], tasks: [task] }
+  const f = await client(t, snapshot, 'denied', null, true)
+  const summary = () => f.dom.window.document.querySelector('[data-sentinel-model-summary]')
+  assert.ok(summary(), 'the current model-generated summary is visible in the actual task detail')
+  assert.ok(summary().textContent.includes('已观察到当前执行结果。'))
+  const citation = summary().querySelector('small[data-sentinel-citation="basis"]')
+  assert.ok(citation.textContent.includes('本轮实际执行依据'))
+  assert.equal(citation.dataset.sourceKey, 'summary-source')
+  assert.equal(summary().closest('[data-gs-checks]'), null, 'summary and citations are directly visible without opening full checks')
+  task.analysis.resultDisposition = 'reused'; await f.tick()
+  assert.ok(summary(), 'a valid reused result stays visible')
+  assert.ok(summary().textContent.includes('复用有效总结：已观察到当前执行结果。'), 'a valid reused result stays visible without claiming a new model call')
+  task.analysis.resultDisposition = 'current'; await f.tick()
+  assert.ok(summary().textContent.includes('模型总结：已观察到当前执行结果。'))
+  assert.equal(summary().textContent.includes('复用有效总结'), false)
+  task.analysis.state = 'analyzing'; task.analysis.resultDisposition = 'pending'; task.activity.summary = '已采集新材料，等待本轮模型结果'
+  await f.tick()
+  assert.equal(summary(), null, 'a prior generated summary does not cover pending material')
+  assert.ok(f.dom.window.document.querySelector('[data-gs-detail]').textContent.includes(task.activity.summary))
+  for (const state of ['failed', 'stale', 'unavailable', 'interrupted']) {
+    task.analysis.state = state; task.analysis.resultDisposition = 'current'; await f.tick()
+    assert.equal(summary(), null, state + ' never publishes a complete model summary')
+  }
+  task.analysis.state = 'cooldown'; await f.tick()
+  assert.ok(summary().textContent.includes('已观察到当前执行结果。'))
+})
+
+test('a failed or pending DSH detail keeps only its last successful summary as folded owned history and rejects late expired or foreign records', async t => {
+  const at = Date.now(), completedAt = at - 2000
+  const generated = { text: '上次已完成日志检查。', evidenceIds: ['basis'], evidenceRefs: [{ taskId: 'main', lifecycleId: 'run', eventId: 'basis' }] }
+  const successful = { generated, completedAt, configScope: { registrationId: 'dsh:summary', revision: 'prior-settings' }, expiresAt: completedAt + 86400000 }
+  const task = { key: 'summary-history-task', sourceKey: 'summary-source', id: 'main', lifecycleId: 'run', title: '历史总结观察', status: 'running',
+    currentRequest: 'Continue inspecting', activity: { summary: '新一轮结果不可用', observedAt: at },
+    events: [{ id: 'basis', taskId: 'main', taskLifecycleId: 'run', kind: 'output', capturedAt: at - 3000, text: '本来源的原始完成依据' }],
+    analysis: { state: 'failed', resultDisposition: 'invalid', completedAt: at - 1000, summary: { generated: { ...generated, text: '不可发布的当前旧总结' } },
+      currentConfigScope: { registrationId: 'dsh:summary', revision: 'current-settings' }, lastSuccessfulSummary: successful, checks: [] } }
+  const foreign = { key: 'foreign-task', sourceKey: 'foreign-source', id: 'foreign', lifecycleId: 'foreign-run', title: '另一个来源', status: 'idle',
+    events: [{ id: 'basis', taskId: 'foreign', taskLifecycleId: 'foreign-run', kind: 'output', capturedAt: at - 3000, text: 'FOREIGN-SOURCE-PRIVATE-BASIS' }], analysis: { state: 'unknown', checks: [] } }
+  const snapshot = { protocol: 1, generatedAt: at, monitoring: { state: 'active' }, overview: {},
+    sources: [{ key: 'summary-source', status: 'connected', descriptor: { name: '本安装', registrationId: 'dsh:summary' } }, { key: 'foreign-source', status: 'connected', descriptor: { name: '另一安装', registrationId: 'dsh:foreign' } }], tasks: [task, foreign] }
+  const f = await client(t, snapshot, 'denied', null, true)
+  const current = () => f.dom.window.document.querySelector('[data-sentinel-model-summary]'), history = () => f.dom.window.document.querySelector('[data-sentinel-summary-history]')
+  assert.equal(current(), null)
+  assert.ok(history(), 'a failed new round preserves access to its earlier successful model summary')
+  assert.equal(history().open, false)
+  assert.equal(history().querySelector('summary').textContent, '上次成功总结')
+  assert.ok(history().textContent.includes('历史总结'))
+  assert.ok(history().textContent.includes(new Date(completedAt).toLocaleString()))
+  assert.ok(history().textContent.includes(generated.text))
+  assert.ok(history().querySelector('small[data-sentinel-citation="basis"]').textContent.includes('本来源的原始完成依据'))
+  assert.equal(history().textContent.includes('不可发布的当前旧总结'), false)
+  for (const state of ['analyzing', 'failed', 'stale', 'unavailable', 'interrupted']) {
+    task.analysis.state = state; task.analysis.resultDisposition = state === 'analyzing' ? 'pending' : 'invalid'; await f.tick()
+    assert.equal(current(), null)
+    assert.ok(history().textContent.includes(new Date(completedAt).toLocaleString()), 'history keeps its original completion time')
+  }
+  task.analysis.lastSuccessfulSummary = { ...successful, completedAt: at - 500, expiresAt: at - 500 + 86400000 }; await f.tick()
+  assert.equal(history(), null, 'a late result cannot replace history after a more recent settled round')
+  task.analysis.lastSuccessfulSummary = { ...successful, completedAt: at + 10000 }; await f.tick()
+  assert.equal(history(), null, 'a future completion is unconfirmed')
+  task.analysis.lastSuccessfulSummary = { ...successful, expiresAt: at - 1 }; await f.tick()
+  assert.equal(history(), null, 'expired historical text is no longer displayed')
+  task.analysis.lastSuccessfulSummary = { ...successful, configScope: { registrationId: 'dsh:foreign', revision: 'other' } }; await f.tick()
+  assert.equal(history(), null, 'another source installation cannot contribute the historical summary')
+  task.analysis.lastSuccessfulSummary = { ...successful, generated: { ...generated, evidenceRefs: [{ taskId: 'foreign', lifecycleId: 'foreign-run', eventId: 'basis' }] } }; await f.tick()
+  assert.ok(history().querySelector('[data-sentinel-citation-gap]'))
+  assert.equal(history().textContent.includes('FOREIGN-SOURCE-PRIVATE-BASIS'), false, 'missing own references never resolve through another source')
 })
 
 test('current activity handles older snapshots without the field and preserves the core disconnected-source boundary', async t => {

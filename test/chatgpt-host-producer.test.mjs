@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
@@ -11,6 +12,7 @@ import { supportsHostProfile } from '../chatgpt/storage-compatibility.mjs'
 import { createServer } from 'node:http'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
 
@@ -302,7 +304,7 @@ async function publicFixture(t) {
   const wire = createServer(async (req, res) => {
     let body = ''; for await (const chunk of req) body += chunk
     res.setHeader('content-type', 'application/json')
-    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] }))
     else {
       const request = decodeJevRequest(JSON.parse(body))
       res.end(JSON.stringify({ model: 'fixed-judge', answers: Object.fromEntries(Object.keys(request.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) }))
@@ -312,11 +314,11 @@ async function publicFixture(t) {
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); wire.closeAllConnections(); await new Promise(resolve => wire.close(resolve)); await fs.rm(dir, { recursive: true, force: true }) })
   await new Promise(resolve => wire.listen(0, '127.0.0.1', resolve))
   const baseUrl = 'http://127.0.0.1:' + wire.address().port
-  await fs.writeFile(join(dataDir, 'analysis-config.json'), JSON.stringify({ llm: { baseUrl, model: 'fixed-extractor' }, jev: { baseUrl, model: 'fixed-judge' } }))
   await fs.writeFile(path, row(0, 'session_meta', header(owner, currentHost.cliVersion)) + row(1, 'event_msg', start('turn'))
     + row(2, 'event_msg', user(owner, 'turn', 'Read only this synthetic log'))
     + row(3, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item: { type: 'AgentMessage', id: 'agent-output', content: [{ type: 'Text', text: 'The synthetic log has been inspected' }] } }))
   server = await startServer({ dataDir, now: () => clock, cooldownMs: 0 }); core = await connectCore({ dataDir })
+  await configureInstallationModels(core, 'chatgpt:candidate-material-http', { llm: { baseUrl, model: 'fixed-extractor' }, jev: { baseUrl, model: 'fixed-judge' } })
   // The actual adapter remains on its old admitted Host. The stored producer is
   // current: this tests the candidate storage policy without enabling a new Host.
   const native = { async sampleHost() { return { available: true, hostRunId: 'public-fixture', hostStartedAt: at - 10000, profile: supportedProfile } }, async readThread(id) { return id === owner ? { thread: { id, path, cwd: dir, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop' }, anchorTurnId: 'turn' } : null }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async close() {} }

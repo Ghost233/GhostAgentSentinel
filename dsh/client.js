@@ -46,7 +46,7 @@
           return value
         } }) }
       }
-      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'], configureAnalysis: ['config'], configureAnalysisIfCurrent: ['config', 'revision'], ackNotification: ['id', 'result'] }
+      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], ackNotification: ['id', 'result'] }
       const descriptors = Object.entries(methods).map(([method, parameters]) => ({
         id: `${id}#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,
         invocation: { kind: 'direct' }, cancellation: { parameter: 'signal' }, parameters: parameters.map(name => ({ name, wire: name, source: 'json', codec: parameterCodec(name) })), result: { mode: 'src-json' },
@@ -139,7 +139,7 @@
           if (snapshot?.protocol !== 1 || !Array.isArray(snapshot.tasks) || !Array.isArray(snapshot.sources)) throw new Error('观察协议不兼容')
           notifyState({ snapshot, snapshotVersion: state.snapshotVersion + 1, sourcePlan: snapshot.enrollment || state.sourcePlan, error: snapshot.adapter?.error || '', notification: state.notification || notificationStatus() })
           if (!state.config) {
-            const config = await read('analysisConfig')
+            const config = await read('analysisConfigState')
             if (connectionScope !== scope || request.abort.signal.aborted || visibleViewers() === 0) return
             notifyState({ config })
           }
@@ -279,10 +279,10 @@
         return summary
       }
       function AnalysisConfig({ config }) {
-        const [llmUrl, setLlmUrl] = useState(config?.llm?.baseUrl || '')
-        const [llmModel, setLlmModel] = useState(config?.llm?.model || '')
-        const [jevUrl, setJevUrl] = useState(config?.jev?.baseUrl || '')
-        const [jevModel, setJevModel] = useState(config?.jev?.model || '')
+        const [llmUrl, setLlmUrl] = useState(config?.config?.llm?.baseUrl || '')
+        const [llmModel, setLlmModel] = useState(config?.config?.llm?.model || '')
+        const [jevUrl, setJevUrl] = useState(config?.config?.jev?.baseUrl || '')
+        const [jevModel, setJevModel] = useState(config?.config?.jev?.model || '')
         const [result, setResult] = useState('')
         async function save(event) {
           event.preventDefault(); setResult('正在保存')
@@ -290,17 +290,25 @@
             const next = {}
             if (llmUrl || llmModel) next.llm = { baseUrl: llmUrl.trim(), model: llmModel.trim() }
             if (jevUrl || jevModel) next.jev = { baseUrl: jevUrl.trim(), model: jevModel.trim() }
-            const saved = await call('configureAnalysis', next)
+            const saved = await call('configureAnalysisIfCurrent', next, config.revision)
             notifyState({ config: saved }); setResult('已保存；下一轮采用新配置')
+          } catch (error) { setResult(errorText(error)) }
+        }
+        async function reload() {
+          try {
+            const current = await call('analysisConfigState')
+            setLlmUrl(current.config?.llm?.baseUrl || ''); setLlmModel(current.config?.llm?.model || '')
+            setJevUrl(current.config?.jev?.baseUrl || ''); setJevModel(current.config?.jev?.model || '')
+            notifyState({ config: current }); setResult('已读取本安装当前配置')
           } catch (error) { setResult(errorText(error)) }
         }
         const field = (label, value, set, placeholder) => h('label', null, label,
           h('input', { value, placeholder, onChange: event => set(event.target.value), autoComplete: 'off' }))
         return h('details', null, h('summary', null, '本地分析连接'), h('form', { onSubmit: save },
-          h('p', null, '设置本机服务地址和模型 ID。未配置时继续采集，语义问题显示不可判断。'),
-          field('证据摘取服务', llmUrl, setLlmUrl, 'http://127.0.0.1:端口'), field('摘取模型 ID', llmModel, setLlmModel, '模型 ID'),
+          h('p', null, '设置本安装的本机服务地址和模型 ID。未配置时继续采集，语义问题显示不可判断。'),
+          field('总结模型服务', llmUrl, setLlmUrl, 'http://127.0.0.1:端口'), field('总结模型 ID', llmModel, setLlmModel, '模型 ID'),
           field('JEV 服务', jevUrl, setJevUrl, 'http://127.0.0.1:端口'), field('JEV 模型 ID', jevModel, setJevModel, '模型 ID'),
-          h('button', { type: 'submit' }, '保存分析连接'), result && h('p', { role: 'status' }, result)))
+          h('button', { type: 'submit' }, '保存分析连接'), h('button', { type: 'button', onClick: reload }, '读取当前配置'), result && h('p', { role: 'status' }, result)))
       }
       const enrollmentStatus = { pending: '等待首次连接', connecting: '已连接，等待基线', connected: '已连接', disconnected: '已断开', disabled: '清单项已停用' }
       function SourcePlan({ plan, sources }) {
@@ -340,7 +348,7 @@
         'Task baseline is not yet available': '任务基线尚未取得',
       }
       const gapText = value => historicalGaps[value] || value
-      function EvidenceCitations({ record, task, snapshot, recovery = false }) {
+      function EvidenceCitations({ record, task, snapshot, recovery = false, compact = false }) {
         const references = recovery ? record?.recoveryEvidenceRefs : record?.evidenceRefs
         const ids = recovery ? record?.recoveryEvidenceIds : record?.evidenceIds
         const scoped = Array.isArray(references)
@@ -350,9 +358,9 @@
           const owner = scoped ? snapshot?.tasks?.find(item => item.sourceKey === task?.sourceKey && item.id === reference.taskId && item.lifecycleId === reference.lifecycleId) : task
           const event = owner?.events?.find(event => event.id === reference.eventId && (!scoped || event.taskId === reference.taskId && event.taskLifecycleId === reference.lifecycleId)
             && (!Number.isFinite(event.capturedAt) || event.capturedAt <= now && event.capturedAt > now - 86400000))
-          if (!event) return h('p', { key: index, 'data-sentinel-citation-gap': true }, '原拥有节点的部分引用已到期或不在当前读取范围，不能作为当前完整依据。')
+          if (!event) return h(compact ? 'small' : 'p', { key: index, 'data-sentinel-citation-gap': true }, '原拥有节点的部分引用已到期或不在当前读取范围，不能作为当前完整依据。')
           const source = snapshot?.sources?.find(source => source.key === owner.sourceKey)
-          return h('p', { key: index, 'data-sentinel-citation': reference.eventId, 'data-source-key': owner.sourceKey, 'data-task-id': owner.id, 'data-lifecycle-id': owner.lifecycleId },
+          return h(compact ? 'small' : 'p', { key: index, 'data-sentinel-citation': reference.eventId, 'data-source-key': owner.sourceKey, 'data-task-id': owner.id, 'data-lifecycle-id': owner.lifecycleId },
             scoped && h('span', null, '原拥有节点：', text(owner.title) || owner.id, ' · 来源：', text(source?.descriptor?.name) || owner.sourceKey, ' · '), event.text || '仅执行元数据')
         }))
       }
@@ -385,12 +393,23 @@
       function ObservationDetail({ task, snapshot, current }) {
         const analysis = task.analysis || {}, source = snapshot.sources.find(item => item.key === task.sourceKey)
         const observed = connectionScope?.active && !current.error && !snapshot.adapter?.error
+        const generated = analysis.summary?.generated
+        const publishableSummary = observed && source?.status === 'connected' && ['current', 'reused'].includes(analysis.resultDisposition) && !['failed', 'stale', 'unavailable', 'interrupted', 'unknown'].includes(analysis.state) && text(generated?.text)
+        const previous = analysis.lastSuccessfulSummary, now = Date.now()
+        const observedThrough = Number.isFinite(snapshot.generatedAt) ? Math.min(now, snapshot.generatedAt) : now
+        const completedThrough = Number.isFinite(analysis.completedAt) ? Math.min(observedThrough, analysis.completedAt) : observedThrough
+        const historicalSummary = !publishableSummary && source?.descriptor?.registrationId && previous?.configScope?.registrationId === source.descriptor.registrationId
+          && Number.isSafeInteger(previous.completedAt) && previous.completedAt <= completedThrough
+          && Number.isSafeInteger(previous.expiresAt) && previous.expiresAt > now && previous.expiresAt <= previous.completedAt + 86400000 && text(previous.generated?.text)
         const analyzing = observed && snapshot.monitoring?.state !== 'paused' && task.status === 'running' && source?.status === 'connected'
           && !['unknown', 'interrupted', 'stale', 'failed', 'unavailable', 'paused'].includes(analysis.state)
         return h('article', { 'data-gs-detail': task.key, 'aria-live': 'polite' },
           h('p', null, '当前任务：', text(analysis.summary?.currentTask) || text(task.currentRequest) || '未采集当前请求'),
           h('p', null, '当前状态：', observed ? taskStatus[task.status] || '状态未知' : '当前无法确认', ' · ',
             observed ? '' : '历史活动：', text(task.activity?.summary) || '活动摘要未提供'),
+          publishableSummary && h('div', { 'data-sentinel-model-summary': true }, h('p', null, analysis.resultDisposition === 'reused' ? '复用有效总结：' : '模型总结：', generated.text), h(EvidenceCitations, { record: generated, task, snapshot, compact: true })),
+          historicalSummary && h('details', { 'data-sentinel-summary-history': true }, h('summary', null, '上次成功总结'),
+            h('small', null, '历史总结 · 原完成时间：', timeText(previous.completedAt)), h('p', null, previous.generated.text), h(EvidenceCitations, { record: previous.generated, task, snapshot, compact: true })),
           task.instructionContext?.gaps?.length > 0 && h('p', null, '当前指令上下文缺口：', task.instructionContext.gaps.join('；')),
           h('details', { 'data-gs-checks': true }, h('summary', null, '完整检查与依据'),
             h('p', null, '最近推进：', text(analysis.summary?.recentProgress) || '尚未判断'),
@@ -594,7 +613,7 @@
           try { await Notification.requestPermission(); notifyState({ notification: notificationStatus() }); await pollNotifications(); await pollSnapshot() }
           catch (error) { notifyState({ notification: errorText(error) }) }
         }
-        const paused = snapshot?.monitoring?.state === 'paused'
+        const paused = snapshot?.adapter?.monitoring?.paused ?? snapshot?.monitoring?.state === 'paused'
         const currentObservation = connectionScope?.active && !current.error && !snapshot?.adapter?.error
         const observedStatus = item => {
           const status = taskStatus[item.status] || '状态未知'
@@ -653,7 +672,7 @@
           snapshot?.monitoring?.pendingCancelledRequests > 0 && h('p', null, '已取消的分析仍有 ', snapshot.monitoring.pendingCancelledRequests, ' 个底层请求可能晚到；结果将忽略。'),
           h(SourcePlan, { plan: current.sourcePlan, sources: snapshot?.sources || [] }),
           h('details', null, h('summary', null, '查看此客户端资源计数'), h('pre', null, JSON.stringify(diagnostics(), null, 2))),
-          current.config && h(AnalysisConfig, { key: JSON.stringify(current.config), config: current.config })),
+          current.config && h(AnalysisConfig, { key: current.config.registrationId, config: current.config })),
           h('footer', null, '本地资料保留 24 小时。告警是有依据的疑点；模型质量仍待独立验收。'))
       }
       const inject = ['slots']

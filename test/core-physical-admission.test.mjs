@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -25,7 +26,7 @@ async function fixture(t, { honorAbort = false } = {}) {
     if (request.url === '/v1/chat/completions') {
       const job = { body, finished: false, closedBeforeFinished: false }
       response.once('close', () => { if (!job.finished) job.closedBeforeFinished = true })
-      const reply = () => { if (!job.finished) { job.finished = true; liveHttp--; if (!response.destroyed) response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] })) } }
+      const reply = () => { if (!job.finished) { job.finished = true; liveHttp--; if (!response.destroyed) response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] })) } }
       held.push({ ...job, reply, get finished() { return job.finished }, get closedBeforeFinished() { return job.closedBeforeFinished } })
       if (draining) reply()
     } else { liveHttp--; response.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'clear' : 'unknown' }])) })) }

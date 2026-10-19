@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -74,12 +75,12 @@ async function fixture(t, beforeAdapter = () => {}, judgment = 'clear', waitForO
     modelCalls.push({ path: request.url, model: body.model, inputChars: raw.length })
     response.setHeader('content-type', 'application/json')
     if (judgment === 'failed') { response.statusCode = 500; response.end(JSON.stringify({ error: 'controlled native wait analyzer failure' })); return }
-    if (request.url === '/v1/chat/completions') response.end(JSON.stringify({ model: 'native-wait-select', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+    if (request.url === '/v1/chat/completions') response.end(JSON.stringify({ model: 'native-wait-select', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }))
     else response.end(JSON.stringify({ model: 'native-wait-judge', answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: judgment, probabilities: { attention: 0, clear: judgment === 'clear' ? 1 : 0, unknown: judgment === 'unknown' ? 1 : 0 } }])) }))
   })
   await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
   const baseUrl = `http://127.0.0.1:${models.address().port}`
-  const configureAnalysis = async () => { await adapter.configureAnalysis({ llm: { baseUrl, model: 'native-wait-select' }, jev: { baseUrl, model: 'native-wait-judge' } }); if (deferAnalysis) await adapter.resume() }
+  const configureAnalysis = async () => { const current = await adapter.analysisConfigState(); await adapter.configureAnalysisIfCurrent({ llm: { baseUrl, model: 'native-wait-select' }, jev: { baseUrl, model: 'native-wait-judge' } }, current.revision); if (deferAnalysis) await adapter.resume() }
   if (!deferAnalysis) await configureAnalysis()
   const create = async (sessionId = randomUUID()) => {
     const handle = await ctx.agents.create({ sessionId, agentOptions: { provider: 'native-waits-fixture', model: randomUUID() } }); handles.push(handle)

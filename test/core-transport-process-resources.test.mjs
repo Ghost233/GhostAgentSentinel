@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -6,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { connectCore } from '../src/core-client.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 
 const alive = pid => { try { process.kill(pid, 0); return true } catch (error) { if (error.code === 'ESRCH') return false; throw error } }
 const missing = async path => { try { await stat(path); return false } catch (error) { if (error.code === 'ENOENT') return true; throw error } }
@@ -24,7 +26,7 @@ test('ordinary replacements retain one submitted HTTP call, while owner stop rel
     const job = { finished: false, closedBeforeFinished: false, finish() {
       if (job.finished) return
       job.finished = true; modelWork--
-      if (!response.destroyed) { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(request.url === '/v1/chat/completions' ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] } : { model: body.model, answers: {} })) }
+      if (!response.destroyed) { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(request.url === '/v1/chat/completions' ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] } : { model: body.model, answers: {} })) }
     } }
     response.once('close', () => { if (!job.finished) job.closedBeforeFinished = true })
     jobs.push(job)
@@ -57,7 +59,7 @@ test('ordinary replacements retain one submitted HTTP call, while owner stop rel
   assert.equal(health.instanceId, runtime.instanceId)
   assert.equal((await client.diagnostics()).pid, runtime.pid)
   const config = { llm: { baseUrl, model: 'process-extractor' }, jev: { baseUrl, model: 'process-judge' } }
-  await client.configureAnalysis(config)
+  await configureInstallationModels(client, 'owner-stop', config)
   source = await client.registerSource({ registrationId: 'owner-stop', hostRunId: 'own', name: 'Own controlled source' })
   const request = index => ({ id: `request-${index}`, taskId: 'actor', taskLifecycleId: 'life', kind: 'input', text: `Fixed request ${index}`, capturedAt: Date.now(), occurredAt: null })
   await client.ingest(source, { tasks: [{ id: 'actor', lifecycleId: 'life', status: 'running', title: 'Own actor' }], events: [request(0)] })
@@ -82,7 +84,9 @@ test('ordinary replacements retain one submitted HTTP call, while owner stop rel
   await until(async () => !alive(runtime.pid) && await missing(join(dataDir, 'runtime.json')) && await missing(join(dataDir, 'core.lock')), stoppedAt + 13_000, 'default ten-second daemon idle exit')
   assert.ok(Date.now() - stoppedAt >= 9000, 'the real daemon keeps its existing ten-second idle grace')
   await assert.rejects(fetch(`${runtime.url}/v1/health`, { signal: AbortSignal.timeout(1000) }), /fetch failed/)
-  assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'analysis-config.json'), 'utf8')), config)
+  const { createCore } = await import('../src/core/index.mjs')
+  const saved = await createCore({ dataDir })
+  try { assert.deepEqual((await saved.installationAnalysisConfig('owner-stop')).config, config) } finally { await saved.close() }
   assert.equal(models.listening, true, 'closing the last source does not unload the model service')
   assert.equal(jobs[0].finished, false)
   t.diagnostic(`server-work: ${JSON.stringify({ entered: jobs.length, peakUnfinished: peak, clientTransportEnded: true, serviceFinishedAtDaemonExit: jobs[0].finished, idleExitMs: Date.now() - stoppedAt, runtimeRemoved: true, lockRemoved: true, pidGone: true, listenerGone: true, configurationSaved: true })}`)

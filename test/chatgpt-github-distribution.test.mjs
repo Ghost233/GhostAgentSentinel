@@ -7,10 +7,30 @@ import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import filesystem from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { PLUGIN_NODE_SHA256 } from '../chatgpt/plugin-package.mjs'
+import { buildGitHubPlugins } from '../scripts/build-github-plugins.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url)), execute = promisify(execFile)
 const hash = bytes => createHash('sha256').update(bytes).digest('hex')
+
+test('GitHub distribution preserves the pinned official Node license without reading mutable App files', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'sentinel-independent-license-')), payload = join(directory, 'payload')
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  await mkdir(payload, { mode: 0o700 })
+  await execute('/usr/bin/tar', ['-xzf', join(root, 'plugins/ghost-sentinel/payload.tar.gz'), '-C', payload], { timeout: 30000 })
+  const read = filesystem.readFile
+  filesystem.readFile = (path, ...args) => {
+    if (String(path).startsWith('/Applications/')) throw new Error('mutable App files are unavailable during this build')
+    return read(path, ...args)
+  }
+  syncBuiltinESMExports()
+  let built
+  try { built = await buildGitHubPlugins({ packageRoot: payload, outputRoot: join(directory, 'distribution') }) }
+  finally { filesystem.readFile = read; syncBuiltinESMExports() }
+  for (const plugin of built.plugins) assert.equal(hash(await readFile(join(plugin.pluginRoot, 'licenses/node-LICENSE'))), '5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace')
+})
 
 test('GitHub catalog ships two isolated, self-contained plugin sources with test suffix', async () => {
   const catalog = JSON.parse(await readFile(join(root, '.agents/plugins/marketplace.json')))

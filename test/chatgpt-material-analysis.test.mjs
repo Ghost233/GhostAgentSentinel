@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createAnalyzer } from '../src/analysis/index.mjs'
@@ -55,7 +56,7 @@ async function modelIO(t, { choice = 'clear', failure = false, hold = false } = 
     if (hold) return
     res.setHeader('content-type', 'application/json')
     if (failure) { res.writeHead(503).end(JSON.stringify({ error: { code: 'controlled-unavailable' } })); return }
-    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }], usage: { prompt_tokens: 10, completion_tokens: 5 } }))
+    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(wire, { selectedOptionIds: [], gaps: [] })) } }], usage: { prompt_tokens: 10, completion_tokens: 5 } }))
     else res.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(decoded.questions).map(id => [id, { type: 'choice', choice }])), usage: { input_tokens: 20, output_tokens: 1 } }))
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))

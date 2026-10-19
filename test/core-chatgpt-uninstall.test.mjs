@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -10,6 +11,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { createServer } from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 
@@ -216,7 +218,7 @@ test('completed summaries and a cancelled analysis cannot restore purged install
     if (req.url === '/v1/chat/completions') {
       const evidence = JSON.parse(wire.messages[1].content).evidence
       const selectedOptionIds = evidence.flatMap(group => { const kind = group.options.some(option => option.kind === 'authorization') ? 'authorization' : group.options.some(option => option.kind === 'action') ? 'action' : 'context'; return group.options.filter(option => option.kind === kind).slice(0, 1).map(option => option.optionId) })
-      res.end(JSON.stringify({ model: wire.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [] }) } }] }))
+      res.end(JSON.stringify({ model: wire.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(wire, { selectedOptionIds, gaps: [] })) } }] }))
     } else {
       const json = decodeJevRequest(wire), finish = () => { if (holdJudgment) completedLate++; if (!res.destroyed) res.end(JSON.stringify({ model: json.model, answers: Object.fromEntries(Object.keys(json.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) })) }
       if (holdJudgment) held.push(finish); else finish()
@@ -225,7 +227,7 @@ test('completed summaries and a cancelled analysis cannot restore purged install
   await new Promise(resolve => model.listen(0, '127.0.0.1', resolve))
   t.after(async () => { for (const finish of held.splice(0)) finish(); model.closeAllConnections(); await new Promise(resolve => model.close(resolve)) })
   const baseUrl = 'http://127.0.0.1:' + model.address().port
-  await f.core.configureAnalysis({ llm: { baseUrl, model: 'owned-extractor' }, jev: { baseUrl, model: 'owned-judge' } })
+  await configureInstallationModels(f.core, 'chatgpt:analysis-install', { llm: { baseUrl, model: 'owned-extractor' }, jev: { baseUrl, model: 'owned-judge' } })
   const descriptor = { registrationId: 'chatgpt:analysis-install', hostRunId: 'first-host', name: 'Owned analysis', policy: 'chatgpt-main/1' }
   const batch = () => {
     const ref = eventId => ({ taskId: 'main', lifecycleId: 'run', eventId }), event = (id, kind, text, data) => ({ id, taskId: 'main', taskLifecycleId: 'run', kind, text, capturedAt: f.now, occurredAt: f.now, data: { sourceKind: 'chatgpt-native', runId: 'run', ...data } })
@@ -240,6 +242,7 @@ test('completed summaries and a cancelled analysis cannot restore purged install
   assert.equal(completed.logical.removed.summaries, 1)
   assert.equal(JSON.stringify(await f.core.gsSummary(first, 'main')).includes('secret uninstall request'), false)
   holdJudgment = true; f.advance()
+  await configureInstallationModels(f.core, 'chatgpt:analysis-install', { llm: { baseUrl, model: 'owned-extractor' }, jev: { baseUrl, model: 'owned-judge' } })
   const next = await f.core.registerSource({ ...descriptor, hostRunId: 'next-host' })
   await f.core.ingest(next, batch())
   await until(() => held.length === 1)

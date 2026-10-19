@@ -6,6 +6,53 @@ const ids = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_co
 const result = id => ({ signal: 'gray', summary: id ? id + ' 执行开始' : '无法确认当前观察', identity: { threadId: id }, observation: { coverage: 'caught-up', gap: null }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
 const material = (id = 'main-a', signal = 'red') => ({ ...result(id), signal, summary: '当前修改可能偏离请求', analysis: { connected: true, state: 'cooldown', resultDisposition: 'current', summary: '本轮六项检查已更新', waitMs: 0, lagMs: 2500, coverage: { complete: true, gaps: [] }, checks: ids.map(checkId => ({ id: checkId, status: checkId === 'request_drift' ? 'attention' : 'clear', reason: '已核对现有材料' })), issues: [{ checkId: 'request_drift', reason: '用户只要求改文字，代理却更改了数据层', evidence: [{ text: '<img src=x onerror="alert(1)"> 只改按钮文字', reference: 'record:private-evidence-id' }] }] }, discovery: { complete: false, directoryComplete: true, counts: { main: 3, fork: 1, child: 2, remote: 0, cloud: 0, unknown: 1 }, tracked: 3, connected: 1, currentIncluded: true, gaps: ['fork-coverage-pending'] } })
 
+test('a completed model summary keeps literal evidence and disappears when the next result is pending or failed', async t => {
+  const page = await harness(t), view = material('main-a', 'gray')
+  view.analysis.generated = { text: '正在核对按钮文案。尚未得到验证结果。', evidence: [{ text: '<button> 已修改', reference: 'native:current-evidence' }] }
+  await page.deliver(view)
+  assert.equal(page.element('#model-summary').hidden, false)
+  assert.match(page.element('#model-summary-text').textContent, /按钮文案/)
+  assert.match(page.element('#model-summary-evidence').textContent, /<button> 已修改/)
+  assert.match(page.element('#model-summary-evidence').textContent, /native:current-evidence/)
+  assert.equal(page.element('#model-summary-evidence').children[0].children.length, 0)
+  await page.refresh(); await page.deliver({ ...view, analysis: { ...view.analysis, state: 'idle', resultDisposition: 'reused' } })
+  assert.equal(page.element('#model-summary').hidden, false, 'unchanged valid material keeps its successful model summary')
+  assert.match(page.element('#model-status').textContent, /复用/)
+  await page.refresh(); await page.deliver({ ...view, analysis: { ...view.analysis, resultDisposition: 'pending' } })
+  assert.equal(page.element('#model-summary').hidden, true)
+  await page.refresh(); await page.deliver({ ...view, analysis: { ...view.analysis, state: 'failed' } })
+  assert.equal(page.element('#model-summary').hidden, true)
+})
+
+test('a failed new round keeps the prior successful summary only in collapsed history with its original time and evidence', async t => {
+  const page = await harness(t), view = material('main-a', 'gray'), completedAt = Date.now() - 1000
+  view.analysis.state = 'failed'; view.analysis.resultDisposition = 'invalid'
+  view.analysis.lastSuccessfulSummary = { generated: { text: '上次已观察到按钮更新。', evidence: [{ text: '<button> 已修改', reference: 'native:prior-result' }] }, completedAt, expiresAt: completedAt + 86400000, configScope: { registrationId: 'chatgpt:installation-a', revision: 'prior-revision' } }
+  view.history = { currentKey: 'current', selectedKey: 'current', executions: [{ key: 'current', status: 'running', observedAt: completedAt }], hasMore: false }
+  await page.deliver(view)
+  assert.equal(page.element('#model-summary').hidden, true)
+  assert.equal(page.element('#last-summary').hidden, false)
+  assert.equal(page.element('#last-summary').open, false)
+  assert.match(page.element('#last-summary-text').textContent, /上次已观察/)
+  assert.match(page.element('#last-summary-time').textContent, /历史.*当前/)
+  assert.match(page.element('#last-summary-evidence').textContent, /<button> 已修改.*native:prior-result/s)
+  assert.doesNotMatch(page.element('#summary').textContent, /正常/)
+  await page.refresh(); await page.deliver({ ...view, analysis: { ...view.analysis, lastSuccessfulSummary: { ...view.analysis.lastSuccessfulSummary, expiresAt: Date.now() - 1 } } })
+  assert.equal(page.element('#last-summary').hidden, true)
+  assert.equal(page.element('#last-summary-text').textContent, '')
+  await page.refresh(); await page.deliver(result('main-b'))
+  assert.equal(page.element('#last-summary').hidden, true)
+  assert.equal(page.element('#last-summary-evidence').textContent, '')
+})
+
+test('an unconfirmed chat explains the actual collection boundary while keeping settings reachable', async t => {
+  const page = await harness(t)
+  await page.deliver({ ...result(null), observation: { gap: 'observation-unavailable', failureStage: 'core-connection' }, health: { state: 'failed', failures: [{ domain: 'collection', error: { code: 'ECONNREFUSED', stage: 'core' } }] } })
+  assert.match(page.element('#observation').textContent, /共享核心连接/)
+  assert.match(page.element('#health').textContent, /ECONNREFUSED/)
+  assert.equal(typeof page.element('#settings-toggle').onclick, 'function')
+})
+
 
 test('current facts stay visible while inherited requirements remain pending and cannot appear fully green', async t => {
   const page = await harness(t), view = material('main-a', 'green')

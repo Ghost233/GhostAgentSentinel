@@ -1,7 +1,7 @@
 {
   "name": "ghost-sentinel-test",
-  "version": "0.1.2-preview.2",
-  "description": "ChatGPT.app 本机主聊天及分叉的只读检查（开发预览）",
+  "version": "0.1.2",
+  "description": "ChatGPT.app 本机主聊天及分叉的只读检查",
   "author": {
     "name": "Ghost233",
     "url": "https://github.com/Ghost233/GhostAgentSentinel"

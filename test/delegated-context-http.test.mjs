@@ -1,7 +1,8 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { startServer } from '../src/server.mjs'
@@ -19,7 +20,7 @@ async function fixture(t, { sameId = false, holdChild = false } = {}) {
     if (req.url === '/v1/chat/completions') {
       const evidence = JSON.parse(json.messages[1].content).evidence
       const selectedOptionIds = evidence.flatMap(group => group.options.filter(option => option.kind === (group.options.some(option => option.kind === 'authorization') ? 'authorization' : group.options.some(option => option.kind === 'action') ? 'action' : 'context')).slice(0, 1).map(option => option.optionId))
-      res.end(JSON.stringify({ model: json.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [] }) } }] }))
+      res.end(JSON.stringify({ model: json.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(json, { selectedOptionIds, gaps: [] })) } }] }))
     } else {
       const finish = () => res.end(JSON.stringify({ model: json.model, answers: Object.fromEntries(Object.keys(json.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'clear' : 'unknown' }])) }))
       if (holdChild && json.state.instruction?.inputRef.taskId === 'child' && json.state.events.some(event => event.id === json.state.requestId && event.text === 'Inspect HTTP.')) held.push(finish)
@@ -33,12 +34,13 @@ async function fixture(t, { sameId = false, holdChild = false } = {}) {
     if (failures.length) throw new AggregateError(failures, 'HTTP context cleanup failed')
   })
   const baseUrl = `http://127.0.0.1:${models.address().port}`
-  await writeFile(join(dataDir, 'analysis-config.json'), JSON.stringify({ llm: { baseUrl, model: 'boundary-extractor' }, jev: { baseUrl, model: 'boundary-judge' } }))
   server = await startServer({ dataDir, now: () => clock, cooldownMs: 1000, leaseMs: 172_800_000 })
   async function request(path, body) {
     const response = await fetch(`${server.url}/v1/${path}`, { method: body === undefined ? 'GET' : 'POST', headers: { authorization: `Bearer ${server.token}`, 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) })
     return { status: response.status, body: await response.json() }
   }
+  const configuration = (await request('analysis/installations/config?registrationId=context')).body
+  assert.equal((await request('analysis/installations/config', { registrationId: 'context', config: { llm: { baseUrl, model: 'boundary-extractor' }, jev: { baseUrl, model: 'boundary-judge' } }, revision: configuration.revision })).status, 200)
   const sourceKey = (await request('source/register', { registrationId: 'context', hostRunId: 'host', name: 'context' })).body
   const event = (taskId, id, kind, text, data, capturedAt = clock) => ({ id, taskId, taskLifecycleId: 'life', kind, text, occurredAt: null, capturedAt, data })
   const rootId = sameId ? 'same-input' : 'root-input', childId = sameId ? 'same-input' : 'child-input'

@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { createAnalyzer } from '../src/analysis/index.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
+import { withModelSummary } from './helpers/model-summary.mjs'
 
 async function inference(t) {
   const requests = [], results = []
@@ -22,7 +23,7 @@ async function inference(t) {
           const kind = group.contextRole === 'ancestor-limit' ? 'authorization' : group.origin === 'tool-result' ? 'result' : ['tool-start', 'output'].includes(group.origin) ? 'action' : 'context'
           return group.options.filter(option => option.kind === kind).slice(0, 1).map(option => option.optionId)
         })
-        response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [] }) } }] }))
+        response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds, gaps: [] })) } }] }))
       } else response.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown' }])) }))
     } catch (error) { response.writeHead(500); response.end(JSON.stringify({ error: error.message })) }
     finally { activeRequests-- }

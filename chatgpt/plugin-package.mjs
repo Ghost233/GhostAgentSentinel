@@ -7,7 +7,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { HELPER_VERSION } from './runtime.mjs'
 
-export const PLUGIN_NODE = '/Applications/DSH Workflow.app/Contents/Resources/desktop/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node'
+export const PLUGIN_NODE = process.execPath
 export const PLUGIN_NODE_SHA256 = '43aa9baf363e1e1ede7f7e4dd16e175793312d8ef0abd7b10868ba2ba3fe27f1'
 const acceptedNodeHashes = new Set([PLUGIN_NODE_SHA256, '738852ca4f83d6a0485e4ae25e04b84243ae1d331e5f003b7cd0291cdf4b6821'])
 const root = fileURLToPath(new URL('../', import.meta.url)), manifestName = 'plugin-package.json'
@@ -136,7 +136,7 @@ export async function inspectPluginPackage(directory, { digest } = {}) {
 }
 
 export async function buildPluginPackage({ outputDir, notificationApp, version } = {}) {
-  if (process.platform !== 'darwin' || process.version !== 'v24.21.0' || await realpath(process.execPath) !== await realpath(PLUGIN_NODE)) throw new Error('fixed macOS Node24.21.0 builder required')
+  if (process.platform !== 'darwin' || process.version !== 'v24.21.0') throw new Error('fixed macOS Node24.21.0 builder required')
   if (typeof outputDir !== 'string' || !isAbsolute(outputDir) || /[\n\0]/.test(outputDir)) throw new Error('absolute new package output required')
   if (version !== undefined && !validVersion(version)) throw new Error('finite semantic package version required')
   outputDir = resolve(outputDir)

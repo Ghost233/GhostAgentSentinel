@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
@@ -7,6 +8,7 @@ import { createServer } from 'node:http'
 import { zstdCompressSync } from 'node:zlib'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { candidateHostProfile, supportedProfile } from '../chatgpt/storage-compatibility.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
@@ -28,13 +30,12 @@ async function fixture(t, { profile = candidateHostProfile, suffix = '', records
   const wire = createServer(async (req, res) => {
     let body = ''; for await (const chunk of req) body += chunk
     res.setHeader('content-type', 'application/json')
-    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] }))
     else { const request = decodeJevRequest(JSON.parse(body)); res.end(JSON.stringify({ model: 'fixed-judge', answers: Object.fromEntries(Object.keys(request.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) })) }
   })
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); wire.closeAllConnections(); await new Promise(resolve => wire.close(resolve)); await fs.rm(dir, { recursive: true, force: true }) })
   await new Promise(resolve => wire.listen(0, '127.0.0.1', resolve))
   const baseUrl = 'http://127.0.0.1:' + wire.address().port
-  await fs.writeFile(join(dataDir, 'analysis-config.json'), JSON.stringify({ llm: { baseUrl, model: 'fixed-extractor' }, jev: { baseUrl, model: 'fixed-judge' } }))
   const inherited = row(0, 'session_meta', header(parent), at - 100000) + row(1, 'event_msg', start('inherited'), at - 100000) + row(2, 'event_msg', user(parent, 'inherited', 'Keep the synthetic inherited limit'), at - 100000)
     + row(3, 'event_msg', { type: 'item_completed', thread_id: parent, turn_id: 'inherited', item: { type: 'CommandExecution', id: 'old-validation', aggregated_output: 'Historical validation only', exit_code: 0 } }, at - 100000) + row(4, 'event_msg', { type: 'task_complete', turn_id: 'inherited' }, at - 100000)
   await fs.writeFile(parentPath, inherited)
@@ -43,6 +44,7 @@ async function fixture(t, { profile = candidateHostProfile, suffix = '', records
     + (records ?? row(base + 1, 'event_msg', start('turn')) + row(base + 2, 'event_msg', user(owner, 'turn')) + row(base + 3, 'event_msg', agent(owner, 'turn'))) + suffix
   await fs.writeFile(path, compressed ? zstdCompressSync(Buffer.from(bytes)) : bytes)
   server = await startServer({ dataDir, now: () => clock, cooldownMs: 0 }); core = await connectCore({ dataDir })
+  await configureInstallationModels(core, 'chatgpt:current-app-material', { llm: { baseUrl, model: 'fixed-extractor' }, jev: { baseUrl, model: 'fixed-judge' } })
   const state = { profile, enabled: true, available: true, threadReads: 0, currentRecordReads: 0 }
   const native = { async sampleHost() { return { available: state.available, hostRunId: 'current-app-fixture', hostStartedAt: at - 10000, profile: state.profile } }, async readThread(id) { state.threadReads++; return { thread: { id, path: id === owner ? path : parentPath, cwd: '/synthetic-project', parentThreadId: null, forkedFromId: id === owner && fork ? parent : null, source: 'vscode', originator: 'Codex Desktop' }, anchorTurnId: id === owner ? 'turn' : null } }, async readEnablement() { return { user: state.enabled ? 'enabled' : 'disabled', effective: state.enabled ? 'enabled' : 'disabled' } }, async close() {} }
   const open = fs.open, watched = new Set([await fs.realpath(path), await fs.realpath(parentPath)])

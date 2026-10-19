@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -8,6 +9,7 @@ import { connectCore } from '../src/core-client.mjs'
 import { createServer } from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 
 async function fixture(t, options = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-native-notification-'))
@@ -151,7 +153,7 @@ async function provider(t, { failFirst = false, attention = false } = {}) {
     let raw = ''; for await (const chunk of request) raw += chunk
     response.setHeader('content-type', 'application/json')
     if (++calls === 1 && failFirst) { response.writeHead(503).end('{"error":{"code":"controlled"}}'); return }
-    if (request.url === '/v1/chat/completions') response.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+    if (request.url === '/v1/chat/completions') response.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(raw), { selectedOptionIds: [], gaps: [] })) } }] }))
     else response.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(decodeJevRequest(JSON.parse(raw)).questions).map(id => [id, { type: 'choice', choice: attention && id === 'request_drift' ? 'attention' : 'clear' }])) }))
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -162,7 +164,7 @@ async function provider(t, { failFirst = false, attention = false } = {}) {
 
 for (const transition of ['running', 'idle', 'next-execution']) test(`an actual analysis HTTP failure survives recovery and ${transition} before its first notification poll`, async t => {
   const model = await provider(t, { failFirst: true }), f = await fixture(t, { cooldownMs: 0, leaseMs: 1e9 })
-  await f.core.configureAnalysis(model.config)
+  await configureInstallationModels(f.core, 'chatgpt:native-notification', model.config)
   await f.core.ingest(f.sourceKey, nativeBatch(f.now()))
   await until(async () => { const actor = (await f.core.snapshot()).tasks[0]; return actor.analysis.summary && !actor.analysis.error && model.calls() >= 3 }, 'actual failed and recovered provider calls settle')
   const receipt = (await f.core.failureReceipts({ sourceKey: f.sourceKey })).receipts[0]
@@ -183,7 +185,7 @@ for (const transition of ['running', 'idle', 'next-execution']) test(`an actual 
 
 test('ChatGPT task alerts retain the three-second window and ten-minute successful repeat while a late old attempt cannot overwrite the new one', async t => {
   const model = await provider(t, { attention: true }), f = await fixture(t, { leaseMs: 1e9 })
-  await f.core.configureAnalysis(model.config)
+  await configureInstallationModels(f.core, 'chatgpt:native-notification', model.config)
   await f.core.ingest(f.sourceKey, nativeBatch(f.now()))
   await until(async () => (await f.core.snapshot()).tasks[0].gs.light === 'red', 'grounded concern updates the panel immediately')
   const qualify = () => f.core.setNativeNotificationEligibility({ sourceKey: f.sourceKey, hostRunId: 'native-host', appRunning: true, pluginEnabled: true })

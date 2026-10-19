@@ -1,6 +1,6 @@
-# 首版开发接缝与验收
+# 开发接缝与验收
 
-源码候选：0.1.2-dev.0。本文记录核心开发接缝；已发布 0.1.1 的验收范围见 [发布验证范围](release-status.md)。ChatGPT 增量仍在开发，不扩大旧版本的交付承诺。
+源码候选：0.1.2，DSH 与 Codex 使用同一正式版本目标。本文记录当前开发接缝；候选尚未完成全部验收，已发布正式基线仍为 0.1.1，具体证据范围见 [发布验证范围](release-status.md)。
 
 ## 范围和分工
 
@@ -44,15 +44,19 @@ DSH 0.1.2 的目标已随子模块更新，具体提交、共享核心回归和�
 
 事件：`{id, taskId, taskLifecycleId, kind, occurredAt, capturedAt, text, evidence?, data?}`。kind 为 input/output/tool-start/tool-result/status/gap。data 只放可获取的事实：callId/rootCallId/parentCallId、toolName、command、exitCode、isError、errorCode、sourceVersion、validationScope、artifactChanged、status、truncated、redacted。无来源的字段不补造。摘录默认最多 240 字符单元，截断标明缺口，不能读认证头、凭据配置或传输令牌。传输认证只用于核心连接，不进入监控结果。原任务内容中显式的认证头、常见凭据字段、私钥和已识别凭据读取命令，在适配器与 HTTP 接收处整字段省略，标 redacted；省略影响当前请求的覆盖。该规则识别显式格式，不是任意秘密文本的通用识别器。
 
-核心模块导出 `createCore({dataDir, analyzer, now?, cooldownMs?, repeatMs?, leaseMs?, idleGraceMs?, onIdle?})`，异步方法：registerSource(descriptor)、heartbeat(sourceKey)、ingest(sourceKey,{events?,tasks?,gaps?})、unregisterSource(sourceKey,reason)、snapshot()、diagnostics()、sourcePlan()、configureSources(entries)、pause()、resume()、setAnalyzer(analyzer)、claimNotifications(sourceKey)、ackNotification(id,result)、close()。register 返回来源 key；ingest 返回接受/重复/过期计数与 paused。snapshot 读取业务状态；diagnostics 只读资源计数，不含任务正文或令牌。configureSources 整体替换最多 100 条配置，不控制宿主插件开关。
+核心模块导出 `createCore({dataDir, analyzer, analyzerFactory?, now?, cooldownMs?, repeatMs?, leaseMs?, idleGraceMs?, onIdle?})`，异步方法包括 registerSource(descriptor)、heartbeat(sourceKey)、ingest(sourceKey,{events?,tasks?,gaps?})、unregisterSource(sourceKey,reason)、snapshot()、diagnostics()、sourcePlan()、configureSources(entries)、claimNotifications(sourceKey)、ackNotification(id,result)、close()。安装模型配置与暂停使用下文的安装级接缝。register 返回来源 key；ingest 返回接受/重复/过期计数与 paused。snapshot 读取业务状态；diagnostics 只读资源计数，不含任务正文或令牌。configureSources 整体替换最多 100 条配置，不控制宿主插件开关。
 
 用户已确认首版沿用聊天和工具现有的版本、验证范围与退出结果。缺失时显示不可判断，六项检测全部保留。额外读取工作区的版本指纹采集后置；适配器不主动读取工作区来补全证据。
 
-分析模块导出 `createAnalyzer(config)`，对象提供 `analyze({task,source,events,coverage},{signal})`。返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`；summary 包含 currentTask/currentState/recentProgress/attention 字符串。checks 固定六项 ID：stalled_progress/request_drift/failure_loop/validation_cost/validation_gap/long_wait，每项 `{id,status,reason,evidenceIds}`，status 是 attention/clear/unknown。evidenceIds 必须属于本轮对应任务，unknown 不算正常，confidence 不表示准确率。未配置推理时返回明确依赖状态，不能发语义成功告警。
+分析模块导出 `createAnalyzer(config)`，对象提供 `analyze({task,source,events,coverage},{signal})`。返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`；summary 保留 currentTask/currentState/recentProgress/attention 字符串。执行短总结使用可选的 `summary.generated = {text,evidenceIds,evidenceRefs}`，只在本轮总结模型和 JEV 实际调用成功且输出、引用合法后赋值。text 为附依据的 1～2 句，最多 600 字符单元；任一环节失败或未完成均不发布新总结。
+
+checks 固定六项 ID：stalled_progress/request_drift/failure_loop/validation_cost/validation_gap/long_wait，每项 `{id,status,reason,evidenceIds}`，status 是 attention/clear/unknown。evidenceIds 必须属于本轮对应任务，unknown 不算正常，confidence 不表示准确率。未配置推理时返回明确依赖状态，不能发语义成功告警。旧总结受原历史与保留期规则管理，不能充当本轮结果。
 
 核心 snapshot 包含 protocol、generatedAt、monitoring、overview、sources、tasks。overview 显示 runningTasks/knownSources/connectedSources/attentionTasks/coverage。任务含 key/sourceKey/id/lifecycleId/title/status/currentRequest/updatedAt/lastActivity/events/analysis/alerts。analysis 含 state/through/completedAt/nextEligibleAt/error/summary/checks；来源含 key/descriptor/status/lastSeenAt/gaps。响应不暴露访问令牌。
 
-分析模块的私有 LLM 接缝使用有限证据目录。每组原文只提供一次，可选项明确使用 `optionId`；模型只返回 `selectedOptionIds` 与 `gaps`。模型载荷不展示结构化的来源事件 ID 或当前请求 ID，以 `isCurrentInput` 标明已确认锚点；真实事件定位、原文和来源允许的事实分类仍由代码绑定。目录项仅表示可选择资格，实际门禁、授权等语义仍需选择与判断。未知或重复选项、额外字段、旧键和自由事实格式均报错，不自动修复或接受事件 ID 作为选项。还原后继续校验原文引用与来源权限。当前请求从保留范围内已确认的真实非空 input 确定，空、缺失或过期时保留未知，不以任务标题或元数据补造。完整 LLM 请求 JSON 受原 24,000 字符预算约束，输出上限仍为 1,024 token；公共分析结果、JEV 和适配器协议保持不变。
+分析模块的私有 LLM 接缝使用有限证据目录，每组原文只提供一次，可选项使用 `optionId`。模型必须严格返回 `{selectedOptionIds,gaps,summary:{text,evidenceOptionIds}}`；总结依据也使用目录选项，代码再映射为公开的事件引用。模型载荷不展示结构化的来源事件 ID 或当前请求 ID，以 `isCurrentInput` 标明已确认锚点；真实事件定位、原文和来源允许的事实分类仍由代码绑定。
+
+目录项仅表示可选择资格，实际门禁、授权等语义仍需选择与判断。未知或重复选项、额外字段、旧键、无效总结或引用均报错，不自动修复，也不接受事件 ID 作为选项。还原后继续校验原文引用与来源权限。当前请求从保留范围内已确认的真实非空 input 确定，空、缺失或过期时保留未知，不以任务标题或元数据补造。完整 LLM 请求 JSON 受原 24,000 字符预算约束，输出上限仍为 1,024 token；JEV 的判断职责和既有适配器输入协议保持。
 
 偏离检查的询问资格依据真实当前请求、完整覆盖以及本轮非空输出或工具开始活动，不要求模型再选出 action 分类。活动只说明有材料可问，偏离、合理调查或必要前置仍由 JEV 核对；不直接设置判断，也不补造分类。仅有工具结果、缺少请求或活动、覆盖不足时保持未知。引用保留本轮相关原文，便于展开核对权限和调查理由。
 
@@ -64,11 +68,17 @@ DSH 0.1.2 的目标已随子模块更新，具体提交、共享核心回归和�
 
 同一主会话合并多个代理告警时，兼容字段 `taskKey` 和正文中的完整观察身份指向投递前仍有效的首成员，共同来源身份仍完整显示。首成员被过滤后，两处身份一起更新，原 3 秒合并截止不延后。其余成员在正文以名称、必要短标识和原因表示，公开 `members` 资料保留逐代理完整身份及问题关系；它不替代上述系统可见定位。该规则不改变单成员通知、前 240 字符定位和 1200 字符正文界限。
 
-适配器接缝：`src/core-client.mjs` 导出 `connectCore({dataDir})`，返回与上述核心方法同名的 HTTP 方法（不含 setAnalyzer），以及 `configureAnalysis(config)`、`analysisConfig()` 和 `close()`。close 只关闭客户端；适配器须先 unregisterSource。连接断开后适配器重试 connectCore 和登记/基线，不能依赖旧连接 token 或旧 sourceKey。配置为 `{llm:{baseUrl,model},jev:{baseUrl,model}}`，未设置的项可以省略；只允许回环 HTTP(S)，不包含密钥。配置读取仅返回这两个公开地址/模型 ID。公开事件验证由主线程完成，业务语义与去重由核心完成。核心默认租约 15 秒，适配器心跳 3 秒；开发默认长等待阈值 5 分钟明确标为待质量验收，不作为任务失败结论。
+适配器接缝：`src/core-client.mjs` 导出 `connectCore({dataDir})`，提供上述业务方法对应的 HTTP 方法及 `close()`。close 只关闭客户端；适配器须先 unregisterSource。连接断开后适配器重试 connectCore 和登记／基线，不能依赖旧连接 token 或旧 sourceKey。公开事件验证由主线程完成，业务语义与去重由核心完成。核心默认租约 15 秒，适配器心跳 3 秒；开发默认长等待阈值 5 分钟明确标为待质量验收，不作为任务失败结论。
 
-第二十轮新增条件配置接缝，用于避免临时测试覆盖并发修改。`analysisConfigState()` 返回 `{config,revision}`。`configureAnalysisIfCurrent(config,revision)` 在共享写入队列内核对修订号，成功后返回新的状态。原 `configureAnalysis(config)` 也进入同一队列。每次成功写入均换修订号，包括值未变化的写入；核心重启也换号。修订号只在当前运行中有效，不改变持久配置格式。
+安装配置使用 `installationAnalysisConfig(registrationId)` 读取 `{registrationId,config,revision}`，使用 `configureInstallationAnalysis(registrationId,config,revision)` 比较保存。HTTP 为 `GET /v1/analysis/installations/config?registrationId=…` 与同路径 POST，写入正文为 `{registrationId,config,revision}`。配置为 `{llm:{baseUrl,model},jev:{baseUrl,model}}`，未设置的项可以省略，只允许回环 HTTP(S)，不包含密钥。同安装的聊天共用配置，不同 registrationId 各自持久保存；未配置安装返回空配置，不回落到旧全局设置。
 
-HTTP 状态读取为 `GET /v1/analysis/config/state`，条件写入为 `POST /v1/analysis/config/compare`，正文是 `{config,revision}`。修订冲突返回 409 和 `analysis_config_conflict`，不修改配置。应用失败先尝试逐项恢复旧文件和旧分析器，保留原错误和恢复错误。恢复无法确认时，两个配置读取入口及条件写入返回 503 和 `analysis_config_unconfirmed`。成功的原无条件写入可以重新确认配置。响应丢失时，调用方保留结果未知，不能仅凭值相同推定写入归属。具体实现与故障验收状态见 [发布验证范围](release-status.md)。
+安装配置修订冲突返回 409 和 `analysis_config_conflict`，不修改配置。每次成功写入更换该安装的修订号，并将该安装受影响的配置、任务和通知变化一起持久提交。分析轮次和结果绑定 registrationId、配置修订号及执行材料；保存后取消旧轮次、封存晚到结果，按新配置公平排队。采集、原任务、其它安装与手动暂停保持。响应丢失时保留结果未知，调用方重新读取，不能仅凭值相同推定写入归属。
+
+安装暂停使用 `installationMonitoring(registrationId)` 和 `setInstallationMonitoring(registrationId,paused,revision)`，返回 `{registrationId,paused,revision}`。HTTP 为 `GET /v1/monitoring/installations?registrationId=…` 与同路径 POST，写入正文为 `{registrationId,paused,revision}`。相同目标状态幂等，过期的相反写入返回 409 和 `installation_monitoring_conflict`。DSH 界面只调用所属安装的控制；安装暂停与会话暂停取逻辑或，恢复其中一项不解除另一项，暂停期间仍采集。
+
+旧 `configureAnalysis`、`analysisConfig`、`analysisConfigState`、`configureAnalysisIfCurrent`、全局 pause／resume 和 setAnalyzer 仅保留给内部管理或 CLI。对应 `/v1/analysis/config`、`/state`、`/compare` 不代表安装配置，也不为新安装导入或迁移旧设置。旧全局比较保存仍使用修订号；恢复无法确认时返回 503 和 `analysis_config_unconfirmed`，该状态不能当作安装配置已确认。
+
+模型连接检查仅请求 `GET /v1/models`，核对在线与模型可见状态，不发送聊天材料或合成推理。服务在线和模型可见不证明实际分析成功，也不按名称猜测 JEV 能力。生产分析失败沿既有调度默认退避 60、120、240、480 秒，最长 900 秒；同服务及模型恢复后继续合法分析，不新增常驻恢复器，不解除暂停，不下载、更换或启动模型。
 
 最后来源退出：保存、取消自己分析请求，短宽限后退出；模型驻留，晚到结果忽略。重启恢复只使用 24 小时保留资料，来源/运行状态先标未知，重新登记与基线确认后再分析，不恢复原任务或旧请求。
 
@@ -80,7 +90,7 @@ HTTP 状态读取为 `GET /v1/analysis/config/state`，条件写入为 `POST /v1
 
 ## ChatGPT 只读观察增量
 
-0.1.2-dev.0 新增 source-observation/1 健康能力。来源登记可声明 mode 为 observation-only；省略该字段保持原有分析行为。未知模式拒绝整次登记，不静默回落。
+0.1.2 候选提供 source-observation/1 健康能力。来源登记可声明 mode 为 observation-only；省略该字段保持原有分析行为。未知模式拒绝整次登记，不静默回落。
 
 该模式保留真实任务生命周期和观察事件。分析状态为 observation-only，不调度语义或时间分析，不从静默生成任务告警。活动节点以灰色“只读观察”说明尚无语义结论；任务结束仍保留真实结束状态。来源失联和任务未知单独表达。
 
@@ -152,4 +162,4 @@ plain 读取在接受材料前再次核对路径与打开文件的身份、大�
 
 游标保存有界元数据，重放回到上次已确认位置；完成的压缩游标恢复也核对 inode、size、mtime 与 ctime。跨 codec 必须重新核对唯一候选和已确认前缀，只重绑物理状态。非空 v1／v2 进度不能相互切换；无法映射的旧进度及不具备所需状态的游标明确拒绝，不能清空游标、变更 registration 或重计时间绕过。分析复用身份包含当前指令上下文成员与缺口，隐含开始证明过期后不复用旧完整结论。
 
-自动发现和原生材料的覆盖边界见 [开发候选说明](chatgpt-observation.md)。首版须通过真实主聊天、小规模真实分叉、压缩可读和生命周期框架验收；十几层完整重放改为非阻塞兼容性专项。来源串位、错误授权、首采刷新和资源泄漏仍是框架缺陷。正式后台、稳定连接、升级、按来源卸载及新候选实机验收由后续阶段完成。
+自动发现和原生材料的覆盖边界见 [开发候选说明](chatgpt-observation.md)。候选须通过真实主聊天、小规模真实分叉、压缩可读和生命周期框架验收；十几层完整重放为非阻塞兼容性专项。来源串位、错误授权、首采刷新和资源泄漏仍是框架缺陷。最终候选、实机、完整本地门禁和交付复核仍按实际证据验收，真实 App 退出重开留到最后。本轮按用户确认不执行升级专项，未执行项不计通过；统一版本号也不扩大已完成验收的范围。

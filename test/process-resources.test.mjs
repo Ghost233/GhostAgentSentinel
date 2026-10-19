@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import { req, workflowRoot } from './dsh-native-runtime.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -11,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
 import { connectCore } from '../src/core-client.mjs'
 import { createCore } from '../src/core/index.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 
 const fixturePath = fileURLToPath(new URL('./dsh-process-runtime.mjs', import.meta.url))
 const alive = pid => { try { process.kill(pid, 0); return true } catch (error) { if (error.code === 'ESRCH') return false; throw error } }
@@ -181,7 +183,7 @@ async function inferenceFixture() {
       }
       completed++
       response.setHeader('content-type', 'application/json')
-      response.end(JSON.stringify({ model: 'fixture-llm', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds: [], gaps: [] }) } }] }))
+      response.end(JSON.stringify({ model: 'fixture-llm', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }))
     } else if (request.url === '/v1/systemone') {
       response.setHeader('content-type', 'application/json')
       response.end(JSON.stringify({ model: 'fixture-jev', answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown' }])) }))
@@ -263,10 +265,15 @@ test('abrupt native Host exits expire real leases, cancel held inference, preser
   const startedAt = Date.now(), environment = await nativeEvidence(), runtime = await ownedRuntime(t)
   const inference = await inferenceFixture()
   t.after(() => inference.close())
-  await runtime.client.configureAnalysis(inference.config)
+  const aRegistrationId = 'dsh:' + join(runtime.dataDir, 'profiles', 'process-a')
+  await configureInstallationModels(runtime.client, aRegistrationId, inference.config)
   const a = await runtime.host('process-a')
+  assert.equal(a.initial.registrationId, aRegistrationId)
   await until(() => inference.diagnostics().held === 1, Date.now() + 10_000, 'first held inference')
+  const bRegistrationId = 'dsh:' + join(runtime.dataDir, 'profiles', 'process-b')
+  await configureInstallationModels(runtime.client, bRegistrationId, inference.config)
   const b = await runtime.host('process-b')
+  assert.equal(b.initial.registrationId, bRegistrationId)
   assert.notEqual(a.initial.hostRunId, b.initial.hostRunId); assert.notEqual(a.initial.lifecycleId, b.initial.lifecycleId)
   assert.equal(a.initial.taskId, b.initial.taskId)
   assert.equal(a.initial.profile, join(runtime.dataDir, 'profiles', 'process-a'))
@@ -308,7 +315,7 @@ test('abrupt native Host exits expire real leases, cancel held inference, preser
   assert.ok(cooling.analysis.nextEligibleAt > Date.now(), 'the completed surviving round still has its real cooldown')
   inference.hold('process-b')
   const reconfiguredAt = Date.now()
-  await runtime.client.configureAnalysis(inference.config)
+  await configureInstallationModels(runtime.client, b.initial.registrationId, inference.config)
   const reconfigured = (await runtime.client.snapshot()).tasks.find(task => task.sourceKey === b.initial.sourceKey)
   assert.equal(reconfigured.analysis.completedAt, cooling.analysis.completedAt)
   assert.equal(reconfigured.analysis.nextEligibleAt, cooling.analysis.nextEligibleAt, 'configuration replacement preserves the surviving object completion cooldown')

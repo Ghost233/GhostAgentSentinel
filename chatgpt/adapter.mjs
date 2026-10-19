@@ -8,6 +8,7 @@ import { startPanelServer } from './panel-server.mjs'
 import { loadCursor, saveCursor } from './cursor-store.mjs'
 import { classifyThread, createDiscovery, nativeStorageRoot } from './discovery.mjs'
 import { openHealthOutbox } from './health-outbox.mjs'
+import { readModelDirectory } from './model-directory.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
 import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE } from '../src/protocol.mjs'
@@ -65,7 +66,7 @@ function materialContext(snapshot, sourceKey, batch, inheritance = null) {
   return { schemaVersion: 1, revision: (previous?.revision ?? 0) + 1, sessions: [...sessions].map(sessionId => ({ sessionId })), activations, instructionBindings, relations: [], coverage: { complete: true, branchGaps: [] } }
 }
 
-function materialView(view, task, { historical = false } = {}) {
+function materialView(view, task, { historical = false, snapshot } = {}) {
   const states = { queued: '检查排队中', analyzing: '正在检查', unavailable: '本地摘取模型或 JEV 未配置', failed: '本轮分析失败', unknown: '当前请求或分析证据不足', cooldown: '本轮六项检查已更新', idle: '最近检查结果' }
   const findings = historical ? task.analysis.checks.filter(check => check.status === 'attention').map(check => ({ ...check, checkId: check.id })) : task.alerts.filter(alert => alert.status === 'attention')
   const issues = findings.map(alert => ({ checkId: alert.checkId, reason: alert.reason.slice(0, 240), evidence: (alert.evidenceIds ?? []).map(id => task.events.find(event => event.id === id)).filter(Boolean).slice(0, 2).map(event => ({ text: event.text.slice(0, 120), reference: event.evidence ?? event.id })) }))
@@ -76,11 +77,21 @@ function materialView(view, task, { historical = false } = {}) {
   const forkBinding = task.instructionContext?.binding?.forkContext
   const inheritance = forkBinding ? { state: forkBinding.receiptId ? 'complete' : 'pending', gaps: [...new Set([...(task.instructionContext.gaps ?? []), ...(!historical ? view.inheritance?.gaps ?? [] : [])])] } : null
   const revalidating = !historical && view.observation?.recordRevalidating === true
+  const generated = task.analysis.summary?.generated && (historical || ['current', 'reused'].includes(task.analysis.resultDisposition)) && !['failed', 'unavailable', 'interrupted', 'stale'].includes(task.analysis.state) ? task.analysis.summary.generated : null
+  const generatedView = value => value ? { text: value.text, evidence: value.evidenceRefs.slice(0, 2).map(reference => {
+    const owner = (snapshot?.tasks ?? [task]).find(candidate => candidate.sourceKey === task.sourceKey && candidate.id === reference.taskId && candidate.lifecycleId === reference.lifecycleId)
+    const event = owner?.events.find(event => event.id === reference.eventId && event.taskId === reference.taskId && event.taskLifecycleId === reference.lifecycleId)
+    return { text: event?.text?.slice(0, 240) ?? '引用材料当前不可读取', reference: event?.evidence ?? JSON.stringify(reference) }
+  }) } : null
+  const prior = task.analysis.lastSuccessfulSummary, readAt = snapshot?.generatedAt ?? Date.now()
+  const lastSuccessfulSummary = prior && prior.completedAt <= readAt && prior.expiresAt > readAt && (!prior.configScope || prior.configScope.registrationId === task.analysis.currentConfigScope?.registrationId)
+    ? { ...prior, generated: generatedView(prior.generated) } : null
   return { ...view, ...(currentFacts ? { currentFacts } : {}), ...(!historical && inheritance ? { inheritance } : {}), signal: task.conversationMonitoring?.paused || revalidating ? 'gray' : task.gs?.light ?? 'gray', summary: (task.conversationMonitoring?.paused ? '本聊天分析已暂停，继续只读采集' : revalidating ? '当前记录重验中' : task.currentRequest ? task.gs?.reason ?? view.summary : '当前用户请求尚未核实，检查结论不可判断').slice(0, 240),
     ...(task.conversationMonitoring ? { monitoring: task.conversationMonitoring } : {}),
     health: task.monitoringHealth,
     observation: { ...view.observation, gap: view.observation.gap ?? (!task.currentRequest ? 'current-user-request-unverified' : null) },
     analysis: { connected: true, state: task.analysis.state, summary: states[task.analysis.state] ?? '本轮尚无有效检查结论', checks: task.analysis.checks, issues,
+      generated: generatedView(generated), lastSuccessfulSummary, configScope: task.analysis.configScope, currentConfigScope: task.analysis.currentConfigScope,
       resultDisposition: task.analysis.resultDisposition, completedAt: task.analysis.completedAt, through: task.analysis.through, waitMs: task.analysis.waitMs, lagMs: task.analysis.lagMs, error: task.analysis.error, coverage: task.analysis.coverage ?? task.coverage } }
 }
 
@@ -100,7 +111,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   await mkdir(join(dataDir, 'cursors'), { recursive: true, mode: 0o700 })
   const healthOutbox = collectMaterials ? await openHealthOutbox({ dataDir, now }) : null
   let closed = false, closing = null, timer = null, refreshPending = null, source = null, sourceEpoch = 0, registration = null
-  let sourceHealth = null, outboxError = null, coreInstanceId = null
+  let sourceHealth = null, outboxError = null, coreInstanceId = null, availabilityFailure = null
   let notificationPending = null, notificationError = null
   let qualifiedHost = null
   const threads = new Map(), operations = new Set()
@@ -191,7 +202,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       await core.setNativeNotificationEligibility(facts).catch(() => { notificationError = 'native_unavailable' })
       refreshNotifications(facts)
     }
-    if (reason !== 'observation-unavailable') { sourceHealth = null; outboxError = null; for (const entry of threads.values()) entry.health = null }
+    if (reason !== 'observation-unavailable') { sourceHealth = null; outboxError = null; availabilityFailure = null; for (const entry of threads.values()) entry.health = null }
     await Promise.all([unregistering, metadataClosing, ...[...threads.values()].map(entry => stop(entry, reason, false))])
     for (const [id, entry] of threads) if (!entry.lifecycleId && !entry.blocked) threads.delete(id)
     if (previous && !onQualificationLost) await core.unregisterSource(previous.key, reason)
@@ -373,7 +384,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       const task = snapshot.tasks.find(task => task.sourceKey === connection.key && task.id === entry.id && task.lifecycleId === lifecycleId)
       if (!task || !collectMaterials && task.analysis.state !== 'observation-only') { await stop(entry, 'core-capability-unconfirmed'); return entry.view }
       entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, ...(fork ? { currentCoverage: observed.currentCoverage } : {}), gap: observed.gap, readBytes: observed.readBytes, ...(nativeOriginVersion === 2 ? { decodedBytes: observed.decodedBytes, recordRevalidating: observed.recordRevalidating === true } : {}), observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
-      if (collectMaterials) entry.view = materialView(entry.view, task)
+      if (collectMaterials) entry.view = materialView(entry.view, task, { snapshot })
       if (fork) {
         entry.view.forkProvenance = observed.forkProvenance
         entry.view.inheritance = { state: observed.forkProvenance.complete ? 'complete' : 'pending', gaps: [...new Set([...(task.instructionContext?.gaps ?? []), ...(observed.forkProvenance.gap ? [observed.forkProvenance.gap] : [])])] }
@@ -396,15 +407,16 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const retained = healthOutbox?.diagnostics()
     const directory = discovery.snapshot(), forks = new Set([...discovery.candidates().filter(id => discovery.kind(id) === 'fork'), ...[...threads.values()].filter(entry => entry.fork).map(entry => entry.id)])
     const verified = [...forks].filter(id => threads.get(id)?.view.forkProvenance?.complete && threads.get(id).view.observation.coverage === 'caught-up').length
-    return { ...view, ...(delivery ? { notifications: { permission: delivery.authorization(), errorCode: notificationError, scope: { sourceKey: view.execution?.sourceKey ?? source?.key ?? null, lifecycleId: view.execution?.lifecycleId ?? null, executionKey: view.execution?.key ?? null } } } : {}), ...(healthOutbox ? { health: { ...combineHealth(view.health, sourceHealth, outboxError), historyGap: retained.rejected > 0 || retained.expired > 0 } } : {}), discovery: { ...directory, gaps: [...new Set([...directory.gaps, ...(forks.size > verified ? ['fork-coverage-pending'] : [])])], forkCoverage: { known: forks.size, verified, pending: forks.size - verified }, tracked: threads.size, connected: source ? 1 : 0, currentIncluded: Boolean(view.identity.threadId && threads.has(view.identity.threadId)) } }
+    return { ...view, ...(availabilityFailure ? { observation: { ...view.observation, failureStage: availabilityFailure.stage } } : {}), ...(delivery ? { notifications: { permission: delivery.authorization(), errorCode: notificationError, scope: { sourceKey: view.execution?.sourceKey ?? source?.key ?? null, lifecycleId: view.execution?.lifecycleId ?? null, executionKey: view.execution?.key ?? null } } } : {}), ...(healthOutbox ? { health: { ...combineHealth(view.health, sourceHealth, outboxError, availabilityFailure?.health), historyGap: retained.rejected > 0 || retained.expired > 0 } } : {}), discovery: { ...directory, gaps: [...new Set([...directory.gaps, ...(forks.size > verified ? ['fork-coverage-pending'] : [])])], forkCoverage: { known: forks.size, verified, pending: forks.size - verified }, tracked: threads.size, connected: source ? 1 : 0, currentIncluded: Boolean(view.identity.threadId && threads.has(view.identity.threadId)) } }
   }
 
   async function collect(requested = [], discover = false) {
-    let epoch = sourceEpoch
+    let epoch = sourceEpoch, failureStage = 'host-verification'
     try {
       const { host, gap } = await qualification()
       if (closed || epoch !== sourceEpoch) return
       if (gap) { await stopSource(gap); return }
+      failureStage = 'core-connection'
       const supported = await capability()
       if (closed || epoch !== sourceEpoch) return
       if (!supported.available) { await stopSource('core-capability-unavailable'); return }
@@ -414,7 +426,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         epoch = sourceEpoch
       }
       coreInstanceId = supported.instanceId ?? null
+      failureStage = 'source-registration'
       if (collectMaterials) await sourceFor(host, epoch)
+      failureStage = 'material-collection'
       if (discover) {
         const roundId = randomUUID(), result = await discovery.refresh()
         if (result.state === 'unavailable') await collectionOutcome(null, 'failed', result.error ?? { code: 'metadata-unavailable', stage: 'metadata' }, roundId)
@@ -459,9 +473,16 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         if (closed || epoch !== sourceEpoch || value.generation !== entry.generation) break
         await publish(entry, value)
       }
+      failureStage = 'source-heartbeat'
       if (source && !closed && epoch === sourceEpoch) await core.heartbeat(source.key)
       if (discover && source && !closed && epoch === sourceEpoch) refreshNotifications({ sourceKey: source.key, hostRunId: source.hostRunId, appRunning: true, pluginEnabled: true })
-    } catch (error) { if (closed || epoch !== sourceEpoch) return; await collectionOutcome(null, 'failed', error, randomUUID()); await updateHealth(); await stopSource('observation-unavailable').catch(() => {}) }
+      availabilityFailure = null
+    } catch (error) {
+      if (closed || epoch !== sourceEpoch) return
+      const info = failureErrorInfo({ code: error.code ?? error.cause?.code ?? 'collection_failed', codeHash: error.codeHash, stage: error.stage ?? (['core-connection', 'source-registration', 'source-heartbeat'].includes(failureStage) ? 'core' : 'collection'), status: error.status, details: error.details })
+      availabilityFailure = { stage: failureStage, health: { state: 'failed', failures: [{ domain: 'collection', error: info }] } }
+      await collectionOutcome(null, 'failed', info, randomUUID()); await updateHealth(); await stopSource('observation-unavailable').catch(() => {})
+    }
   }
   async function historyProof(entry, expected = null) {
     const { host, gap } = await qualification()
@@ -501,7 +522,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null, hasMore, cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0), currentGap: retainedOnly ? entry.view.observation?.gap ?? 'current-turn-not-observed' : null, retentionMs: 86400000 }
     if (!selected) return { ...(entry.view.observation?.coldReadStage ? entry.view : gapView(selection.executionKey ? 'history-unavailable' : entry.view.observation?.gap ?? 'current-turn-not-observed', entry.id)), health: entry.health, history }
     const historical = retainedOnly || selected !== current || ['ended', 'aborted'].includes(selected.item.status)
-    const view = materialView({ ...entry.view, ...(historical ? { currentFacts: undefined, inheritance: undefined } : {}), identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical })
+    const view = materialView({ ...entry.view, ...(historical ? { currentFacts: undefined, inheritance: undefined } : {}), identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical, snapshot })
     if (selected === current) view.health = combineHealth(view.health, entry.health)
     if (historical) {
       view.signal = 'gray'; view.summary = retainedOnly ? '当前执行尚未确认 · 显示最近检查记录' : '历史执行 · 仅表示当时的检查记录'
@@ -584,7 +605,12 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
   async function refresh() { if (closed) return; if (refreshPending) return refreshPending; const pending = enqueue(() => collect([], true)); if (!pending) return; refreshPending = pending.finally(() => { refreshPending = null }); return refreshPending }
   let panel
-  try { panel = await startPanelServer({ read, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
+  const modelSettings = collectMaterials && typeof core.installationAnalysisConfig === 'function' ? {
+    async read() { if (closed) throw new Error('观察实例已关闭'); return core.installationAnalysisConfig('chatgpt:' + installationId) },
+    async save({ config, revision }) { if (closed) throw new Error('观察实例已关闭'); return core.configureInstallationAnalysis('chatgpt:' + installationId, config, revision) },
+    async directory({ baseUrl }, options) { if (closed) throw new Error('观察实例已关闭'); return readModelDirectory(baseUrl, options) },
+  } : undefined
+  try { panel = await startPanelServer({ read, modelSettings, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }
   if (onQualificationLost) await qualification()
   const schedule = () => { if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(); schedule() }, pollMs) }

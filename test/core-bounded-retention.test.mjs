@@ -1,3 +1,4 @@
+import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -29,7 +30,7 @@ test('graph and grouped notification replay stays bounded, then expired proof an
       response.setHeader('content-type', 'application/json')
       if (request.url === '/v1/chat/completions') {
         llmCalls++; largestRequest = Math.max(largestRequest, raw.length)
-        response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
+        response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }))
       } else { jevCalls++; response.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'attention' : 'unknown' }])) })) }
     } finally { modelWork-- }
   })

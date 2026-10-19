@@ -11,7 +11,7 @@ import { createInstructionLookup, instructionContext, eventRef, referenceKey } f
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
 import { analysisTimeConditions } from '../analysis/index.mjs';
 import { inferenceFailureInfo } from '../analysis/failure-info.mjs';
-import { normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge } from '../protocol.mjs';
+import { normalizeAnalysisConfig, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
 import { createNativeNotificationStore } from './native-notifications.mjs';
 import { createNativeCaptureProgress } from './native-capture-progress.mjs';
@@ -31,7 +31,7 @@ const unknownChecks = (reason, judgmentState = 'insufficient') => CHECK_IDS.map(
 
 // This module owns monitoring state only. It never controls a source task or a model process.
 export async function createCore({
-  dataDir, analyzer = null, now = Date.now, cooldownMs = 60_000,
+  dataDir, analyzer = null, analyzerFactory = null, now = Date.now, cooldownMs = 60_000,
   repeatMs = 600_000, leaseMs = 15_000, idleGraceMs = 2_000, onIdle,
 }) {
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
@@ -53,8 +53,12 @@ export async function createCore({
   const events = new Map();
   const notifications = new Map();
   const conversationSettings = new Map();
+  const installationAnalysisSettings = new Map();
+  const installationMonitoringSettings = new Map();
+  const installationAnalyzers = new Map();
+  const installationRevision = randomUUID();
   const conversationRevision = randomUUID();
-  const collections = { sources, tasks, events, notifications, conversationSettings };
+  const collections = { sources, tasks, events, notifications, conversationSettings, installationAnalysisSettings, installationMonitoringSettings };
   let paused = false;
   let enrollment = { entries: [], configuredAt: null, managed: false };
   for (const row of rows) {
@@ -76,7 +80,8 @@ export async function createCore({
     const unsettledCalls = (active ? 1 : 0) + pendingCancelledRequests;
     return { limit: 1, unsettledCalls, blocked: unsettledCalls >= 1 };
   };
-  let sequence = Math.max(0, ...Array.from(events.values(), event => event.sequence));
+  let sequence = 0;
+  for (const event of events.values()) sequence = Math.max(sequence, event.sequence);
   let hadConnection = true;
   let idleTimer = null;
   let wakeTimer = null;
@@ -121,7 +126,30 @@ export async function createCore({
     const setting = conversationSettings.get(identity(registrationId, taskId));
     return { registrationId, taskId, paused: setting?.paused ?? false, revision: setting?.revision ?? fingerprint([conversationRevision, registrationId, taskId]) };
   };
-  const conversationPaused = task => conversationFor(task)?.paused === true;
+  const installationPaused = registrationId => installationMonitoringSettings.get(registrationId)?.paused === true;
+  const taskPaused = task => conversationFor(task)?.paused === true || installationPaused(sources.get(task.sourceKey)?.descriptor.registrationId);
+  const installationConfig = registrationId => {
+    if (typeof registrationId !== 'string' || !registrationId || registrationId.length > 2000) throw new Error('invalid installation registrationId');
+    const saved = installationAnalysisSettings.get(registrationId);
+    return copy(saved ? { registrationId, config: saved.config, revision: saved.revision } : { registrationId, config: {}, revision: fingerprint([installationRevision, registrationId]) });
+  };
+  const installationMonitoringState = registrationId => {
+    installationConfig(registrationId);
+    const saved = installationMonitoringSettings.get(registrationId);
+    return saved ? { registrationId, paused: saved.paused, revision: saved.revision } : { registrationId, paused: false, revision: fingerprint([installationRevision, 'monitoring', registrationId]) };
+  };
+  const configScopeFor = task => {
+    if (!analyzerFactory) return null;
+    const { registrationId, revision } = installationConfig(sources.get(task.sourceKey).descriptor.registrationId);
+    return { registrationId, revision };
+  };
+  const analyzerFor = task => {
+    if (!analyzerFactory) return analyzer;
+    const registrationId = sources.get(task.sourceKey)?.descriptor.registrationId;
+    const setting = installationAnalysisSettings.get(registrationId);
+    if (!installationAnalyzers.has(registrationId)) installationAnalyzers.set(registrationId, analyzerFactory(copy(setting?.config ?? {})));
+    return installationAnalyzers.get(registrationId);
+  };
   const conversationScope = value => {
     const stored = conversationSettings.get(identity(value.registrationId, value.taskId));
     if (stored) return { registrationId: stored.registrationId, taskId: stored.taskId, paused: stored.paused, revision: stored.revision };
@@ -130,7 +158,7 @@ export async function createCore({
     return conversationFor(scoped);
   };
   nativeNotifications = createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, readReceipt: id => failureStore.read(id), monitoringPaused: () => paused,
-    chatPaused: (sourceKey, mainId) => conversationSettings.get(identity(sources.get(sourceKey)?.descriptor.registrationId, mainId))?.paused === true,
+    chatPaused: (sourceKey, mainId) => conversationSettings.get(identity(sources.get(sourceKey)?.descriptor.registrationId, mainId))?.paused === true || installationPaused(sources.get(sourceKey)?.descriptor.registrationId),
     taskNoticeEligible: notification => notificationMembers(notification).some(member => memberAlerts(member).length > 0),
     accepted: notification => {
       for (const member of notificationMembers(notification)) {
@@ -170,12 +198,13 @@ export async function createCore({
   const resultKeyFor = (task, context, read) => {
     context ??= contextFor(task, read);
     const coverage = coverageFor(task, read), input = { task: { id: task.id, lifecycleId: task.lifecycleId, status: task.status, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt }, source: sources.get(task.sourceKey)?.descriptor, events: publicEvents(task, context, read).filter(event => !historical(event)), coverage };
-    return fingerprint([task.revision, resultScopeFor(task, read), typeof analyzer?.timeConditions === 'function' ? analyzer.timeConditions(input, now()) : analysisTimeConditions(input, now()), context && [context.binding, context.inheritedEvents.map(event => [eventRef(event), event.capturedAt]), context.gaps]]);
+    const currentAnalyzer = analyzerFor(task);
+    return fingerprint([task.revision, resultScopeFor(task, read), typeof currentAnalyzer?.timeConditions === 'function' ? currentAnalyzer.timeConditions(input, now()) : analysisTimeConditions(input, now()), context && [context.binding, context.inheritedEvents.map(event => [eventRef(event), event.capturedAt]), context.gaps]]);
   };
   const resultScopeFor = (task, read) => {
     const source = sources.get(task.sourceKey), activation = source?.hierarchyContext?.activations.find(item => item.taskId === task.id && item.lifecycleId === task.lifecycleId);
     const parent = source?.hierarchyContext?.relations.find(item => item.kind === 'delegation' && (item.childSessionId === task.sessionId || item.childActivationRef?.taskId === task.id && item.childActivationRef?.lifecycleId === task.lifecycleId));
-    return fingerprint([task.requestId, task.contextFingerprint, task.status, activation?.sessionId, activation?.runId, parent?.parentSessionId, source?.descriptor, coverageFor(task, read)]);
+    return fingerprint([task.requestId, task.contextFingerprint, task.status, activation?.sessionId, activation?.runId, parent?.parentSessionId, source?.descriptor, coverageFor(task, read), configScopeFor(task)]);
   };
   const resultDispositionFor = (task, context, read) => {
     if (!task.resultScope || !task.analysis.summary) return task.resultScope != null || task.analysis.completedAt != null || ['analysis_expired', 'evidence_expired'].includes(task.analysis.error?.code) ? 'invalid' : 'none';
@@ -217,7 +246,7 @@ export async function createCore({
   function cleanQueue() {
     for (let index = queue.length - 1; index >= 0; index--) {
       const task = tasks.get(queue[index]);
-      if (!paused && !closed && task && usable(task) && !observationOnly(task) && !conversationPaused(task)) continue;
+      if (!paused && !closed && task && usable(task) && !observationOnly(task) && !taskPaused(task)) continue;
       queued.delete(queue[index]);
       queue.splice(index, 1);
       if (task && task.analysis.queuedAt !== null) {
@@ -298,7 +327,7 @@ export async function createCore({
     }
   }
 
-  function cancelRound(reason, onlyTask, retainTransport = false) {
+  function cancelRound(reason, onlyTask, retainTransport = false, persist = true) {
     const error = new Error(reason);
     if (!retainTransport && cancelledRound && (!onlyTask || cancelledRound.taskKey === onlyTask.key)) cancelledRound.transportController.abort(error);
     if (!active || (onlyTask && active.taskKey !== onlyTask.key)) return;
@@ -319,8 +348,7 @@ export async function createCore({
       task.analysis.error = { code: 'cancelled', message: reason };
       task.analysis.cancelledComputeMayContinue = true;
       task.analysis.nextEligibleAt = now();
-      invalidateAlerts(task, 'unknown');
-      save('tasks', task);
+      if (persist) { invalidateAlerts(task, 'unknown'); save('tasks', task); }
     }
   }
 
@@ -431,6 +459,7 @@ export async function createCore({
     }
     for (const task of tasks.values()) {
       let changed = pendingPrunedTasks.has(task.key);
+      if (task.analysis.lastSuccessfulSummary?.expiresAt <= current) { delete task.analysis.lastSuccessfulSummary; changed = true; }
       const expired = new Set(expiredByTask.get(task.key) ?? []);
       const retained = new Set(taskEvents(task).map(event => event.id));
       const references = [task.requestId, ...(task.analysis.inputEventIds ?? []),
@@ -606,7 +635,7 @@ export async function createCore({
 
   function memberAlerts(member) {
     const task = tasks.get(member.taskKey);
-    if (!task || !usable(task) || paused || conversationPaused(task) || task.requestId !== member.requestId) return [];
+    if (!task || !usable(task) || paused || taskPaused(task) || task.requestId !== member.requestId) return [];
     if (['stale', 'failed', 'interrupted', 'unknown'].includes(task.analysis.state) || task.analysis.checks.some(check => check.judgmentState === 'failed')) return [];
     const retained = new Set(taskEvents(task).map(event => event.id));
     const waiting = userWait(task, taskEvents(task), now());
@@ -726,6 +755,20 @@ export async function createCore({
     const referenceIds = new Set([...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])].map(event => referenceKey(eventRef(event))));
     const checks = new Map();
     if (!['currentTask', 'currentState', 'recentProgress', 'attention'].every(field => typeof result.summary[field] === 'string')) throw new Error('Analyzer summary fields must be strings');
+    if (result.summary.generated !== undefined) {
+      const generated = result.summary.generated;
+      const invalid = () => { throw Object.assign(new Error('Analyzer returned invalid or unverified generated summary evidence'), { code: 'invalid_summary', stage: 'llm' }); };
+      if (!generated || typeof generated !== 'object' || Array.isArray(generated) || Object.keys(generated).length !== 3 || typeof generated.text !== 'string' || !generated.text.trim() || generated.text.length > 600 || !Array.isArray(generated.evidenceIds) || !generated.evidenceIds.length || new Set(generated.evidenceIds).size !== generated.evidenceIds.length || generated.evidenceIds.some(id => typeof id !== 'string' || !id) || !Array.isArray(generated.evidenceRefs) || !generated.evidenceRefs.length) invalid();
+      const retained = new Set([...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])].filter(event => event.capturedAt > now() - DAY).map(event => referenceKey(eventRef(event))));
+      const seen = new Set(), citedIds = new Set();
+      for (const reference of generated.evidenceRefs) {
+        if (!reference || typeof reference !== 'object' || Array.isArray(reference) || Object.keys(reference).length !== 3 || !['taskId', 'lifecycleId', 'eventId'].every(key => typeof reference[key] === 'string' && reference[key])) invalid();
+        const key = referenceKey(reference);
+        if (!retained.has(key) || seen.has(key)) invalid();
+        seen.add(key); citedIds.add(reference.eventId);
+      }
+      if (citedIds.size !== generated.evidenceIds.length || generated.evidenceIds.some(id => !citedIds.has(id))) invalid();
+    }
     for (const check of result.checks) {
       if (!CHECK_IDS.includes(check.id) || checks.has(check.id) || !['attention', 'clear', 'unknown'].includes(check.status) || !Array.isArray(check.evidenceIds) || check.evidenceIds.some(id => !eventIds.has(id))) throw new Error('Analyzer returned invalid or cross-task evidence');
       if (check.evidenceRefs && (!Array.isArray(check.evidenceRefs) || check.evidenceRefs.some(reference => !referenceIds.has(referenceKey(reference))))) throw new Error('Analyzer returned unverified context evidence');
@@ -760,7 +803,7 @@ export async function createCore({
     if (closed || active !== round || round.cancelled) return;
     active = null;
     const task = tasks.get(round.taskKey);
-    if (!task || !usable(task) || observationOnly(task) || conversationPaused(task) || task.requestId !== round.requestId) return;
+    if (!task || !usable(task) || observationOnly(task) || taskPaused(task) || task.requestId !== round.requestId) return;
     if ([...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])].some(event => event.capturedAt <= now() - DAY)) {
       error = Object.assign(new Error('Analysis inputs expired before the response completed'), { code: 'evidence_expired' });
     }
@@ -798,6 +841,13 @@ export async function createCore({
     }
     const failedCheck = !error && sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' ? result.checks.find(check => check.judgmentState === 'failed') : null;
     const settledError = error ?? failedCheck?.error ?? (failedCheck ? { code: 'analysis_failed' } : null);
+    if (!settledError && result.summary.generated && !result.coverage?.dependencies?.length) {
+      let expiresAt = completedAt + DAY;
+      for (const material of [round.input.events, round.input.instructionContext?.inheritedEvents ?? []]) for (const event of material) expiresAt = Math.min(expiresAt, event.capturedAt + DAY);
+      task.analysis.lastSuccessfulSummary = { generated: copy(result.summary.generated), completedAt, configScope: copy(round.configScope), expiresAt };
+    }
+    task.analysis.retryAttempt = settledError ? Math.min(32, (task.analysis.retryAttempt ?? 0) + 1) : 0;
+    if (settledError) task.analysis.nextEligibleAt = completedAt + Math.max(cooldownMs, Math.min(15 * 60_000, cooldownMs * 2 ** (task.analysis.retryAttempt - 1)));
     if (failedCheck) {
       task.resultKey = null; task.resultScope = null;
       task.analysis.state = 'failed';
@@ -813,12 +863,14 @@ export async function createCore({
   }
 
   function startNext() {
-    if (closed || paused || active || pendingCancelledRequests > 0 || !analyzer) return;
+    if (closed || paused || active || pendingCancelledRequests > 0) return;
     while (queue.length > 0) {
       const key = queue.shift();
       queued.delete(key);
       const task = tasks.get(key);
-      if (!task || !usable(task) || observationOnly(task) || conversationPaused(task)) continue;
+      if (!task || !usable(task) || observationOnly(task) || taskPaused(task)) continue;
+      const currentAnalyzer = analyzerFor(task);
+      if (!currentAnalyzer) continue;
       if (now() < (task.analysis.nextEligibleAt ?? 0)) continue;
       const capturedEvents = publicEvents(task).filter(event => !historical(event));
       const instruction = contextFor(task);
@@ -826,7 +878,7 @@ export async function createCore({
       const source = sources.get(task.sourceKey);
       const round = {
         id: randomUUID(),
-        taskKey: key, requestId: task.requestId, revision: task.revision, observedAt: now(), resultKey: resultKeyFor(task), resultScope: resultScopeFor(task),
+        taskKey: key, requestId: task.requestId, revision: task.revision, configScope: configScopeFor(task), observedAt: now(), resultKey: resultKeyFor(task), resultScope: resultScopeFor(task),
         through: capturedEvents.length ? Math.max(...capturedEvents.map(event => event.capturedAt)) : null,
         controller: new AbortController(), transportController: new AbortController(), cancelled: false,
         input: { task: copy({ key: task.key, id: task.id, lifecycleId: task.lifecycleId, title: task.title, status: task.status, currentRequest: task.currentRequest, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt, lastActivity: task.lastActivity, activeAlerts: task.alerts.filter(alert => alert.status === 'attention' && alert.requestId === task.requestId).map(({ id, checkId, reason, evidenceIds }) => ({ id, checkId, reason, evidenceIds })) }), source: copy(source.descriptor), events: capturedEvents, coverage: coverageFor(task), ...(roundContext ? { instructionContext: roundContext } : {}) },
@@ -836,8 +888,8 @@ export async function createCore({
       task.analysis.startedAt = round.observedAt;
       task.analysis.queuedAt = null;
       task.analysis.error = null;
+      if (round.configScope) task.analysis.configScope = round.configScope;
       save('tasks', task);
-      const currentAnalyzer = analyzer;
       Promise.resolve().then(() => round.cancelled ? null : currentAnalyzer.analyze(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal }))
         .then(result => round.cancelled ? null : validateResult(result, round))
         .then(result => completeRound(round, result, null), error => completeRound(round, null, error));
@@ -874,7 +926,7 @@ export async function createCore({
     prune();
     cleanQueue();
     for (const task of tasks.values()) {
-      if (conversationPaused(task)) {
+      if (taskPaused(task)) {
         if (task.analysis.state !== 'paused' || task.analysis.queuedAt !== null) {
           task.analysis.state = 'paused'; task.analysis.queuedAt = null; save('tasks', task);
         }
@@ -891,7 +943,7 @@ export async function createCore({
         continue;
       }
       if (!usable(task) || paused || active?.taskKey === task.key) continue;
-      if (!analyzer) {
+      if (!analyzerFor(task)) {
         task.analysis.state = 'unavailable';
         task.analysis.error = { code: 'analyzer_unconfigured', message: 'Inference dependencies are not configured' };
         task.analysis.checks = unknownChecks('Inference dependencies are not configured');
@@ -922,12 +974,12 @@ export async function createCore({
     }
     // Native maintenance uses this tick's time; legacy task checks keep their own clock reads.
     nativeNotifications.reconcile(current);
-    for (const task of tasks.values()) if (usable(task) && !observationOnly(task) && !paused && !conversationPaused(task) && !['unknown', 'failed', 'stale', 'interrupted'].includes(task.analysis.state) && !task.analysis.checks.some(check => check.judgmentState === 'failed')) makeNotification(task, task.alerts.filter(alert => alert.status === 'attention'));
+    for (const task of tasks.values()) if (usable(task) && !observationOnly(task) && !paused && !taskPaused(task) && !['unknown', 'failed', 'stale', 'interrupted'].includes(task.analysis.state) && !task.analysis.checks.some(check => check.judgmentState === 'failed')) makeNotification(task, task.alerts.filter(alert => alert.status === 'attention'));
     scheduleIdle();
     startNext();
     if (wakeTimer) clearTimeout(wakeTimer);
     wakeTimer = null;
-    const times = Array.from(tasks.values()).filter(task => usable(task) && !observationOnly(task) && !conversationPaused(task) && task.analysis.nextEligibleAt > current).map(task => task.analysis.nextEligibleAt);
+    const times = Array.from(tasks.values()).filter(task => usable(task) && !observationOnly(task) && !taskPaused(task) && task.analysis.nextEligibleAt > current).map(task => task.analysis.nextEligibleAt);
     times.push(...Array.from(notifications.values()).filter(notification => notification.status === 'pending' && notification.readyAt > current).map(notification => notification.readyAt));
     if (times.length > 0) {
       wakeTimer = setTimeout(tick, Math.max(1, Math.min(...times) - current));
@@ -944,7 +996,7 @@ export async function createCore({
       const source = sources.get(task.sourceKey);
       const scopedTask = { ...task, events: task.events.filter(event => !historical(event)), requestId: tasks.get(task.key).requestId };
       task.gs = gsStatus(scopedTask, source, current, childWait(scopedTask, source, publicTasks, current));
-      if (conversationPaused(task) && source.status === 'connected' && task.gs.light !== null) task.gs = { ...task.gs, light: 'gray', label: '本聊天分析已暂停', reason: '执行观察继续；仅手动恢复本聊天分析，恢复后按当前材料重新排队' };
+      if (taskPaused(task) && source.status === 'connected' && task.gs.light !== null) task.gs = { ...task.gs, light: 'gray', label: installationPaused(source.descriptor.registrationId) ? '本安装分析已暂停' : '本聊天分析已暂停', reason: '执行观察继续；手动恢复后按当前材料重新排队' };
       task.lastActivity = task.gs.silence.since;
     }
   }
@@ -1320,7 +1372,7 @@ export async function createCore({
       const selectedSources = [...sources].filter(([, source]) => source.descriptor.registrationId === registrationId && source.descriptor.policy === 'chatgpt-main/1');
       if (selectedSources.some(([, source]) => connected(source))) throw Object.assign(new Error('Stop the ChatGPT installation before purging its Core data'), { code: 'chatgpt_installation_connected' });
       const sourceKeys = new Set(selectedSources.map(([key]) => key)), selectedTasks = [...tasks].filter(([, task]) => sourceKeys.has(task.sourceKey)), taskKeys = new Set(selectedTasks.map(([key]) => key));
-      const selected = { sources: selectedSources, tasks: selectedTasks, events: [...events].filter(([, event]) => sourceKeys.has(event.sourceKey) || taskKeys.has(event.taskKey)), notifications: [...notifications].filter(([, notice]) => sourceKeys.has(notice.sourceKey)), conversationSettings: [...conversationSettings].filter(([, setting]) => setting.registrationId === registrationId) };
+      const selected = { sources: selectedSources, tasks: selectedTasks, events: [...events].filter(([, event]) => sourceKeys.has(event.sourceKey) || taskKeys.has(event.taskKey)), notifications: [...notifications].filter(([, notice]) => sourceKeys.has(notice.sourceKey)), conversationSettings: [...conversationSettings].filter(([, setting]) => setting.registrationId === registrationId), installationAnalysisSettings: [...installationAnalysisSettings].filter(([key]) => key === registrationId), installationMonitoringSettings: [...installationMonitoringSettings].filter(([key]) => key === registrationId) };
       const sharedEnrollment = [...sources.values()].some(source => source.descriptor.registrationId === registrationId && source.descriptor.policy !== 'chatgpt-main/1');
       const nextEnrollment = { ...enrollment, entries: enrollment.entries.filter(entry => entry.registrationId !== registrationId || sharedEnrollment) };
       const failurePlan = failureStore.prepareClearSources(sourceKeys);
@@ -1344,6 +1396,7 @@ export async function createCore({
         return { installationId, registrationId, status: 'failed', logical: { status: errors.length > 1 ? 'unknown' : 'retained', removed: empty, remaining: errors.length > 1 ? null : counts }, physical: { status: 'not-attempted', secureDelete: true }, errors, retryable: true };
       }
       for (const [collection, entries] of Object.entries(selected)) for (const [key] of entries) collections[collection].delete(key);
+      installationAnalyzers.delete(registrationId);
       for (const apply of publish) apply();
       enrollment = nextEnrollment;
       for (const key of taskKeys) { queued.delete(key); pendingPrunedTasks.delete(key); }
@@ -1371,6 +1424,7 @@ export async function createCore({
         value.analysis.lagMs = task.lastActivity === null ? null : Math.max(0, task.lastActivity - (task.analysis.through ?? task.lastActivity));
         value.analysis.waitMs = task.analysis.queuedAt === null ? 0 : Math.max(0, current - task.analysis.queuedAt);
         value.analysis.resultDisposition = resultDispositionFor(task, instruction, read);
+        if (analyzerFactory) value.analysis.currentConfigScope = configScopeFor(task);
         const conversation = conversationFor(task);
         if (conversation) value.conversationMonitoring = conversation;
         if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1') value.monitoringHealth = failureStore.health({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId }, current);
@@ -1434,6 +1488,7 @@ export async function createCore({
       for (const event of events.values()) captured(event.capturedAt);
       for (const task of tasks.values()) {
         if (task.analysis.summary) captured(task.analysis.summaryAt ?? task.analysis.completedAt);
+        if (task.analysis.lastSuccessfulSummary) deadline(task.analysis.lastSuccessfulSummary.expiresAt);
         if (!liveIdentity(task) && task.updatedAt + DAY > diagnostics.generatedAt) captured(task.updatedAt);
         for (const alert of task.alerts) captured(alert.firstAt);
         gaps(task.gapRecords);
@@ -1504,6 +1559,28 @@ export async function createCore({
       tick();
       return conversationScope(control);
     },
+    async installationMonitoring(registrationId) { ensureOpen(); return installationMonitoringState(registrationId); },
+    async setInstallationMonitoring(registrationId, installationPause, revision) {
+      ensureOpen();
+      const current = installationMonitoringState(registrationId);
+      if (typeof installationPause !== 'boolean' || typeof revision !== 'string' || !revision || revision.length > 2000) throw new Error('invalid installation monitoring control');
+      if (current.paused === installationPause) return current;
+      if (current.revision !== revision) throw Object.assign(new Error('Installation monitoring state changed'), { code: 'installation_monitoring_conflict' });
+      const setting = { key: registrationId, registrationId, paused: installationPause, revision: randomUUID() };
+      save('installationMonitoringSettings', setting);
+      installationMonitoringSettings.set(registrationId, setting);
+      for (const task of tasks.values()) {
+        if (sources.get(task.sourceKey)?.descriptor.registrationId !== registrationId) continue;
+        if (installationPause) cancelRound('Installation analysis is paused', task, true);
+        queued.delete(task.key); task.analysis.queuedAt = null;
+        task.analysis.state = taskPaused(task) || paused ? 'paused' : 'unknown';
+        task.analysis.nextEligibleAt = Math.max(now(), task.analysis.nextEligibleAt ?? 0);
+        task.resultKey = null; task.resultScope = null;
+        invalidateAlerts(task, 'paused'); save('tasks', task);
+      }
+      tick();
+      return installationMonitoringState(registrationId);
+    },
     async pause() {
       ensureOpen();
       paused = true;
@@ -1526,8 +1603,56 @@ export async function createCore({
       tick();
       return { paused };
     },
+    async installationAnalysisConfig(registrationId) { ensureOpen(); return installationConfig(registrationId); },
+    async configureInstallationAnalysis(registrationId, config, revision) {
+      ensureOpen();
+      const current = installationConfig(registrationId), normalized = normalizeAnalysisConfig(config);
+      if (typeof revision !== 'string' || !revision || revision.length > 2000) throw new Error('invalid installation configuration revision');
+      if (current.revision !== revision) throw Object.assign(new Error('analysis configuration revision conflict'), { code: 'analysis_config_conflict' });
+      const setting = { key: registrationId, registrationId, config: normalized, revision: randomUUID() };
+      const affected = new Map();
+      for (const original of tasks.values()) {
+        if (sources.get(original.sourceKey)?.descriptor.registrationId !== registrationId) continue;
+        const task = copy(original);
+        task.analysis.queuedAt = null; task.resultKey = null; task.resultScope = null;
+        task.analysis.checks = unknownChecks('Installation inference configuration changed; waiting for current analysis');
+        task.analysis.retryAttempt = 0;
+        task.analysis.nextEligibleAt = Math.max(now(), task.analysis.completedAt == null ? 0 : task.analysis.completedAt + cooldownMs);
+        if (active?.taskKey === task.key) {
+          task.analysis.state = 'interrupted'; task.analysis.error = { code: 'cancelled', message: 'Installation inference configuration changed' };
+          task.analysis.cancelledComputeMayContinue = true;
+        }
+        for (const alert of task.alerts) if (alert.status === 'attention') { alert.status = 'unknown'; alert.updatedAt = now(); }
+        affected.set(task.key, task);
+      }
+      const notices = [...notifications.values()].filter(notice => ['pending', 'claimed'].includes(notice.status) && notificationMembers(notice).some(member => affected.has(member.taskKey)))
+        .map(notice => ({ ...copy(notice), status: 'cancelled', error: 'unknown' }));
+      // Commit every affected record before sealing an external inference call.
+      db.exec('SAVEPOINT installation_analysis_configuration');
+      try {
+        for (const [collection, values] of [['installationAnalysisSettings', [setting]], ['tasks', affected.values()], ['notifications', notices]]) {
+          for (const value of values) write.run(collection, value.key ?? value.id, JSON.stringify(value));
+        }
+        db.exec('RELEASE installation_analysis_configuration');
+      } catch (error) {
+        try { db.exec('ROLLBACK TO installation_analysis_configuration'); db.exec('RELEASE installation_analysis_configuration'); }
+        catch (rollback) { throw new AggregateError([error, rollback], error.message); }
+        throw error;
+      }
+      installationAnalysisSettings.set(registrationId, setting);
+      installationAnalyzers.delete(registrationId);
+      for (const [key, task] of affected) {
+        cancelRound('Installation inference configuration changed', tasks.get(key), true, false);
+        tasks.set(key, task); queued.delete(key);
+      }
+      for (const notice of notices) { notifications.set(notice.id, notice); nativeNotifications.touch(notice); }
+      for (let index = queue.length - 1; index >= 0; index--) if (affected.has(queue[index])) queue.splice(index, 1);
+      tick();
+      return installationConfig(registrationId);
+    },
     async setAnalyzer(nextAnalyzer) {
       ensureOpen();
+      if (analyzerFactory) { analyzer = nextAnalyzer; return; }
       cancelRound('Inference configuration changed');
       analyzer = nextAnalyzer;
       queue.length = 0;

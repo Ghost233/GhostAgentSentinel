@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createAnalyzer, CHECK_IDS } from '../src/analysis/index.mjs';
 import { qualityCases } from '../probes/modeldeck/quality-cases.mjs';
 import { decodeJevRequest } from './helpers/jev-wire.mjs';
+import { withModelSummary } from './helpers/model-summary.mjs';
 import { renderJevRequest, JEV_PROVENANCE_INSTRUCTIONS } from '../src/analysis/jev-rendering.mjs';
 
 const now = 1_800_000_000_000;
@@ -42,7 +43,7 @@ async function inference(t, { holdJudge = false, recoveryChoice = 'unknown' } = 
           const chosen = group.options.find(option => option.kind === kind);
           return chosen ? [chosen.optionId] : [];
         });
-        res.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [] }) } }] }));
+        res.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds, gaps: [] })) } }] }));
       } else if (!holdJudge) res.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'clear' : id === 'recover_request_drift' ? recoveryChoice : 'unknown' }])) }));
     } catch (error) { res.writeHead(500); res.end(JSON.stringify({ error: error.message })); }
   });

@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
 import { prepareInstallation, startFromInstallation, resolvePluginOwner } from '../chatgpt/runtime.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { notificationPrefix } from '../chatgpt/native-notifications.mjs'
@@ -196,9 +197,9 @@ test('qualification loss aborts in-flight analysis, seals late output and retain
   const server = await startServer({ dataDir: join(dir, 'core') }), client = await connectCore({ dataDir: join(dir, 'core') })
   t.after(async () => { await runtime?.close(); await client.close(); await server.close(); model.closeAllConnections(); await new Promise(resolve => model.close(resolve)); await rm(dir, { recursive: true, force: true }) })
   const baseUrl = 'http://127.0.0.1:' + model.address().port
-  await client.configureAnalysis({ llm: { baseUrl, model: 'owned-extractor' }, jev: { baseUrl, model: 'owned-judge' } })
   const prepared = await prepareInstallation({ dataDir, coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@inflight' })
   const config = JSON.parse(await readFile(prepared.configPath, 'utf8')), hostStartedAt = Date.now() - 10000, at = Date.now() - 1000, path = join(dir, 'main.jsonl')
+  await configureInstallationModels(client, 'chatgpt:' + config.installationId, { llm: { baseUrl, model: 'owned-extractor' }, jev: { baseUrl, model: 'owned-judge' } })
   const line = (type, payload, offset = 0) => JSON.stringify({ type, timestamp: new Date(at + offset).toISOString(), payload }) + '\n'
   await writeFile(path, line('session_meta', { id: 'main', cli_version: supportedProfile.cliVersion, originator: 'Codex Desktop', source: 'vscode', cwd: dir }) + line('event_msg', { type: 'task_started', turn_id: 'turn', turn_attribution: { turn_id: 'turn', turn_trigger: 'composer' } })
     + line('event_msg', { type: 'item_completed', thread_id: 'main', turn_id: 'turn', item: { type: 'UserMessage', id: 'message', content: [{ type: 'text', text: 'Read the requested log only' }] } }, 1)
@@ -457,9 +458,9 @@ for (const notificationFailure of [false, true]) test(`an unsupported profile re
   const server = await startServer({ dataDir: join(dir, 'core') }), client = await connectCore({ dataDir: join(dir, 'core') })
   t.after(async () => { failNotifications = false; await runtime?.close(); await client.close(); await server.close(); model.closeAllConnections(); await new Promise(resolve => model.close(resolve)); await rm(dir, { recursive: true, force: true }) })
   const baseUrl = 'http://127.0.0.1:' + model.address().port
-  await client.configureAnalysis({ llm: { baseUrl, model: 'owned-extractor' }, jev: { baseUrl, model: 'owned-judge' } })
   const prepared = await prepareInstallation({ dataDir, coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@profile-change' })
   const config = JSON.parse(await readFile(prepared.configPath, 'utf8')), hostStartedAt = Date.now() - 10000, at = Date.now() - 1000, path = join(dir, 'main.jsonl')
+  await configureInstallationModels(client, 'chatgpt:' + config.installationId, { llm: { baseUrl, model: 'owned-extractor' }, jev: { baseUrl, model: 'owned-judge' } })
   const line = (type, payload, offset = 0) => JSON.stringify({ type, timestamp: new Date(at + offset).toISOString(), payload }) + '\n'
   await writeFile(path, line('session_meta', { id: 'main', cli_version: supportedProfile.cliVersion, originator: 'Codex Desktop', source: 'vscode', cwd: dir }) + line('event_msg', { type: 'task_started', turn_id: 'turn', turn_attribution: { turn_id: 'turn', turn_trigger: 'composer' } })
     + line('event_msg', { type: 'item_completed', thread_id: 'main', turn_id: 'turn', item: { type: 'UserMessage', id: 'message', content: [{ type: 'text', text: 'Read the requested log only' }] } }, 1)

@@ -98,7 +98,7 @@ export async function startServer({ dataDir, onIdle, ...options }) {
   try {
     try { config = normalizeAnalysisConfig(JSON.parse(await readFile(configPath, 'utf8'))) }
     catch (error) { if (error.code !== 'ENOENT') throw new Error(`cannot read analysis configuration: ${error.message}`) }
-    core = await createCore({ dataDir, ...options, analyzer: createAnalyzer(config), onIdle: () => { idlePending = true; void flushIdle() } })
+    core = await createCore({ dataDir, ...options, analyzer: createAnalyzer(config), analyzerFactory: config => createAnalyzer({ ...config, now: options.now }), onIdle: () => { idlePending = true; void flushIdle() } })
   } catch (error) { await releaseLock(); throw error }
   const configState = () => {
     if (!configConfirmed) throw Object.assign(new Error('analysis configuration application is unconfirmed'), { code: 'analysis_config_unconfirmed' })
@@ -134,7 +134,19 @@ export async function startServer({ dataDir, onIdle, ...options }) {
     if (request.headers.host !== expectedHost || !authorized(request, token)) return send(401, { error: 'private connection required' })
     if (stopping) return send(503, { error: 'core shutting down' })
     try {
-      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: [FORK_COMPRESSION_FEATURE, FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE] })
+      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: ['installation-monitoring/1', 'installation-model-settings/1', FORK_COMPRESSION_FEATURE, FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE] })
+      if (request.method === 'GET' && request.url.startsWith('/v1/analysis/installations/config')) {
+        const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
+        if (url.pathname !== '/v1/analysis/installations/config') return send(404, { error: 'unknown endpoint' })
+        if ([...params.keys()].length !== 1 || params.getAll('registrationId').length !== 1) throw new Error('invalid installation analysis configuration query')
+        return send(200, await core.installationAnalysisConfig(identifier(params.get('registrationId'))))
+      }
+      if (request.method === 'GET' && request.url.startsWith('/v1/monitoring/installations')) {
+        const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
+        if (url.pathname !== '/v1/monitoring/installations') return send(404, { error: 'unknown endpoint' })
+        if ([...params.keys()].length !== 1 || params.getAll('registrationId').length !== 1) throw new Error('invalid installation monitoring query')
+        return send(200, await core.installationMonitoring(identifier(params.get('registrationId'))))
+      }
       if (request.method === 'GET' && request.url.startsWith('/v1/notifications/native')) {
         const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
         if (url.pathname !== '/v1/notifications/native') return send(404, { error: 'unknown endpoint' })
@@ -180,6 +192,8 @@ export async function startServer({ dataDir, onIdle, ...options }) {
       const body = await readBody(request)
       let result
       switch (request.url) {
+        case '/v1/analysis/installations/config': result = await core.configureInstallationAnalysis(identifier(body.registrationId), normalizeAnalysisConfig(body.config), identifier(body.revision)); break
+        case '/v1/monitoring/installations': result = await core.setInstallationMonitoring(identifier(body.registrationId), body.paused, identifier(body.revision)); break
         case '/v1/source/register': result = await core.registerSource(normalizeSource(body)); break
         case '/v1/source/heartbeat': result = await core.heartbeat(identifier(body.sourceKey)); break
         case '/v1/source/native-origin': result = await core.nativeOriginFence(identifier(body.sourceKey), identifier(body.key)); break;
@@ -207,7 +221,7 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         default: return send(404, { error: 'unknown endpoint' })
       }
       send(200, result ?? null)
-    } catch (error) { send(['chatgpt_installation_connected', 'analysis_config_conflict', 'hierarchy_version_unsupported', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : error.code === 'analysis_config_unconfirmed' ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['chatgpt_installation_connected', 'analysis_config_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
+    } catch (error) { send(['chatgpt_installation_connected', 'analysis_config_conflict', 'installation_monitoring_conflict', 'hierarchy_version_unsupported', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : error.code === 'analysis_config_unconfirmed' ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['chatgpt_installation_connected', 'analysis_config_conflict', 'installation_monitoring_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
     } finally { counts.activeRequests--; await flushIdle() }
   })
   server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)) })
