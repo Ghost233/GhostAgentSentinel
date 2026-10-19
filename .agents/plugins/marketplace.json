@@ -7,8 +7,10 @@
     {
       "name": "ghost-sentinel",
       "source": {
-        "source": "local",
-        "path": "./plugins/ghost-sentinel"
+        "source": "git-subdir",
+        "url": "https://github.com/Ghost233/GhostAgentSentinel",
+        "path": "./plugins/ghost-sentinel",
+        "sha": "78548f3fff583d23290edfcec151549b2e3489b1"
       },
       "policy": {
         "installation": "AVAILABLE",
@@ -19,8 +21,10 @@
     {
       "name": "ghost-sentinel-test",
       "source": {
-        "source": "local",
-        "path": "./plugins/ghost-sentinel-test"
+        "source": "git-subdir",
+        "url": "https://github.com/Ghost233/GhostAgentSentinel",
+        "path": "./plugins/ghost-sentinel-test",
+        "ref": "test"
       },
       "policy": {
         "installation": "AVAILABLE",

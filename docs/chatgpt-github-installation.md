@@ -74,7 +74,7 @@ sentinel_release="$sentinel_root/payloads/$sentinel_archive"
 
 ## 开发者重建
 
-先按锁文件准备依赖，用已有自包含构建器生成新运行包。再生成两个 GitHub 插件目录：
+开发代码位于 `test` 分支。使用该分支的干净副本，先按锁文件准备依赖，用已有自包含构建器生成新运行包。再生成两个 GitHub 插件目录：
 
 ```sh
 node scripts/build-github-plugins.mjs \
