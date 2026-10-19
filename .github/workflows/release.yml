@@ -1,4 +1,4 @@
-name: Release validation
+name: Release packaging
 on:
   push:
     branches:
@@ -10,12 +10,13 @@ permissions:
 jobs:
   package:
     name: Build and verify release package
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '24.21.0'
+          architecture: arm64
           cache: npm
       - name: Match the release build toolchain
         run: npm install --global npm@11.19.1 --ignore-scripts --no-audit --no-fund

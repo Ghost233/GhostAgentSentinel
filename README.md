@@ -52,7 +52,7 @@ Codex 的“读取列表／检查连接”只读取 `GET /v1/models`，提供目
 
 ## 开发与验证
 
-源码测试依赖已构建的 DSH-Workflow SDK 与其测试解析器。默认查找同级 `DSH-Workflow` 目录，也可指定绝对路径：
+源码测试在本地 macOS arm64 完成，依赖已构建的 DSH-Workflow SDK 与其测试解析器。默认查找同级 `DSH-Workflow` 目录，也可指定绝对路径：
 
 ```sh
 npm ci --ignore-scripts
@@ -62,6 +62,8 @@ npm run check
 npm test
 npm run test:resources
 ```
+
+GitHub Actions 只负责打包、核对版本／文件清单／哈希并上传产物，不运行测试或真实宿主验收。仅调整 workflow 时，复用未受影响的本地证据，只验证相关配置和打包；发布门槛见 [发布流程](docs/release-status.md#发布流程与完成条件)。
 
 SDK 缺失时检查会明确失败。普通用户安装发布包不需要这套开发环境。运行包不包含合成测试驱动、真实会话记录、模型服务或本机连接信息。
 
