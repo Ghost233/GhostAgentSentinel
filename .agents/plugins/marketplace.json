@@ -1,0 +1,36 @@
+{
+  "name": "ghostsentinel",
+  "interface": {
+    "displayName": "GhostSentinel"
+  },
+  "plugins": [
+    {
+      "name": "ghost-sentinel",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/Ghost233/GhostAgentSentinel",
+        "path": "./plugins/ghost-sentinel",
+        "sha": "78548f3fff583d23290edfcec151549b2e3489b1"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "ghost-sentinel-test",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/Ghost233/GhostAgentSentinel",
+        "path": "./plugins/ghost-sentinel-test",
+        "ref": "test"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
