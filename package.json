@@ -7,7 +7,7 @@
   "main": "dsh/host.mjs",
   "exports": { ".": "./dsh/host.mjs", "./client": "./dsh/client.js", "./package.json": "./package.json" },
   "bin": { "ghost-agent-sentinel": "src/daemon.mjs" },
-  "files": ["src", "dsh", "docs/installation.md", "docs/development-contract.md", "docs/chatgpt-observation.md", "docs/release-status.md", "docs/release-notes.md", "README.md", "GLOSSARY.md"],
+  "files": ["src", "dsh", "docs/installation.md", "docs/development-contract.md", "docs/chatgpt-observation.md", "docs/dsh-0.1.2-compatibility.md", "docs/release-status.md", "docs/release-notes.md", "README.md", "GLOSSARY.md"],
   "engines": { "node": ">=22.13.0" },
   "scripts": {
     "release:check": "node scripts/check-release.mjs",
