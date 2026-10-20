@@ -71,7 +71,7 @@ async function saveModelSettings(){
   try{
     const response=await request('tools/call',{name:'sentinel_save_model_settings',arguments:{config,revision:settingsState.revision}});
     if(stopped||version!==settingsVersion)return;
-    if(response.isError){element('settings-status').textContent='保存失败 · 输入已保留';return;}
+    if(response.isError){if(response.structuredContent?.saveOutcome!=='rejected')throw new Error(text(response.content?.find(entry=>entry.type==='text')?.text)||'保存响应未确认');element('settings-status').textContent='保存失败 · 输入已保留';return;}
     const value=response.structuredContent;validateModelSettings(value);
     if(!['llm','jev'].every(role=>sameGroup(value.config[role],config[role])))throw new Error('保存响应内容未确认');
     settingsState=value;

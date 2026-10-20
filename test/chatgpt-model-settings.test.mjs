@@ -118,12 +118,12 @@ test('a model group cleared before the initial read completes stays cleared and 
   assert.equal(page.element('#settings-llm-model').value, '')
 })
 
-for (const failure of ['rejected', 'timeout', 'wrong-installation', 'wrong-content']) test('settings preserve a failed draft and distinguish unconfirmed writes: ' + failure, async t => {
+for (const failure of ['rejected', 'unclassified', 'timeout', 'wrong-installation', 'wrong-content']) test('settings preserve a failed draft and distinguish unconfirmed writes: ' + failure, async t => {
   const page = await settingsPage(t), input = page.element('#settings-llm-model')
   input.value = 'unsaved-summary'; input.oninput(); input.onchange(); await page.flush()
   const save = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
   if (failure === 'timeout') [...page.timers.values()].find(timer => timer.delay === 5000).callback()
-  else page.reply(save.id, failure === 'rejected' ? { isError: true } : { structuredContent: { ...state, registrationId: failure === 'wrong-installation' ? 'chatgpt:another-installation' : state.registrationId, revision: 'unexpected-save', config: failure === 'wrong-content' ? state.config : save.params.arguments.config } })
+  else page.reply(save.id, failure === 'rejected' ? { isError: true, structuredContent: { saveOutcome: 'rejected' } } : failure === 'unclassified' ? { isError: true } : { structuredContent: { ...state, registrationId: failure === 'wrong-installation' ? 'chatgpt:another-installation' : state.registrationId, revision: 'unexpected-save', config: failure === 'wrong-content' ? state.config : save.params.arguments.config } })
   await page.flush()
   assert.match(page.element('#settings-status').textContent, failure === 'rejected' ? /保存失败/ : /保存结果未确认/)
   assert.doesNotMatch(page.element('#settings-status').textContent, /已保存/)
@@ -366,6 +366,64 @@ test('production adapter settings bind the installation independently from colle
   assert.equal(page.timers.size, 0)
   assert.equal(adapter.diagnostics().closed, false)
   assert.equal(adapter.diagnostics().trackedThreads, 0)
+})
+
+for (const loss of ['decode', 'transport']) test('Core response ' + loss + ' loss remains unconfirmed in the actual MCP settings page after a committed save', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-settings-core-response-')), originalFetch = globalThis.fetch
+  let server, core, lazy, adapter, blocker, truncate = false, decodeError, truncated = 0
+  t.after(async () => {
+    globalThis.fetch = originalFetch; blocker?.exec('ROLLBACK'); blocker?.close()
+    try { await adapter?.close(); await lazy?.close(); await core?.close(); await server?.close() } finally { await rm(dataDir, { recursive: true, force: true }) }
+  })
+  server = await startServer({ dataDir }); core = await connectCore({ dataDir }); lazy = createLazyCore({ dataDir })
+  const registrationId = 'chatgpt:core-response-loss', token = 'b'.repeat(64)
+  const before = await core.configureInstallationAnalysis(registrationId, state.config, (await core.installationAnalysisConfig(registrationId)).revision)
+  globalThis.fetch = async (input, options) => {
+    const response = await originalFetch(input, options)
+    if (!truncate || input !== server.url + '/v1/analysis/installations/config' || options?.method !== 'POST' || !response.ok) return response
+    truncate = false; truncated++
+    const text = await response.text()
+    if (loss === 'transport') { decodeError = new TypeError('controlled Core response transport loss'); throw decodeError }
+    const broken = new Response(text.slice(0, -1), { status: response.status, headers: response.headers })
+    const json = broken.json.bind(broken)
+    broken.json = async () => { try { return await json() } catch (error) { decodeError = error; throw error } }
+    return broken
+  }
+  adapter = await startChatGPTAdapter({ core: lazy, native: {
+    async sampleHost() { return { available: true, hostRunId: 'core-response-host', hostStartedAt: 1, profile: null } },
+    async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
+  }, installationId: 'core-response-loss', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
+  const rpc = async (method, params) => {
+    const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
+    assert.equal(response.status, 200)
+    return (await response.json()).result
+  }
+  const resource = await rpc('resources/read', { uri: 'ui://ghost-sentinel/settings.html' })
+  const page = await panelHarness(t, { html: resource.contents[0].text })
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_model_settings').id, await rpc('tools/call', { name: 'sentinel_model_settings', arguments: {} })); await page.flush()
+  const complete = async model => {
+    const input = page.element('#settings-llm-model'); input.value = model; input.oninput(); const saving = input.onchange(); await page.flush()
+    const call = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings'), result = await rpc('tools/call', call.params)
+    page.reply(call.id, result); await saving; await page.flush()
+    return result
+  }
+  const { DatabaseSync } = await import('node:sqlite')
+  blocker = new DatabaseSync(join(dataDir, 'observations.sqlite')); blocker.exec('BEGIN IMMEDIATE')
+  const rejected = await complete('explicitly-rejected')
+  assert.equal(rejected.structuredContent?.saveOutcome, 'rejected')
+  assert.match(page.element('#settings-status').textContent, /保存失败/)
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'an explicit Core rejection does not commit')
+  t.diagnostic('control: actual Core SQLite rejection retained the old public configuration and displayed 保存失败')
+  blocker.exec('ROLLBACK'); blocker.close(); blocker = undefined
+  truncate = true
+  const result = await complete('committed-before-decode-loss')
+  assert.equal(truncated, 1)
+  assert.equal(decodeError?.coreRequestFailure?.kind, loss)
+  assert.equal((await core.installationAnalysisConfig(registrationId)).config.llm.model, 'committed-before-decode-loss', 'normal public GET proves the successful POST committed before its response was truncated')
+  assert.equal(result.structuredContent?.saveOutcome, 'unknown')
+  t.diagnostic(JSON.stringify({ coreFailure: decodeError.coreRequestFailure.kind, coreStatus: decodeError.coreRequestFailure.status, mcpIsError: result.isError, saveOutcome: result.structuredContent?.saveOutcome, mcpContent: result.content, ui: page.element('#settings-status').textContent }))
+  assert.match(page.element('#settings-status').textContent, /保存结果(?:未知|未确认)/)
+  assert.doesNotMatch(page.element('#settings-status').textContent, /保存失败|已保存/)
 })
 
 test('global settings reject untrusted host or plugin qualification before accessing installation configuration', async t => {

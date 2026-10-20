@@ -56,7 +56,16 @@ export async function startPanelServer({ read, control, modelSettings, requestNo
         title: '保存本安装模型设置', description: '按读取的配置版本保存，仅影响本安装的分析。',
         inputSchema: { revision: z.string().min(1).max(2000), config: z.object({ llm: model.optional(), jev: model.optional() }).strict() },
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false }, _meta: { ui: { visibility: ['app'] } },
-      }, async change => ({ content: [{ type: 'text', text: '模型设置已保存' }], structuredContent: await modelSettings.save(change) }))
+      }, async change => {
+        try { return { content: [{ type: 'text', text: '模型设置已保存' }], structuredContent: await modelSettings.save(change) } }
+        catch (error) {
+          const failure = error?.coreRequestFailure
+          const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
+            && error?.code !== 'analysis_config_unconfirmed' && failure?.operation === '/v1/analysis/installations/config'
+            && failure.kind === 'http' && failure.status >= 400 && failure.status <= 599
+          return { isError: true, content: [{ type: 'text', text: String(error?.message ?? error) }], structuredContent: { saveOutcome: rejected ? 'rejected' : 'unknown' } }
+        }
+      })
       if (typeof modelSettings.directory === 'function') registerAppTool(mcp, 'sentinel_model_directory', {
         title: '读取本机模型列表', description: '仅检查服务在线及模型名称，不调用生成或 JEV 推理。', inputSchema: { baseUrl: z.string().min(1).max(2000) },
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },

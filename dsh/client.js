@@ -110,8 +110,7 @@
           if (!scope.active || abort.signal.aborted) throw new Error('观察请求已取消')
           if (!response?.ok) {
             const error = new Error(response?.error?.message || `观察操作失败：${response?.error?.code || method}`)
-            error.responseReceived = Boolean(response?.error) && response.error.code !== 'gateway/cancelled'
-              && !(response.error.code === 'gateway/internal' && response.error.message?.startsWith('client api: '))
+            if (method === 'configureAnalysisIfCurrent') error.saveOutcome = response?.error?.details?.saveOutcome === 'rejected' ? 'rejected' : 'unknown'
             throw error
           }
           return response.value
@@ -319,8 +318,8 @@
                 confirmed.current = saved; savedEdits.current[role] = edit.version; uncertain.current = false; onConfig(saved); report('已保存；下一轮采用新配置')
               } catch (error) {
                 if (!valid()) break
-                if (!error.responseReceived) uncertain.current = true
-                report(`${error.responseReceived ? '保存失败' : '保存结果未知'}：${errorText(error)}`)
+                if (error.saveOutcome !== 'rejected') uncertain.current = true
+                report(`${error.saveOutcome === 'rejected' ? '保存失败' : '保存结果未知'}：${errorText(error)}`)
               }
             }
           } finally {

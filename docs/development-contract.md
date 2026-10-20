@@ -76,6 +76,8 @@ checks 固定六项 ID：stalled_progress/request_drift/failure_loop/validation_
 
 同一安装以最后一次有效保存为准，不因另一窗口先保存而拒绝旧修订号；仍校验安装身份、修订号格式和整份配置。每次成功写入更换该安装的修订号，并将该安装受影响的配置、任务和通知变化一起持久提交。无效配置不部分生效。分析轮次和结果绑定 registrationId、配置修订号及执行材料；保存后取消旧轮次、封存晚到结果，按新配置公平排队。采集、原任务、其它安装与手动暂停保持。响应丢失时保留结果未知，调用方重新读取，不能仅凭值相同推定写入归属。安装暂停、会话暂停和旧全局配置各自的修订冲突规则保持。
 
+双端的保存响应用 `saveOutcome` 区分明确拒写与结果未知。只有已确认的配置 HTTP 拒绝才显示保存失败；未确认、混合错误和响应中断保持未知。MCP 的 `isError` 或 Remote 的通用错误本身不能证明配置未写入。缺少结果标记时也按未知处理，保留输入，不自动重试；其它操作的错误语义保持。
+
 安装暂停使用 `installationMonitoring(registrationId)` 和 `setInstallationMonitoring(registrationId,paused,revision)`，返回 `{registrationId,paused,revision}`。HTTP 为 `GET /v1/monitoring/installations?registrationId=…` 与同路径 POST，写入正文为 `{registrationId,paused,revision}`。相同目标状态幂等，过期的相反写入返回 409 和 `installation_monitoring_conflict`。DSH 界面只调用所属安装的控制；安装暂停与会话暂停取逻辑或，恢复其中一项不解除另一项，暂停期间仍采集。
 
 旧 `configureAnalysis`、`analysisConfig`、`analysisConfigState`、`configureAnalysisIfCurrent`、全局 pause／resume 和 setAnalyzer 仅保留给内部管理或 CLI。对应 `/v1/analysis/config`、`/state`、`/compare` 不代表安装配置，也不为新安装导入或迁移旧设置。旧全局比较保存仍使用修订号；恢复无法确认时返回 503 和 `analysis_config_unconfirmed`，该状态不能当作安装配置已确认。

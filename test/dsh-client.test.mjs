@@ -304,6 +304,64 @@ test('native system settings edits only its stable installation through producti
   assert.equal(f.ctx.slots.entries('settings.section').length, 0, 'plugin unload reclaims its native settings contribution')
 })
 
+for (const loss of ['decode', 'transport']) test('Core response ' + loss + ' loss remains unconfirmed in actual Native Remote settings after a committed save', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-core-response-')), host = new Context(), originalFetch = globalThis.fetch
+  let server, core, adapter, f, blocker, truncate = false, decodeError, truncated = 0, wire
+  t.after(async () => {
+    globalThis.fetch = originalFetch; blocker?.exec('ROLLBACK'); blocker?.close()
+    await f?.dispose(); await adapter?.close(); await host.fiber.dispose(); await core?.close(); await server?.close(); await rm(dataDir, { recursive: true, force: true })
+  })
+  server = await startServer({ dataDir }); core = await connectCore({ dataDir })
+  const registrationId = 'dsh:core-response-loss', config = { llm: { baseUrl: 'http://127.0.0.1:1', model: 'before-loss' }, jev: { baseUrl: 'http://localhost:1', model: 'judge' } }
+  const before = await core.configureInstallationAnalysis(registrationId, config, (await core.installationAnalysisConfig(registrationId)).revision)
+  globalThis.fetch = async (input, options) => {
+    const response = await originalFetch(input, options)
+    if (!truncate || input !== server.url + '/v1/analysis/installations/config' || options?.method !== 'POST' || !response.ok) return response
+    truncate = false; truncated++
+    const text = await response.text()
+    if (loss === 'transport') { decodeError = new TypeError('controlled Core response transport loss'); throw decodeError }
+    const broken = new Response(text.slice(0, -1), { status: response.status, headers: response.headers })
+    const json = broken.json.bind(broken)
+    broken.json = async () => { try { return await json() } catch (error) { decodeError = error; throw error } }
+    return broken
+  }
+  await host.plugin(req('@deepseek-ai/dsh-llm').default)
+  for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop']) await host.plugin(req(`@deepseek-ai/${name}`).default, { agents: [] })
+  for (const name of ['dsh-typert-registry', 'dsh-api-remote-access', 'dsh-api-gateway']) await host.plugin(req(`@deepseek-ai/${name}`).default)
+  adapter = createAdapter(host, { dataDir, registrationId }, { flushMs: 10, heartbeatMs: 1000 })
+  const { Peer } = req('@deepseek-ai/dsh-client-connection'), peer = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' })
+  f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true, async $dispatch(endpoint, payload, signal) {
+    const result = await host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer)
+    if (endpoint === 'sentinel/configureAnalysisIfCurrent') wire = result
+    return result
+  } })
+  await f.mountSettings()
+  await f.waitUntil(() => f.dom.window.document.querySelector('[data-sentinel-installation-settings] input'), 'actual settings read the public installation config')
+  const inputs = [...f.dom.window.document.querySelectorAll('[data-sentinel-installation-settings] input')], { Simulate } = clientRequire('react-dom/test-utils')
+  const status = () => inputs[1].closest('fieldset').querySelector('[role=status]')?.textContent || ''
+  const complete = async model => {
+    await f.interact(async () => { inputs[1].value = model; Simulate.change(inputs[1]); Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle() })
+    await f.waitUntil(() => f.plugin.diagnostics().activeRequests === 0, 'the native settings request finished')
+  }
+  const { DatabaseSync } = await import('node:sqlite')
+  blocker = new DatabaseSync(join(dataDir, 'observations.sqlite')); blocker.exec('BEGIN IMMEDIATE')
+  await complete('explicitly-rejected')
+  assert.equal(wire.error?.details?.saveOutcome, 'rejected')
+  assert.match(status(), /保存失败/)
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'an explicit Core rejection does not commit')
+  t.diagnostic('control: actual Core SQLite rejection retained the old public configuration and displayed 保存失败')
+  blocker.exec('ROLLBACK'); blocker.close(); blocker = undefined
+  truncate = true
+  await complete('committed-before-decode-loss')
+  assert.equal(truncated, 1)
+  assert.equal(decodeError?.coreRequestFailure?.kind, loss)
+  assert.equal((await core.installationAnalysisConfig(registrationId)).config.llm.model, 'committed-before-decode-loss', 'normal public GET proves the successful POST committed before its response was truncated')
+  assert.equal(wire.error?.details?.saveOutcome, 'unknown')
+  t.diagnostic(JSON.stringify({ coreFailure: decodeError.coreRequestFailure.kind, coreStatus: decodeError.coreRequestFailure.status, nativeError: wire.error, ui: status() }))
+  assert.match(status(), /保存结果(?:未知|未确认)/)
+  assert.doesNotMatch(status(), /保存失败|已保存/)
+})
+
 test('closing native settings cancels its read and plugin reconnection discards old saves and queued groups', async t => {
   const pending = [], current = { registrationId: 'dsh:owned', config: { llm: { baseUrl: 'http://127.0.0.1:1', model: 'current' } }, revision: 'current' }
   let holdRead = true

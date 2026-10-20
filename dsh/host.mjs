@@ -264,7 +264,19 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
     },
     pause(signal) { return setInstallationPaused(true, signal) }, resume(signal) { return setInstallationPaused(false, signal) },
     analysisConfigState(signal) { return installationCall('installationAnalysisConfig', [], signal) },
-    configureAnalysisIfCurrent(value, revision, signal) { return installationCall('configureInstallationAnalysis', [value, revision], signal) },
+    async configureAnalysisIfCurrent(value, revision, signal) {
+      try { return await installationCall('configureInstallationAnalysis', [value, revision], signal) }
+      catch (error) {
+        const requestFailure = error?.coreRequestFailure
+        const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
+          && error?.code !== 'analysis_config_unconfirmed' && requestFailure?.operation === '/v1/analysis/installations/config'
+          && requestFailure.kind === 'http' && requestFailure.status >= 400 && requestFailure.status <= 599
+        const failure = error && typeof error === 'object' ? error : new Error(String(error))
+        failure.code ??= 'gateway/internal'; failure.isDSHRemoteError = true
+        failure.details = { ...failure.details, saveOutcome: rejected ? 'rejected' : 'unknown' }
+        throw failure
+      }
+    },
     async analysisConfig(signal) { return (await service.analysisConfigState(signal)).config },
     sourcePlan(signal) { return invoke('sourcePlan', signal) }, configureSources(value, signal) { return invoke('configureSources', value, signal) },
     claimNotifications(signal) { return invoke('claimNotifications', sourceKey, signal) },
