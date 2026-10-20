@@ -6,7 +6,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
 import { z } from 'zod'
 
-export async function startPanelServer({ read, control, modelSettings, requestNotifications, notificationRecords, runtimeStatus, displayName = 'Sentinel', token, port = 0 }) {
+export async function startPanelServer({ read, control, modelSettings, installationNotifications, requestNotifications, notificationRecords, runtimeStatus, displayName = 'Sentinel', token, port = 0 }) {
   if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) throw new Error('installation authentication is required')
   if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid panel display name')
   const title = displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查'
@@ -74,6 +74,29 @@ export async function startPanelServer({ read, control, modelSettings, requestNo
         title: '本安装连接诊断', description: '只读核对本安装采集与保留分析状态，不读取聊天或运行模型检查。', inputSchema: z.object({}).strict(),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
       }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装连接诊断' }], structuredContent: await modelSettings.diagnostics({ signal: extra.signal }) }))
+    }
+    if (installationNotifications) {
+      registerAppTool(mcp, 'sentinel_installation_notification_preferences', {
+        title: '读取本安装通知偏好', description: '读取任务告警和监控故障投递偏好，系统许可另行表达。', inputSchema: z.object({}).strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+      }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装通知偏好' }], structuredContent: await installationNotifications.read({ signal: extra.signal }) }))
+      registerAppTool(mcp, 'sentinel_set_installation_notification_preference', {
+        title: '保存本安装通知偏好', description: '仅改变本安装对应类别的桌面通知，不暂停采集或分析。', inputSchema: { kind: z.enum(['task-alert', 'monitoring-failure']), enabled: z.boolean() },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+      }, async (change, extra) => {
+        try { return { content: [{ type: 'text', text: '通知偏好已保存' }], structuredContent: await installationNotifications.save(change, { signal: extra.signal }) } }
+        catch (error) {
+          const failure = error?.coreRequestFailure
+          const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
+            && error?.code !== 'analysis_config_unconfirmed' && failure?.operation === '/v1/notifications/installations/preferences'
+            && failure.kind === 'http' && failure.status >= 400 && failure.status <= 599
+          return { isError: true, content: [{ type: 'text', text: String(error?.message ?? error) }], structuredContent: { saveOutcome: rejected ? 'rejected' : 'unknown' } }
+        }
+      })
+      if (typeof installationNotifications.requestPermission === 'function') registerAppTool(mcp, 'sentinel_request_installation_notification_permission', {
+        title: '允许本安装桌面通知', description: '由明确用户动作请求系统许可，不依赖当前聊天。', inputSchema: z.object({}).strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+      }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装系统通知许可' }], structuredContent: await installationNotifications.requestPermission({ signal: extra.signal }) }))
     }
     if (typeof control === 'function') registerAppTool(mcp, 'sentinel_set_chat_analysis', {
       title: '设置本聊天分析', description: '仅暂停或恢复当前聊天的监控分析，继续只读采集。',

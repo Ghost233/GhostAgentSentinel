@@ -18,11 +18,222 @@ const diagnostics = { protocol: 1, registrationId: state.registrationId, generat
 async function settingsPage(t, initial = state) {
   const page = await panelHarness(t, { html: await readFile(new URL('../chatgpt/settings.html', import.meta.url), 'utf8') })
   page.reply(page.sent.findLast(row => row.method === 'tools/call').id, { structuredContent: initial })
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_preferences').id, { structuredContent: { registrationId: initial.registrationId, revision: 'notification-revision-a', preferences: { 'task-alert': true, 'monitoring-failure': true }, permission: null } })
   await page.flush()
   return page
 }
 
 function leaveModelGroup(page, role) { return page.element('#settings-' + role + '-group').onfocusout({ relatedTarget: null }) }
+
+async function installationNotificationPage(t, { installationId = 'notification-settings', authorization = 'denied' } = {}) {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-notification-settings-')), token = '7'.repeat(64)
+  let server, core, adapter, authorizationCalls = 0, settingsCalls = 0, threadCalls = 0, authorizationError = false
+  t.after(async () => { try { await adapter?.close(); await core?.close(); await server?.close() } finally { await rm(dataDir, { recursive: true, force: true }) } })
+  server = await startServer({ dataDir }); core = await connectCore({ dataDir })
+  const permission = () => ({ authorization, alertSetting: 'enabled', notificationCenterSetting: 'enabled', observedAt: Date.now() })
+  adapter = await startChatGPTAdapter({ core, native: {
+    async sampleHost() { return { available: true, hostRunId: 'notification-settings-host', hostStartedAt: 1, profile: supportedProfile } },
+    async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
+    async readThread() { threadCalls++; throw new Error('installation settings must not read a chat') },
+  }, notificationIO: {
+    async settings() { settingsCalls++; return permission() },
+    async requestAuthorization() { authorizationCalls++; if (authorizationError) throw Object.assign(new Error('controlled native failure'), { code: 'native_unavailable' }); return permission() },
+    async snapshot() { return { pending: [], delivered: [], actions: [], observedAt: Date.now() } },
+    async cancel() { return { pendingIds: [], observedAt: Date.now() } }, close() {},
+  }, installationId, sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
+  const rpc = async (method, params) => {
+    const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
+    assert.equal(response.status, 200)
+    const envelope = await response.json(); assert.equal(envelope.error, undefined, JSON.stringify(envelope)); return envelope.result
+  }
+  const resource = await rpc('resources/read', { uri: 'ui://ghost-sentinel/settings.html' })
+  const deliver = async (page, name) => {
+    const call = page.sent.findLast(row => row.params?.name === name); assert.ok(call, 'the actual settings page invokes ' + name)
+    const result = await rpc('tools/call', call.params); page.reply(call.id, result); await page.flush(); return result
+  }
+  const open = async () => {
+    const page = await panelHarness(t, { html: resource.contents[0].text })
+    await deliver(page, 'sentinel_model_settings'); const notifications = await deliver(page, 'sentinel_installation_notification_preferences'); assert.ok(!notifications.isError, JSON.stringify(notifications)); return page
+  }
+  return { dataDir, server, rpc, deliver, open, counts: () => ({ authorizationCalls, settingsCalls, threadCalls }), failAuthorization: () => { authorizationError = true } }
+}
+
+test('the actual global settings page independently saves both notification kinds through MCP and Core and retains them on reopen', async t => {
+  const fixture = await installationNotificationPage(t), page = await fixture.open()
+  assert.equal(page.element('#settings-notification-task-alert').checked, true)
+  assert.equal(page.element('#settings-notification-monitoring-failure').checked, true)
+  for (const kind of ['task-alert', 'monitoring-failure']) {
+    const checkbox = page.element('#settings-notification-' + kind); checkbox.checked = false
+    const saving = checkbox.onchange(); await page.flush()
+    assert.match(page.element('#settings-notification-' + kind + '-status').textContent, /正在保存/)
+    const result = await fixture.deliver(page, 'sentinel_set_installation_notification_preference'); await saving
+    assert.equal(result.structuredContent.preferences[kind], false)
+    assert.match(page.element('#settings-notification-' + kind + '-status').textContent, /已保存.*关闭/)
+  }
+  await page.destroy()
+  const reopened = await fixture.open()
+  assert.equal(reopened.element('#settings-notification-task-alert').checked, false)
+  assert.equal(reopened.element('#settings-notification-monitoring-failure').checked, false)
+  assert.deepEqual(fixture.counts(), { authorizationCalls: 0, settingsCalls: 0, threadCalls: 0 })
+  assert.equal(reopened.timers.size, 0)
+})
+
+test('a notification read started during a save cannot repaint the completed newer choice', async t => {
+  const page = await settingsPage(t), checkbox = page.element('#settings-notification-task-alert')
+  checkbox.checked = false; const saving = checkbox.onchange(); await page.flush()
+  const save = page.sent.findLast(row => row.params?.name === 'sentinel_set_installation_notification_preference')
+  const reading = page.element('#settings-notification-reload').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_preferences')
+  page.reply(save.id, { structuredContent: { registrationId: state.registrationId, revision: 'notification-disabled', preferences: { 'task-alert': false, 'monitoring-failure': true } } }); await saving
+  page.reply(read.id, { structuredContent: { registrationId: state.registrationId, revision: 'notification-before-save', preferences: { 'task-alert': true, 'monitoring-failure': true }, permission: null } }); await reading
+  assert.equal(checkbox.checked, false)
+  assert.match(page.element('#settings-notification-task-alert-status').textContent, /已保存.*关闭/)
+  assert.equal(page.element('#settings-notification-monitoring-failure').checked, true)
+})
+
+test('notification changes serialize each kind and keep the last intent across tabs and model refreshes', async t => {
+  const fixture = await installationNotificationPage(t), page = await fixture.open(), task = page.element('#settings-notification-task-alert'), failure = page.element('#settings-notification-monitoring-failure')
+  task.checked = false; const firstSaving = task.onchange(); await page.flush()
+  const first = page.sent.findLast(row => row.params?.name === 'sentinel_set_installation_notification_preference'), firstResult = await fixture.rpc('tools/call', first.params)
+  task.checked = true; task.onchange(); failure.checked = false; const failureSaving = failure.onchange(); await page.flush()
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_set_installation_notification_preference').length, 2, 'another kind can save while the first kind waits')
+  const failureCall = page.sent.findLast(row => row.params?.name === 'sentinel_set_installation_notification_preference'), failureResult = await fixture.rpc('tools/call', failureCall.params)
+  page.reply(failureCall.id, failureResult); await failureSaving
+  const reading = page.element('#settings-notification-reload').onclick(); await page.flush()
+  const oldRead = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_preferences'), oldResult = await fixture.rpc('tools/call', oldRead.params)
+  const modelReading = page.element('#settings-reload').onclick(); await page.flush()
+  await fixture.deliver(page, 'sentinel_model_settings'); await modelReading
+  page.element('#settings-tab-notifications').onclick(); page.element('#settings-tab-settings').onclick()
+  page.reply(first.id, firstResult); await firstSaving; await page.flush()
+  const last = page.sent.findLast(row => row.params?.name === 'sentinel_set_installation_notification_preference')
+  assert.notEqual(last.id, first.id)
+  assert.deepEqual(JSON.parse(JSON.stringify(last.params.arguments)), { kind: 'task-alert', enabled: true })
+  assert.equal(task.checked, true)
+  assert.match(page.element('#settings-notification-task-alert-status').textContent, /正在保存/)
+  await fixture.deliver(page, 'sentinel_set_installation_notification_preference')
+  page.reply(oldRead.id, oldResult); await reading
+  assert.equal(task.checked, true)
+  assert.equal(failure.checked, false)
+  assert.match(page.element('#settings-notification-task-alert-status').textContent, /已保存.*开启/)
+  const persisted = await fixture.rpc('tools/call', { name: 'sentinel_installation_notification_preferences', arguments: {} })
+  assert.deepEqual(persisted.structuredContent.preferences, { 'task-alert': true, 'monitoring-failure': false })
+  assert.equal(page.timers.size, 0)
+})
+
+for (const outcome of ['rejected', 'unknown', 'timeout', 'wrong-installation', 'wrong-content']) test('notification choices survive an unacknowledged host response without reporting success: ' + outcome, async t => {
+  const page = await settingsPage(t), checkbox = page.element('#settings-notification-task-alert')
+  checkbox.checked = false; const saving = checkbox.onchange(); await page.flush()
+  const call = page.sent.findLast(row => row.params?.name === 'sentinel_set_installation_notification_preference')
+  if (outcome === 'timeout') [...page.timers.values()].find(timer => timer.delay === 5000).callback()
+  else page.reply(call.id, ['rejected', 'unknown'].includes(outcome) ? { isError: true, structuredContent: { saveOutcome: outcome } } : { structuredContent: { registrationId: outcome === 'wrong-installation' ? 'chatgpt:foreign' : state.registrationId, revision: 'not-confirmed', preferences: { 'task-alert': outcome === 'wrong-content', 'monitoring-failure': true } } })
+  await saving
+  assert.equal(checkbox.checked, false)
+  assert.match(page.element('#settings-notification-task-alert-status').textContent, outcome === 'rejected' ? /保存失败.*拒绝/ : /保存结果未确认/)
+  assert.doesNotMatch(page.element('#settings-notification-task-alert-status').textContent, /已保存/)
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_set_installation_notification_preference').length, 1)
+  if (outcome === 'timeout') { page.reply(call.id, { structuredContent: { registrationId: state.registrationId, revision: 'late', preferences: { 'task-alert': false, 'monitoring-failure': true } } }); await page.flush(); assert.match(page.element('#settings-notification-task-alert-status').textContent, /未确认/) }
+})
+
+test('the global permission action shows actual native denial and errors without reading a chat or authorizing on ordinary reads', async t => {
+  const fixture = await installationNotificationPage(t), page = await fixture.open()
+  assert.match(page.element('#settings-notification-permission-status').textContent, /未确认/)
+  assert.equal(page.element('#settings-notification-task-alert').checked, true)
+  assert.deepEqual(fixture.counts(), { authorizationCalls: 0, settingsCalls: 0, threadCalls: 0 })
+  const staleReading = page.element('#settings-notification-reload').onclick(); await page.flush()
+  const staleRead = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_preferences'), staleResult = await fixture.rpc('tools/call', staleRead.params)
+  for (const failed of [false, true]) {
+    if (failed) fixture.failAuthorization()
+    const requesting = page.element('#settings-notification-permission').onclick(); await page.flush()
+    const call = page.sent.findLast(row => row.params?.name === 'sentinel_request_installation_notification_permission')
+    assert.deepEqual(JSON.parse(JSON.stringify(call.params.arguments)), {})
+    await fixture.deliver(page, call.params.name); await requesting
+    if (!failed) { const current = page.element('#settings-notification-permission-status').textContent; page.reply(staleRead.id, staleResult); await staleReading; assert.equal(page.element('#settings-notification-permission-status').textContent, current, 'an older preference read cannot erase the explicit permission result') }
+    const rereading = page.element('#settings-notification-reload').onclick(); await page.flush()
+    await fixture.deliver(page, 'sentinel_installation_notification_preferences'); await rereading
+    assert.match(page.element('#settings-notification-permission-status').textContent, failed ? /授权出错.*native_unavailable/ : /未允许.*系统设置/)
+    assert.doesNotMatch(page.element('#settings-notification-permission-status').textContent, /已允许/)
+  }
+  assert.deepEqual(fixture.counts(), { authorizationCalls: 2, settingsCalls: 0, threadCalls: 0 })
+  assert.equal(page.timers.size, 0)
+})
+
+test('failed notification reads leave model editing and an explicit global permission request available', async t => {
+  const page = await panelHarness(t, { html: await readFile(new URL('../chatgpt/settings.html', import.meta.url), 'utf8') })
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_preferences').id, { isError: true })
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_model_settings').id, { structuredContent: state }); await page.flush()
+  assert.match(page.element('#settings-notification-status').textContent, /读取未确认/)
+  assert.equal(page.element('#settings-notification-task-alert').disabled, true)
+  assert.equal(page.element('#settings-llm-model').value, 'summary-a')
+  const model = page.element('#settings-llm-model'); model.value = 'still-editable'; model.oninput(); const saving = leaveModelGroup(page, 'llm'); await page.flush()
+  const save = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
+  page.reply(save.id, { structuredContent: { ...state, revision: 'independent-save', config: save.params.arguments.config } }); await saving
+  assert.match(page.element('#settings-status').textContent, /已保存/)
+  const requesting = page.element('#settings-notification-permission').onclick(); await page.flush()
+  const permission = page.sent.findLast(row => row.params?.name === 'sentinel_request_installation_notification_permission')
+  page.reply(permission.id, { structuredContent: { registrationId: state.registrationId, permission: { authorization: 'denied', requestInFlight: false, errorCode: null } } }); await requesting
+  assert.match(page.element('#settings-notification-permission-status').textContent, /未允许/)
+  assert.equal(page.timers.size, 0)
+})
+
+test('foreign notification and permission results stay unconfirmed and disposed settings ignore late writes', async t => {
+  const fixture = await installationNotificationPage(t), page = await fixture.open()
+  const reading = page.element('#settings-notification-reload').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_preferences'), value = (await fixture.rpc('tools/call', read.params)).structuredContent
+  page.reply(read.id, { structuredContent: { ...value, registrationId: 'chatgpt:foreign', preferences: { 'task-alert': false, 'monitoring-failure': false } } }); await reading
+  assert.match(page.element('#settings-notification-status').textContent, /未确认/)
+  assert.equal(page.element('#settings-notification-task-alert').checked, true)
+  const requesting = page.element('#settings-notification-permission').onclick(); await page.flush()
+  const permission = page.sent.findLast(row => row.params?.name === 'sentinel_request_installation_notification_permission')
+  page.reply(permission.id, { structuredContent: { registrationId: 'chatgpt:foreign', permission: { authorization: 'authorized' } } }); await requesting
+  assert.match(page.element('#settings-notification-permission-status').textContent, /未确认/)
+  const checkbox = page.element('#settings-notification-task-alert'); checkbox.checked = false; const saving = checkbox.onchange(); await page.flush()
+  const save = page.sent.findLast(row => row.params?.name === 'sentinel_set_installation_notification_preference'), result = await fixture.rpc('tools/call', save.params), listener = page.handlers.get('message'), before = page.element('#settings-notification-task-alert-status').textContent
+  await page.destroy()
+  listener({ source: page.parent, data: { jsonrpc: '2.0', id: save.id, result } }); await saving
+  assert.equal(page.element('#settings-notification-task-alert-status').textContent, before)
+  assert.equal(checkbox.checked, false)
+  assert.equal(page.timers.size, 0)
+  assert.equal((await fixture.rpc('tools/call', { name: 'sentinel_installation_notification_preferences', arguments: {} })).structuredContent.preferences['task-alert'], false)
+})
+
+for (const loss of ['decode', 'transport']) test('notification settings distinguish an actual Core rejection from a committed response ' + loss + ' loss', async t => {
+  const fixture = await installationNotificationPage(t), page = await fixture.open(), checkbox = page.element('#settings-notification-task-alert'), originalFetch = globalThis.fetch
+  let truncate = false, truncated = 0
+  t.after(() => { globalThis.fetch = originalFetch })
+  globalThis.fetch = async (input, options) => {
+    const response = await originalFetch(input, options)
+    if (!truncate || input !== fixture.server.url + '/v1/notifications/installations/preferences' || options?.method !== 'POST' || !response.ok) return response
+    truncate = false; truncated++
+    if (loss === 'transport') { await response.text(); throw new TypeError('controlled committed notification response loss') }
+    return new Response((await response.text()).slice(0, -1), { status: response.status, headers: response.headers })
+  }
+  const change = async enabled => {
+    checkbox.checked = enabled; const saving = checkbox.onchange(); await page.flush()
+    const result = await fixture.deliver(page, 'sentinel_set_installation_notification_preference'); await saving; return result
+  }
+  const { DatabaseSync } = await import('node:sqlite'), blocker = new DatabaseSync(join(fixture.dataDir, 'observations.sqlite'))
+  try {
+    blocker.exec('BEGIN IMMEDIATE')
+    const result = await change(false)
+    assert.equal(result.structuredContent.saveOutcome, 'rejected')
+    assert.match(page.element('#settings-notification-task-alert-status').textContent, /保存失败/)
+    assert.equal((await fixture.rpc('tools/call', { name: 'sentinel_installation_notification_preferences', arguments: {} })).structuredContent.preferences['task-alert'], true)
+  } finally { blocker.exec('ROLLBACK'); blocker.close() }
+  await change(true)
+  truncate = true
+  const unknown = await change(false)
+  assert.equal(truncated, 1)
+  assert.equal(unknown.structuredContent.saveOutcome, 'unknown')
+  assert.match(page.element('#settings-notification-task-alert-status').textContent, /保存结果未确认/)
+  assert.doesNotMatch(page.element('#settings-notification-task-alert-status').textContent, /已保存|保存失败/)
+  const persisted = await fixture.rpc('tools/call', { name: 'sentinel_installation_notification_preferences', arguments: {} })
+  assert.equal(persisted.structuredContent.preferences['task-alert'], false, 'the real public read proves the Core committed before its response was lost')
+  assert.equal(checkbox.checked, false)
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_set_installation_notification_preference').length, 3, 'an unconfirmed write is not retried automatically')
+  const reading = page.element('#settings-notification-reload').onclick(); await page.flush()
+  await fixture.deliver(page, 'sentinel_installation_notification_preferences'); await reading
+  assert.match(page.element('#settings-notification-task-alert-status').textContent, /保存结果未确认/)
+})
 
 for (const role of ['llm', 'jev']) test('settings list and connection buttons keep separate results and never save the focused draft: ' + role, async t => {
   const page = await settingsPage(t), model = page.element('#settings-' + role + '-model'), group = page.element('#settings-' + role + '-group')
@@ -401,31 +612,6 @@ test('installation settings remain available through the real MCP when current-c
   assert.deepEqual(saved, [change])
 })
 
-test('the fixed settings entry saves an installation configuration without needing a confirmed chat', async t => {
-  const page = await panelHarness(t)
-  await page.deliver({ signal: 'gray', summary: '当前会话未确认', identity: { threadId: null }, observation: { gap: 'observation-unavailable' }, analysis: { state: 'unknown' } })
-  const open = page.element('#settings-toggle').onclick()
-  await page.flush()
-  let call = page.sent.findLast(row => row.method === 'tools/call')
-  assert.equal(call.params.name, 'sentinel_model_settings')
-  page.reply(call.id, { structuredContent: state })
-  await open
-  assert.equal(page.element('#model-settings').hidden, false)
-  assert.equal(page.element('#settings-llm-model').value, 'summary-a')
-  page.element('#settings-llm-model').value = 'summary-b'
-  const saving = page.element('#settings-form').onsubmit({ preventDefault() {} })
-  await page.flush()
-  call = page.sent.findLast(row => row.method === 'tools/call')
-  assert.equal(call.params.name, 'sentinel_save_model_settings')
-  assert.equal(call.params.arguments.revision, state.revision)
-  assert.equal(call.params.arguments.config.llm.model, 'summary-b')
-  assert.equal(call.params.arguments.expectedThreadId, undefined)
-  page.reply(call.id, { structuredContent: { ...state, revision: 'settings-revision-b', config: { ...state.config, llm: { ...state.config.llm, model: 'summary-b' } } } })
-  await saving
-  assert.match(page.element('#settings-status').textContent, /已保存.*等待重新分析/)
-  assert.match(page.element('#summary').textContent, /未确认/)
-})
-
 test('production adapter settings bind the installation independently from collection and other installations', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-settings-'))
   let server, core, lazy, adapter
@@ -751,36 +937,4 @@ test('the actual diagnostics tab reads own failed collection through MCP and Cor
   assert.deepEqual(modelCalls, [])
   assert.equal((await core.snapshot()).sources.length, 2)
   assert.equal(page.sent.filter(row => row.params?.name === diagnosticTool.name).length, 1, 'saving and tab changes do not poll diagnostics')
-})
-
-test('model dropdown checks only directory metadata and preserves the manual model choice', async t => {
-  const page = await panelHarness(t)
-  await page.deliver({ summary: '当前会话未确认', identity: { threadId: null }, analysis: { state: 'unknown' } })
-  const opening = page.element('#settings-toggle').onclick(); await page.flush()
-  page.reply(page.sent.findLast(row => row.method === 'tools/call').id, { structuredContent: state }); await opening
-  const checking = page.element('#settings-llm-check').onclick(); await page.flush()
-  const call = page.sent.findLast(row => row.method === 'tools/call')
-  assert.equal(call.params.name, 'sentinel_model_directory')
-  assert.equal(call.params.arguments.baseUrl, state.config.llm.baseUrl)
-  assert.equal(call.params.arguments.model, undefined)
-  page.reply(call.id, { structuredContent: { state: 'online', online: true, inferenceVerified: false, models: [{ id: 'summary-a', role: 'summary' }, { id: '<manual>', role: 'unknown' }, { id: 'judge-a', role: 'jev' }] } })
-  await checking
-  assert.equal(page.element('#settings-llm-options').children.length, 2)
-  assert.match(page.element('#settings-llm-status').textContent, /模型可见.*未验证/)
-  assert.equal(page.element('#settings-llm-model').value, 'summary-a')
-})
-
-test('saving models rejects an already pending old-view response instead of restoring its summary', async t => {
-  const page = await panelHarness(t)
-  const view = { signal: 'gray', summary: '当前执行', identity: { threadId: 'main' }, analysis: { state: 'cooldown', resultDisposition: 'current', generated: { text: '旧模型总结。', evidence: [{ text: '旧依据', reference: 'old' }] } } }
-  await page.deliver(view)
-  const opening = page.element('#settings-toggle').onclick(); await page.flush()
-  page.reply(page.sent.findLast(row => row.method === 'tools/call').id, { structuredContent: state }); await opening
-  const oldRead = await page.refresh()
-  const saving = page.element('#settings-form').onsubmit({ preventDefault() {} }); await page.flush()
-  const save = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
-  page.reply(save.id, { structuredContent: { ...state, revision: 'settings-revision-b' } }); await saving
-  page.reply(oldRead, { structuredContent: view }); await page.flush()
-  assert.equal(page.element('#model-summary').hidden, true)
-  assert.doesNotMatch(page.element('#model-summary-text').textContent, /旧模型总结/)
 })

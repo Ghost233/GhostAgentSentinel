@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile, rename, chmod, rm, stat } from 'node:fs/pro
 import { join } from 'node:path'
 import { createCore } from './core/index.mjs'
 import { createAnalyzer } from './analysis/index.mjs'
-import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig } from './protocol.mjs'
+import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig, normalizeInstallationNotificationPreference } from './protocol.mjs'
 import { normalizeEnrollment } from './enrollment-config.mjs'
 import { HIERARCHY_FEATURE } from './hierarchy.mjs'
 import { GS_FEATURE } from './gs-status.mjs'
@@ -147,6 +147,12 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         if ([...params.keys()].length !== 1 || params.getAll('registrationId').length !== 1) throw new Error('invalid installation monitoring query')
         return send(200, await core.installationMonitoring(identifier(params.get('registrationId'))))
       }
+      if (request.method === 'GET' && request.url.startsWith('/v1/notifications/installations/preferences')) {
+        const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
+        if (url.pathname !== '/v1/notifications/installations/preferences') return send(404, { error: 'unknown endpoint' })
+        if ([...params.keys()].length !== 1 || params.getAll('registrationId').length !== 1) throw new Error('invalid installation notification preference query')
+        return send(200, await core.installationNotificationPreferences(identifier(params.get('registrationId'))))
+      }
       if (request.method === 'GET' && request.url.startsWith('/v1/notifications/native')) {
         const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
         if (url.pathname !== '/v1/notifications/native') return send(404, { error: 'unknown endpoint' })
@@ -192,6 +198,11 @@ export async function startServer({ dataDir, onIdle, ...options }) {
       const body = await readBody(request)
       let result
       switch (request.url) {
+        case '/v1/notifications/installations/preferences': {
+          const preference = normalizeInstallationNotificationPreference(body)
+          result = await core.setInstallationNotificationPreference(preference.registrationId, preference.kind, preference.enabled)
+          break
+        }
         case '/v1/analysis/installations/config': result = await core.configureInstallationAnalysis(identifier(body.registrationId), normalizeAnalysisConfig(body.config), identifier(body.revision)); break
         case '/v1/monitoring/installations': result = await core.setInstallationMonitoring(identifier(body.registrationId), body.paused, identifier(body.revision)); break
         case '/v1/source/register': result = await core.registerSource(normalizeSource(body)); break
@@ -205,6 +216,11 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         case '/v1/monitoring/collection-outcome': result = await core.recordCollectionOutcome(body); break
         case '/v1/conversation/monitoring': result = await core.setConversationMonitoring(body); break
         case '/v1/notifications/claim': counts.notificationClaims++; result = await core.claimNotifications(identifier(body.sourceKey)); break
+        case '/v1/notifications/submitting': {
+          if (Object.keys(body).some(key => !['sourceKey', 'id'].includes(key))) throw new Error('invalid notification submission scope')
+          result = await core.beginNotificationSubmission(identifier(body.sourceKey), identifier(body.id))
+          break
+        }
         case '/v1/notifications/native/eligibility': result = await core.setNativeNotificationEligibility(body); break
         case '/v1/notifications/native/result': result = await core.recordNativeNotificationResult(body); break
         case '/v1/sources': result = await core.configureSources(normalizeEnrollment(body)); break

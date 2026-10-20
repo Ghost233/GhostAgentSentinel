@@ -240,6 +240,7 @@ test('a disconnected source refreshes closed GS with core gray counts and an exp
 test('native UI pause leaves public event collection active while analysis and notifications pause and resume once', async t => {
   const data = await observedTree(t, ['root', 'deep', 'red'])
   data.service.claimNotifications = () => data.core.claimNotifications(data.sourceKey)
+  data.service.beginNotificationSubmission = id => data.core.beginNotificationSubmission(data.sourceKey, id)
   data.service.ackNotification = (id, result) => data.core.ackNotification(id, result)
   data.service.pause = () => data.core.pause(); data.service.resume = () => data.core.resume()
   await data.core.pause()

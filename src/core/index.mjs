@@ -11,7 +11,7 @@ import { createInstructionLookup, instructionContext, eventRef, referenceKey } f
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
 import { analysisTimeConditions } from '../analysis/index.mjs';
 import { inferenceFailureInfo } from '../analysis/failure-info.mjs';
-import { normalizeAnalysisConfig, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge } from '../protocol.mjs';
+import { normalizeAnalysisConfig, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
 import { createNativeNotificationStore } from './native-notifications.mjs';
 import { createNativeCaptureProgress } from './native-capture-progress.mjs';
@@ -55,10 +55,11 @@ export async function createCore({
   const conversationSettings = new Map();
   const installationAnalysisSettings = new Map();
   const installationMonitoringSettings = new Map();
+  const installationNotificationSettings = new Map();
   const installationAnalyzers = new Map();
   const installationRevision = randomUUID();
   const conversationRevision = randomUUID();
-  const collections = { sources, tasks, events, notifications, conversationSettings, installationAnalysisSettings, installationMonitoringSettings };
+  const collections = { sources, tasks, events, notifications, conversationSettings, installationAnalysisSettings, installationMonitoringSettings, installationNotificationSettings };
   let paused = false;
   let enrollment = { entries: [], configuredAt: null, managed: false };
   for (const row of rows) {
@@ -138,6 +139,14 @@ export async function createCore({
     const saved = installationMonitoringSettings.get(registrationId);
     return saved ? { registrationId, paused: saved.paused, revision: saved.revision } : { registrationId, paused: false, revision: fingerprint([installationRevision, 'monitoring', registrationId]) };
   };
+  const installationNotificationPreferences = registrationId => {
+    installationConfig(registrationId);
+    const saved = installationNotificationSettings.get(registrationId);
+    return copy(saved ? { registrationId, preferences: saved.preferences, revision: saved.revision } : { registrationId, preferences: { 'task-alert': true, 'monitoring-failure': true }, revision: fingerprint([installationRevision, 'notifications', registrationId]) });
+  };
+  const notificationEnabled = (registrationId, kind) => ['task-alert', 'monitoring-failure'].includes(kind) && (installationNotificationSettings.get(registrationId)?.preferences[kind] ?? true);
+  const notificationKind = notice => notice.kind ?? (sources.get(notice.sourceKey)?.descriptor.policy !== 'chatgpt-main/1' && notificationMembers(notice).some(member => tasks.get(member.taskKey)?.sourceKey === notice.sourceKey) ? 'task-alert' : null);
+  const notificationEvidence = alert => fingerprint([alert.requestId, alert.checkId, [...(alert.evidenceIds ?? [])].sort(), (alert.evidenceRefs ?? []).map(referenceKey).sort()]);
   const configScopeFor = task => {
     if (!analyzerFactory) return null;
     const { registrationId, revision } = installationConfig(sources.get(task.sourceKey).descriptor.registrationId);
@@ -157,7 +166,7 @@ export async function createCore({
     if (!scoped) throw new Error('Unknown ChatGPT conversation scope');
     return conversationFor(scoped);
   };
-  nativeNotifications = createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, readReceipt: id => failureStore.read(id), monitoringPaused: () => paused,
+  nativeNotifications = createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, readReceipt: id => failureStore.read(id), monitoringPaused: () => paused, notificationEnabled,
     chatPaused: (sourceKey, mainId) => conversationSettings.get(identity(sources.get(sourceKey)?.descriptor.registrationId, mainId))?.paused === true || installationPaused(sources.get(sourceKey)?.descriptor.registrationId),
     taskNoticeEligible: notification => notificationMembers(notification).some(member => memberAlerts(member).length > 0),
     accepted: notification => {
@@ -165,6 +174,7 @@ export async function createCore({
         const task = tasks.get(member.taskKey);
         for (const alert of task?.alerts ?? []) if (member.alertIds.includes(alert.id) && alert.notification?.id === notification.id) {
           alert.lastSubmittedAt = now();
+          delete alert.notificationMutedEvidence;
           alert.notification = { id: notification.id, status: 'submitted', delivery: 'system-accepted', seen: 'unknown', at: now() };
         }
         if (task) save('tasks', task);
@@ -646,6 +656,7 @@ export async function createCore({
   }
 
   function notificationEligible(notification, current) {
+    if (!notificationEnabled(sources.get(notification.sourceKey)?.descriptor.registrationId, notificationKind(notification))) return false;
     if (notification.kind === 'monitoring-failure') return nativeNotifications.scopeEligible(notification, current);
     return notificationMembers(notification).some(member => memberAlerts(member).length > 0);
   }
@@ -701,8 +712,15 @@ export async function createCore({
 
   function makeNotification(task, alerts) {
     if (alerts.length === 0) return;
+    if (!notificationEnabled(sources.get(task.sourceKey)?.descriptor.registrationId, 'task-alert')) {
+      let changed = false;
+      for (const alert of alerts) if (alert.lastSubmittedAt == null && alert.notificationMutedEvidence !== notificationEvidence(alert)) { alert.notificationMutedEvidence = notificationEvidence(alert); changed = true; }
+      if (changed) save('tasks', task);
+      return;
+    }
     const current = now();
     const due = alerts.filter(alert => {
+      if (alert.notificationMutedEvidence === notificationEvidence(alert) || current < (alert.notificationNotBefore ?? 0)) return false;
       if (waitExempts(alert, userWait(task, taskEvents(task), current), taskEvents(task))) return false;
       if (Array.from(notifications.values()).some(value => notificationMembers(value).some(member => member.alertIds.includes(alert.id)) && ['pending', 'claimed'].includes(value.status))) return false;
       const lastAttempt = Math.max(alert.lastSubmittedAt ?? 0, alert.lastAttemptAt ?? 0);
@@ -1372,7 +1390,7 @@ export async function createCore({
       const selectedSources = [...sources].filter(([, source]) => source.descriptor.registrationId === registrationId && source.descriptor.policy === 'chatgpt-main/1');
       if (selectedSources.some(([, source]) => connected(source))) throw Object.assign(new Error('Stop the ChatGPT installation before purging its Core data'), { code: 'chatgpt_installation_connected' });
       const sourceKeys = new Set(selectedSources.map(([key]) => key)), selectedTasks = [...tasks].filter(([, task]) => sourceKeys.has(task.sourceKey)), taskKeys = new Set(selectedTasks.map(([key]) => key));
-      const selected = { sources: selectedSources, tasks: selectedTasks, events: [...events].filter(([, event]) => sourceKeys.has(event.sourceKey) || taskKeys.has(event.taskKey)), notifications: [...notifications].filter(([, notice]) => sourceKeys.has(notice.sourceKey)), conversationSettings: [...conversationSettings].filter(([, setting]) => setting.registrationId === registrationId), installationAnalysisSettings: [...installationAnalysisSettings].filter(([key]) => key === registrationId), installationMonitoringSettings: [...installationMonitoringSettings].filter(([key]) => key === registrationId) };
+      const selected = { sources: selectedSources, tasks: selectedTasks, events: [...events].filter(([, event]) => sourceKeys.has(event.sourceKey) || taskKeys.has(event.taskKey)), notifications: [...notifications].filter(([, notice]) => sourceKeys.has(notice.sourceKey)), conversationSettings: [...conversationSettings].filter(([, setting]) => setting.registrationId === registrationId), installationAnalysisSettings: [...installationAnalysisSettings].filter(([key]) => key === registrationId), installationMonitoringSettings: [...installationMonitoringSettings].filter(([key]) => key === registrationId), installationNotificationSettings: [...installationNotificationSettings].filter(([key]) => key === registrationId) };
       const sharedEnrollment = [...sources.values()].some(source => source.descriptor.registrationId === registrationId && source.descriptor.policy !== 'chatgpt-main/1');
       const nextEnrollment = { ...enrollment, entries: enrollment.entries.filter(entry => entry.registrationId !== registrationId || sharedEnrollment) };
       const failurePlan = failureStore.prepareClearSources(sourceKeys);
@@ -1604,6 +1622,57 @@ export async function createCore({
       return { paused };
     },
     async installationAnalysisConfig(registrationId) { ensureOpen(); return installationConfig(registrationId); },
+    async installationNotificationPreferences(registrationId) { ensureOpen(); return installationNotificationPreferences(registrationId); },
+    async setInstallationNotificationPreference(registrationId, kind, enabled) {
+      ensureOpen();
+      normalizeInstallationNotificationPreference({ registrationId, kind, enabled });
+      const current = installationNotificationPreferences(registrationId);
+      if (current.preferences[kind] === enabled) return current;
+      const setting = { key: registrationId, registrationId, preferences: { ...current.preferences, [kind]: enabled }, revision: randomUUID() };
+      const affected = new Map(), currentTime = now(), interval = Math.max(600_000, repeatMs);
+      if (kind === 'task-alert') for (const original of tasks.values()) {
+        if (sources.get(original.sourceKey)?.descriptor.registrationId !== registrationId || !original.alerts.some(alert => alert.status === 'attention')) continue;
+        const task = copy(original);
+        for (const alert of task.alerts) if (alert.status === 'attention') {
+          if (!enabled && alert.lastSubmittedAt == null) alert.notificationMutedEvidence = notificationEvidence(alert);
+          if (enabled && alert.lastSubmittedAt != null) {
+            const base = Math.max(alert.lastSubmittedAt, alert.lastAttemptAt ?? 0);
+            alert.notificationNotBefore = base + Math.max(1, Math.floor((currentTime - base) / interval) + 1) * interval;
+          }
+        }
+        affected.set(task.key, task);
+      }
+      const notices = enabled ? [] : [...notifications.values()].filter(notice => sources.get(notice.sourceKey)?.descriptor.registrationId === registrationId && notificationKind(notice) === kind && (['pending', 'claimed'].includes(notice.status) || notice.native?.nativeRequestId && notice.native.pendingCancellation?.pending !== false && !notice.native.cancelRequestedAt)).map(original => {
+        const notice = copy(original);
+        if (['pending', 'claimed'].includes(notice.status)) { notice.status = 'cancelled'; notice.error = 'Installation notification preference is disabled'; }
+        if (notice.native?.nativeRequestId && notice.native.pendingCancellation?.pending !== false && !notice.native.cancelRequestedAt) notice.native.cancelRequestedAt = currentTime;
+        for (const member of notificationMembers(notice)) {
+          const originalTask = tasks.get(member.taskKey);
+          if (!originalTask) continue;
+          const task = affected.get(originalTask.key) ?? copy(originalTask);
+          for (const alert of task.alerts) if (alert.notification?.id === notice.id && notice.status === 'cancelled') alert.notification = { ...alert.notification, status: 'cancelled', at: currentTime };
+          affected.set(task.key, task);
+        }
+        return notice;
+      });
+      const nativeChanges = nativeNotifications.prepareTouches(notices);
+      let publishNative;
+      db.exec('SAVEPOINT installation_notification_preferences');
+      try {
+        for (const [collection, values] of [['installationNotificationSettings', [setting]], ['tasks', affected.values()], ['notifications', notices]]) for (const value of values) write.run(collection, value.key ?? value.id, JSON.stringify(value));
+        publishNative = nativeChanges.stage();
+        db.exec('RELEASE installation_notification_preferences');
+      } catch (error) {
+        try { db.exec('ROLLBACK TO installation_notification_preferences'); db.exec('RELEASE installation_notification_preferences'); }
+        catch (rollback) { throw new AggregateError([error, rollback], error.message); }
+        throw error;
+      }
+      installationNotificationSettings.set(registrationId, setting);
+      for (const [key, task] of affected) tasks.set(key, task);
+      for (const notice of notices) notifications.set(notice.id, notice);
+      publishNative();
+      return installationNotificationPreferences(registrationId);
+    },
     async configureInstallationAnalysis(registrationId, config, revision) {
       ensureOpen();
       installationConfig(registrationId);
@@ -1691,6 +1760,16 @@ export async function createCore({
       }
       return claimed;
     },
+    async beginNotificationSubmission(sourceKey, id) {
+      ensureOpen();
+      if (typeof sourceKey !== 'string' || !sourceKey || typeof id !== 'string' || !id || sourceKey.length > 2000 || id.length > 2000) throw new Error('Invalid notification submission scope');
+      const source = sources.get(sourceKey), notice = notifications.get(id);
+      if (!source || !notice || notice.sourceKey !== sourceKey || source.descriptor.policy === 'chatgpt-main/1' || notice.kind) throw new Error('Unknown legacy task notification scope');
+      tick(); expireClaim(notice);
+      const maySubmit = connected(source) && notice.status === 'claimed' && notice.submissionStartedAt == null && notificationEligible(notice);
+      if (maySubmit) { notice.submissionStartedAt = now(); save('notifications', notice); }
+      return { id, maySubmit };
+    },
     async ackNotification(id, result) {
       ensureOpen();
       const notification = notifications.get(id);
@@ -1707,7 +1786,7 @@ export async function createCore({
       for (const member of notificationMembers(notification)) {
         const task = tasks.get(member.taskKey);
         for (const alert of task?.alerts ?? []) if (member.alertIds.includes(alert.id) && alert.notification?.id === id) {
-          if (result.status === 'submitted') alert.lastSubmittedAt = now();
+          if (result.status === 'submitted') { alert.lastSubmittedAt = now(); delete alert.notificationMutedEvidence; }
           alert.notification = { id, status: result.status, delivery: notification.delivery, seen: 'unknown', error: notification.error, at: now() };
         }
         if (task) save('tasks', task);

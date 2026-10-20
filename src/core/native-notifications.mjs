@@ -6,7 +6,7 @@ const BASELINES = 'native-initial-baselines', MONITORED = 'native-initial-monito
 const copy = value => structuredClone(value);
 
 // Native facts extend the core's notification records; DSH records are untouched.
-export function createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused, chatPaused, taskNoticeEligible, accepted, readReceipt }) {
+export function createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused, chatPaused, taskNoticeEligible, accepted, readReceipt, notificationEnabled = () => true }) {
   const write = db.prepare('INSERT INTO records(collection,key,value) VALUES(?,?,?) ON CONFLICT(collection,key) DO UPDATE SET value=excluded.value');
   const remove = db.prepare('DELETE FROM records WHERE collection=? AND key=?');
   const saved = db.prepare('SELECT value FROM records WHERE collection=? AND key=?').get('settings', META);
@@ -106,6 +106,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
   }
   function scopeEligible(value, current) {
     const owner = sources.get(value.sourceKey);
+    if (!notificationEnabled(owner?.descriptor.registrationId, value.kind)) return false;
     if (!owner || owner.descriptor.policy !== 'chatgpt-main/1' || owner.descriptor.hostRunId !== value.hostRunId || monitoringPaused() || value.evidenceThrough <= (current ?? now()) - DAY) return false;
     if (value.mainId !== null && chatPaused(value.sourceKey, value.mainId)) return false;
     if (value.kind === 'task-alert') return taskNoticeEligible(value);
@@ -151,6 +152,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     let value = [...notifications.values()].find(value => value.kind === 'monitoring-failure' && value.groupKey === groupKey && value.status === 'pending' && value.receiptIds.length < 100 && current - value.createdAt < 3000);
     if (!value && !capacity()) return;
     value = value ? copy(value) : { id: randomUUID(), kind: 'monitoring-failure', sourceKey: receipt.sourceKey, hostRunId: owner.descriptor.hostRunId, mainId: receipt.mainId, lifecycleId: receipt.lifecycleId, groupKey, members: [], receiptIds: [], firstRoundIds: [], evidenceThrough: receipt.firstFailedAt, createdAt: current, readyAt: current, status: 'pending', delivery: 'unknown', seen: 'unknown', humanSeen: 'unknown', claimedAt: null };
+    if (!notificationEnabled(owner.descriptor.registrationId, 'monitoring-failure')) { value.status = 'cancelled'; value.error = 'Installation notification preference is disabled'; }
     if (rollup) value.rollupId = rollup.id;
     value.receiptIds.push(receipt.id); value.firstRoundIds.push(receipt.firstRoundId);
     value.title = 'GhostSentinel · 监控状态提醒';
@@ -255,6 +257,14 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     }
   }
   return { touch, removed, registerEnrollment, markMonitored, enrollmentPhase, prepareTask, observeFailure, scopeEligible, qualified, reconcile, cancel, publicRecord, claim, recordResult,
+    prepareTouches(values) {
+      let next = sequence;
+      for (const value of values) if (native(value)) value.nativeSequence = ++next;
+      return { stage() {
+        if (next !== sequence) write.run('settings', META, JSON.stringify({ sequence: next, prunedThrough, receiptPrunedThrough, historyGap, classificationGap }));
+        return () => { sequence = next; };
+      } };
+    },
     prepareClearSources(sourceKeys, notificationIds, receiptIds, registrationId) {
       const selected = [...links].filter(([id, link]) => notificationIds.has(link.notificationId) || receiptIds.has(id)), selectedEligibility = [...eligibility.keys()].filter(key => sourceKeys.has(key));
       const initial = [[BASELINES, baselines], [MONITORED, monitored], [ROLLUPS, rollups]].map(([collection, index]) => ({ collection, index, keys: [...index].filter(([key, value]) => collection === BASELINES ? key === registrationId : value.registrationId === registrationId).map(([key]) => key) }));

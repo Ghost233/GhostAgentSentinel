@@ -91,6 +91,8 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   const methods = {
     async snapshot() { invoked.push('snapshot'); return { ok: true, value: snapshot } },
     async claimNotifications() { invoked.push('claim'); return { ok: true, value: [{ id: 'notice-one', taskKey: 'task-one', title: '关注任务', body: '有依据的疑点' }] } },
+    // Only the single synthetic default notice is admitted here. Public Core fixtures supply their actual gate.
+    async beginNotificationSubmission(id) { assert.equal(id, 'notice-one'); invoked.push('begin'); return { ok: true, value: { id, maySubmit: true } } },
     async ackNotification(id, result) { acknowledged.push({ id, result }); return { ok: true, value: {} } },
     async analysisConfig() { return { ok: true, value: {} } },
     async analysisConfigState() { return { ok: true, value: { registrationId: 'fixture', config: {}, revision: 'fixture-revision' } } },
@@ -173,6 +175,142 @@ async function waitForDisplayedTask(fixture, title) {
     await fixture.settle()
   }
 }
+
+test('native task notification preferences persist independently from models and browser permission without a monitor', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-notification-settings-')), host = new Context(), operations = []
+  let server, core, adapter, f, blocker, permissionRequests = 0, holdWrites = false, responseFault = null
+  const held = [], originalFetch = globalThis.fetch
+  t.after(async () => { globalThis.fetch = originalFetch; blocker?.exec('ROLLBACK'); blocker?.close(); await f?.dispose(); for (const request of held) request.resolve(request.value); await f?.settle(); await adapter?.close(); await host.fiber.dispose(); await core?.close(); await server?.close(); await rm(dataDir, { recursive: true, force: true }) })
+  server = await startServer({ dataDir }); core = await connectCore({ dataDir })
+  const registrationId = 'dsh:notification-settings', other = await core.installationNotificationPreferences('chatgpt:other-notifications')
+  const models = await core.installationAnalysisConfig(registrationId)
+  globalThis.fetch = async (input, options) => {
+    const response = await originalFetch(input, options)
+    if (!responseFault || typeof input !== 'string' || !input.startsWith(server.url + '/v1/notifications/installations/preferences') || !response.ok) return response
+    const matches = responseFault === 'save' ? options?.method === 'POST' : options?.method === 'GET' && new URL(input).searchParams.get('registrationId') === registrationId
+    if (!matches) return response
+    responseFault = null
+    return new Response((await response.text()).slice(0, -1), { status: response.status, headers: response.headers })
+  }
+  await host.plugin(req('@deepseek-ai/dsh-llm').default)
+  for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop']) await host.plugin(req(`@deepseek-ai/${name}`).default, { agents: [] })
+  for (const name of ['dsh-typert-registry', 'dsh-api-remote-access', 'dsh-api-gateway']) await host.plugin(req(`@deepseek-ai/${name}`).default)
+  adapter = createAdapter(host, { dataDir, registrationId }, { flushMs: 10, heartbeatMs: 1000 })
+  const { Peer } = req('@deepseek-ai/dsh-client-connection'), peer = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' })
+  f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true, async $dispatch(endpoint, payload, signal) {
+    operations.push(endpoint)
+    const value = await host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer)
+    if (endpoint === 'sentinel/setInstallationNotificationPreference' && holdWrites) return new Promise(resolve => held.push({ value, resolve }))
+    return value
+  } })
+  f.Notification.requestPermission = async () => { permissionRequests++; return 'denied' }
+  await f.mountSettings()
+  const settings = () => f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  const toggle = () => settings().querySelector('[role=switch][aria-label="任务告警通知"]')
+  const status = () => settings().querySelector('[data-sentinel-notification-preferences-status]')?.textContent || ''
+  assert.ok(toggle(), 'the native installation settings expose a task-alert preference switch')
+  await f.waitUntil(() => status().includes('已读取'), 'the preference read is confirmed through actual Native Remote/Core')
+  assert.equal(toggle().getAttribute('aria-checked'), 'true')
+  assert.match(settings().textContent, /监控故障通知 · 暂不支持/)
+  assert.equal(settings().querySelectorAll('[role=switch]').length, 1, 'unsupported monitoring-failure delivery has no usable switch')
+  const inputs = [...settings().querySelectorAll('input')], { Simulate } = clientRequire('react-dom/test-utils')
+  await f.interact(async () => { inputs[1].value = 'unfinished-model-draft'; Simulate.change(inputs[1]); toggle().click(); await f.settle() })
+  await f.waitUntil(() => status().includes('已保存'), 'OFF receives its actual public persistence result')
+  assert.equal((await core.installationNotificationPreferences(registrationId)).preferences['task-alert'], false)
+  assert.equal((await core.installationNotificationPreferences(registrationId)).preferences['monitoring-failure'], true)
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), models)
+  assert.equal(inputs[1].value, 'unfinished-model-draft')
+  assert.equal((await core.installationMonitoring(registrationId)).paused, false)
+  assert.equal(f.plugin.diagnostics().viewInstances, 0)
+  await f.tick()
+  assert.equal(operations.filter(value => value === 'sentinel/installationNotificationPreferences').length, 1, 'preferences have no background polling')
+  assert.equal(permissionRequests, 0, 'reading or changing a preference never requests browser permission')
+  assert.ok([...settings().querySelectorAll('button')].find(value => value.textContent === '启用桌面通知'))
+  await f.unmountSettings(); await f.tick()
+  assert.equal(adapter.connected, true, 'closing the settings page keeps the same observation instance')
+  assert.equal((await core.installationNotificationPreferences(registrationId)).preferences['task-alert'], false)
+  await f.mountSettings()
+  await f.waitUntil(() => status().includes('已读取'), 'reopening reads the persisted OFF preference')
+  assert.equal(toggle().getAttribute('aria-checked'), 'false')
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  await f.waitUntil(() => status().includes('已保存'), 'a new valid ON click is saved')
+  assert.equal((await core.installationNotificationPreferences(registrationId)).preferences['task-alert'], true)
+  assert.deepEqual(await core.installationNotificationPreferences('chatgpt:other-notifications'), other)
+  assert.equal(permissionRequests, 0)
+  holdWrites = true
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  await f.waitUntil(() => held.length === 1, 'the first completed click has a real Core response delayed at Remote IO')
+  assert.match(status(), /正在保存/)
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  assert.equal(toggle().getAttribute('aria-checked'), 'true', 'the newer ON click is retained while the old OFF response is pending')
+  holdWrites = false; held[0].resolve(held[0].value)
+  await f.waitUntil(() => status().includes('已保存'), 'the later explicit click drains after the prior confirmed write')
+  assert.equal(toggle().getAttribute('aria-checked'), 'true')
+  assert.equal((await core.installationNotificationPreferences(registrationId)).preferences['task-alert'], true)
+  const { DatabaseSync } = await import('node:sqlite')
+  blocker = new DatabaseSync(join(dataDir, 'observations.sqlite')); blocker.exec('BEGIN IMMEDIATE')
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  await f.waitUntil(() => status().includes('保存失败'), 'an explicit Core rejection is shown as failed')
+  assert.equal(toggle().getAttribute('aria-checked'), 'false', 'the failed input is retained')
+  assert.equal((await core.installationNotificationPreferences(registrationId)).preferences['task-alert'], true)
+  blocker.exec('ROLLBACK'); blocker.close(); blocker = undefined
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  await f.waitUntil(() => status().includes('已保存'), 'a new valid click remains usable after rejection')
+  responseFault = 'save'
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  await f.waitUntil(() => status().includes('保存结果未知'), 'a committed save with a broken Core response is not called failed or saved')
+  assert.equal((await core.installationNotificationPreferences(registrationId)).preferences['task-alert'], false)
+  assert.equal(toggle().getAttribute('aria-checked'), 'false')
+  const writes = operations.filter(value => value === 'sentinel/setInstallationNotificationPreference').length
+  await f.tick(); assert.equal(operations.filter(value => value === 'sentinel/setInstallationNotificationPreference').length, writes, 'unknown saves are not blindly retried')
+  await f.unmountSettings(); responseFault = 'read'; await f.mountSettings()
+  await f.waitUntil(() => status().includes('读取通知偏好失败'), 'the independent preference read exposes its own failure')
+  assert.equal(settings().querySelectorAll('input').length, 4, 'preference read failure does not block model settings')
+  assert.ok([...settings().querySelectorAll('button')].find(value => value.textContent === '启用桌面通知'), 'preference read failure does not hide the explicit permission action')
+  assert.equal(permissionRequests, 0)
+})
+
+for (const ending of ['close', 'disable', 'reconnect']) test('notification preference requests keep the latest click and reject stale results after ' + ending, async t => {
+  const initial = { registrationId: 'fixture', preferences: { 'task-alert': true, 'monitoring-failure': true }, revision: 'preferences-initial' }, pending = []
+  let f, holdRead = true
+  t.after(async () => { await f?.dispose(); for (const request of pending) request.resolve({ ok: true, value: initial }); await f?.settle() })
+  f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true,
+    async installationNotificationPreferences(signal) { return holdRead ? new Promise(resolve => pending.push({ kind: 'read', signal, resolve })) : { ok: true, value: initial } },
+    async setInstallationNotificationPreference(kind, enabled, signal) { return new Promise(resolve => pending.push({ kind, enabled, signal, resolve })) },
+  })
+  await f.mountSettings()
+  await f.waitUntil(() => pending.length === 1, 'the settings preference read has its own actual Remote lifetime')
+  await f.unmountSettings(); assert.equal(pending[0].signal.aborted, true)
+  holdRead = false; await f.mountSettings()
+  const settings = () => f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  const toggle = () => settings().querySelector('[role=switch][aria-label="任务告警通知"]')
+  const status = () => settings().querySelector('[data-sentinel-notification-preferences-status]').textContent
+  await f.waitUntil(() => !toggle().disabled, 'reopening reads its current preference independently')
+  pending[0].resolve({ ok: true, value: { ...initial, preferences: { ...initial.preferences, 'task-alert': false } } })
+  await f.interact(async () => { await f.settle() })
+  assert.equal(toggle().getAttribute('aria-checked'), 'true', 'the late read does not repaint the new page')
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  await f.waitUntil(() => pending.length === 2, 'the OFF write entered actual Remote IO')
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  assert.equal(toggle().getAttribute('aria-checked'), 'true')
+  if (ending === 'close') await f.unmountSettings()
+  else if (ending === 'disable') { await f.disable(); await f.unmountSettings(); await f.reinstall(false) }
+  else await f.reinstall(false)
+  assert.equal(pending[1].signal.aborted, true)
+  if (ending !== 'reconnect') await f.mountSettings()
+  await f.waitUntil(() => !toggle().disabled, 'the new scope confirms identity without replaying an old queued write')
+  const beforeLate = status()
+  pending[1].resolve({ ok: true, value: { ...initial, preferences: { ...initial.preferences, 'task-alert': false }, revision: 'late-off' } })
+  await f.interact(async () => { await f.settle() })
+  assert.equal(toggle().getAttribute('aria-checked'), 'true'); assert.equal(status(), beforeLate)
+  assert.equal(pending.length, 2, 'closing or losing the scope discards its old pending ON click rather than blindly replaying it')
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  await f.waitUntil(() => pending.length === 3, 'a new explicit completion remains usable')
+  pending[2].resolve({ ok: true, value: { ...initial, registrationId: 'another-installation', preferences: { ...initial.preferences, 'task-alert': false } } })
+  await f.interact(async () => { await f.settle() })
+  assert.match(status(), /保存结果未知/); assert.equal(toggle().getAttribute('aria-checked'), 'false')
+  await f.tick(); assert.equal(pending.length, 3)
+})
 
 test('native model buttons read candidates and check connections independently without saving drafts or invoking inference', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-model-buttons-')), host = new Context(), calls = []
@@ -718,7 +856,7 @@ test('the actual DSH settings form autosaves groups through Native Remote and dr
   for (const sourceKey of peers.values()) assert.equal((await core.snapshot()).sources.find(source => source.key === sourceKey).status, 'connected')
 })
 
-async function publicNotificationClient(t, memberCount, overflow = false) {
+async function publicNotificationClient(t, memberCount, overflow = false, holdSubmission = false) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-notification-consumer-'))
   let time = Date.now(), core
   t.after(async () => { try { await core?.close() } finally { await rm(dataDir, { recursive: true, force: true }) } })
@@ -754,19 +892,81 @@ async function publicNotificationClient(t, memberCount, overflow = false) {
   assert.equal(snapshot.tasks.filter(task => task.gs.light === 'red').length, memberCount, 'Public grounded producer alerts settle before delivery')
   time += 3000
   assert.deepEqual(await core.claimNotifications(otherSourceKey), [], 'An unrelated source cannot claim these notifications')
-  const claims = [], acknowledgements = [], wireBodies = []
-  const f = await client(t, snapshot, 'granted', null, true, false, {
+  const claims = [], acknowledgements = [], wireBodies = [], submissions = []
+  let f
+  t.after(async () => { if (holdSubmission) { await f?.dispose(); for (const submission of submissions) { submission.resume?.(); submission.resolve?.({ ok: true, value: submission.permit }) }; await f?.settle() } })
+  f = await client(t, snapshot, 'granted', null, true, false, {
+    $nativeSlots: true,
+    async analysisConfigState() { return { ok: true, value: await core.installationAnalysisConfig('notification-consumer') } },
+    async installationNotificationPreferences() { return { ok: true, value: await core.installationNotificationPreferences('notification-consumer') } },
+    async setInstallationNotificationPreference(kind, enabled) { return { ok: true, value: await core.setInstallationNotificationPreference('notification-consumer', kind, enabled) } },
     async claimNotifications() {
       const notices = await core.claimNotifications(sourceKey); claims.push(...notices)
       // Fault injection at external Remote IO checks the consumer limit independently of the bounded producer.
       const wire = overflow ? notices.map(notice => ({ ...notice, body: notice.body + '\ncontrolled transport overflow' })) : notices
       wireBodies.push(...wire.map(notice => notice.body)); return { ok: true, value: wire }
     },
+    async beginNotificationSubmission(id) {
+      const submission = { id }; submissions.push(submission)
+      if (holdSubmission === 'before') await new Promise(resolve => { submission.resume = resolve })
+      const permit = await core.beginNotificationSubmission(sourceKey, id); submission.permit = permit
+      if (holdSubmission === true) return new Promise(resolve => { submission.resolve = resolve })
+      return { ok: true, value: permit }
+    },
     async ackNotification(id, result) { const receipt = await core.ackNotification(id, result); acknowledgements.push({ id, result, receipt }); return { ok: true, value: receipt } },
   })
-  await f.waitUntil(() => f.delivered.length === 1 && acknowledgements.length === 1 && f.plugin.diagnostics().pendingNotification === 0, 'Actual Remote delivers and acknowledges the public core claim')
-  return { core, sourceKey, otherSourceKey, sourceName, claims, acknowledgements, wireBodies, f }
+  if (holdSubmission) await f.waitUntil(() => submissions.length === 1 || f.delivered.length > 0, 'the actual client reaches the pre-submission boundary')
+  else await f.waitUntil(() => f.delivered.length === 1 && acknowledgements.length === 1 && f.plugin.diagnostics().pendingNotification === 0, 'Actual Remote delivers and acknowledges the public core claim')
+  return { core, sourceKey, otherSourceKey, sourceName, claims, acknowledgements, wireBodies, submissions, f }
 }
+
+test('a late public Core submission permit cannot deliver an old claim after task notifications switch OFF then ON', async t => {
+  const data = await publicNotificationClient(t, 1, false, true), { f, core } = data
+  assert.equal(f.delivered.length, 0, 'the actual client must await public Core eligibility before constructing a notification')
+  assert.equal(data.submissions.length, 1); assert.equal(data.submissions[0].permit.maySubmit, true)
+  await f.mountSettings()
+  const settings = f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  const toggle = () => settings.querySelector('[role=switch][aria-label="任务告警通知"]')
+  const status = () => settings.querySelector('[data-sentinel-notification-preferences-status]').textContent
+  await f.waitUntil(() => toggle() && !toggle().disabled, 'settings read the same production Core installation')
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  await f.waitUntil(() => status().includes('已保存'), 'OFF is confirmed before releasing the old permit')
+  assert.equal((await core.installationNotificationPreferences('notification-consumer')).preferences['task-alert'], false)
+  await f.interact(async () => { toggle().click(); await f.settle() })
+  await f.waitUntil(() => status().includes('已保存'), 'the new explicit ON completes without replaying an old claim')
+  data.submissions[0].resolve({ ok: true, value: data.submissions[0].permit })
+  await f.interact(async () => { await f.settle() })
+  await f.waitUntil(() => f.plugin.diagnostics().pendingNotification === 0, 'the held old submission response finishes')
+  assert.equal(f.delivered.length, 0); assert.equal(data.acknowledgements.length, 0)
+  assert.deepEqual(await core.claimNotifications(data.sourceKey), [], 'ON does not requeue the cancelled backlog')
+  assert.deepEqual(await core.beginNotificationSubmission(data.sourceKey, data.claims[0].id), { id: data.claims[0].id, maySubmit: false })
+  assert.equal((await core.snapshot()).monitoring.state, 'active')
+})
+
+test('an external OFF write rejects the old public claim at the Native submission gate without a local click', async t => {
+  const data = await publicNotificationClient(t, 1, false, 'before'), { f, core } = data
+  assert.equal(f.delivered.length, 0)
+  await core.setInstallationNotificationPreference('notification-consumer', 'task-alert', false)
+  assert.equal((await core.installationNotificationPreferences('other-consumer-source')).preferences['task-alert'], true)
+  data.submissions[0].resume()
+  await f.waitUntil(() => f.plugin.diagnostics().pendingNotification === 0, 'the pre-constructor gate observes the actual external preference write')
+  assert.equal(data.submissions[0].permit.maySubmit, false)
+  assert.equal(f.delivered.length, 0); assert.equal(data.acknowledgements.length, 0)
+  await core.setInstallationNotificationPreference('notification-consumer', 'task-alert', true)
+  await f.tick()
+  assert.equal(f.delivered.length, 0); assert.deepEqual(await core.claimNotifications(data.sourceKey), [])
+})
+
+for (const ending of ['disable', 'reconnect']) test('a pending public submission permit is discarded after client ' + ending, async t => {
+  const data = await publicNotificationClient(t, 1, false, true), { f } = data
+  assert.equal(f.delivered.length, 0); assert.equal(data.submissions[0].permit.maySubmit, true)
+  if (ending === 'disable') await f.disable()
+  else await f.reinstall(false)
+  data.submissions[0].resolve({ ok: true, value: data.submissions[0].permit })
+  await f.interact(async () => { await f.settle() })
+  await f.waitUntil(() => f.plugin.diagnostics().pendingNotification === 0, 'the old permit no longer owns a live client delivery')
+  assert.equal(f.delivered.length, 0); assert.equal(data.acknowledgements.length, 0)
+})
 
 test('actual native Remote passes both grouped public notification members to the system constructor beyond the first 240 characters', async t => {
   const data = await publicNotificationClient(t, 2), { f } = data
@@ -1336,6 +1536,7 @@ test('notification transport recovery retains an earlier browser delivery failur
   let claims = 0
   const snapshot = { protocol: 1, generatedAt: Date.now(), monitoring: { state: 'active' }, overview: {}, sources: [], tasks: [] }
   const f = await client(t, snapshot, 'granted', null, true, true, {
+    async beginNotificationSubmission(id) { assert.equal(id, 'persistent-delivery'); return { ok: true, value: { id, maySubmit: true } } },
     async claimNotifications() {
       claims++
       if (claims === 1) return { ok: true, value: [{ id: 'persistent-delivery', title: '执行疑点' }] }

@@ -90,6 +90,12 @@ Codex 的 app-only `sentinel_installation_diagnostics({})` 与 DSH 的 `installa
 
 最后来源退出：保存、取消自己分析请求，短宽限后退出；模型驻留，晚到结果忽略。重启恢复只使用 24 小时保留资料，来源/运行状态先标未知，重新登记与基线确认后再分析，不恢复原任务或旧请求。
 
+安装通知偏好由 `installationNotificationPreferences(registrationId)` 读取，`setInstallationNotificationPreference(registrationId, kind, enabled)` 只修改一类；返回 `{registrationId, preferences, revision}`，两类键为 `task-alert` 与 `monitoring-failure`，默认开启，revision 仅作状态标识，不做比较交换。HTTP 使用 `/v1/notifications/installations/preferences` 的 GET／POST。偏好、待发取消和证据抑制在既有存储事务中提交，关闭与重开不清除任务问题，也不补发关闭期间积压；正式版、test 和 DSH 按各自安装隔离。DSH 监控故障通知按用户决定后置，设置明确显示“暂不支持”。
+
+Codex 设置使用 app-only 的 `sentinel_installation_notification_preferences` 与 `sentinel_set_installation_notification_preference`；明确申请系统许可使用 `sentinel_request_installation_notification_permission`，不依赖某条聊天或采集恢复，普通读取不申请许可。保存拒写与响应未知沿用模型设置的分类。DSH 在调用浏览器通知前经 `beginNotificationSubmission(sourceKey, id)` 取得一次性资格，客户端不能指定另一来源。已返回资格后的跨窗口关闭与浏览器外部 IO 仍有异步窗口；旧回执不恢复已取消资格，这一窗口尚未作为完全阻断通过验收。
+
+Codex 监控页只提供“当前问题／详情”，不再包含设置表单、系统许可按钮和旧的按执行通知记录界面。历史结果仅在详情呈现；`history.currentStatus` 与 `history.currentSignal` 取当前主聊天执行，不使用所选历史轮次的灯号。无已确认身份不补造运行节点，终止节点退出四灯计数。问题中的通知短标记只反映已有提交事实，不表示用户看见。安装级通知记录界面仍由工单 08 接入，不将旧服务接口或占位 tab 记为完成。
+
 ## 交付界限
 
 共享运行与资源回收覆盖任务／工具索引、客户端请求收尾、面板刷新与后台通知分工，保留至少 20 个并发客户端和 100 次循环的资源检查。Codex 共享 HTTP MCP 方案后置。
@@ -130,7 +136,7 @@ ChatGPT 的通知驱动在共享核心登记可信 App／插件资格，每次�
 
 撤销每批最多向原生 IO 提交 100 个请求 ID，一轮最多 11 批；只为实际提交的 ID 确认撤销结果。已确认不再待投递的撤销记录不占用后续批次，超过处理上限保留缺口，不能提前确认未提交的请求。
 
-sentinel_current_chat 可携带 expectedThreadId、executionKey 和 historyCursor，按当前已核实的主聊天返回本安装 24 小时内已监控执行。历史选择和分页不调度已结束执行的分析；首次采集时间不因核心或适配器重启延长。app-only 的 sentinel_notification_records 另按所选执行查询通知，每页最多 20 条，页面仅在用户打开、刷新或翻页时读取。所有返回均核对聊天、来源和执行范围，切换或销毁页面后晚到结果失效。
+sentinel_current_chat 可携带 expectedThreadId、executionKey 和 historyCursor，按当前已核实的主聊天返回本安装 24 小时内已监控执行。历史选择和分页不调度已结束执行的分析；首次采集时间不因核心或适配器重启延长。旧 app-only 的 sentinel_notification_records 按所选执行查询通知，每页最多 20 条；该服务接口保留，但监控页面已移除旧入口。所有返回均核对聊天、来源和执行范围，切换或销毁页面后晚到结果失效。
 
 history 或 inherited 材料保留为上下文，但不更新当前请求、任务状态、执行活动，也不作新验证。历史非用户材料的缺口保留在历史，不直接污染当前检查；缺少用户上下文所需的证明仍阻止完整判断。
 

@@ -302,6 +302,20 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       }
     },
     async analysisConfig(signal) { return (await service.analysisConfigState(signal)).config },
+    installationNotificationPreferences(signal) { return installationCall('installationNotificationPreferences', [], signal) },
+    async setInstallationNotificationPreference(kind, enabled, signal) {
+      try { return await installationCall('setInstallationNotificationPreference', [kind, enabled], signal) }
+      catch (error) {
+        const requestFailure = error?.coreRequestFailure
+        const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
+          && error?.code !== 'analysis_config_unconfirmed' && requestFailure?.operation === '/v1/notifications/installations/preferences' && requestFailure.kind === 'http' && requestFailure.status >= 400 && requestFailure.status <= 599
+        const failure = error && typeof error === 'object' ? error : new Error(String(error))
+        failure.code ??= 'gateway/internal'; failure.isDSHRemoteError = true
+        failure.details = { ...failure.details, saveOutcome: rejected ? 'rejected' : 'unknown' }
+        throw failure
+      }
+    },
+    beginNotificationSubmission(id, signal) { return invoke('beginNotificationSubmission', sourceKey, id, signal) },
     sourcePlan(signal) { return invoke('sourcePlan', signal) }, configureSources(value, signal) { return invoke('configureSources', value, signal) },
     claimNotifications(signal) { return invoke('claimNotifications', sourceKey, signal) },
     ackNotification(id, result, signal) { return invoke('ackNotification', id, result, signal) },

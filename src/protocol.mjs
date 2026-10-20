@@ -37,6 +37,12 @@ function time(value, field) {
   return value
 }
 
+export function normalizeInstallationNotificationPreference(value) {
+  const input = object(value, 'installation notification preference')
+  if (Object.keys(input).some(key => !['registrationId', 'kind', 'enabled'].includes(key)) || !['task-alert', 'monitoring-failure'].includes(input.kind) || typeof input.enabled !== 'boolean') throw new Error('invalid installation notification preference')
+  return { registrationId: string(input.registrationId, 'registrationId', 2000), kind: input.kind, enabled: input.enabled }
+}
+
 export function normalizeConversationMonitoring(value, control = false) {
   const input = object(value, 'conversation monitoring')
   const allowed = control ? ['registrationId', 'taskId', 'paused', 'revision'] : ['registrationId', 'taskId']

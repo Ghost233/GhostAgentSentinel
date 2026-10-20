@@ -70,7 +70,7 @@ function materialContext(snapshot, sourceKey, batch, inheritance = null) {
 function materialView(view, task, { historical = false, snapshot } = {}) {
   const states = { queued: '检查排队中', analyzing: '正在检查', unavailable: '本地摘取模型或 JEV 未配置', failed: '本轮分析失败', unknown: '当前请求或分析证据不足', cooldown: '本轮六项检查已更新', idle: '最近检查结果' }
   const findings = historical ? task.analysis.checks.filter(check => check.status === 'attention').map(check => ({ ...check, checkId: check.id })) : task.alerts.filter(alert => alert.status === 'attention')
-  const issues = findings.map(alert => ({ checkId: alert.checkId, reason: alert.reason.slice(0, 240), evidence: (alert.evidenceIds ?? []).map(id => task.events.find(event => event.id === id)).filter(Boolean).slice(0, 2).map(event => ({ text: event.text.slice(0, 120), reference: event.evidence ?? event.id })) }))
+  const issues = findings.map(alert => ({ checkId: alert.checkId, reason: alert.reason.slice(0, 240), notificationStatus: !historical && ['pending', 'claimed', 'submitted', 'failed', 'cancelled', 'expired'].includes(alert.notification?.status) ? alert.notification.status : null, evidence: (alert.evidenceIds ?? []).map(id => task.events.find(event => event.id === id)).filter(Boolean).slice(0, 2).map(event => ({ text: event.text.slice(0, 120), reference: event.evidence ?? event.id })) }))
   const own = task.events.filter(event => event.taskLifecycleId === task.lifecycleId && !event.data?.history && !event.data?.inherited)
   const inputRef = task.instructionContext?.binding?.inputRef
   const request = own.find(event => event.kind === 'input' && event.id === inputRef?.eventId && event.taskId === inputRef.taskId && event.taskLifecycleId === inputRef.lifecycleId && event.authorizationEligible)
@@ -521,7 +521,10 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const selected = selection.executionKey ? records.find(value => value.task.key === selection.executionKey) : current
     const cursorIndex = selection.historyCursor ? records.findIndex(value => value.task.key === selection.historyCursor) : -1
     const page = records.slice(cursorIndex + 1, cursorIndex + 21), hasMore = records.length > cursorIndex + 21
-    const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null, hasMore, cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0), currentGap: retainedOnly ? entry.view.observation?.gap ?? 'current-turn-not-observed' : null, retentionMs: 86400000 }
+    const currentVerified = Boolean(current && !retainedOnly && !entry.view.observation?.recordRevalidating)
+    const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null,
+      currentStatus: currentVerified ? current.task.status : 'unknown', currentSignal: currentVerified && current.task.analysis.state !== 'paused' && !snapshot.monitoring?.paused ? current.task.gs?.light ?? 'gray' : 'gray',
+      hasMore, cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0), currentGap: retainedOnly ? entry.view.observation?.gap ?? 'current-turn-not-observed' : null, retentionMs: 86400000 }
     if (!selected) return { ...(entry.view.observation?.coldReadStage ? entry.view : gapView(selection.executionKey ? 'history-unavailable' : entry.view.observation?.gap ?? 'current-turn-not-observed', entry.id)), health: entry.health, history }
     const historical = retainedOnly || selected !== current || ['ended', 'aborted'].includes(selected.item.status)
     const view = materialView({ ...entry.view, ...(historical ? { currentFacts: undefined, inheritance: undefined } : {}), identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical, snapshot })
@@ -642,7 +645,28 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       return projectInstallationDiagnostics(result.setting, result.snapshot, { collectionError, collectionState: qualified.gap ? 'unconfirmed' : null })
     },
   } : undefined
-  try { panel = await startPanelServer({ read, modelSettings, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
+  const installationNotifications = collectMaterials ? {
+    async read({ signal } = {}) {
+      const { result } = await settingsRead(signal, async signal => {
+        await core.health(signal); await qualifySettings(); signal.throwIfAborted()
+        return core.installationNotificationPreferences('chatgpt:' + installationId, signal)
+      })
+      return { ...result, permission: delivery?.authorization() ?? null }
+    },
+    async save({ kind, enabled }, { signal } = {}) {
+      const { result } = await settingsRead(signal, async signal => {
+        await core.health(signal); await qualifySettings(); signal.throwIfAborted()
+        return core.setInstallationNotificationPreference('chatgpt:' + installationId, kind, enabled, signal)
+      })
+      if (delivery) track(delivery.preferencesChanged(kind)).catch(() => { notificationError = 'native_unavailable' })
+      return result
+    },
+    ...(delivery ? { async requestPermission({ signal } = {}) {
+      const { result } = await settingsRead(signal, () => delivery.requestAuthorization())
+      return { registrationId: 'chatgpt:' + installationId, permission: result }
+    } } : {}),
+  } : undefined
+  try { panel = await startPanelServer({ read, modelSettings, installationNotifications, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }
   if (onQualificationLost) await qualification()
   const schedule = () => { if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(); schedule() }, pollMs) }

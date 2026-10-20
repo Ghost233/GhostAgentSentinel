@@ -8,6 +8,8 @@ export function createNotificationDelivery({ core, native, installationId, quali
   if (!core || !native || typeof qualify !== 'function' || typeof installationId !== 'string' || !installationId) throw new Error('Notification delivery requires core, native IO and installation qualification')
   const prefix = notificationPrefix(installationId), sources = new Map(), refreshing = new Map()
   let stopped = false, stopping = null, queue = Promise.resolve(), authorizing = null
+  const preferenceRevisions = { 'task-alert': 0, 'monitoring-failure': 0 }
+  let activeNoticeKind = null
   let authorization = { authorization: 'unknown', lastCheckedAt: null, bundleId: NOTIFICATION_BUNDLE_ID, alertSetting: 'unknown', notificationCenterSetting: 'unknown', requestInFlight: false, errorCode: null }
   const serial = operation => { const pending = queue.then(operation); queue = pending.catch(() => {}); return pending }
   const cache = result => { authorization = { authorization: result.authorization, lastCheckedAt: now(), bundleId: NOTIFICATION_BUNDLE_ID, alertSetting: result.alertSetting ?? authorization.alertSetting, notificationCenterSetting: result.notificationCenterSetting ?? authorization.notificationCenterSetting, requestInFlight: false, errorCode: null } }
@@ -69,18 +71,20 @@ export function createNotificationDelivery({ core, native, installationId, quali
     if (!current() || facts.appRunning !== true || facts.pluginEnabled !== true || !permitted(authorization.authorization)) return summary
     const notices = await core.claimNotifications(sourceKey)
     for (const notice of notices) {
+      const preferenceRevision = preferenceRevisions[notice.kind]
+      const noticeCurrent = () => current() && preferenceRevisions[notice.kind] === preferenceRevision
       if (!notice.native?.attemptId || notice.hostRunId !== facts.hostRunId) { summary.historyGap = true; continue }
       let qualification
       try { qualification = await qualify(notice) } catch { qualification = null }
       if (qualification?.hostRunId === notice.hostRunId && (qualification.appRunning !== true || qualification.pluginEnabled !== true)) await core.setNativeNotificationEligibility({ sourceKey, hostRunId: qualification.hostRunId, appRunning: qualification.appRunning ?? null, pluginEnabled: qualification.pluginEnabled ?? null })
-      let reason = stopped ? 'driver-stopped' : !current() || !qualification || qualification.hostRunId !== notice.hostRunId || qualification.appRunning !== true || qualification.pluginEnabled !== true ? 'qualification-unconfirmed' : notice.mainId !== null && qualification.projectEnabled !== true ? qualification.projectEnabled === false ? 'project-disabled' : 'project-unconfirmed' : null
+      let reason = stopped ? 'driver-stopped' : !noticeCurrent() || !qualification || qualification.hostRunId !== notice.hostRunId || qualification.appRunning !== true || qualification.pluginEnabled !== true ? 'qualification-unconfirmed' : notice.mainId !== null && qualification.projectEnabled !== true ? qualification.projectEnabled === false ? 'project-disabled' : 'project-unconfirmed' : null
       if (reason) { await record(notice, { event: 'suppressed', reason }, summary); summary.suppressed++; continue }
       await core.setNativeNotificationEligibility({ sourceKey, hostRunId: qualification.hostRunId, appRunning: qualification.appRunning, pluginEnabled: qualification.pluginEnabled })
-      if (!current()) { await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary); summary.suppressed++; continue }
+      if (!noticeCurrent()) { await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary); summary.suppressed++; continue }
       await record(notice, { event: 'authorization', authorization: authorization.authorization, observedAt: authorization.lastCheckedAt }, summary)
       const intent = await record(notice, { event: 'submitting' }, summary)
-      if (!intent?.maySubmit || !current()) {
-        if (!current()) {
+      if (!intent?.maySubmit || !noticeCurrent()) {
+        if (!noticeCurrent()) {
           await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary)
           if (intent?.maySubmit) await record(notice, { event: 'not-submitted' }, summary)
         }
@@ -89,21 +93,27 @@ export function createNotificationDelivery({ core, native, installationId, quali
         continue
       }
       try {
+        activeNoticeKind = notice.kind
         const result = await native.submit({ requestId: packet(notice, {}).nativeRequestId, title: notice.title, body: notice.body, metadata: { notificationId: notice.id, attemptId: notice.native.attemptId, sourceKey: notice.sourceKey, hostRunId: notice.hostRunId, mainId: notice.mainId, lifecycleId: notice.lifecycleId } })
-        if (!current()) await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary)
+        if (!noticeCurrent()) await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary)
         cache({ ...authorization, ...result })
         await record(notice, { event: 'authorization', authorization: result.authorization, observedAt: result.observedAt }, summary)
         if (result.accepted) { await record(notice, { event: 'accepted', observedAt: result.observedAt }, summary); summary.submitted++ }
         else { await record(notice, { event: 'suppressed', reason: 'qualification-unconfirmed', observedAt: result.observedAt }, summary); summary.suppressed++ }
       } catch (error) {
-        if (!current()) await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary)
+        if (!noticeCurrent()) await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary)
         await record(notice, { event: safeError(error) === 'native_submission' ? 'submission-failed' : 'submission-unknown', errorCode: safeError(error) }, summary); summary.failed++; summary.errorCode = safeError(error)
-      }
+      } finally { activeNoticeKind = null }
     }
     return summary
   }
   return {
     authorization: () => ({ ...authorization, requestInFlight: authorizing !== null }),
+    preferencesChanged(kind) {
+      preferenceRevisions[kind]++
+      if (activeNoticeKind === kind) native.cancelPendingOperations?.()
+      return Promise.allSettled([...sources.values()].map(state => this.refresh(state.facts)))
+    },
     requestAuthorization() {
       if (stopped) return Promise.resolve({ ...authorization, errorCode: 'native_unavailable' })
       if (authorizing) return authorizing

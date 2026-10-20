@@ -17,6 +17,14 @@ function parameterCodec(name) {
       if (typeof value !== 'string' || !value || value.length > 2000) throw new Error('分析配置修订令牌无效')
       return value
     }
+    if (name === 'kind') {
+      if (!['task-alert', 'monitoring-failure'].includes(value)) throw new Error('通知类别无效')
+      return value
+    }
+    if (name === 'enabled') {
+      if (typeof value !== 'boolean') throw new Error('通知偏好必须为布尔值')
+      return value
+    }
     if (name === 'directorySelection') {
       if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 || typeof value.baseUrl !== 'string' || !value.baseUrl || value.baseUrl.length > 2000 || /[\u0000-\u001f\u007f]/.test(value.baseUrl)) throw new Error('模型目录地址无效')
       return value
@@ -48,6 +56,7 @@ module.exports = function descriptors() {
   const methods = {
     snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'],
     configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'],
+    installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id'],
   }
   return Object.entries(methods).map(([method, parameters]) => ({
     id: `ghost-agent-sentinel#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,

@@ -11,6 +11,7 @@ import { connectCore } from '../src/core-client.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
 import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
+import { panelHarness } from './helpers/chatgpt-panel.mjs'
 
 const DAY = 86_400_000
 const profile = { appVersion: '26.1007.71326', appBuild: '20398', cliVersion: '0.162.0-alpha.17.2' }
@@ -123,6 +124,8 @@ test('the authenticated current-chat panel can select a monitored prior executio
   assert.deepEqual(current.history.executions.map(item => item.lifecycleId), ['alpha-two', 'alpha-one'])
   assert.equal(current.execution.lifecycleId, 'alpha-two')
   assert.equal(current.execution.historical, false)
+  assert.equal(current.history.currentStatus, 'running')
+  assert.equal(current.history.currentSignal, 'gray', 'an unconfigured current execution cannot borrow an old analysis result')
   const previous = current.history.executions.find(item => item.lifecycleId === 'alpha-one')
   const old = await f.read('alpha', { executionKey: previous.key, expectedThreadId: 'alpha' })
   assert.equal(old.identity.threadId, 'alpha')
@@ -197,6 +200,8 @@ test('a newly qualified App generation can show retained history while the old t
   assert.equal(recent.execution.request, 'Read retained.log only')
   assert.equal(recent.signal, 'gray')
   assert.ok(recent.history.currentGap, 'history does not claim the old turn started in this App generation')
+  assert.equal(recent.history.currentStatus, 'unknown')
+  assert.equal(recent.history.currentSignal, 'gray')
   assert.ok((await f.core.snapshot()).tasks.every(task => task.status !== 'running'))
 })
 
@@ -261,13 +266,27 @@ test('a historical execution retains the grounded problem and its own inline evi
   f.advance(1000)
   await appendFile(f.threads.get('main').path, row('event_msg', { type: 'task_complete', turn_id: 'prior-alert' }, f.now()) + turn('main', 'next', 'Read next log only', f.now() + 1))
   f.threads.get('main').anchorTurnId = 'next'
+  await f.read('main'); await settled(f, [['main', 'next']])
   const current = await f.read('main'), prior = current.history.executions.find(item => item.lifecycleId === 'prior-alert')
+  assert.equal(current.history.currentStatus, 'running')
+  assert.equal(current.history.currentSignal, 'red')
   const old = await f.read('main', { executionKey: prior.key, expectedThreadId: 'main' })
   const issue = old.analysis.issues.find(issue => issue.checkId === 'request_drift')
   assert.ok(issue, 'ending a task stops notices without deleting its monitored history finding')
   assert.ok(issue.evidence.some(evidence => evidence.text === 'Read the log only'))
   assert.ok(issue.evidence.every(evidence => !evidence.text.includes('next log')))
   assert.equal(old.signal, 'gray')
+  assert.equal(old.history.currentSignal, 'red', 'historical selection preserves the current main execution light')
+  const page = await panelHarness(t); await page.deliver(current)
+  const selecting = page.element('#history-list').children.find(item => item.getAttribute('data-execution-key') === prior.key).onclick()
+  await page.flush()
+  const request = page.sent.findLast(item => item.params?.name === 'sentinel_current_chat')
+  assert.equal(request.params.arguments.executionKey, prior.key)
+  page.reply(request.id, { structuredContent: old }); await selecting
+  assert.equal(page.element('#monitor-details').hidden, false)
+  assert.equal(page.element('#gs-red').textContent, '🔴 1')
+  assert.equal(page.element('#issues').textContent, '', 'the old problem is available only in its historical detail')
+  assert.match(page.element('#detail-issues').textContent, /Read the log only/)
 })
 
 test('two main chats keep their source context while completed turns stop analysis and never grant proof to a different current turn', async t => {

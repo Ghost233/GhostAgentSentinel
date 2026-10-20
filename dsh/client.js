@@ -24,6 +24,14 @@
             if (typeof value !== 'string' || !value || value.length > 2000) throw new Error('分析配置修订令牌无效')
             return value
           }
+          if (name === 'kind') {
+            if (!['task-alert', 'monitoring-failure'].includes(value)) throw new Error('通知类别无效')
+            return value
+          }
+          if (name === 'enabled') {
+            if (typeof value !== 'boolean') throw new Error('通知偏好无效')
+            return value
+          }
           if (name === 'id') {
             if (typeof value !== 'string' || !value || value.length > 2000) throw new Error('通知 ID 无效')
             return value
@@ -50,7 +58,7 @@
           return value
         } }) }
       }
-      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'] }
+      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id'] }
       const descriptors = Object.entries(methods).map(([method, parameters]) => ({
         id: `${id}#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,
         invocation: { kind: 'direct' }, cancellation: { parameter: 'signal' }, parameters: parameters.map(name => ({ name, wire: name, source: 'json', codec: parameterCodec(name) })), result: { mode: 'src-json' },
@@ -114,7 +122,7 @@
           if (!scope.active || abort.signal.aborted) throw new Error('观察请求已取消')
           if (!response?.ok) {
             const error = new Error(response?.error?.message || `观察操作失败：${response?.error?.code || method}`)
-            if (method === 'configureAnalysisIfCurrent') error.saveOutcome = response?.error?.details?.saveOutcome === 'rejected' ? 'rejected' : 'unknown'
+            if (['configureAnalysisIfCurrent', 'setInstallationNotificationPreference'].includes(method)) error.saveOutcome = response?.error?.details?.saveOutcome === 'rejected' ? 'rejected' : 'unknown'
             throw error
           }
           return response.value
@@ -160,14 +168,19 @@
       }
       async function pollNotifications() {
         if (!connectionScope?.active || notificationRequest || typeof Notification === 'undefined' || Notification.permission !== 'granted') return
-        const scope = connectionScope, request = { scope }; notificationRequest = request
+        const scope = connectionScope, request = { scope, preferenceVersion: scope.notificationPreferenceVersion || 0 }; notificationRequest = request
+        const current = () => connectionScope === scope && scope.active && Notification.permission === 'granted' && request.preferenceVersion === (scope.notificationPreferenceVersion || 0)
         try {
           const notices = await scopedCall(scope, 'claimNotifications')
-          if (connectionScope !== scope || !scope.active) return
+          if (!current()) return
           if (state.notificationError) notifyState({ notificationError: '' })
           for (const notice of Array.isArray(notices) ? notices : []) {
-            if (!scope.active) return
+            if (!current()) return
             try {
+              const permit = await scopedCall(scope, 'beginNotificationSubmission', [notice.id])
+              if (!current()) return
+              if (permit?.id !== notice.id || typeof permit.maySubmit !== 'boolean') throw new Error('通知提交资格未确认')
+              if (!permit.maySubmit) continue
               const notification = new Notification(text(notice.title) || 'Sentinel · 执行疑点', {
                 body: (text(notice.body) || text(notice.message) || '请打开 Sentinel 查看依据和分析覆盖').slice(0, 1200), tag: `sentinel:${notice.id}`,
               })
@@ -184,12 +197,12 @@
               await scopedCall(scope, 'ackNotification', [notice.id, { status: 'submitted' }])
               if (scope.active && connectionScope === scope) notifyState({ notification: '通知已提交给系统；未确认用户看见' })
             } catch (error) {
-              if (!scope.active || connectionScope !== scope) return
+              if (!current()) return
               notifyState({ notification: `桌面通知投递失败：${errorText(error)}` })
               await scopedCall(scope, 'ackNotification', [notice.id, { status: 'failed', error: errorText(error) }])
             }
           }
-        } catch (error) { if (scope.active && connectionScope === scope) notifyState({ notificationError: errorText(error) }) }
+        } catch (error) { if (current()) notifyState({ notificationError: errorText(error) }) }
         finally { if (notificationRequest === request) notificationRequest = undefined }
       }
       function attachView(binding) {
@@ -451,14 +464,72 @@
         const [tab, setTab] = useState('settings'), [config, setConfig] = useState(null), [error, setError] = useState('')
         const [permissionMessage, setPermissionMessage] = useState(notificationStatus), [requestingPermission, setRequestingPermission] = useState(false)
         const [modelChecks, setModelChecks] = useState({})
+        const [preferences, setPreferences] = useState({ enabled: true, ready: false, status: '正在读取通知偏好' })
+        const preferenceIdentity = useRef(null), preferenceScope = useRef(null), preferenceRead = useRef(null)
+        const preferenceDraft = useRef(true), preferenceVersion = useRef(0), preferenceDirty = useRef(false), preferencePending = useRef(null), preferenceWriting = useRef(false)
         const savedConfig = useRef(null), lifetime = useRef(null), permissionRequest = useRef(null)
         if (!lifetime.current) lifetime.current = new AbortController()
         const acceptConfig = current => { savedConfig.current = current; setConfig(current) }
+        const preferenceCurrent = scope => !lifetime.current.signal.aborted && scope?.active && scope === connectionScope
+        function validatePreferences(value) {
+          const registrationId = savedConfig.current?.registrationId || preferenceIdentity.current
+          if (!value || typeof value.registrationId !== 'string' || !value.registrationId || registrationId && value.registrationId !== registrationId
+            || typeof value.revision !== 'string' || !value.revision || typeof value.preferences?.['task-alert'] !== 'boolean' || typeof value.preferences?.['monitoring-failure'] !== 'boolean') throw new Error('通知偏好响应归属或内容未确认')
+        }
+        function readPreferences(scope) {
+          preferenceScope.current = null
+          if (preferencePending.current?.scope !== scope) preferencePending.current = null
+          if (!scope?.active) { preferenceRead.current = null; setPreferences(previous => ({ ...previous, ready: false, status: '通知偏好结果未知：观察连接已关闭' })); return }
+          const reading = { scope, version: preferenceVersion.current }; preferenceRead.current = reading
+          setPreferences(previous => ({ ...previous, ready: false, status: '正在读取通知偏好' }))
+          scopedCall(scope, 'installationNotificationPreferences', [], lifetime.current.signal).then(value => {
+            if (!preferenceCurrent(scope) || preferenceRead.current !== reading) return
+            validatePreferences(value); preferenceIdentity.current = value.registrationId; preferenceScope.current = scope
+            if (!preferenceDirty.current && preferenceVersion.current === reading.version) preferenceDraft.current = value.preferences['task-alert']
+            setPreferences(previous => ({ ...previous, enabled: preferenceDraft.current, ready: true, status: `通知偏好已读取${preferenceDirty.current ? '；仍有未保存输入' : ''}` }))
+          }).catch(error => {
+            if (preferenceCurrent(scope) && preferenceRead.current === reading) setPreferences(previous => ({ ...previous, ready: false, status: `读取通知偏好失败：${errorText(error)}` }))
+          })
+        }
+        async function flushPreference() {
+          if (preferenceWriting.current) return
+          const scope = connectionScope, valid = () => preferenceCurrent(scope) && preferenceScope.current === scope
+          preferenceWriting.current = true
+          try {
+            while (preferencePending.current && valid()) {
+              const change = preferencePending.current; preferencePending.current = null
+              if (change.scope !== scope) continue
+              try {
+                const value = await scopedCall(scope, 'setInstallationNotificationPreference', ['task-alert', change.enabled], lifetime.current.signal)
+                if (!valid()) break
+                validatePreferences(value)
+                if (value.preferences['task-alert'] !== change.enabled) throw new Error('通知偏好保存内容未确认')
+                if (preferenceVersion.current === change.version) { preferenceDirty.current = false; setPreferences(previous => ({ ...previous, status: '已保存通知偏好' })) }
+              } catch (error) {
+                if (valid() && preferenceVersion.current === change.version) setPreferences(previous => ({ ...previous, status: `${error.saveOutcome === 'rejected' ? '保存失败' : '保存结果未知'}：${errorText(error)}；输入已保留` }))
+              }
+            }
+          } finally {
+            preferenceWriting.current = false
+            if (!valid() && preferencePending.current?.scope === scope) preferencePending.current = null
+            if (preferencePending.current && preferenceCurrent(preferenceScope.current)) void flushPreference()
+          }
+        }
+        function changeTaskPreference() {
+          const scope = connectionScope
+          if (!preferenceCurrent(scope) || preferenceScope.current !== scope) return
+          const enabled = !preferenceDraft.current, version = ++preferenceVersion.current
+          preferenceDraft.current = enabled; preferenceDirty.current = true
+          scope.notificationPreferenceVersion = (scope.notificationPreferenceVersion || 0) + 1
+          preferencePending.current = { enabled, version, scope }
+          setPreferences(previous => ({ ...previous, enabled, status: '正在保存通知偏好' })); void flushPreference()
+        }
         useEffect(() => {
           const abort = lifetime.current
           let loading
           const connect = scope => {
             permissionRequest.current = null; setRequestingPermission(false); setPermissionMessage(notificationStatus())
+            readPreferences(scope)
             if (!scope?.active) { loading = undefined; setError('观察连接已关闭'); return }
             setError('')
             if (savedConfig.current || loading?.scope === scope) return
@@ -497,6 +568,11 @@
           error && h('p', { role: 'alert' }, error),
           h('div', { role: 'tabpanel', id: `${id}-settings-panel`, 'aria-labelledby': `${id}-settings-tab`, hidden: tab !== 'settings' },
             config ? h(AnalysisConfig, { key: config.registrationId, config, request, onConfig: acceptConfig, expanded: true, signal: lifetime.current.signal, onCheck: (role, value) => setModelChecks(previous => ({ ...previous, [role]: value })) }) : h('p', null, error ? '尚未读取本安装配置。' : '正在读取本安装配置…'),
+            h('section', { 'aria-label': '桌面通知偏好' }, h('h3', null, '桌面通知偏好'),
+              h('button', { type: 'button', role: 'switch', 'aria-label': '任务告警通知', 'aria-checked': preferences.enabled,
+                disabled: !preferences.ready || preferenceScope.current !== connectionScope || !connectionScope?.active, onClick: changeTaskPreference }, `任务告警通知 · ${preferences.enabled ? '开启' : '关闭'}`),
+              h('p', { 'data-sentinel-notification-preferences-status': true, role: 'status' }, preferences.status),
+              h('p', null, '监控故障通知 · 暂不支持'), h('p', null, '偏好只控制本安装桌面投递；系统许可和分析暂停分别设置。')),
             h('section', { 'aria-label': '桌面通知许可' }, h('h3', null, '桌面通知许可'),
               h('p', { role: 'status', 'data-sentinel-notification-permission': true }, permissionMessage),
               typeof Notification !== 'undefined' && Notification.permission !== 'granted' && h('button', { type: 'button',
