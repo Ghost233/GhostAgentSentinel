@@ -2,6 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mountGS } from './gs-session-client-runtime.mjs'
 
+const showDetails = async f => {
+  const tab = f.element.querySelector('[data-gs-tab=details]'); if (tab) await f.click(tab)
+  const tree = f.element.querySelector('[data-gs-scope-tree]'); if (tree && !tree.open) await f.click(tree.querySelector('summary'))
+}
+
 const emptySnapshot = () => ({ protocol: 1, generatedAt: Date.now(), sources: [], tasks: [], adapter: { sourceKey: 'own' }, hierarchyContext: { schemaVersion: 1, groups: [], scopes: [] } })
 test('GS appends beside native round steps, falls back to the header only without a footer and keeps all zero counts', async t => {
   const service = { snapshot: async () => emptySnapshot(), analysisConfig: async () => ({}), claimNotifications: async () => [] }
@@ -55,7 +60,7 @@ test('the actual GS popup uses the core current scope, selects details without r
   const f = await mountGS(t, { snapshot: async () => snapshot, gsSummary: async sessionId => ({ protocol: 1, generatedAt: snapshot.generatedAt, sourceKey: 'own', sessionId, sourceStatus: 'connected', scopeKnown: sessionId === 'child', counts: sessionId === 'child' ? snapshot.hierarchyContext.scopes[0].counts : { green: 0, yellow: 0, red: 0, gray: 0 }, coverage: { complete: false, gaps: [] }, gsStatus: { supported: true } }), analysisConfig: async () => ({}), claimNotifications: async () => [] }, 'child')
   const document = f.dom.window.document
   await f.until(() => document.querySelector('[data-gs-count="gray"]')?.textContent === '2', 'core scope counts rendered')
-  await f.click(document.querySelector('[data-gs-entry]'))
+  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
   let dialog = document.querySelector('[role="dialog"]')
   assert.ok(dialog, 'GS must open a real mounted popup')
   assert.deepEqual([...dialog.querySelectorAll('[data-gs-node]')].map(node => node.dataset.gsNode), ['child-task', 'deep-task'])
@@ -89,7 +94,7 @@ test('child checks and alert history show only source-scoped original ancestor c
       { key: 'other-root', sourceKey: 'other', id: 'root-id', lifecycleId: 'root-life', title: 'Other source ancestor', status: 'running', events: [{ id: 'shared-local-id', taskId: 'root-id', taskLifecycleId: 'root-life', capturedAt: at, text: 'Wrong other-source collision' }], analysis: { checks: [] } },
     ], hierarchyContext: { schemaVersion: 1, groups: [{ key: 'citation-group', nodes: [{ taskKey: 'root-key', sessionId: 'root', depth: 0 }, { taskKey: 'child-key', sessionId: 'child', depth: 1 }], counts: { gray: 2 }, coverage: { complete: true, branchGaps: [] } }], scopes: [{ sessionId: 'child', sourceKey: 'own', groupKey: 'citation-group', rootSessionId: 'root', start: 1, end: 2, path: [{ sessionId: 'root', title: 'Original ancestor' }, { sessionId: 'child', title: 'Checked child' }], counts: { gray: 1 }, coverage: { complete: true, branchGaps: [] } }] } }
   const f = await mountGS(t, { snapshot: async () => snapshot, analysisConfig: async () => ({}), claimNotifications: async () => [] }, 'child')
-  await f.renderOverview()
+  await f.renderOverview(); await showDetails(f)
   await f.until(() => f.dom.window.document.body.textContent.includes('Checked child'), 'overview loaded')
   await f.click([...f.dom.window.document.querySelectorAll('nav button')].find(node => node.textContent.includes('Checked child')))
   const article = f.dom.window.document.querySelector('article')
@@ -98,7 +103,7 @@ test('child checks and alert history show only source-scoped original ancestor c
   assert.ok(citations.every(node => node.textContent.includes('Original ancestor') && node.textContent.includes('Actual ancestor user restriction') && node.dataset.sourceKey === 'own' && node.dataset.taskId === 'root-id' && node.dataset.lifecycleId === 'root-life'))
   assert.ok(citations.every(node => !node.textContent.includes('Wrong child') && !node.textContent.includes('Wrong other-source')))
   assert.equal(article.querySelectorAll('[data-sentinel-citation-gap]').length, 3, 'missing lifecycle and expired original event refs must stay gaps')
-  await f.render('child'); await f.click(f.dom.window.document.querySelector('[data-gs-entry]')); await f.click(f.dom.window.document.querySelector('[data-gs-node="child-key"]'))
+  await f.render('child'); await f.click(f.dom.window.document.querySelector('[data-gs-entry]')); await showDetails(f); await f.click(f.dom.window.document.querySelector('[data-gs-node="child-key"]'))
   const popupDetail = f.dom.window.document.querySelector('[data-gs-detail]')
   assert.equal(popupDetail.querySelectorAll('[data-sentinel-citation]').length, 3)
   assert.equal(popupDetail.querySelectorAll('[data-sentinel-citation-gap]').length, 3)
@@ -109,19 +114,19 @@ test('a judged clear child displays its actual result while a missing-context ch
   let snapshot = { ...emptySnapshot(), monitoring: { state: 'active' }, sources: [{ key: 'own', status: 'connected' }], tasks: [{ key: 'child-clear', sourceKey: 'own', id: 'child', lifecycleId: 'life', title: 'Clear child', status: 'running', hierarchy: { parentSessionId: 'parent' }, events: [], instructionContext: { gaps: [] }, analysis: { state: 'completed', checks: [{ id: 'request_drift', status: 'clear', reason: 'Delegation stays in scope', evidenceIds: [] }] } }] }
   snapshot.hierarchyContext = { schemaVersion: 1, groups: [{ key: 'clear-group', nodes: [{ taskKey: 'child-clear', sessionId: 'child', depth: 1 }], counts: { gray: 1 }, coverage: { complete: true, branchGaps: [] } }], scopes: [{ sessionId: 'child', sourceKey: 'own', groupKey: 'clear-group', rootSessionId: 'parent', start: 0, end: 1, path: [{ sessionId: 'parent', title: 'Parent' }, { sessionId: 'child', title: 'Clear child' }], counts: { gray: 1 }, coverage: { complete: true, branchGaps: [] } }] }
   const f = await mountGS(t, { snapshot: async () => snapshot, analysisConfig: async () => ({}), claimNotifications: async () => [] }, 'child')
-  await f.renderOverview(); await f.until(() => f.dom.window.document.body.textContent.includes('Clear child'), 'actual child result')
+  await f.renderOverview(); await showDetails(f); await f.until(() => f.dom.window.document.body.textContent.includes('Clear child'), 'actual child result')
   await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
   let article = f.dom.window.document.querySelector('article')
   assert.ok(article.textContent.includes('本轮未发现疑点'))
   assert.ok(!article.textContent.includes('子代理判断尚未接入'))
-  await f.render('child'); await f.click(f.dom.window.document.querySelector('[data-gs-entry]')); await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
+  await f.render('child'); await f.click(f.dom.window.document.querySelector('[data-gs-entry]')); await showDetails(f); await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
   assert.ok(f.dom.window.document.querySelector('[data-gs-detail]').textContent.includes('本轮未发现疑点'))
-  await f.renderOverview()
+  await f.renderOverview(); await showDetails(f)
   await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
   snapshot = { ...snapshot, tasks: [{ ...snapshot.tasks[0], instructionContext: { gaps: ['actual inherited permission provenance missing'] }, analysis: { state: 'unknown', checks: [{ id: 'request_drift', status: 'unknown', reason: 'actual inherited permission provenance missing', evidenceIds: [] }] } }] }
   await f.tick(); article = f.dom.window.document.querySelector('article')
   assert.ok(article.textContent.includes('actual inherited permission provenance missing'))
   assert.ok(article.textContent.includes('当前不可判断'))
-  await f.render('child'); await f.click(f.dom.window.document.querySelector('[data-gs-entry]')); await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
+  await f.render('child'); await f.click(f.dom.window.document.querySelector('[data-gs-entry]')); await showDetails(f); await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
   assert.ok(f.dom.window.document.querySelector('[data-gs-detail]').textContent.includes('actual inherited permission provenance missing'))
 })

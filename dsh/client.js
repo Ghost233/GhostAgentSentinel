@@ -139,11 +139,6 @@
           if (connectionScope !== scope || request.abort.signal.aborted || visibleViewers() === 0) return
           if (snapshot?.protocol !== 1 || !Array.isArray(snapshot.tasks) || !Array.isArray(snapshot.sources)) throw new Error('观察协议不兼容')
           notifyState({ snapshot, snapshotVersion: state.snapshotVersion + 1, sourcePlan: snapshot.enrollment || state.sourcePlan, error: snapshot.adapter?.error || '', notification: state.notification || notificationStatus() })
-          if (!state.config) {
-            const config = await read('analysisConfigState')
-            if (connectionScope !== scope || request.abort.signal.aborted || visibleViewers() === 0) return
-            notifyState({ config })
-          }
         } catch (error) { if (connectionScope === scope && !request.abort.signal.aborted && visibleViewers() > 0) notifyState({ error: errorText(error) }) }
         finally {
           if (snapshotRequest === request) snapshotRequest = undefined
@@ -423,7 +418,30 @@
         return h('label', { className: 'sentinel-hide-normal' }, h('input', { type: 'checkbox', 'data-gs-hide-normal': true,
           checked: value, onChange: event => change(event.target.checked) }), '隐藏正常')
       }
-      function ObservationDetail({ task, snapshot, current }) {
+      function MonitorHeader({ scope, tab, change, counts, children, close, overview = false }) {
+        return h('header', { className: 'sentinel-monitor-header', 'data-gs-monitor-header': true },
+          h('div', { className: 'sentinel-monitor-title' }, h('strong', null, scope), close && h('button', { type: 'button', onClick: close, 'aria-label': '关闭 GS' }, '关闭')),
+          h('div', { className: 'sentinel-monitor-lamps', ...(overview ? { 'data-gs-overview-counts': true } : {}) }, h('strong', null, 'GS'), h(GSCounts, { counts }), overview && children), !overview && children,
+          h('nav', { role: 'tablist', 'aria-label': '监控内容', className: 'sentinel-monitor-tabs' },
+            [['issues', '当前问题'], ['details', '详情']].map(([value, label]) => h('button', { key: value, type: 'button', role: 'tab',
+              'data-gs-tab': value, 'aria-selected': tab === value, tabIndex: tab === value ? 0 : -1,
+              onClick: () => change(value), onKeyDown: event => {
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+                event.preventDefault()
+                const next = event.key === 'Home' ? 'issues' : event.key === 'End' ? 'details' : tab === 'issues' ? 'details' : 'issues'
+                change(next); event.currentTarget.parentElement.querySelector(`[data-gs-tab=${next}]`)?.focus()
+              } }, label))))
+      }
+      function IssueEvidence({ task, snapshot, gs = task.gs }) {
+        const attention = gs?.light === 'red' ? (task.analysis?.checks || []).filter(check => check.status === 'attention') : []
+        const notification = (task.alerts || []).find(alert => alert.status === 'attention' && alert.notification)?.notification
+        return h('div', { className: 'sentinel-issue-evidence' },
+          attention.map(check => h('div', { key: check.id }, h('small', null, checks[check.id] || '执行疑点', '：', text(check.reason)),
+            h(EvidenceCitations, { record: { ...check, ...(Array.isArray(check.evidenceRefs) ? { evidenceRefs: check.evidenceRefs.slice(0, 2) } : { evidenceIds: check.evidenceIds?.slice(0, 2) }) }, task, snapshot, compact: true }))),
+          notification && h('small', { 'data-gs-notification': true }, notification.status === 'submitted' ? '系统已受理 · 是否看见未知'
+            : notification.status === 'failed' ? '通知投递失败' : notification.status === 'claimed' ? '通知待确认' : '通知尚未确认'))
+      }
+      function ObservationDetail({ task, snapshot, current, gs = task.gs }) {
         const analysis = task.analysis || {}, source = snapshot.sources.find(item => item.key === task.sourceKey)
         const observed = connectionScope?.active && !current.error && !snapshot.adapter?.error
         const generated = analysis.summary?.generated
@@ -437,6 +455,11 @@
         const analyzing = observed && snapshot.monitoring?.state !== 'paused' && task.status === 'running' && source?.status === 'connected'
           && !['unknown', 'interrupted', 'stale', 'failed', 'unavailable', 'paused'].includes(analysis.state)
         return h('article', { 'data-gs-detail': task.key, 'aria-live': 'polite' },
+          h('div', { 'data-gs-focus-summary': true, className: 'sentinel-focus-summary' },
+            h('small', null, text(task.title) || task.id),
+            h('strong', { 'data-gs-focus-status': true }, observed ? gs ? gsLabel(gs) : taskStatus[task.status] || '当前状态不可判断' : '当前状态不可判断'),
+            gs?.reason && h('small', null, observed ? '' : '上次观察依据：', text(gs.reason)),
+            h('p', null, observed ? '最近活动：' : '历史活动：', text(task.activity?.summary) || '活动摘要未提供')),
           h('p', null, '当前任务：', text(analysis.summary?.currentTask) || text(task.currentRequest) || '未采集当前请求'),
           h('p', null, '当前状态：', observed ? taskStatus[task.status] || '状态未知' : '当前无法确认', ' · ',
             observed ? '' : '历史活动：', text(task.activity?.summary) || '活动摘要未提供'),
@@ -470,7 +493,7 @@
               timeText(event.capturedAt), ' · ', event.kind, ' · ', event.text || '仅元数据')))))
       }
       // Depth and light are public core projections; this tree only controls display.
-      function displayTree(nodes, tasks, hideNormal) {
+      function displayTree(nodes, tasks, hideNormal, issuesOnly = false) {
         const roots = [], stack = [], byKey = new Map(tasks.map(task => [task.key, task]))
         for (const node of nodes) {
           const task = byKey.get(node.taskKey), light = node.light ?? node.gs?.light ?? task?.gs?.light
@@ -484,14 +507,15 @@
           entry.children = prune(entry.children)
           entry.rank = Math.min(entry.rank, ...entry.children.map(child => child.rank))
           entry.active = hideNormal && entry.light === 'green' ? entry.children.some(child => child.active) : !entry.ended || entry.children.some(child => child.active)
+          if (issuesOnly && (entry.ended || !['red', 'yellow'].includes(entry.light)) && !entry.children.length) return []
           if (hideNormal && entry.light === 'green' && !entry.children.length) return []
-          entry.pathOnly = hideNormal && entry.light === 'green' || entry.ended && entry.active
+          entry.pathOnly = issuesOnly && !['red', 'yellow'].includes(entry.light) || hideNormal && entry.light === 'green' || entry.ended && entry.active
           return [entry]
         }).sort((a, b) => a.rank - b.rank)
         return prune(roots)
       }
-      function ObservationTree({ nodes, snapshot, current, selected, select, hideNormal, overview = false }) {
-        const tree = displayTree(nodes, snapshot.tasks, hideNormal)
+      function ObservationTree({ nodes, snapshot, current, selected, select, hideNormal, overview = false, issuesOnly = false }) {
+        const tree = displayTree(nodes, snapshot.tasks, hideNormal, issuesOnly)
         const observed = connectionScope?.active && !current.error && !snapshot.adapter?.error
         const render = entry => {
           const { node, task, light, children, pathOnly } = entry
@@ -504,11 +528,10 @@
                   h('span', { className: 'sentinel-node-name' }, text(task?.title) || node.sessionId || '外部执行'),
                   h('small', { 'data-gs-light': light, 'data-sentinel-light': light }, node.external ? '外部执行 · ' : '', observed ? '' : '当前无法确认 · 上次观察：', label)),
               !pathOnly && (light !== 'green' || selected === node.taskKey) && gs?.reason && !(snapshot.sources.find(source => source.key === task?.sourceKey)?.status === 'disconnected' && gs.reason.startsWith('来源失联')) && h('small', { 'data-gs-basis': node.taskKey, className: 'sentinel-node-basis' }, observed ? '' : '上次观察依据：', text(gs.reason).slice(0, 160), gs.reason.length > 160 ? '…' : ''),
-              !pathOnly && task && selected === node.taskKey && h(ObservationDetail, { task, snapshot, current }),
-              pathOnly && entry.ended && task && h('details', { 'data-gs-history': true }, h('summary', null, '已结束节点'),
+              issuesOnly && !pathOnly && task && h(IssueEvidence, { task, gs, snapshot }),
+              !issuesOnly && pathOnly && entry.ended && task && h('details', { 'data-gs-history': true }, h('summary', null, '已结束节点'),
                 h('button', { type: 'button', 'data-gs-node': node.taskKey, 'data-task-key': node.taskKey, 'aria-pressed': selected === node.taskKey,
-                  onClick: () => select(selected === node.taskKey ? null : node.taskKey) }, h('span', { className: 'sentinel-node-name' }, text(task.title) || node.sessionId), ' · 已结束'),
-                selected === node.taskKey && h(ObservationDetail, { task, snapshot, current }))),
+                  onClick: () => select(selected === node.taskKey ? null : node.taskKey) }, h('span', { className: 'sentinel-node-name' }, text(task.title) || node.sessionId), ' · 已结束'))),
             children.length > 0 && h('details', { 'data-gs-branch': node.taskKey, open: children.some(child => child.rank < 3) },
               h('summary', null, '委派后代'), children.filter(child => child.active).map(render),
               children.some(child => !child.active) && h('details', { 'data-gs-history': true }, h('summary', null, '已结束历史'), children.filter(child => !child.active).map(render))))
@@ -516,10 +539,10 @@
         return h('nav', { 'aria-label': overview ? '选择观察任务' : '选择检查节点', className: 'sentinel-tree' },
           tree.filter(entry => entry.active).map(render),
           tree.some(entry => !entry.active) && h('details', { 'data-gs-history': true }, h('summary', null, '已结束历史'), tree.filter(entry => !entry.active).map(render)),
-          !tree.some(entry => entry.active) && h('p', { 'data-gs-empty': true }, observed ? hideNormal ? '没有需要关注的节点。' : '当前范围没有活动节点。' : hideNormal ? '上次观察中没有需要关注的节点；当前无法确认。' : '上次观察中没有活动节点；当前无法确认。'))
+          !issuesOnly && !tree.some(entry => entry.active) && h('p', { 'data-gs-empty': true }, observed ? hideNormal ? '没有需要关注的节点。' : '当前范围没有活动节点。' : hideNormal ? '上次观察中没有需要关注的节点；当前无法确认。' : '上次观察中没有活动节点；当前无法确认。'))
       }
       function GSView({ sessionId, placement = 'above', visible = true, signal, useTabInfo }) {
-        const [open, setOpen] = useState(false), [selected, select] = useState(null), [wholeTree, setWholeTree] = useState(false), [hideNormal, setHideNormal] = useState(false)
+        const [open, setOpen] = useState(false), [selected, select] = useState(null), [wholeTree, setWholeTree] = useState(false), [hideNormal, setHideNormal] = useState(false), [monitorTab, setMonitorTab] = useState('issues')
         const [intersects, setIntersects] = useState(!document.defaultView?.IntersectionObserver)
         const tab = useTabInfo ? useTabInfo().tab : { visible, signal }, tabSignal = signal || tab.signal, entryVisible = Boolean(visible && tab.visible && intersects && !tabSignal?.aborted)
         const current = useMonitor(open && entryVisible, tabSignal), snapshot = current.snapshot
@@ -529,6 +552,10 @@
         const group = snapshot?.hierarchyContext?.groups?.find(item => item.key === scope?.groupKey)
         const nodes = group ? wholeTree ? group.nodes : group.nodes.slice(scope.start, scope.end) : []
         const coverage = wholeTree ? group?.coverage : scope?.coverage
+        const focused = selected || nodes.find(node => ['red', 'yellow'].includes(node.light ?? node.gs?.light))?.taskKey
+          || nodes.find(node => node.state !== 'ended' && (!hideNormal || (node.light ?? node.gs?.light) !== 'green'))?.taskKey
+          || (!hideNormal && nodes[0]?.taskKey)
+        const focusedTask = snapshot?.tasks.find(task => task.key === focused), focusedGS = nodes.find(node => node.taskKey === focused)?.gs
         const freshTree = Boolean(open && scope && current.snapshotVersion > openedVersion.current && !current.error && !snapshot.adapter?.error)
         const treeCurrent = { ...current, error: current.error || (open && !freshTree ? '正在读取完整检查；已有树为上次观察' : '') }
         const cached = Boolean(snapshot && (!connectionScope?.active || treeCurrent.error || snapshot.adapter?.error))
@@ -567,20 +594,26 @@
           h('button', { type: 'button', 'data-gs-entry': sessionId, 'aria-label': `GS 当前会话检查${entryContext ? `；${entryContext}，当前无法确认` : ''}`, 'aria-expanded': open,
             onClick: () => { if (!open) openedVersion.current = state.snapshotVersion; setOpen(value => !value); select(null); setWholeTree(false) } }, 'GS ', entryContext && h('span', { 'data-gs-count-context': true }, '· ', entryContext, ' '), h(GSCounts, { counts: entryCounts })),
           open && h('section', { className: `sentinel-gs-popup sentinel-gs-${placement}`, role: 'dialog', 'aria-label': 'GS 当前会话检查', 'data-gs-scope': wholeTree ? scope?.rootSessionId : sessionId },
-            h('header', null, h('strong', null, wholeTree ? '主会话整棵树' : '当前会话及委派后代'), h('button', { type: 'button', onClick: close, 'aria-label': '关闭 GS' }, '关闭')),
-            h(GSCounts, { counts: wholeTree ? group?.counts : scope?.counts }),
-            cached && scope && h('small', { 'data-gs-count-context': true }, '上次读取计数 · 当前无法确认'),
-            h(HideNormal, { value: hideNormal, change: setHideNormal }),
-            scope && h('p', null, scope.path.map(item => item.title).join(' / ')),
-            scope?.rootSessionId !== sessionId && scope?.rootSessionId && h('button', { type: 'button', 'data-gs-return-root': true, onClick: () => { setWholeTree(value => !value); select(null) } }, wholeTree ? '返回当前会话范围' : '返回主会话整棵树'),
-            current.error && h('p', { role: 'alert' }, current.error),
-            summary.value?.gsStatus?.supported === false && h('p', null, '共享核心尚不支持轻量 GS 摘要；关闭浮层时计数不可判断。'),
-            snapshot?.adapter?.gsStatus?.supported === false && h('p', null, '共享核心尚不支持 GS 状态与等待规则；相关检查覆盖不可判断。'),
-            !scope && h('p', null, snapshot ? '当前会话的层级材料尚未取得；覆盖不可判断。' : '正在读取当前会话；覆盖不可判断。'),
-            scope && !coverage?.complete && h('p', null, '层级覆盖不完整；未知后代数量不估算。'),
-            snapshot?.sources.find(source => source.key === scope?.sourceKey)?.status === 'disconnected' && h('p', { 'data-gs-disconnected': true }, '来源失联；所属节点当前不可判断。'),
-            coverage?.branchGaps?.length > 0 && h('details', null, h('summary', null, '查看层级缺口'), coverage.branchGaps.map((gap, index) => h('p', { key: index }, gap.sessionId, '：', gap.reason))),
-            snapshot && h(ObservationTree, { nodes, snapshot, current: treeCurrent, selected, select, hideNormal })))
+            h(MonitorHeader, { scope: wholeTree ? '主会话整棵树' : '当前会话及委派后代', tab: monitorTab, change: setMonitorTab,
+              counts: wholeTree ? group?.counts : scope?.counts, close },
+              cached && scope && h('small', { 'data-gs-count-context': true }, '上次读取计数 · 当前无法确认')),
+            h('section', { role: 'tabpanel', 'aria-label': '当前问题', 'data-gs-issues': true, hidden: monitorTab !== 'issues' },
+              monitorTab === 'issues' && freshTree && snapshot && nodes.some(node => ['red', 'yellow'].includes(node.light ?? node.gs?.light ?? snapshot.tasks.find(task => task.key === node.taskKey)?.gs?.light)) &&
+                h(ObservationTree, { nodes, snapshot, current: treeCurrent, selected, select: key => { select(key); setMonitorTab('details') }, hideNormal: true, issuesOnly: true })),
+            h('section', { role: 'tabpanel', 'aria-label': '详情', hidden: monitorTab !== 'details' }, monitorTab === 'details' && h(React.Fragment, null,
+              focusedTask && (!hideNormal || focusedTask.gs?.light !== 'green') && h(ObservationDetail, { key: focusedTask.key, task: focusedTask, gs: focusedGS || focusedTask.gs, snapshot, current: treeCurrent }),
+              h(HideNormal, { value: hideNormal, change: setHideNormal }),
+              scope && h('p', null, scope.path.map(item => item.title).join(' / ')),
+              scope?.rootSessionId !== sessionId && scope?.rootSessionId && h('button', { type: 'button', 'data-gs-return-root': true, onClick: () => { setWholeTree(value => !value); select(null) } }, wholeTree ? '返回当前会话范围' : '返回主会话整棵树'),
+              current.error && h('p', { role: 'alert' }, current.error),
+              summary.value?.gsStatus?.supported === false && h('p', null, '共享核心尚不支持轻量 GS 摘要；关闭浮层时计数不可判断。'),
+              snapshot?.adapter?.gsStatus?.supported === false && h('p', null, '共享核心尚不支持 GS 状态与等待规则；相关检查覆盖不可判断。'),
+              !scope && h('p', null, snapshot ? '当前会话的层级材料尚未取得；覆盖不可判断。' : '正在读取当前会话；覆盖不可判断。'),
+              scope && !coverage?.complete && h('p', null, '层级覆盖不完整；未知后代数量不估算。'),
+              snapshot?.sources.find(source => source.key === scope?.sourceKey)?.status === 'disconnected' && h('p', { 'data-gs-disconnected': true }, '来源失联；所属节点当前不可判断。'),
+              coverage?.branchGaps?.length > 0 && h('details', null, h('summary', null, '查看层级缺口'), coverage.branchGaps.map((gap, index) => h('p', { key: index }, gap.sessionId, '：', gap.reason))),
+              snapshot && h('details', { 'data-gs-scope-tree': true }, h('summary', null, '代理与所属会话'),
+                h(ObservationTree, { nodes, snapshot, current: treeCurrent, selected: focused, select, hideNormal }))))))
       }
       function GSFooter({ sessionId, visible = true, signal, useTabInfo }) {
         const anchor = useRef(null), [usable, setUsable] = useState(false)
@@ -619,7 +652,7 @@
       function Panel({ useTabInfo } = {}) {
         const tab = useTabInfo ? useTabInfo().tab : { visible: false }
         const current = useMonitor(tab.visible, tab.signal), snapshot = current.snapshot
-        const [selected, select] = useState(null), [operation, setOperation] = useState(''), [hideNormal, setHideNormal] = useState(false)
+        const [selected, select] = useState(null), [operation, setOperation] = useState(''), [hideNormal, setHideNormal] = useState(false), [monitorTab, setMonitorTab] = useState('issues')
         const tasks = snapshot?.tasks || []
         const sessionGroups = snapshot?.hierarchyContext?.schemaVersion === 1 ? snapshot.hierarchyContext.groups || [] : []
         const groupedTasks = new Set(sessionGroups.flatMap(group => group.nodes.map(node => node.taskKey)))
@@ -635,16 +668,11 @@
         }
         const groupRank = group => group.counts?.red ? 0 : group.counts?.yellow ? 1 : group.counts?.gray || !group.coverage?.complete ? 2 : 3
         const visibleGroups = sessionGroups.filter(group => !hideNormal || groupRank(group) < 3 || group.nodes.some(node => node.state === 'ended')).sort((a, b) => groupRank(a) - groupRank(b))
-        const task = tasks.find(item => item.key === selected) || tasks.find(item => item.status === 'running') || tasks[0]
+        const task = tasks.find(item => item.key === selected) || tasks.find(item => ['red', 'yellow'].includes(item.gs?.light)) || tasks.find(item => item.status === 'running') || tasks[0]
         const overview = snapshot?.overview || {}
         async function action(method) {
           try { await call(method); setOperation(''); await pollSnapshot() }
           catch (error) { setOperation(errorText(error)) }
-        }
-        async function permission() {
-          if (typeof Notification === 'undefined') return
-          try { await Notification.requestPermission(); notifyState({ notification: notificationStatus() }); await pollNotifications(); await pollSnapshot() }
-          catch (error) { notifyState({ notification: errorText(error) }) }
         }
         const paused = snapshot?.adapter?.monitoring?.paused ?? snapshot?.monitoring?.state === 'paused'
         const currentObservation = connectionScope?.active && !current.error && !snapshot?.adapter?.error
@@ -656,20 +684,33 @@
           const activity = text(item.activity?.summary) || '活动摘要未提供'
           return currentObservation ? activity : `历史活动：${activity}`
         }
-        return h('section', { className: 'sentinel-overview', 'aria-label': 'Sentinel 执行监控总览' },
-          h('header', null, h('strong', null, 'Sentinel · 全局总览')),
+        return h('section', { className: 'sentinel-overview', 'aria-label': 'Sentinel 执行监控总览', 'data-gs-snapshot-time': snapshot?.generatedAt },
+          h(MonitorHeader, { scope: 'Sentinel · 全局总览', tab: monitorTab, change: setMonitorTab, counts: globalCounts, overview: true },
+            h('div', { 'data-gs-overview-context': true }, snapshot && !currentObservation && h('small', { 'data-gs-count-context': true }, '上次读取计数 · 当前无法确认'),
+              h('small', null, '会话 ', snapshot?.hierarchyContext?.schemaVersion === 1 ? sessionGroups.filter(group => group.rootSessionId).length : '未知',
+                ' · 活动代理 ', snapshot?.hierarchyContext?.schemaVersion === 1 ? globalRunning : overview.runningTasks ?? '未知',
+                ' · 关注 ', snapshot?.hierarchyContext?.schemaVersion === 1 ? globalCounts.red : overview.attentionTasks ?? '未知'))),
+          h('section', { role: 'tabpanel', 'aria-label': '当前问题', 'data-gs-issues': true, hidden: monitorTab !== 'issues' }, monitorTab === 'issues' && currentObservation && h(React.Fragment, null,
+            sessionGroups.filter(group => group.nodes.some(node => ['red', 'yellow'].includes(node.light ?? node.gs?.light ?? tasks.find(task => task.key === node.taskKey)?.gs?.light))).map(group => {
+              const main = tasks.find(task => group.nodes.some(node => node.sessionId === group.rootSessionId && node.taskKey === task.key))
+              return h('section', { key: group.key, 'data-sentinel-session-group': group.key },
+                h('strong', null, text(main?.title) || group.rootSessionId || '外部执行'),
+                h(ObservationTree, { nodes: group.nodes, snapshot, current, selected, select: key => { select(key); setMonitorTab('details') }, hideNormal: true, overview: true, issuesOnly: true }))
+            }),
+            ungroupedTasks.filter(item => ['red', 'yellow'].includes(item.gs?.light)).map(item => h('article', { key: item.key, 'data-gs-row': item.key },
+              h('button', { type: 'button', onClick: () => { select(item.key); setMonitorTab('details') } }, text(item.title) || item.id),
+              h('small', { 'data-gs-basis': item.key, className: 'sentinel-node-basis' }, text(item.gs?.reason)), h(IssueEvidence, { task: item, gs: item.gs, snapshot }))))),
+          h('section', { role: 'tabpanel', 'aria-label': '详情', hidden: monitorTab !== 'details' }, monitorTab === 'details' && h(React.Fragment, null,
+          task && (!hideNormal || task.gs?.light !== 'green') && h(ObservationDetail, { key: task.key, task, snapshot, current }),
           current.error && h('p', { role: 'alert', className: 'sentinel-attention' }, current.error),
           snapshot?.adapter?.gsStatus?.supported === false && h('p', null, '共享核心尚不支持 GS 状态与等待规则；相关检查覆盖不可判断。'),
-          h('div', { 'data-gs-overview-counts': true }, snapshot && !currentObservation && h('small', { 'data-gs-count-context': true }, '上次读取计数 · 当前无法确认'), h('p', null, '会话 ', snapshot?.hierarchyContext?.schemaVersion === 1 ? sessionGroups.filter(group => group.rootSessionId).length : '未知',
-            ' · 活动代理 ', snapshot?.hierarchyContext?.schemaVersion === 1 ? globalRunning : overview.runningTasks ?? '未知',
-            ' · 关注 ', snapshot?.hierarchyContext?.schemaVersion === 1 ? globalCounts.red : overview.attentionTasks ?? '未知'),
-            snapshot?.hierarchyContext?.schemaVersion === 1 && h(GSCounts, { counts: globalCounts })),
           h('p', null, '观察覆盖：已接入和预期后台的范围；整机来源发现完整性未确认。'),
           ungroupedTasks.length > 0 && h('p', null, '另有未分组观察对象；会话及后代数量不可判断。'),
           sessionGroups.some(group => !group.coverage?.complete) && h('p', { 'data-gs-coverage': true }, '层级覆盖有缺口；未知后代数量不估算。'),
           snapshot?.sources.some(source => source.status === 'disconnected') && h('p', { 'data-gs-disconnected': true }, '来源失联：',
             snapshot.sources.filter(source => source.status === 'disconnected').map(source => text(source.descriptor?.name) || '来源名称未知').join('、'), '；所属节点当前不可判断。'),
           h(HideNormal, { value: hideNormal, change: setHideNormal }),
+          h('details', { 'data-gs-scope-tree': true }, h('summary', null, '代理与所属会话'),
           h('nav', { 'aria-label': '会话分组' }, visibleGroups.map(group => {
             const main = tasks.find(task => group.nodes.some(node => node.sessionId === group.rootSessionId && node.taskKey === task.key))
             return h('section', { key: group.key, 'data-sentinel-session-group': group.key },
@@ -679,7 +720,7 @@
                   h('small', null, '活动代理 ', group.runningCount ?? '未知', ' · 关注 ', group.counts?.red ?? '未知'), h(GSCounts, { counts: group.counts }),
                   !group.coverage?.complete && h('small', null, '层级覆盖不完整')),
                 group.coverage?.branchGaps?.length > 0 && h('details', null, h('summary', null, '查看层级缺口'), group.coverage.branchGaps.map((gap, index) => h('p', { key: index }, gap.sessionId, '：', gap.reason))),
-                h(ObservationTree, { nodes: group.nodes, snapshot, current, selected, select, hideNormal, overview: true })))
+                h(ObservationTree, { nodes: group.nodes, snapshot, current, selected: selected || task?.key, select, hideNormal, overview: true })))
           })),
           snapshot?.hierarchyContext?.schemaVersion === 1 && !visibleGroups.length && !visibleUngroupedTasks.length && h('p', { 'data-gs-empty': true }, currentObservation ? hideNormal ? '没有需要关注的节点。' : '目前没有活动会话。' : hideNormal ? '上次观察中没有需要关注的节点；当前无法确认。' : '上次观察中没有活动会话；当前无法确认。'),
           h('nav', { 'aria-label': '未分组观察任务' },
@@ -687,13 +728,11 @@
               'aria-pressed': item.key === task?.key, onClick: () => select(item.key) },
             text(item.title) || item.id, h('small', null, observedStatus(item), ' · ',
               text(snapshot.sources.find(entry => entry.key === item.sourceKey)?.descriptor?.name) || '来源未知'),
-            h('small', null, observedActivity(item))))),
+            h('small', null, observedActivity(item)))))),
           snapshot && !tasks.length && h('p', null, '已接入来源目前没有已知任务。'),
-          task && !groupedTasks.has(task.key) && (!hideNormal || task.gs?.light !== 'green') && h(ObservationDetail, { task, snapshot, current }),
-          h('details', { 'data-gs-settings': true }, h('summary', null, '设置与诊断'),
+          h('details', { 'data-gs-monitor-diagnostics': true }, h('summary', null, '观察与诊断'),
           h('div', { className: 'sentinel-controls' },
-            h('button', { type: 'button', onClick: () => action(paused ? 'resume' : 'pause') }, paused ? '继续分析' : '暂停分析'),
-            typeof Notification !== 'undefined' && Notification.permission !== 'granted' && h('button', { type: 'button', onClick: permission }, '启用桌面通知')),
+            h('button', { type: 'button', onClick: () => action(paused ? 'resume' : 'pause') }, paused ? '继续分析' : '暂停分析')),
           operation && h('p', { role: 'alert' }, operation),
           h('small', null, current.notificationError || current.notification || notificationStatus()),
           h('small', null, '暂停期间仍采集；分析和通知暂停。'),
@@ -704,9 +743,8 @@
             ' · ', [...new Set(item.gaps || [])].map(gapText).join('；'), item.disconnectReason ? ` · ${item.disconnectReason}` : ''))),
           snapshot?.monitoring?.pendingCancelledRequests > 0 && h('p', null, '已取消的分析仍有 ', snapshot.monitoring.pendingCancelledRequests, ' 个底层请求可能晚到；结果将忽略。'),
           h(SourcePlan, { plan: current.sourcePlan, sources: snapshot?.sources || [] }),
-          h('details', null, h('summary', null, '查看此客户端资源计数'), h('pre', null, JSON.stringify(diagnostics(), null, 2))),
-          current.config && h(AnalysisConfig, { key: current.config.registrationId, config: current.config })),
-          h('footer', null, '本地资料保留 24 小时。告警是有依据的疑点；模型质量仍待独立验收。'))
+          h('details', null, h('summary', null, '查看此客户端资源计数'), h('pre', null, JSON.stringify(diagnostics(), null, 2))))),
+          h('footer', null, '本地资料保留 24 小时。告警是有依据的疑点；模型质量仍待独立验收。')))
       }
       const inject = ['slots']
       function apply(ctx) {
@@ -714,6 +752,7 @@
         style.textContent = '.sentinel-overview{padding:14px;font:13px/1.6 system-ui;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}.sentinel-overview p{margin:8px 0}.sentinel-overview nav{display:flex;flex-direction:column;gap:6px;margin:14px 0}.sentinel-overview button{background:var(--dsw-alias-bg-layer-2);color:inherit;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px;text-align:left;cursor:pointer}.sentinel-overview button[aria-pressed=true]{font-weight:600;border-color:currentColor}.sentinel-overview small,.sentinel-overview footer{display:block;font-size:11px;opacity:.8}.sentinel-overview article{border-top:1px solid var(--dsw-alias-border-l2);padding-top:8px}.sentinel-overview details{margin:10px 0}.sentinel-overview summary{cursor:pointer}.sentinel-overview label{display:block;margin:8px 0}.sentinel-overview input,.sentinel-overview textarea{width:100%;box-sizing:border-box;background:var(--dsw-alias-bg-layer-2);color:inherit;padding:7px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px}.sentinel-controls{display:flex;gap:6px;flex-wrap:wrap}.sentinel-attention{color:#b97925}.sentinel-overview footer{margin-top:18px}'
         style.textContent += '.sentinel-gs{position:relative;display:inline-flex;font:12px/1.4 system-ui;color:var(--dsw-alias-label-primary)}.sentinel-gs button{font:inherit;color:inherit;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:4px 6px;cursor:pointer}.sentinel-gs-counts{display:inline-flex;gap:6px}.sentinel-gs-counts>span{display:inline-flex;align-items:center;gap:3px}.sentinel-gs-counts i{width:6px;height:6px;border-radius:50%;background:currentColor}.sentinel-gs-green{color:#378458}.sentinel-gs-yellow{color:#b97925}.sentinel-gs-red{color:#c44b4b}.sentinel-gs-gray{color:#7a8190}.sentinel-gs-popup{box-sizing:border-box;overflow-wrap:anywhere;position:absolute;bottom:calc(100% + 6px);right:0;z-index:1000;width:min(360px,85vw);max-height:60vh;overflow:auto;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);box-shadow:0 6px 24px #0003}.sentinel-gs-popup.sentinel-gs-below{bottom:auto;top:calc(100% + 6px)}.sentinel-gs-popup header{display:flex;justify-content:space-between;gap:8px}.sentinel-gs-popup nav{display:flex;flex-direction:column;gap:4px;margin:8px 0}.sentinel-gs-popup small{display:block;font-size:12px}.sentinel-gs-popup p{font-size:12px;margin:6px 0}.sentinel-gs-popup article{border-top:1px solid var(--dsw-alias-border-l2);padding-top:8px}'
         style.textContent += '.sentinel-tree,.sentinel-tree-node,[data-gs-row]{min-width:0;max-width:100%;box-sizing:border-box}.sentinel-tree button{width:100%;min-width:0;text-align:left;overflow-wrap:anywhere;box-sizing:border-box}.sentinel-node-name{font-size:13px;line-height:1.5}.sentinel-overview .sentinel-node-basis,.sentinel-gs-popup .sentinel-node-basis{font-size:12px;line-height:1.5;opacity:1;color:var(--dsw-alias-label-primary)}.sentinel-gs-counts{flex-wrap:wrap}.sentinel-hide-normal{display:flex;align-items:center;gap:6px;font-size:12px;margin:8px 0}.sentinel-overview .sentinel-hide-normal input{width:auto}.sentinel-tree details{margin:4px 0}.sentinel-tree summary{font-size:12px;cursor:pointer}.sentinel-tree article{font-size:12px;overflow-wrap:anywhere}.sentinel-gs-popup button:focus-visible,.sentinel-overview button:focus-visible{outline:2px solid currentColor;outline-offset:2px}.sentinel-gs-popup header>*{min-width:0}'
+        style.textContent += '.sentinel-monitor-header{position:sticky;top:0;z-index:2;background:var(--dsw-alias-bg-layer-2);padding:8px 0;margin:0 0 12px;min-width:0}.sentinel-monitor-title,.sentinel-monitor-lamps{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sentinel-monitor-title{justify-content:space-between}.sentinel-monitor-header .sentinel-monitor-tabs{display:flex;flex-direction:row;gap:6px;margin:8px 0 0}.sentinel-monitor-tabs button{flex:1;text-align:center}.sentinel-monitor-tabs [aria-selected=true]{font-weight:600;border-color:currentColor}.sentinel-gs-popup .sentinel-monitor-header{display:block}.sentinel-issue-evidence small{font-size:11px;line-height:1.45;margin:3px 0;overflow-wrap:anywhere}.sentinel-issue-evidence [data-sentinel-citation]{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.sentinel-focus-summary{border-left:3px solid var(--dsw-alias-border-l2);padding-left:10px}.sentinel-focus-summary>strong{font-size:15px}.sentinel-monitor-header .sentinel-gs-counts{flex-wrap:nowrap}.sentinel-gs-popup [role=tabpanel],.sentinel-overview [role=tabpanel]{min-width:0}[data-gs-issues]:empty{min-height:40px}'
         document.head.appendChild(style)
         ctx.effect(() => () => { style.remove() })
         ctx.inject(['remote', 'typert'], child => {

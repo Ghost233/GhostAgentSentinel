@@ -67,6 +67,8 @@ test('twenty actual native clients keep summary, tree, notification and connecti
   const clickAll = async selector => { await act(async () => { for (const f of clients) f.element.querySelector(selector)?.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); await new Promise(resolve => setTimeout(resolve, 5)) }); await idle() }
   const cycle = async index => {
     await clickAll('[data-gs-entry]')
+    await clickAll('[data-gs-tab=details]')
+    await clickAll('[data-gs-scope-tree]:not([open]) > summary')
     await clickAll('[data-gs-hide-normal]')
     for (const f of clients) assert.ok(f.element.querySelector('[data-gs-path]'), 'Green ancestors remain display paths after filtering')
     await clickAll('[data-gs-light=red]')

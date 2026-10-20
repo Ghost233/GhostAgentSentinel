@@ -15,7 +15,6 @@ import { decodeJevRequest } from './helpers/jev-wire.mjs'
 
 const { Context } = req('@deepseek-ai/cordis')
 const { createElement: h, act } = clientRequire('react')
-const { renderToStaticMarkup } = clientRequire('react-dom/server')
 const { createRoot } = clientRequire('react-dom/client')
 const { JSDOM } = clientRequire('jsdom')
 
@@ -41,7 +40,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   }
   const dataReady = async () => {
     await waitUntil(() => plugin.diagnostics().pendingSnapshot === 0 && plugin.diagnostics().pendingNotification === 0
-      && dom.window.document.body.textContent.includes('保存分析连接'), 'Actual overview snapshot/configuration did not finish rendering')
+      && dom.window.document.querySelector('[data-gs-snapshot-time]'), 'Actual overview snapshot did not finish rendering')
     await commit(async () => {})
   }
   const mount = async (nextVisible = true, count = 1) => {
@@ -50,6 +49,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     await commit(async () => { viewRoot.render(h('div', null, ...Array.from({ length: count }, (_, index) => h(Panel, { useTabInfo, key: index })))) })
     await waitUntil(() => plugin.diagnostics().viewInstances === count
       && plugin.diagnostics().visibleViewers === (nextVisible && document.visibilityState !== 'hidden' ? count : 0), 'Actual sidebar viewer effects did not commit')
+    await commit(async () => { for (const tab of document.querySelectorAll('[data-gs-tab=details]')) tab.click(); await settle(); for (const tree of document.querySelectorAll('[data-gs-scope-tree]:not([open])')) tree.querySelector('summary').click(); await settle() })
   }
   const unmount = async () => {
     await commit(async () => { viewRoot?.unmount(); viewRoot = undefined })
@@ -284,7 +284,9 @@ test('the actual DSH settings form saves its installation CAS through Native Rem
   host.llm.registerAdapter(['isolation-fixture'], new NativeModel())
   adapter = createAdapter(host, { dataDir, registrationId: 'dsh:stable' }, { flushMs: 10, heartbeatMs: 1000 })
   const { Peer } = req('@deepseek-ai/dsh-client-connection'), peer = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' })
-  f = await client(t, null, 'denied', null, true, true, { $dispatch: (endpoint, payload, signal) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer) })
+  f = await client(t, null, 'denied', null, true, true, { $nativeSlots: true, $dispatch: (endpoint, payload, signal) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer) })
+  await f.mountSettings()
+  await f.waitUntil(() => f.dom.window.document.querySelector('[data-sentinel-installation-settings] input'), 'Native settings configuration loaded')
   const { Simulate } = clientRequire('react-dom/test-utils'), values = [baseUrl, 'dsh-summary', baseUrl, 'dsh-judge']
   const inputs = [...f.dom.window.document.querySelectorAll('input')].filter(input => input.type !== 'checkbox')
   assert.equal(inputs.length, 4)
@@ -479,7 +481,7 @@ test('client registers the right overview and submits notifications even when no
   assert.equal(f.acknowledged[0].result.seen, undefined)
   await f.mount()
   await waitForDisplayedTask(f, '并行任务')
-  const html = renderToStaticMarkup(h(f.Panel))
+  const html = f.dom.window.document.getElementById('view').innerHTML
   assert.ok(html.includes('并行任务')); assert.ok(html.includes('排队')); assert.ok(html.includes('覆盖'))
   assert.ok(html.includes('推进不足')); assert.ok(html.includes('证据缺口'))
   assert.ok(!f.invoked.includes('followup'))
@@ -514,10 +516,10 @@ test('overview assertion waits for an actual first snapshot response', async t =
     await f.mount()
     const deadline = Date.now() + 1000
     while (!received) { assert.ok(Date.now() < deadline, 'Actual snapshot request was not received'); await f.settle() }
-    assert.ok(!renderToStaticMarkup(h(f.Panel)).includes('实际响应后才显示的任务'))
+    assert.ok(!f.dom.window.document.getElementById('view').innerHTML.includes('实际响应后才显示的任务'))
     release({ ok: true, value: snapshot })
     await waitForDisplayedTask(f, '实际响应后才显示的任务')
-    assert.ok(renderToStaticMarkup(h(f.Panel)).includes('实际响应后才显示的任务'))
+    assert.ok(f.dom.window.document.getElementById('view').innerHTML.includes('实际响应后才显示的任务'))
   } finally { release({ ok: true, value: snapshot }); await f.settle() }
 })
 
@@ -530,7 +532,7 @@ test('fixture HTML readiness follows a delayed actual Native Remote response rat
     async snapshot() { await new Promise(resolve => setTimeout(resolve, 80)); responded = true; return { ok: true, value: snapshot } },
   })
   assert.equal(responded, true, 'the fixture must wait for its actual data before snapshot-dependent HTML assertions')
-  const html = renderToStaticMarkup(h(f.Panel))
+  const html = f.dom.window.document.getElementById('view').innerHTML
   assert.ok(html.includes('继续分析')); assert.ok(html.includes('分析覆盖截止'))
   assert.ok(html.includes(new Date(through).toLocaleString())); assert.ok(html.includes('延迟原生快照'))
 })
@@ -538,7 +540,7 @@ test('fixture HTML readiness follows a delayed actual Native Remote response rat
 test('denied desktop permission does not claim or falsely acknowledge a notification', async t => {
   const f = await client(t, { protocol: 1, generatedAt: Date.now(), monitoring: { state: 'paused' }, overview: {}, sources: [], tasks: [] }, 'denied')
   assert.equal(f.delivered.length, 0); assert.equal(f.acknowledged.length, 0); assert.ok(!f.invoked.includes('claim'))
-  const html = renderToStaticMarkup(h(f.Panel))
+  const html = f.dom.window.document.getElementById('view').innerHTML
   assert.ok(html.includes('通知被拒绝')); assert.ok(html.includes('继续分析')); assert.ok(html.includes('暂停期间仍采集'))
 })
 
@@ -546,7 +548,7 @@ test('a failed desktop submission is reported as failed while the observation ov
   const f = await client(t, { protocol: 1, generatedAt: Date.now(), monitoring: { state: 'active' }, overview: {}, sources: [], tasks: [] }, 'granted', new Error('desktop not available'))
   assert.equal(f.delivered.length, 0); assert.equal(f.acknowledged[0].result.status, 'failed')
   assert.equal(f.acknowledged[0].result.error, 'desktop not available')
-  const html = renderToStaticMarkup(h(f.Panel))
+  const html = f.dom.window.document.getElementById('view').innerHTML
   assert.ok(html.includes('投递失败')); assert.ok(html.includes('已接入来源目前没有已知任务'))
 })
 
@@ -561,7 +563,7 @@ test('ended tasks display alert history, original and recovery evidence, and fai
         evidenceIds: ['original-evidence'], recoveryEvidenceIds: ['recovery-evidence'],
         notification: { id: 'notice-history', status: 'failed', delivery: 'failed', seen: 'unknown', error: '系统拒绝投递', at: 1700000025000 } }] }] }
   const f = await client(t, snapshot, 'denied')
-  const html = renderToStaticMarkup(h(f.Panel))
+  const html = f.dom.window.document.getElementById('view').innerHTML
   assert.ok(html.includes('告警记录')); assert.ok(html.includes('已恢复')); assert.ok(html.includes('首次发现'))
   assert.ok(html.includes('原失败证据')); assert.ok(html.includes('新验证通过')); assert.ok(html.includes('系统拒绝投递'))
   assert.ok(html.includes('用户是否看见未知'))
@@ -575,7 +577,7 @@ test('analysis coverage timestamps and actual activity times are shown separatel
     sources: [{ key: 'source-times', descriptor: { name: '后台' }, status: 'connected', gaps: [] }],
     tasks: [{ key: 'task-times', sourceKey: 'source-times', id: 'times', title: '时间覆盖', status: 'running', lastActivity, updatedAt, events: [],
       analysis: { state: 'cooldown', through, completedAt: 1700000020000, checks: [] } }] }
-  const f = await client(t, snapshot, 'denied'), html = renderToStaticMarkup(h(f.Panel))
+  const f = await client(t, snapshot, 'denied'), html = f.dom.window.document.getElementById('view').innerHTML
   assert.ok(html.includes('分析覆盖截止')); assert.ok(html.includes(new Date(through).toLocaleString()))
   assert.ok(html.includes('最近实际活动')); assert.ok(html.includes(new Date(lastActivity).toLocaleString()))
   assert.ok(html.includes('任务资料更新时间')); assert.ok(html.includes(new Date(updatedAt).toLocaleString()))
@@ -617,7 +619,7 @@ test('a later browser notification error updates a successful submission to fail
   assert.equal(f.acknowledged.at(-1).result.status, 'failed')
   assert.equal(f.acknowledged.at(-1).result.error, '浏览器报告通知投递失败')
   assert.ok(f.acknowledged.every(ack => ack.result.seen === undefined))
-  const html = renderToStaticMarkup(h(f.Panel))
+  const html = f.dom.window.document.getElementById('view').innerHTML
   assert.ok(html.includes('桌面通知投递失败'))
 })
 
@@ -626,8 +628,8 @@ test('the production client mounts the real native Remote namespace and reads th
     overview: { runningTasks: 4, knownSources: 2, connectedSources: 2, attentionTasks: 0 }, sources: [], tasks: [] }
   const f = await client(t, snapshot, 'denied', null, true)
   await new Promise(resolve => setTimeout(resolve, 20))
-  assert.ok(f.invoked.includes('snapshot'), renderToStaticMarkup(h(f.Panel)))
-  const html = renderToStaticMarkup(h(f.Panel))
+  assert.ok(f.invoked.includes('snapshot'), f.dom.window.document.getElementById('view').innerHTML)
+  const html = f.dom.window.document.getElementById('view').innerHTML
   assert.ok(html.includes('活动代理 4')); assert.ok(!html.includes('正在连接共享核心'))
 })
 
@@ -768,10 +770,10 @@ test('document hidden state also pauses view refresh and native sidebar restore 
   assert.equal(f.plugin.diagnostics().pendingSnapshot, 0); assert.equal(f.plugin.diagnostics().snapshotTimer, 0)
   resolveSnapshot({ ok: true, value: { ...snapshot, overview: { runningTasks: 999 } } })
   await f.settle()
-  assert.ok(!renderToStaticMarkup(h(f.Panel)).includes('活动代理 999'))
+  assert.ok(!f.dom.window.document.getElementById('view').innerHTML.includes('活动代理 999'))
   await f.visibility('visible')
   assert.equal(calls, 2); assert.equal(f.plugin.diagnostics().snapshotTimer, 1)
-  assert.ok(renderToStaticMarkup(h(f.Panel)).includes('活动代理 8'))
+  assert.ok(f.dom.window.document.getElementById('view').innerHTML.includes('活动代理 8'))
 })
 
 test('connection disposal aborts its own native pending notification call and ignores a late notice', async t => {
@@ -815,7 +817,7 @@ test('the expected background list reports configuration counts and Host counts 
     ], discovery: { complete: false } },
   }
   const f = await client(t, snapshot, 'denied', null, true)
-  const html = renderToStaticMarkup(h(f.Panel))
+  const html = f.dom.window.document.getElementById('view').innerHTML
   assert.ok(html.includes('启用配置 2')); assert.ok(html.includes('已连接配置 1')); assert.ok(html.includes('已连接 Host 1'))
   assert.ok(html.includes('等待首次连接')); assert.ok(html.includes('清单项已停用')); assert.ok(html.includes('不代表整机发现完整'))
   const codec = descriptors().find(method => method.method === 'configureSources').parameters[0].codec.create()
@@ -907,7 +909,7 @@ test('the real Remote namespace cancels in-flight calls and survives re-enableme
     },
   })
   assert.ok(signals.length > 0)
-  assert.ok(renderToStaticMarkup(h(f.Panel)).includes('活动代理 4'))
+  assert.ok(f.dom.window.document.getElementById('view').innerHTML.includes('活动代理 4'))
   for (let cycle = 0; cycle < 3; cycle++) {
     holdNext = true
     await f.tick()
@@ -930,12 +932,12 @@ test('the real Remote namespace cancels in-flight calls and survives re-enableme
     assert.equal(f.plugin.diagnostics().pendingSnapshot, 0)
     assert.equal(f.plugin.diagnostics().pendingNotification, 0)
     assert.equal(f.plugin.diagnostics().activeRequests, 0)
-    assert.ok(renderToStaticMarkup(h(f.Panel)).includes(`活动代理 ${runningTasks}`))
+    assert.ok(f.dom.window.document.getElementById('view').innerHTML.includes(`活动代理 ${runningTasks}`))
     const notifications = f.delivered.length
     old.release(); await f.settle()
     assert.equal(old.completed, true)
-    assert.ok(renderToStaticMarkup(h(f.Panel)).includes(`活动代理 ${runningTasks}`))
-    assert.ok(!renderToStaticMarkup(h(f.Panel)).includes('活动代理 999'))
+    assert.ok(f.dom.window.document.getElementById('view').innerHTML.includes(`活动代理 ${runningTasks}`))
+    assert.ok(!f.dom.window.document.getElementById('view').innerHTML.includes('活动代理 999'))
     assert.equal(f.delivered.length, notifications, 'a late old snapshot cannot trigger a notification')
     assert.equal(f.plugin.diagnostics().activeRequests, 0)
   }
@@ -950,7 +952,7 @@ test('a temporary notification claim failure clears after a successful empty cla
       return claims === 1 ? { ok: false, error: { code: 'CORE_STARTING', message: '正在连接共享核心' } } : { ok: true, value: [] }
     },
   })
-  const notificationText = () => f.dom.window.document.querySelector('[data-gs-settings] > small').textContent
+  const notificationText = () => f.dom.window.document.querySelector('[data-gs-monitor-diagnostics] > small').textContent
   assert.equal(notificationText(), '正在连接共享核心')
   await f.tick()
   assert.ok(notificationText().includes('桌面通知已获授权'), 'a healthy empty claim restores permission/check state')
@@ -967,7 +969,7 @@ test('notification transport recovery retains an earlier browser delivery failur
       return claims === 2 ? { ok: false, error: { code: 'TEMPORARY', message: '通知连接临时失联' } } : { ok: true, value: [] }
     },
   })
-  const notificationText = () => f.dom.window.document.querySelector('[data-gs-settings] > small').textContent
+  const notificationText = () => f.dom.window.document.querySelector('[data-gs-monitor-diagnostics] > small').textContent
   assert.ok(notificationText().includes('通知已提交给系统'))
   f.delivered[0].instance.onerror(); await f.settle()
   const failed = notificationText()
@@ -1115,7 +1117,7 @@ test('same-name tasks expose their separate observed activity in the list and se
   const snapshot = { protocol: 1, generatedAt: Date.now(), monitoring: { state: 'active' }, overview: {},
     sources: [{ key: 'same-name-source', descriptor: { name: '并行后台' }, status: 'connected', gaps: [] }], tasks }
   const f = await client(t, snapshot, 'denied', null, true)
-  const rows = [...f.dom.window.document.querySelectorAll('.sentinel-overview nav button')]
+  const rows = [...f.dom.window.document.querySelectorAll('.sentinel-overview nav:not([role=tablist]) button')]
   assert.equal(rows.length, 2)
   assert.ok(rows[0].textContent.includes('已开始执行 unit-alpha 验证'), 'each task list row must expose its own recent observed work')
   assert.ok(rows[1].textContent.includes('已收到 unit-beta 的失败结果'))
@@ -1147,7 +1149,7 @@ test('a failed snapshot read marks cached task status and activity as historical
   const f = await client(t, snapshot, 'denied', null, true, true, {
     async snapshot() { reads++; if (reads === 2) throw new Error('核心读取临时失败'); return { ok: true, value: snapshot } },
   })
-  const row = () => f.dom.window.document.querySelector('nav button').textContent
+  const row = () => f.dom.window.document.querySelector('nav:not([role=tablist]) button').textContent
   const detail = () => [...f.dom.window.document.querySelectorAll('article > p')].find(item => item.textContent.startsWith('当前状态：')).textContent
   assert.ok(detail().includes('运行中'))
   assert.ok(detail().includes('已开始 npm test；等待工具返回'))
