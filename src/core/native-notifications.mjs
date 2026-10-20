@@ -6,7 +6,7 @@ const BASELINES = 'native-initial-baselines', MONITORED = 'native-initial-monito
 const copy = value => structuredClone(value);
 
 // Native facts extend the core's notification records; DSH records are untouched.
-export function createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused, chatPaused, taskNoticeEligible, accepted, readReceipt, notificationEnabled = () => true, notificationHistoryGap = () => false, markNotificationHistoryGap = () => {} }) {
+export function createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused, chatPaused, taskNoticeEligible, accepted, readReceipt, notificationEnabled = () => true, notificationHistoryGap = () => false }) {
   const write = db.prepare('INSERT INTO records(collection,key,value) VALUES(?,?,?) ON CONFLICT(collection,key) DO UPDATE SET value=excluded.value');
   const remove = db.prepare('DELETE FROM records WHERE collection=? AND key=?');
   const saved = db.prepare('SELECT value FROM records WHERE collection=? AND key=?').get('settings', META);
@@ -153,15 +153,13 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     if (rollup) value.body = '首次接入部分聊天时读取失败；同类问题将在会话检查中持续汇总。每个聊天仍保留独立故障回执，当前是否恢复另行显示。';
     const link = { id: receipt.id, sequence: receipt.sequence, firstFailedAt: receipt.firstFailedAt, notificationId: value.id, ...(rollup ? { rollupId: rollup.id } : {}) };
     const previous = { sequence, receiptPrunedThrough, historyGap };
-    let evictedRollup = null, evictedRegistration = null;
+    let evictedRollup = null;
     db.exec('SAVEPOINT native_failure_notice');
     try {
       save('notifications', value); write.run(LINKS, link.id, JSON.stringify(link));
       if (rollup) write.run(ROLLUPS, rollup.id, JSON.stringify({ ...rollup, membersSeen: rollup.membersSeen + 1 }));
       if (links.size >= LIMIT) {
         const oldest = [...links.values()].sort((a, b) => a.sequence - b.sequence)[0];
-        const oldNotice = notifications.get(oldest.notificationId);
-        if (oldNotice) evictedRegistration = sources.get(oldNotice.sourceKey)?.descriptor.registrationId ?? oldNotice.registrationId;
         if (oldest.rollupId && rollups.has(oldest.rollupId)) {
           const previous = rollups.get(oldest.rollupId);
           evictedRollup = { ...previous, ...(rollup?.id === previous.id ? { membersSeen: rollup.membersSeen + 1 } : {}), incomplete: true };
@@ -175,7 +173,6 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
       if (evictedRollup) rollups.set(evictedRollup.id, evictedRollup);
       if (rollup) rollups.set(rollup.id, { ...rollup, membersSeen: rollup.membersSeen + 1, ...(evictedRollup?.id === rollup.id ? { incomplete: true } : {}) });
     } catch (error) { db.exec('ROLLBACK TO native_failure_notice'); db.exec('RELEASE native_failure_notice'); ({ sequence, receiptPrunedThrough, historyGap } = previous); throw error; }
-    if (evictedRegistration) markNotificationHistoryGap(evictedRegistration);
   }
   function publicRecord(value) {
     return copy({ id: value.id, sequence: value.nativeSequence, sourceKey: value.sourceKey, hostRunId: value.hostRunId, mainId: value.mainId, lifecycleId: value.lifecycleId, kind: value.kind, ...(value.rollupId ? { rollup: rollupRecord(value) } : {}), title: String(value.title ?? '').slice(0, 200), body: String(value.body ?? '').slice(0, 1200), receiptIds: value.receiptIds ?? [], firstRoundIds: value.firstRoundIds ?? [], checkIds: value.checkIds ?? [], alertIds: value.alertIds ?? [], members: (value.members ?? []).map(member => ({ taskKey: member.taskKey, checkIds: member.checkIds ?? [], alertIds: member.alertIds ?? [] })), createdAt: value.createdAt, evidenceThrough: value.evidenceThrough, status: value.status, delivery: value.delivery, humanSeen: 'unknown', waitReason: value.waitReason ?? null, errorCode: value.native?.errorCode ?? (value.error ? 'notification_unavailable' : null), native: value.native ?? null });

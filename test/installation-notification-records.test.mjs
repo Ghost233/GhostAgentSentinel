@@ -79,6 +79,33 @@ test('999, 1000 and 1001 actual notifications apply a real per-installation cap 
   assert.equal((await allRecords(f.client, 'chatgpt:own-cap')).records.length, 1000);
 });
 
+test('another installation evicting a global auxiliary link cannot mark a complete one-record installation history as missing', async t => {
+  const f = await fixture(t), a = await f.source('chatgpt:gap-a'), b = await f.source('chatgpt:gap-b');
+  await f.failure(a, 'a-only');
+  const original = await f.client.installationNotificationRecords('chatgpt:gap-a', {});
+  assert.equal(original.records.length, 1); assert.equal(original.historyGap, false);
+  await f.client.setNativeNotificationEligibility({ sourceKey: a, hostRunId: 'host', appRunning: true, pluginEnabled: true });
+  const [notice] = await f.client.claimNotifications(a);
+  const emit = fields => f.client.recordNativeNotificationResult({ notificationId: notice.id, attemptId: notice.native.attemptId, nativeRequestId: notificationPrefix('gap-a') + notice.native.attemptId, bundleId: 'com.ghostsentinel.notifications', observedAt: f.now(), ...fields });
+  await emit({ event: 'authorization', authorization: 'authorized' }); await emit({ event: 'submitting' });
+  for (let index = 0; index < 1024; index++) { f.advance(1); await f.failure(b, 'b-' + index, 'b-main-' + index); }
+  const retained = await f.client.installationNotificationRecords('chatgpt:gap-a', {});
+  assert.equal(retained.records.length, 1); assert.equal(retained.records[0].id, original.records[0].id);
+  assert.equal(retained.historyGap, false, 'B auxiliary-link churn does not remove any A notification row');
+  const trimmed = await allRecords(f.client, 'chatgpt:gap-b');
+  assert.equal(trimmed.records.length, 1000); assert.equal(trimmed.historyGap, true, 'B actual notification trimming still reports its own gap');
+  const diagnostic = (await f.client.diagnostics()).nativeNotifications;
+  assert.equal(diagnostic.failureLinks, diagnostic.maximumFailureLinks);
+  assert.equal(diagnostic.historyGap, true, 'the original global auxiliary omission remains visible in its own diagnostic');
+  await emit({ event: 'accepted' });
+  const updated = await f.client.installationNotificationRecords('chatgpt:gap-a', {});
+  assert.equal(updated.records[0].status, 'submitted'); assert.equal(updated.historyGap, false);
+  await f.restart();
+  const reopened = await f.client.installationNotificationRecords('chatgpt:gap-a', {});
+  assert.equal(reopened.records.length, 1); assert.equal(reopened.historyGap, false);
+  assert.equal((await f.client.diagnostics()).nativeNotifications.historyGap, true);
+});
+
 test('opaque installation cursors keep createdAt/id order across late facts and restart and reject tampering or another installation', async t => {
   const f = await fixture(t), source = await f.source('chatgpt:paged');
   for (let index = 0; index < 5; index++) await f.failure(source, 'page-' + index, 'main-' + index);
