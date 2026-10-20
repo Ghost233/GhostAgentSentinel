@@ -17,7 +17,11 @@ function parameterCodec(name) {
       if (typeof value !== 'string' || !value || value.length > 2000) throw new Error('分析配置修订令牌无效')
       return value
     }
-    if (name === 'kind') {
+    if (name === 'notificationClaimSelection') {
+              if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 || value.submissionProtocol !== 1) throw new Error('通知客户端不支持撤销确认；未领取通知')
+              return value
+            }
+          if (name === 'kind') {
       if (!['task-alert', 'monitoring-failure'].includes(value)) throw new Error('通知类别无效')
       return value
     }
@@ -33,7 +37,7 @@ function parameterCodec(name) {
       if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 || typeof value.baseUrl !== 'string' || !value.baseUrl || value.baseUrl.length > 2000 || /[\u0000-\u001f\u007f]/.test(value.baseUrl)) throw new Error('模型目录地址无效')
       return value
     }
-    if (name === 'id') {
+    if (name === 'id' || name === 'attemptToken') {
       if (typeof value !== 'string' || !value || value.length > 2000) throw new Error('通知 ID 无效')
       return value
     }
@@ -43,8 +47,8 @@ function parameterCodec(name) {
     }
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('观察操作参数必须是对象')
     if (name === 'result') {
-      if (!['submitted', 'failed'].includes(value.status) || Object.keys(value).some(key => !['status', 'error'].includes(key))
-        || (value.error !== undefined && (typeof value.error !== 'string' || value.error.length > 500))) throw new Error('通知投递结果无效')
+      if (!['submitted', 'failed', 'invalidated'].includes(value.status) || Object.keys(value).some(key => !['status', 'error', 'attemptToken'].includes(key))
+        || (value.attemptToken !== undefined && (typeof value.attemptToken !== 'string' || !value.attemptToken || value.attemptToken.length > 2000)) || (value.error !== undefined && (typeof value.error !== 'string' || value.error.length > 500))) throw new Error('通知投递结果无效')
     } else {
       for (const key of Object.keys(value)) {
         const model = value[key]
@@ -58,10 +62,10 @@ function parameterCodec(name) {
 
 module.exports = function descriptors() {
   const methods = {
-    snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'],
+    snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'],
     configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'],
-    installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id'],
-    installationNotificationRecords: ['notificationRecordsSelection'],
+    installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'],
+    installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'],
   }
   return Object.entries(methods).map(([method, parameters]) => ({
     id: `ghost-agent-sentinel#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,

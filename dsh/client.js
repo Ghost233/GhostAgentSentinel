@@ -24,6 +24,10 @@
             if (typeof value !== 'string' || !value || value.length > 2000) throw new Error('分析配置修订令牌无效')
             return value
           }
+          if (name === 'notificationClaimSelection') {
+              if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 || value.submissionProtocol !== 1) throw new Error('通知客户端不支持撤销确认；未领取通知')
+              return value
+            }
           if (name === 'kind') {
             if (!['task-alert', 'monitoring-failure'].includes(value)) throw new Error('通知类别无效')
             return value
@@ -32,7 +36,7 @@
             if (typeof value !== 'boolean') throw new Error('通知偏好无效')
             return value
           }
-          if (name === 'id') {
+          if (name === 'id' || name === 'attemptToken') {
             if (typeof value !== 'string' || !value || value.length > 2000) throw new Error('通知 ID 无效')
             return value
           }
@@ -50,8 +54,8 @@
             return value
           }
           if (name === 'result') {
-            if (!['submitted', 'failed'].includes(value.status) || Object.keys(value).some(key => !['status', 'error'].includes(key))
-              || (value.error !== undefined && (typeof value.error !== 'string' || value.error.length > 500))) throw new Error('通知投递结果无效')
+            if (!['submitted', 'failed', 'invalidated'].includes(value.status) || Object.keys(value).some(key => !['status', 'error', 'attemptToken'].includes(key))
+              || (value.attemptToken !== undefined && (typeof value.attemptToken !== 'string' || !value.attemptToken || value.attemptToken.length > 2000)) || (value.error !== undefined && (typeof value.error !== 'string' || value.error.length > 500))) throw new Error('通知投递结果无效')
           } else {
             for (const key of Object.keys(value)) {
               const model = value[key]
@@ -62,7 +66,7 @@
           return value
         } }) }
       }
-      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id'], installationNotificationRecords: ['notificationRecordsSelection'] }
+      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'], installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'] }
       const descriptors = Object.entries(methods).map(([method, parameters]) => ({
         id: `${id}#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,
         invocation: { kind: 'direct' }, cancellation: { parameter: 'signal' }, parameters: parameters.map(name => ({ name, wire: name, source: 'json', codec: parameterCodec(name) })), result: { mode: 'src-json' },
@@ -175,16 +179,34 @@
         const scope = connectionScope, request = { scope, preferenceVersion: scope.notificationPreferenceVersion || 0 }; notificationRequest = request
         const current = () => connectionScope === scope && scope.active && Notification.permission === 'granted' && request.preferenceVersion === (scope.notificationPreferenceVersion || 0)
         try {
-          const notices = await scopedCall(scope, 'claimNotifications')
+          const notices = await scopedCall(scope, 'claimNotifications', [{ submissionProtocol: 1 }])
           if (!current()) return
           if (state.notificationError) notifyState({ notificationError: '' })
           for (const notice of Array.isArray(notices) ? notices : []) {
             if (!current()) return
+            const attempt = { sealed: false, consumed: false }, revokeAbort = new AbortController()
+            const token = notice.attemptToken
+            let revocation
+            const invalidate = async () => {
+              attempt.sealed = true
+              if (!attempt.consumed && !attempt.invalidated && scope.active && connectionScope === scope && typeof token === 'string' && token) {
+                attempt.invalidated = true
+                await scopedCall(scope, 'ackNotification', [notice.id, { status: 'invalidated', attemptToken: token }])
+              }
+            }
             try {
-              const permit = await scopedCall(scope, 'beginNotificationSubmission', [notice.id])
-              if (!current()) return
+              if (typeof token !== 'string' || !token || token.length > 2000) throw new Error('通知撤销确认能力未确认；未提交通知')
+              revocation = scopedCall(scope, 'waitNotificationSubmissionRevocation', [notice.id, token], revokeAbort.signal).then(async value => {
+                if (value?.id !== notice.id || typeof value.revoked !== 'boolean') throw new Error('通知撤销确认响应无效')
+                if (value.revoked) await invalidate()
+              }).catch(async error => { if (!revokeAbort.signal.aborted) { await invalidate(); throw error } })
+              // Observe rejection immediately while the independent begin response may still be held.
+              void revocation.catch(() => {})
+              const permit = await scopedCall(scope, 'beginNotificationSubmission', [notice.id, token])
+              if (!current() || attempt.sealed) return
               if (permit?.id !== notice.id || typeof permit.maySubmit !== 'boolean') throw new Error('通知提交资格未确认')
               if (!permit.maySubmit) continue
+              attempt.consumed = true
               const notification = new Notification(text(notice.title) || 'Sentinel · 执行疑点', {
                 body: (text(notice.body) || text(notice.message) || '请打开 Sentinel 查看依据和分析覆盖').slice(0, 1200), tag: `sentinel:${notice.id}`,
               })
@@ -192,18 +214,22 @@
                 releaseNotification(notification)
                 if (!scope.active || connectionScope !== scope) return
                 notifyState({ notification: '桌面通知投递失败；面板仍显示疑点' })
-                void scopedCall(scope, 'ackNotification', [notice.id, { status: 'failed', error: '浏览器报告通知投递失败' }]).catch(error => {
+                void scopedCall(scope, 'ackNotification', [notice.id, { status: 'failed', error: '浏览器报告通知投递失败', attemptToken: token }]).catch(error => {
                   if (scope.active && connectionScope === scope) notifyState({ error: errorText(error) })
                 })
               }
               notificationCallbacks.set(notification, { scope, timer: setTimeout(() => releaseNotification(notification), 10000) })
               while (notificationCallbacks.size > 100) releaseNotification(notificationCallbacks.keys().next().value)
-              await scopedCall(scope, 'ackNotification', [notice.id, { status: 'submitted' }])
+              await scopedCall(scope, 'ackNotification', [notice.id, { status: 'submitted', attemptToken: token }])
               if (scope.active && connectionScope === scope) notifyState({ notification: '通知已提交给系统；未确认用户看见' })
             } catch (error) {
               if (!current()) return
               notifyState({ notification: `桌面通知投递失败：${errorText(error)}` })
-              await scopedCall(scope, 'ackNotification', [notice.id, { status: 'failed', error: errorText(error) }])
+              if (typeof token === 'string' && token) await scopedCall(scope, 'ackNotification', [notice.id, { status: 'failed', error: errorText(error), attemptToken: token }])
+            } finally {
+              attempt.sealed = true
+              try { if (!attempt.consumed) await invalidate() }
+              finally { revokeAbort.abort(); await revocation?.catch(() => {}) }
             }
           }
         } catch (error) { if (current()) notifyState({ notificationError: errorText(error) }) }
@@ -548,7 +574,7 @@
             if (!preferenceCurrent(scope) || preferenceRead.current !== reading) return
             validatePreferences(value); preferenceIdentity.current = value.registrationId; preferenceScope.current = scope
             if (!preferenceDirty.current && preferenceVersion.current === reading.version) preferenceDraft.current = value.preferences['task-alert']
-            setPreferences(previous => ({ ...previous, enabled: preferenceDraft.current, ready: true, status: `通知偏好已读取${preferenceDirty.current ? '；仍有未保存输入' : ''}` }))
+            setPreferences(previous => ({ ...previous, enabled: preferenceDraft.current, ready: true, status: value.revocation?.['task-alert'] === 'unconfirmed' ? '通知偏好已读取；旧通知许可撤销未确认，不能确认关闭完成' : `通知偏好已读取${preferenceDirty.current ? '；仍有未保存输入' : ''}` }))
           }).catch(error => {
             if (preferenceCurrent(scope) && preferenceRead.current === reading) setPreferences(previous => ({ ...previous, ready: false, status: `读取通知偏好失败：${errorText(error)}` }))
           })

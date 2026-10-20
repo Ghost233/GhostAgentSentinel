@@ -12,6 +12,7 @@ import { connectCore } from '../src/core-client.mjs'
 import { createAdapter } from '../dsh/host.mjs'
 import { createServer } from 'node:http'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
+import { withModelSummary } from './helpers/model-summary.mjs'
 
 const { Context } = req('@deepseek-ai/cordis')
 const { createElement: h, act } = clientRequire('react')
@@ -66,6 +67,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   }
   const unmountSettings = async () => { await commit(async () => { settingsRoot?.unmount(); settingsRoot = undefined }); document.getElementById('settings-view')?.remove() }
   t.after(async () => {
+    globalThis.window = dom.window; globalThis.document = dom.window.document
     const errors = []
     try {
       for (const operation of [
@@ -105,6 +107,15 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     async diagnostics() { return { ok: true, value: {} } },
   }
   Object.assign(methods, overrides)
+  const fixtureClaim = methods.claimNotifications
+  methods.claimNotifications = async (_selection, ...args) => {
+    const response = await fixtureClaim(...args)
+    return response?.ok && Array.isArray(response.value) ? { ...response, value: response.value.map(notice => ({ ...notice, attemptToken: notice.attemptToken || 'controlled-' + notice.id })) } : response
+  }
+  methods.waitNotificationSubmissionRevocation ??= (_id, _token, signal) => new Promise((_, reject) => {
+    if (signal.aborted) reject(signal.reason)
+    else signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+  })
   if (overrides.$nativeSlots) {
     let rendererFactory
     runInNewContext(await readFile(req.resolve('@deepseek-ai/dsh-client-ui-renderer/client'), 'utf8'), {
@@ -1021,7 +1032,7 @@ test('the actual DSH settings form autosaves groups through Native Remote and dr
     assert.equal(notices.length, 1, id + ' retains its own notification')
     assert.ok(notices.every(notice => snapshot.tasks.find(task => task.key === notice.taskKey)?.sourceKey === sourceKey))
   }
-  assert.deepEqual(await adapter.claimNotifications(), [], 'DSH pause suppresses only the DSH installation notices')
+  assert.deepEqual(await adapter.claimNotifications({ submissionProtocol: 1 }), [], 'DSH pause suppresses only the DSH installation notices')
   const sharedInstance = (await core.health()).instanceId
   await adapter.close()
   assert.equal(actor.agent.status, 'running')
@@ -1081,14 +1092,15 @@ async function publicNotificationClient(t, memberCount, overflow = false, holdSu
       const wire = overflow ? notices.map(notice => ({ ...notice, body: notice.body + '\ncontrolled transport overflow' })) : notices
       wireBodies.push(...wire.map(notice => notice.body)); return { ok: true, value: wire }
     },
-    async beginNotificationSubmission(id) {
+    async waitNotificationSubmissionRevocation(id, token, signal) { return { ok: true, value: await core.waitNotificationSubmissionRevocation(sourceKey, id, token, signal) } },
+    async beginNotificationSubmission(id, token) {
       const submission = { id }; submissions.push(submission)
       if (holdSubmission === 'before') await new Promise(resolve => { submission.resume = resolve })
-      const permit = await core.beginNotificationSubmission(sourceKey, id); submission.permit = permit
+      const permit = await core.beginNotificationSubmission(sourceKey, id, token); submission.permit = permit
       if (holdSubmission === true) return new Promise(resolve => { submission.resolve = resolve })
       return { ok: true, value: permit }
     },
-    async ackNotification(id, result) { const receipt = await core.ackNotification(id, result); acknowledgements.push({ id, result, receipt }); return { ok: true, value: receipt } },
+    async ackNotification(id, result) { const receipt = await core.ackNotification(id, { ...result, sourceKey }); acknowledgements.push({ id, result, receipt }); return { ok: true, value: receipt } },
   })
   if (holdSubmission) await f.waitUntil(() => submissions.length === 1 || f.delivered.length > 0, 'the actual client reaches the pre-submission boundary')
   else await f.waitUntil(() => f.delivered.length === 1 && acknowledgements.length === 1 && f.plugin.diagnostics().pendingNotification === 0, 'Actual Remote delivers and acknowledges the public core claim')
@@ -1112,9 +1124,9 @@ test('a late public Core submission permit cannot deliver an old claim after tas
   data.submissions[0].resolve({ ok: true, value: data.submissions[0].permit })
   await f.interact(async () => { await f.settle() })
   await f.waitUntil(() => f.plugin.diagnostics().pendingNotification === 0, 'the held old submission response finishes')
-  assert.equal(f.delivered.length, 0); assert.equal(data.acknowledgements.length, 0)
+  assert.equal(f.delivered.length, 0); assert.equal(data.acknowledgements.length, 1); assert.equal(data.acknowledgements[0].result.status, 'invalidated'); assert.equal(data.acknowledgements[0].receipt.status, 'cancelled')
   assert.deepEqual(await core.claimNotifications(data.sourceKey), [], 'ON does not requeue the cancelled backlog')
-  assert.deepEqual(await core.beginNotificationSubmission(data.sourceKey, data.claims[0].id), { id: data.claims[0].id, maySubmit: false })
+  assert.deepEqual(await core.beginNotificationSubmission(data.sourceKey, data.claims[0].id, data.claims[0].attemptToken), { id: data.claims[0].id, maySubmit: false })
   assert.equal((await core.snapshot()).monitoring.state, 'active')
 })
 
@@ -1126,7 +1138,7 @@ test('an external OFF write rejects the old public claim at the Native submissio
   data.submissions[0].resume()
   await f.waitUntil(() => f.plugin.diagnostics().pendingNotification === 0, 'the pre-constructor gate observes the actual external preference write')
   assert.equal(data.submissions[0].permit.maySubmit, false)
-  assert.equal(f.delivered.length, 0); assert.equal(data.acknowledgements.length, 0)
+  assert.equal(f.delivered.length, 0); assert.equal(data.acknowledgements.length, 1); assert.equal(data.acknowledgements[0].result.status, 'invalidated'); assert.equal(data.acknowledgements[0].receipt.status, 'cancelled')
   await core.setInstallationNotificationPreference('notification-consumer', 'task-alert', true)
   await f.tick()
   assert.equal(f.delivered.length, 0); assert.deepEqual(await core.claimNotifications(data.sourceKey), [])
@@ -1179,7 +1191,7 @@ for (const overflow of [false, true]) test(`actual native Remote keeps single-me
   assert.ok(submitted.slice(0, 240).includes(notice.taskKey) && submitted.slice(0, 240).includes(data.sourceKey))
   assert.ok(!submitted.includes(data.otherSourceKey))
   assert.equal(data.acknowledgements.length, 1); assert.equal(data.acknowledgements[0].id, notice.id)
-  assert.deepEqual(JSON.parse(JSON.stringify(data.acknowledgements[0].result)), { status: 'submitted' })
+  assert.deepEqual(JSON.parse(JSON.stringify(data.acknowledgements[0].result)), { status: 'submitted', attemptToken: notice.attemptToken })
   assert.equal(data.acknowledgements[0].receipt.seen, 'unknown')
   t.diagnostic(JSON.stringify({ publicClaim: { id: notice.id, sourceKey: notice.sourceKey, bodyLength: notice.body.length }, wireBodyLength: data.wireBodies[0].length, systemConstructor: { title: data.f.delivered[0].title, ...data.f.delivered[0].options }, acknowledgement: data.acknowledgements[0].receipt }))
   await data.f.tick()
@@ -1927,3 +1939,116 @@ test('a failed snapshot read marks cached task status and activity as historical
   assert.equal(reads, 3)
   assert.equal(f.intervals.size, timers)
 })
+
+for (const mode of ['one Host', 'different Hosts', 'unconfirmed timeout']) test('cross-window OFF must fence an already-issued but undelivered true submission response on ' + mode, { timeout: 8000 }, async t => {
+  const separateHost = mode !== 'one Host';
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-p2-two-windows-')), host = new Context(), secondHost = separateHost ? new Context() : host;
+  const registrationId = 'dsh:p2-cross-window', memberCount = 1, ids = ['one'];
+  const names = { one: 'Observed task' };
+  let time = Date.now(), core, server, adapter, secondAdapter, a, b, held, release, releaseInvalidation, invalidationEntered = false;
+  const trace = [], acknowledgements = [], modelRequests = [];
+  const models = createServer(async (request, response) => {
+    let raw = ''; for await (const bytes of request) raw += bytes;
+    const body = JSON.parse(raw); modelRequests.push({ path: request.url, model: body.model });
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify(request.url === '/v1/chat/completions'
+      ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }
+      : { model: body.model, answers: Object.fromEntries(Object.keys(decodeJevRequest(body).questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'attention' : 'unknown' }])) }));
+  });
+  t.after(async () => {
+    releaseInvalidation?.(); await a?.dispose(); await b?.dispose(); release?.(held);
+    await secondAdapter?.close(); await adapter?.close(); if (separateHost) await secondHost.fiber.dispose(); await host.fiber.dispose(); await core?.close(); await server?.close();
+    models.closeAllConnections(); if (models.listening) await new Promise(resolve => models.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await new Promise(resolve => models.listen(0, '127.0.0.1', resolve));
+  server = await startServer({ dataDir, now: () => time, leaseMs: 172800000, cooldownMs: 1e9 }); core = await connectCore({ dataDir });
+  await host.plugin(req('@deepseek-ai/dsh-llm').default);
+  for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop']) await host.plugin(req('@deepseek-ai/' + name).default, { agents: [] });
+  for (const name of ['dsh-typert-registry', 'dsh-api-remote-access', 'dsh-api-gateway']) await host.plugin(req('@deepseek-ai/' + name).default);
+  adapter = createAdapter(host, { dataDir, registrationId }, { flushMs: 10, heartbeatMs: 1000 });
+  const readyDeadline = Date.now() + 1500;
+  while (!adapter.connected || adapter.diagnostics().adapter.tickInFlight) { assert.ok(Date.now() < readyDeadline, 'Host baseline connects before public ingest'); await new Promise(resolve => setTimeout(resolve, 5)); }
+  const sourceKey = (await adapter.snapshot()).adapter.sourceKey;
+  const baseUrl = 'http://127.0.0.1:' + models.address().port;
+  await core.configureInstallationAnalysis(registrationId, { llm: { baseUrl, model: 'controlled-summary' }, jev: { baseUrl, model: 'controlled-judge' } }, (await core.installationAnalysisConfig(registrationId)).revision);
+  const ref = (taskId, eventId) => ({ taskId, lifecycleId: 'life', eventId })
+  const event = (taskId, id, kind, data = {}) => ({ id, taskId, taskLifecycleId: 'life', kind, capturedAt: time, occurredAt: null, text: `${taskId} ${id}`, data })
+  await core.ingest(sourceKey, { tasks: [{ id: 'root', lifecycleId: 'life', sessionId: 'root', title: 'Notification root', status: 'idle' }, ...ids.map(id => ({ id, lifecycleId: 'life', sessionId: id, title: names[id], status: 'running' }))],
+    events: [event('root', 'state', 'status', { nativeType: 'agent/status', status: 'idle' }), event('root', 'claim', 'input', { nativeType: 'agent/inbox/claimed', inputPhase: 'accepted', sourceKind: 'user', messageId: 'root-request' }),
+      event('root', 'input', 'input', { nativeType: 'user/message', inputPhase: 'consumed', sourceKind: 'user', inputOrigin: 'unknown', inherited: false, messageId: 'root-request' }),
+      ...ids.flatMap(id => [event('root', `catalog-${id}`, 'status', { nativeType: 'subagent/catalog', childSessionId: id }), event(id, 'state', 'status', { nativeType: 'agent/status', status: 'running' }),
+        event(id, 'input', 'input', { nativeType: 'user/message', inputPhase: 'consumed', sourceKind: 'user', inputOrigin: 'delegated', inherited: false, messageId: `${id}-request` }), event(id, 'output', 'output')])],
+    hierarchyContext: { schemaVersion: 1, revision: 2, sessions: ['root', ...ids].map(sessionId => ({ sessionId })),
+      activations: ['root', ...ids].map(taskId => ({ taskId, lifecycleId: 'life', sessionId: taskId, runId: null, state: taskId === 'root' ? 'ended' : 'running', stateRefs: [ref(taskId, 'state')] })),
+      relations: ids.map(childSessionId => ({ parentSessionId: 'root', childSessionId, kind: 'delegation', evidenceRefs: [ref('root', `catalog-${childSessionId}`)] })),
+      instructionBindings: [{ taskId: 'root', lifecycleId: 'life', inputRef: ref('root', 'input'), phase: 'consumed', origin: 'user-entry', originRefs: [ref('root', 'claim')], ancestorLimitRefs: [] },
+        ...ids.map(taskId => ({ taskId, lifecycleId: 'life', inputRef: ref(taskId, 'input'), phase: 'consumed', origin: 'delegated', originRefs: [ref('root', `catalog-${taskId}`)], ancestorLimitRefs: [ref('root', 'input')] }))], coverage: { complete: true, branchGaps: [] } } })
+  let snapshot
+  for (let attempt = 0; attempt < 100; attempt++) {
+    snapshot = await core.snapshot()
+    if (snapshot.tasks.filter(task => ids.includes(task.id)).every(task => task.gs.light === 'red')) break
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  assert.equal(snapshot.tasks.filter(task => task.gs.light === 'red').length, memberCount, 'Public grounded producer alerts settle before delivery')
+  time += 3000
+  if (separateHost) {
+    await secondHost.plugin(req('@deepseek-ai/dsh-llm').default);
+    for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop']) await secondHost.plugin(req('@deepseek-ai/' + name).default, { agents: [] });
+    for (const name of ['dsh-typert-registry', 'dsh-api-remote-access', 'dsh-api-gateway']) await secondHost.plugin(req('@deepseek-ai/' + name).default);
+    secondAdapter = createAdapter(secondHost, { dataDir, registrationId }, { flushMs: 10, heartbeatMs: 1000 });
+    while (!secondAdapter.connected) { assert.ok(Date.now() < readyDeadline + 1000); await new Promise(resolve => setTimeout(resolve, 5)); }
+  }
+  const { Peer } = req('@deepseek-ai/dsh-client-connection');
+  const peerA = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' });
+  const peerB = new Peer(secondHost, { principal: { kind: 'owner' }, interactions: 'none' });
+  for (const args of [{}, { notificationClaimSelection: { submissionProtocol: 2 } }, { notificationClaimSelection: { submissionProtocol: 1, registrationId: 'other' } }]) {
+    const rejected = await host.typertGateway.dispatchRpc('sentinel/claimNotifications', { args }, new AbortController().signal, peerA);
+    assert.equal(rejected.ok, false, 'an old or malformed page cannot claim through the new Remote without the revocation protocol');
+  }
+  a = await client(t, null, 'granted', null, true, false, { $nativeSlots: true, claimNotifications() { throw new Error('All claims must use the actual Native Gateway dispatch below'); }, async $dispatch(endpoint, payload, signal) {
+    if (endpoint === 'sentinel/ackNotification' && payload.args.result.status === 'invalidated') { invalidationEntered = true; await new Promise(resolve => { releaseInvalidation = resolve; }); }
+    const value = await host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peerA);
+    if (endpoint === 'sentinel/beginNotificationSubmission') { held = value; trace.push({ step: 'A Core begin response held', value }); return new Promise(resolve => { release = resolve }); }
+    if (endpoint === 'sentinel/ackNotification') { acknowledgements.push(value); trace.push({ step: 'A late ACK result', value }); }
+    return value;
+  } });
+  await a.waitUntil(() => !!held, 'A true response is held after the actual Core begin');
+  assert.equal(held.ok, true); assert.equal(held.value.maySubmit, true); assert.equal(a.delivered.length, 0);
+  b = await client(t, null, 'denied', null, true, false, { $nativeSlots: true, async $dispatch(endpoint, payload, signal) {
+    const value = await secondHost.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peerB);
+    if (endpoint === 'sentinel/setInstallationNotificationPreference') trace.push({ step: 'B OFF response returned', value });
+    return value;
+  } });
+  await b.mountSettings();
+  const settings = () => b.dom.window.document.querySelector('[data-sentinel-installation-settings]');
+  const toggle = () => settings().querySelector('[role=switch][aria-label="任务告警通知"]');
+  const status = () => settings().querySelector('[data-sentinel-notification-preferences-status]').textContent;
+  await b.waitUntil(() => toggle() && !toggle().disabled && status().includes('已读取'), 'B independent settings has read the same installation');
+  await b.interact(async () => { toggle().click(); await b.settle(); });
+  await b.waitUntil(() => invalidationEntered, 'A has synchronously invalidated its attempt before sending the held ACK');
+  assert.ok(status().includes('正在保存'), 'B cannot report success until A invalidation ACK reaches Core');
+  assert.equal((await core.installationNotificationPreferences(registrationId)).revocation['task-alert'], 'unconfirmed');
+  if (mode === 'unconfirmed timeout') {
+    const timeoutDeadline = Date.now() + 5000;
+    while (!status().includes('保存结果未知')) { assert.ok(Date.now() < timeoutDeadline, 'a nonresponding holder makes OFF unconfirmed, never successful'); await b.settle(); }
+    assert.ok(!status().includes('保存失败'));
+    await b.unmountSettings(); await b.mountSettings();
+    await b.waitUntil(() => status().includes('撤销未确认'), 'reading false does not confirm revocation');
+    await b.interact(async () => { toggle().click(); await b.settle(); });
+    await b.waitUntil(() => status().includes('已保存'), 'a new ON edit remains current while the old attempt stays revoked');
+    assert.equal((await core.installationNotificationPreferences(registrationId)).preferences['task-alert'], true);
+    releaseInvalidation(); releaseInvalidation = undefined;
+  } else {
+    releaseInvalidation(); releaseInvalidation = undefined;
+    await b.waitUntil(() => status().includes('已保存'), 'B OFF succeeded through its actual NativeRemote before releasing A');
+  }
+  assert.equal((await core.installationNotificationPreferences(registrationId)).preferences['task-alert'], mode === 'unconfirmed timeout');
+  assert.equal(a.delivered.length, 0);
+  trace.push({ step: 'release A old true after B OFF succeeded', value: held }); release(held); release = undefined;
+  await a.waitUntil(() => a.plugin.diagnostics().pendingNotification === 0 && acknowledgements.length === 1, 'A late response and ACK settle');
+  const records = await core.installationNotificationRecords(registrationId, {});
+  const notice = records.records.find(record => record.id === held.value.id);
+  assert.equal(notice.status, 'cancelled', 'late ACK cannot revive the cancelled Core record');
+  assert.equal(a.delivered.length, 0, 'A must not construct a browser notification from its stale true after independent window B OFF succeeded');
+});

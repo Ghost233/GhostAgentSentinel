@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile, rename, chmod, rm, stat } from 'node:fs/pro
 import { join } from 'node:path'
 import { createCore } from './core/index.mjs'
 import { createAnalyzer } from './analysis/index.mjs'
-import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig, normalizeInstallationNotificationPreference } from './protocol.mjs'
+import { PROTOCOL, NOTIFICATION_REVOCATION_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig, normalizeInstallationNotificationPreference } from './protocol.mjs'
 import { normalizeEnrollment } from './enrollment-config.mjs'
 import { HIERARCHY_FEATURE } from './hierarchy.mjs'
 import { GS_FEATURE } from './gs-status.mjs'
@@ -124,8 +124,11 @@ export async function startServer({ dataDir, onIdle, ...options }) {
   }
   const token = randomBytes(32).toString('hex')
   let closing
+  const submissionRequests = new Set()
   const server = createServer(async (request, response) => {
     counts.activeRequests++; counts.totalRequests++
+    const submissionAbort = new AbortController(), cancelSubmission = () => submissionAbort.abort(new Error('Notification request disconnected'))
+    response.once('close', cancelSubmission)
     try {
     response.setHeader('content-type', 'application/json; charset=utf-8')
     response.setHeader('cache-control', 'no-store')
@@ -134,7 +137,7 @@ export async function startServer({ dataDir, onIdle, ...options }) {
     if (request.headers.host !== expectedHost || !authorized(request, token)) return send(401, { error: 'private connection required' })
     if (stopping) return send(503, { error: 'core shutting down' })
     try {
-      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: ['installation-monitoring/1', 'installation-model-settings/1', INSTALLATION_NOTIFICATION_RECORDS_FEATURE, FORK_COMPRESSION_FEATURE, FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE] })
+      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: ['installation-monitoring/1', 'installation-model-settings/1', INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE, FORK_COMPRESSION_FEATURE, FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE] })
       if (request.method === 'GET' && request.url.startsWith('/v1/notifications/installations/records')) {
         const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
         if (url.pathname !== '/v1/notifications/installations/records') return send(404, { error: 'unknown endpoint' })
@@ -212,7 +215,8 @@ export async function startServer({ dataDir, onIdle, ...options }) {
       switch (request.url) {
         case '/v1/notifications/installations/preferences': {
           const preference = normalizeInstallationNotificationPreference(body)
-          result = await core.setInstallationNotificationPreference(preference.registrationId, preference.kind, preference.enabled)
+          submissionRequests.add(submissionAbort)
+          result = await core.setInstallationNotificationPreference(preference.registrationId, preference.kind, preference.enabled, submissionAbort.signal)
           break
         }
         case '/v1/analysis/installations/config': result = await core.configureInstallationAnalysis(identifier(body.registrationId), normalizeAnalysisConfig(body.config), identifier(body.revision)); break
@@ -227,18 +231,23 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         case '/v1/monitoring/resume': result = await core.resume(); break
         case '/v1/monitoring/collection-outcome': result = await core.recordCollectionOutcome(body); break
         case '/v1/conversation/monitoring': result = await core.setConversationMonitoring(body); break
-        case '/v1/notifications/claim': counts.notificationClaims++; result = await core.claimNotifications(identifier(body.sourceKey)); break
+        case '/v1/notifications/claim': {
+          if (Object.keys(body).some(key => !['sourceKey', 'submissionProtocol'].includes(key)) || Object.hasOwn(body, 'submissionProtocol') && body.submissionProtocol !== 1) throw new Error('invalid notification submission protocol')
+          counts.notificationClaims++; result = await core.claimNotifications(identifier(body.sourceKey), Object.hasOwn(body, 'submissionProtocol') ? body.submissionProtocol : null); break
+        }
+        case '/v1/notifications/revocation':
         case '/v1/notifications/submitting': {
-          if (Object.keys(body).some(key => !['sourceKey', 'id'].includes(key))) throw new Error('invalid notification submission scope')
-          result = await core.beginNotificationSubmission(identifier(body.sourceKey), identifier(body.id))
+          if (Object.keys(body).some(key => !['sourceKey', 'id', 'attemptToken'].includes(key))) throw new Error('invalid notification submission scope')
+          if (request.url === '/v1/notifications/revocation') submissionRequests.add(submissionAbort)
+          result = await core[request.url === '/v1/notifications/revocation' ? 'waitNotificationSubmissionRevocation' : 'beginNotificationSubmission'](identifier(body.sourceKey), identifier(body.id), identifier(body.attemptToken), submissionAbort.signal)
           break
         }
         case '/v1/notifications/native/eligibility': result = await core.setNativeNotificationEligibility(body); break
         case '/v1/notifications/native/result': result = await core.recordNativeNotificationResult(body); break
         case '/v1/sources': result = await core.configureSources(normalizeEnrollment(body)); break
         case '/v1/notifications/ack': {
-          if (!body.result || !['submitted', 'failed'].includes(body.result.status)) throw new Error('invalid notification result')
-          result = await core.ackNotification(identifier(body.id), { status: body.result.status, ...(typeof body.result.error === 'string' ? { error: body.result.error.slice(0, 500) } : {}) })
+          if (!body.result || !['submitted', 'failed', 'invalidated'].includes(body.result.status)) throw new Error('invalid notification result')
+          result = await core.ackNotification(identifier(body.id), { status: body.result.status, ...(body.result.attemptToken !== undefined ? { attemptToken: identifier(body.result.attemptToken) } : {}), ...(body.result.sourceKey !== undefined ? { sourceKey: identifier(body.result.sourceKey) } : {}), ...(typeof body.result.error === 'string' ? { error: body.result.error.slice(0, 500) } : {}) })
           break
         }
         case '/v1/analysis/config': {
@@ -249,8 +258,8 @@ export async function startServer({ dataDir, onIdle, ...options }) {
         default: return send(404, { error: 'unknown endpoint' })
       }
       send(200, result ?? null)
-    } catch (error) { send(['chatgpt_installation_connected', 'analysis_config_conflict', 'installation_monitoring_conflict', 'hierarchy_version_unsupported', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : error.code === 'analysis_config_unconfirmed' ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['chatgpt_installation_connected', 'analysis_config_conflict', 'installation_monitoring_conflict', 'analysis_config_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
-    } finally { counts.activeRequests--; await flushIdle() }
+    } catch (error) { send(['chatgpt_installation_connected', 'analysis_config_conflict', 'installation_monitoring_conflict', 'hierarchy_version_unsupported', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? 409 : error.code === 'hierarchy_context_invalid' ? 422 : ['analysis_config_unconfirmed', 'notification_revocation_unconfirmed'].includes(error.code) ? 503 : 400, { error: String(error.message || 'request failed').slice(0, 500), ...(['chatgpt_installation_connected', 'analysis_config_conflict', 'installation_monitoring_conflict', 'analysis_config_unconfirmed', 'notification_revocation_unconfirmed', 'hierarchy_version_unsupported', 'hierarchy_context_invalid', 'conversation_monitoring_conflict', 'conversation_monitoring_capacity', 'native_capture_capacity', 'native_capture_body_unavailable', 'native_origin_upgrade_unverified', 'native_origin_revision_conflict', 'native_origin_header_changed', 'native_origin_prefix_changed', 'native_origin_invalid', 'native_origin_capacity'].includes(error.code) ? { code: error.code } : {}), ...(error instanceof AggregateError ? { causes: error.errors.map(cause => String(cause.message || cause).slice(0, 500)) } : {}) }) }
+    } finally { response.removeListener('close', cancelSubmission); submissionRequests.delete(submissionAbort); counts.activeRequests--; await flushIdle() }
   })
   server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)) })
   server.keepAliveTimeout = 5000
@@ -263,6 +272,7 @@ export async function startServer({ dataDir, onIdle, ...options }) {
     return { url, token, instanceId, close() {
       if (closing) return closing
       stopping = true
+      for (const controller of submissionRequests) controller.abort(new Error('Core server is closing; revocation is unconfirmed'))
       closing = (async () => {
         await new Promise(resolve => server.close(resolve))
         await core.close()

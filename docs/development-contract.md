@@ -92,7 +92,13 @@ Codex 的 app-only `sentinel_installation_diagnostics({})` 与 DSH 的 `installa
 
 安装通知偏好由 `installationNotificationPreferences(registrationId)` 读取，`setInstallationNotificationPreference(registrationId, kind, enabled)` 只修改一类；返回 `{registrationId, preferences, revision}`，两类键为 `task-alert` 与 `monitoring-failure`，默认开启，revision 仅作状态标识，不做比较交换。HTTP 使用 `/v1/notifications/installations/preferences` 的 GET／POST。偏好、待发取消和证据抑制在既有存储事务中提交，关闭与重开不清除任务问题，也不补发关闭期间积压；正式版、test 和 DSH 按各自安装隔离。DSH 监控故障通知按用户决定后置，设置明确显示“暂不支持”。
 
-Codex 设置使用 app-only 的 `sentinel_installation_notification_preferences` 与 `sentinel_set_installation_notification_preference`；明确申请系统许可使用 `sentinel_request_installation_notification_permission`，不依赖某条聊天或采集恢复，普通读取不申请许可。保存拒写与响应未知沿用模型设置的分类。DSH 在调用浏览器通知前经 `beginNotificationSubmission(sourceKey, id)` 取得一次性资格，客户端不能指定另一来源。已返回资格后的跨窗口关闭与浏览器外部 IO 仍有异步窗口；旧回执不恢复已取消资格，这一窗口尚未作为完全阻断通过验收。
+Codex 设置使用 app-only 的 `sentinel_installation_notification_preferences` 与 `sentinel_set_installation_notification_preference`；明确申请系统许可使用 `sentinel_request_installation_notification_permission`，不依赖某条聊天或采集恢复，普通读取不申请许可。保存拒写与响应未知沿用模型设置的分类。
+
+DSH 的每次通知认领附带不透明的 `attemptToken`。客户端建立该尝试的撤销等待，再经 `beginNotificationSubmission(sourceKey, id, attemptToken)` 取得提交资格；Host 固定来源身份，客户端不能指定另一来源。一次性的 `waitNotificationSubmissionRevocation(sourceKey, id, attemptToken, signal)` 使用 POST `/v1/notifications/revocation`，只随该尝试存活，不新增轮询或广播。收到撤销后，客户端先同步封存尝试，再提交带令牌的 `invalidated` 回执；旧的 true 回包不能恢复资格。真正调用浏览器通知与本地状态检查之间不插入异步操作，提交或失败回执也绑定同一令牌。实际核心须声明 `notification-submission-revocation/1`，不支持时不得以未受保护的资格继续投递。
+
+新 DSH Remote 的认领请求必填 `{submissionProtocol: 1}`，避免旧页面忽略新资格协议。新版 Core HTTP 客户端也发送该标记。原版 DSH 0.1.1 的 HTTP 请求不带标记，核心保留其既有投递路径，但将返回认领结果视作旧客户端已经取得的在途许可。其原有 `submitted`／`failed` 回执只证明这次尝试已消费，不证明同步撤销，也不恢复已取消记录；没有回执时持续未确认。旧存储中已知认领或提交开始、却没有消费证明的事实同样保留有界围栏。这些兼容检查不能替代原版宿主的实际共享核心验收。
+
+关闭通知先保存偏好并取消待发记录，再等待本安装该类已签发许可完成撤销或提交结算；从另一 Host 操作和重复保存 false 也不能跳过确认。断连、取消或超时不证明旧许可已失效，返回 `notification_revocation_unconfirmed`，读取偏好时也保留对应 `revocation` 未确认状态，不能只凭 false 显示关闭完成。未结算尝试只保留有界、无正文的撤销资料，历史到期、数量裁剪或核心重开不能将其视作已安全结算；晚到回执不能复活通知历史。此接缝的自动检查与实际宿主集中验收分别记录。
 
 Codex 监控页只提供“当前问题／详情”，不再包含设置表单、系统许可按钮和旧的按执行通知记录界面。历史结果仅在详情呈现；`history.currentStatus` 与 `history.currentSignal` 取当前主聊天执行，不使用所选历史轮次的灯号。无已确认身份不补造运行节点，终止节点退出四灯计数。问题中的通知短标记只反映已有提交事实，不表示用户看见。
 

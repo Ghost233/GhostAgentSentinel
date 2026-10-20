@@ -55,7 +55,7 @@ test('twenty actual native clients keep summary, tree, notification and connecti
   for (const sourceKey of sources) {
     const element = dom.window.document.createElement('div'); dom.window.document.body.appendChild(element)
     clients.push(await mountGS(t, { snapshot: async () => ({ ...await core.snapshot(), adapter: { sourceKey } }), gsSummary: sessionId => core.gsSummary({ sourceKey, sessionId }),
-      claimNotifications: () => core.claimNotifications(sourceKey), beginNotificationSubmission: id => core.beginNotificationSubmission(sourceKey, id), ackNotification: (id, result) => core.ackNotification(id, result), analysisConfig: async () => ({}) }, 'root', { dom, element }))
+      claimNotifications: () => core.claimNotifications(sourceKey), beginNotificationSubmission: (id, token) => core.beginNotificationSubmission(sourceKey, id, token), waitNotificationSubmissionRevocation: (id, token, signal) => core.waitNotificationSubmissionRevocation(sourceKey, id, token, signal), ackNotification: (id, result) => core.ackNotification(id, { ...result, sourceKey }), analysisConfig: async () => ({}) }, 'root', { dom, element }))
   }
   const idle = async () => {
     const end = Date.now() + 5000

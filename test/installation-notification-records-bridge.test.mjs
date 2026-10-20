@@ -63,9 +63,9 @@ test('actual MCP and Native Remote read their own produced notification records 
   clock += 3000;
   const peer = new (req('@deepseek-ai/dsh-client-connection').Peer)(ctx, { principal: { kind: 'owner' }, interactions: 'none' });
   const rpc = (method, args = {}) => ctx.typertGateway.dispatchRpc(`sentinel/${method}`, { args }, undefined, peer);
-  const [notice] = (await rpc('claimNotifications')).value;
-  assert.equal((await rpc('beginNotificationSubmission', { id: notice.id })).value.maySubmit, true);
-  await rpc('ackNotification', { id: notice.id, result: { status: 'submitted' } });
+  const [notice] = (await rpc('claimNotifications', { notificationClaimSelection: { submissionProtocol: 1 } })).value;
+  assert.equal((await rpc('beginNotificationSubmission', { id: notice.id, attemptToken: notice.attemptToken })).value.maySubmit, true);
+  await rpc('ackNotification', { id: notice.id, result: { status: 'submitted', attemptToken: notice.attemptToken } });
   const result = await rpc('installationNotificationRecords', { notificationRecordsSelection: {} });
   assert.equal(result.ok, true, JSON.stringify(result.error));
   assert.equal(result.value.records.length, 1);

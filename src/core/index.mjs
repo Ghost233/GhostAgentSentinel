@@ -21,6 +21,7 @@ const CLAIM_MS = 60_000;
 const GROUP_MS = 3_000;
 const HIERARCHY_CAPTURE_LIMIT = 10_000;
 const CONVERSATION_MONITORING_LIMIT = 1_000;
+const SUBMISSION_LIMIT = 1_000;
 const HIERARCHY_CAPTURE_GAP = 'Hierarchy evidence identity retention budget exceeded';
 const CHECK_IDS = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait'];
 const copy = value => structuredClone(value);
@@ -55,6 +56,9 @@ export async function createCore({
   const tasks = new Map();
   const events = new Map();
   const notifications = new Map();
+  const submissionWatches = new Map(), submissionBarriers = new Map();
+  const submissionLifetime = new AbortController();
+  let submissionDeadlineTimers = 0;
   const conversationSettings = new Map();
   const installationAnalysisSettings = new Map();
   const installationMonitoringSettings = new Map();
@@ -102,8 +106,20 @@ export async function createCore({
     const id = identity(collection, key);
     if (!nativeJournal.rows.has(id)) nativeJournal.rows.set(id, { collection, key, value: beforeNativeWrite.get(collection, key)?.value ?? null });
   };
-  const save = (collection, value) => { rememberNativeRow(collection, value.key ?? value.id); if (collection === 'notifications') nativeNotifications?.touch(value); return write.run(collection, value.key ?? value.id, JSON.stringify(value)); };
-  const erase = (collection, key) => { rememberNativeRow(collection, key); if (collection === 'notifications') nativeNotifications?.removed(notifications.get(key)); remove.run(collection, key); collections[collection].delete(key); };
+  const save = (collection, value) => {
+    rememberNativeRow(collection, value.key ?? value.id);
+    if (collection === 'notifications') {
+      if (unsettledSubmission(value) && value.status !== 'claimed') value.submissionAttempt.revoked = true;
+      nativeNotifications?.touch(value);
+    }
+    const result = write.run(collection, value.key ?? value.id, JSON.stringify(value));
+    if (collection === 'notifications') notifySubmission(value);
+    return result;
+  };
+  const erase = (collection, key) => {
+    if (collection === 'notifications' && unsettledSubmission(notifications.get(key))) return retireNotification(notifications.get(key), now());
+    rememberNativeRow(collection, key); if (collection === 'notifications') nativeNotifications?.removed(notifications.get(key)); remove.run(collection, key); collections[collection].delete(key);
+  };
   const taskEvents = (task, read) => read ? read.eventsByTask.get(task.key) ?? [] : Array.from(events.values()).filter(event => event.taskKey === task.key).sort((a, b) => a.capturedAt - b.capturedAt || a.sequence - b.sequence);
   const projectionRead = () => {
     const bySource = new Map(), eventsByTask = new Map();
@@ -146,13 +162,64 @@ export async function createCore({
   const installationNotificationPreferences = registrationId => {
     installationConfig(registrationId);
     const saved = installationNotificationSettings.get(registrationId);
-    return copy(saved ? { registrationId, preferences: saved.preferences, revision: saved.revision } : { registrationId, preferences: { 'task-alert': true, 'monitoring-failure': true }, revision: fingerprint([installationRevision, 'notifications', registrationId]) });
+    const value = saved ? { registrationId, preferences: saved.preferences, revision: saved.revision } : { registrationId, preferences: { 'task-alert': true, 'monitoring-failure': true }, revision: fingerprint([installationRevision, 'notifications', registrationId]) };
+    if ([...notifications.values()].some(notice => notificationRegistration(notice) === registrationId && unsettledSubmission(notice) && notice.submissionAttempt.revoked)) value.revocation = { 'task-alert': 'unconfirmed' };
+    return copy(value);
   };
   const notificationEnabled = (registrationId, kind) => ['task-alert', 'monitoring-failure'].includes(kind) && (installationNotificationSettings.get(registrationId)?.preferences[kind] ?? true);
-  const notificationKind = notice => notice.kind ?? (sources.get(notice.sourceKey)?.descriptor.policy !== 'chatgpt-main/1' && notificationMembers(notice).some(member => tasks.get(member.taskKey)?.sourceKey === notice.sourceKey) ? 'task-alert' : null);
+  const notificationKind = notice => notice.kind ?? (notice.submissionAttempt || sources.get(notice.sourceKey)?.descriptor.policy !== 'chatgpt-main/1' && notificationMembers(notice).some(member => tasks.get(member.taskKey)?.sourceKey === notice.sourceKey) ? 'task-alert' : null);
   const notificationEvidence = alert => fingerprint([alert.requestId, alert.checkId, [...(alert.evidenceIds ?? [])].sort(), (alert.evidenceRefs ?? []).map(referenceKey).sort()]);
   const notificationRegistration = value => sources.get(value.sourceKey)?.descriptor.registrationId ?? (value.historyPruned ? value.registrationId : null);
   const notificationHistoryGap = registrationId => installationNotificationHistory.get(registrationId)?.historyGap === true;
+  for (const notice of notifications.values()) {
+    if (!notice.kind && !notice.submissionAttempt && sources.get(notice.sourceKey)?.descriptor.policy !== 'chatgpt-main/1'
+      && (notice.submissionStartedAt != null || notice.claimedAt != null) && notice.ackedAt == null) {
+      notice.submissionAttempt = { token: randomUUID(), issued: true, settled: false, revoked: true, legacy: true };
+      save('notifications', notice);
+    }
+  }
+  function unsettledSubmission(notice) { return notice?.submissionAttempt?.issued === true && !notice.submissionAttempt.settled; }
+  function notifySubmission(notice) {
+    const attempt = notice.submissionAttempt, watch = attempt && submissionWatches.get(attempt.token);
+    if (watch && (attempt.revoked || attempt.settled)) watch.resolve({ id: notice.id, revoked: attempt.revoked === true });
+    const key = notificationRegistration(notice), barrier = submissionBarriers.get(key);
+    if (barrier && ![...notifications.values()].some(value => notificationRegistration(value) === key && unsettledSubmission(value) && value.submissionAttempt.revoked)) barrier.resolve();
+  }
+  function submissionScope(sourceKey, id, token) {
+    if ([sourceKey, id, token].some(value => typeof value !== 'string' || !value || value.length > 2000)) throw new Error('Invalid notification submission attempt');
+    const notice = notifications.get(id);
+    if (notice?.submissionAttempt?.legacy) throw new Error('Legacy notification attempts cannot attest synchronous invalidation');
+    if (!notice || notice.sourceKey !== sourceKey || notice.kind || notice.submissionAttempt?.token !== token) throw new Error('Unknown legacy notification submission attempt');
+    return notice;
+  }
+  function submissionUnconfirmed() { return Object.assign(new Error('Notification preference is stored; outstanding submission revocation is unconfirmed'), { code: 'notification_revocation_unconfirmed' }); }
+  function waitSubmission(promise, signal, unconfirmed = false) {
+    return new Promise((resolve, reject) => {
+      const abort = () => finish(reject, unconfirmed ? submissionUnconfirmed() : signal.reason);
+      const finish = (settle, value) => { signal.removeEventListener('abort', abort); settle(value); };
+      signal.addEventListener('abort', abort, { once: true });
+      promise.then(value => finish(resolve, value), error => finish(reject, error));
+      if (signal.aborted) abort();
+    });
+  }
+  async function confirmSubmissionRevocation(registrationId, signal) {
+    if (![...notifications.values()].some(value => notificationRegistration(value) === registrationId && unsettledSubmission(value) && value.submissionAttempt.revoked)) return;
+    let barrier = submissionBarriers.get(registrationId);
+    if (!barrier) {
+      let resolve;
+      const promise = new Promise(done => { resolve = done; });
+      barrier = { promise, resolve, callers: 0 }; submissionBarriers.set(registrationId, barrier);
+    }
+    if (barrier.callers >= SUBMISSION_LIMIT) throw submissionUnconfirmed();
+    barrier.callers++;
+    const deadline = new AbortController(), timer = setTimeout(() => deadline.abort(), 4000);
+    submissionDeadlineTimers++;
+    try { await waitSubmission(barrier.promise, AbortSignal.any([submissionLifetime.signal, deadline.signal, ...(signal ? [signal] : [])]), true); }
+    finally {
+      clearTimeout(timer); submissionDeadlineTimers--;
+      if (--barrier.callers === 0 && submissionBarriers.get(registrationId) === barrier) submissionBarriers.delete(registrationId);
+    }
+  }
   const markNotificationHistoryGap = registrationId => {
     if (!registrationId || notificationHistoryGap(registrationId)) return;
     const value = { key: registrationId, historyGap: true };
@@ -170,7 +237,10 @@ export async function createCore({
       }
       if (changed) save('tasks', task);
     }
-    if (nativeNotifications.needsCancellation(value)) {
+    if (unsettledSubmission(value)) {
+      const fence = { id: value.id, registrationId, sourceKey: value.sourceKey, historyPruned: true, createdAt: value.createdAt, status: 'cancelled', submissionAttempt: { ...value.submissionAttempt, revoked: true } };
+      save('notifications', fence); notifications.set(fence.id, fence);
+    } else if (nativeNotifications.needsCancellation(value)) {
       const fence = { id: value.id, registrationId, sourceKey: value.sourceKey, hostRunId: value.hostRunId, kind: value.kind, historyPruned: true, createdAt: value.createdAt, status: 'cancelled',
         native: { attemptId: value.native.attemptId, nativeRequestId: value.native.nativeRequestId, bundleId: value.native.bundleId, cancelRequestedAt: current, pendingCancellation: value.native.pendingCancellation ?? null } };
       nativeNotifications.removed(value);
@@ -699,7 +769,7 @@ export async function createCore({
   }
 
   function notificationMembers(notification) {
-    return notification.members ?? [{ taskKey: notification.taskKey, requestId: notification.requestId, alertIds: notification.alertIds }];
+    return notification.historyPruned ? [] : notification.members ?? [{ taskKey: notification.taskKey, requestId: notification.requestId, alertIds: notification.alertIds }];
   }
 
   function memberAlerts(member) {
@@ -1544,9 +1614,9 @@ export async function createCore({
     },
     async diagnostics() {
       if (!closed) tick();
-      const timers = { lease: closed ? 0 : 1, wakeup: wakeTimer ? 1 : 0, idle: idleTimer ? 1 : 0 };
+      const timers = { lease: closed ? 0 : 1, wakeup: wakeTimer ? 1 : 0, idle: idleTimer ? 1 : 0, notificationSubmission: submissionDeadlineTimers };
       const admission = analysisAdmission();
-      timers.total = timers.lease + timers.wakeup + timers.idle;
+      timers.total = timers.lease + timers.wakeup + timers.idle + timers.notificationSubmission;
       const contexts = [...sources.values()].flatMap(source => source.hierarchyContext ? [source.hierarchyContext] : []);
       const hierarchyReferences = contexts.reduce((count, context) => count + context.activations.reduce((sum, activation) => sum + activation.stateRefs.length, 0) + context.relations.reduce((sum, relation) => sum + relation.evidenceRefs.length, 0) + context.instructionBindings.reduce((sum, binding) => sum + 1 + binding.originRefs.length + binding.ancestorLimitRefs.length, 0) + (context.waitBindings ?? []).reduce((sum, binding) => sum + binding.evidenceRefs.length, 0), 0);
       const metadata = { hierarchySessions: contexts.reduce((count, context) => count + context.sessions.length, 0), hierarchyActivations: contexts.reduce((count, context) => count + context.activations.length, 0), hierarchyRelations: contexts.reduce((count, context) => count + context.relations.length, 0), hierarchyReferences,
@@ -1555,8 +1625,8 @@ export async function createCore({
       const diagnostics = {
         protocol: 1, pid: process.pid, generatedAt: now(), closed, failureReceipts: failureStore.diagnostics(), nativeNotifications: nativeNotifications.diagnostics(),
         runtime: { connectedSources: closed ? 0 : Array.from(sources.values()).filter(connected).length, activeAnalyses: active ? 1 : 0, cancelledUnsettledRequests: pendingCancelledRequests, unsettledAnalysisCalls: admission.unsettledCalls, analysisAdmissionLimit: admission.limit, analysisAdmissionBlocked: admission.blocked },
-        temporary: { queueKeys: queue.length, queueMemberships: queued.size, timers, pendingNotificationWindows: [...notifications.values()].filter(notification => notification.status === 'pending').length },
-        retained: { retentionMs: DAY, sources: sources.size, tasks: tasks.size, events: events.size, alerts: Array.from(tasks.values()).reduce((count, task) => count + task.alerts.length, 0), notifications: notifications.size, sourceGapRecords: Array.from(sources.values()).reduce((count, source) => count + (source.gapRecords?.length ?? 0), 0), taskGapRecords: Array.from(tasks.values()).reduce((count, task) => count + (task.gapRecords?.length ?? 0), 0), hierarchyEvidenceIdentities: Array.from(sources.values()).reduce((count, source) => count + (source.hierarchyEvidenceCaptures?.length ?? 0), 0), hierarchyEvidenceIdentityLimitPerSource: HIERARCHY_CAPTURE_LIMIT, nativeOriginFences: nativeOrigins.diagnostics(), nativeCaptureProgress: nativeProgress.diagnostics(locator => locator && events.get(identity(locator.sourceKey, locator.taskId, locator.lifecycleId, locator.eventId))), ...metadata },
+        temporary: { queueKeys: queue.length, queueMemberships: queued.size, timers, pendingNotificationWindows: [...notifications.values()].filter(notification => notification.status === 'pending').length, submissionRevocationWaits: submissionWatches.size, submissionPreferenceWaits: [...submissionBarriers.values()].reduce((count, value) => count + value.callers, 0) },
+        retained: { submissionPermits: [...notifications.values()].filter(unsettledSubmission).length, submissionLimitPerInstallation: SUBMISSION_LIMIT, retentionMs: DAY, sources: sources.size, tasks: tasks.size, events: events.size, alerts: Array.from(tasks.values()).reduce((count, task) => count + task.alerts.length, 0), notifications: notifications.size, sourceGapRecords: Array.from(sources.values()).reduce((count, source) => count + (source.gapRecords?.length ?? 0), 0), taskGapRecords: Array.from(tasks.values()).reduce((count, task) => count + (task.gapRecords?.length ?? 0), 0), hierarchyEvidenceIdentities: Array.from(sources.values()).reduce((count, source) => count + (source.hierarchyEvidenceCaptures?.length ?? 0), 0), hierarchyEvidenceIdentityLimitPerSource: HIERARCHY_CAPTURE_LIMIT, nativeOriginFences: nativeOrigins.diagnostics(), nativeCaptureProgress: nativeProgress.diagnostics(locator => locator && events.get(identity(locator.sourceKey, locator.taskId, locator.lifecycleId, locator.eventId))), ...metadata },
         configuration: { sourcePlanEntries: enrollment.entries.length, conversationMonitoringScopes: conversationSettings.size, conversationMonitoringLimit: CONVERSATION_MONITORING_LIMIT, pausedConversations: [...conversationSettings.values()].filter(setting => setting.paused).length }, memory: process.memoryUsage(),
       };
       let nextExpiryAt = null;
@@ -1707,11 +1777,14 @@ export async function createCore({
       });
       return { registrationId, generatedAt: now(), records, hasMore, nextCursor: hasMore ? notificationCursor(registrationId, page.at(-1)) : null, historyGap: notificationHistoryGap(registrationId) || Boolean(before && !retained.some(value => value.id === before.id && value.createdAt === before.createdAt)), retentionMs: DAY, maximumRecords: 1000 };
     },
-    async setInstallationNotificationPreference(registrationId, kind, enabled) {
+    async setInstallationNotificationPreference(registrationId, kind, enabled, signal) {
       ensureOpen();
       normalizeInstallationNotificationPreference({ registrationId, kind, enabled });
       const current = installationNotificationPreferences(registrationId);
-      if (current.preferences[kind] === enabled) return current;
+      if (current.preferences[kind] === enabled) {
+        if (!enabled && kind === 'task-alert') await confirmSubmissionRevocation(registrationId, signal);
+        return installationNotificationPreferences(registrationId);
+      }
       const setting = { key: registrationId, registrationId, preferences: { ...current.preferences, [kind]: enabled }, revision: randomUUID() };
       const affected = new Map(), currentTime = now(), interval = Math.max(600_000, repeatMs);
       if (kind === 'task-alert') for (const original of tasks.values()) {
@@ -1726,9 +1799,10 @@ export async function createCore({
         }
         affected.set(task.key, task);
       }
-      const notices = enabled ? [] : [...notifications.values()].filter(notice => sources.get(notice.sourceKey)?.descriptor.registrationId === registrationId && notificationKind(notice) === kind && (['pending', 'claimed'].includes(notice.status) || notice.native?.nativeRequestId && notice.native.pendingCancellation?.pending !== false && !notice.native.cancelRequestedAt)).map(original => {
+      const notices = enabled ? [] : [...notifications.values()].filter(notice => notificationRegistration(notice) === registrationId && notificationKind(notice) === kind && (['pending', 'claimed'].includes(notice.status) || unsettledSubmission(notice) || notice.native?.nativeRequestId && notice.native.pendingCancellation?.pending !== false && !notice.native.cancelRequestedAt)).map(original => {
         const notice = copy(original);
         if (['pending', 'claimed'].includes(notice.status)) { notice.status = 'cancelled'; notice.error = 'Installation notification preference is disabled'; }
+        if (unsettledSubmission(notice)) notice.submissionAttempt.revoked = true;
         if (notice.native?.nativeRequestId && notice.native.pendingCancellation?.pending !== false && !notice.native.cancelRequestedAt) notice.native.cancelRequestedAt = currentTime;
         for (const member of notificationMembers(notice)) {
           const originalTask = tasks.get(member.taskKey);
@@ -1755,6 +1829,8 @@ export async function createCore({
       for (const [key, task] of affected) tasks.set(key, task);
       for (const notice of notices) notifications.set(notice.id, notice);
       publishNative();
+      for (const notice of notices) notifySubmission(notice);
+      if (!enabled && kind === 'task-alert') await confirmSubmissionRevocation(registrationId, signal);
       return installationNotificationPreferences(registrationId);
     },
     async configureInstallationAnalysis(registrationId, config, revision) {
@@ -1820,18 +1896,24 @@ export async function createCore({
       }
       tick();
     },
-    async claimNotifications(sourceKey) {
+    async claimNotifications(sourceKey, submissionProtocol = 1) {
       ensureOpen();
+      if (submissionProtocol !== 1 && submissionProtocol !== null) throw new Error('Invalid notification submission protocol');
       const source = sources.get(sourceKey);
       if (source?.descriptor.policy !== 'chatgpt-main/1' || !nativeNotifications.qualified(sourceKey)) getSource(sourceKey);
       tick();
+      const legacy = source?.descriptor.policy !== 'chatgpt-main/1' && submissionProtocol !== 1;
+      const registrationId = source?.descriptor.registrationId;
+      let issuedCount = legacy ? [...notifications.values()].filter(value => notificationRegistration(value) === registrationId && unsettledSubmission(value)).length : 0;
       const claimed = [];
       for (const notification of notifications.values()) {
         if (notification.sourceKey !== sourceKey || notification.status !== 'pending' || now() < (notification.readyAt ?? notification.createdAt + GROUP_MS) || !notificationEligible(notification)) continue;
         if (notification.kind === 'monitoring-failure' && !nativeNotifications.qualified(sourceKey)) continue;
+        if (legacy && issuedCount >= SUBMISSION_LIMIT) break;
         refreshNotification(notification);
         notification.status = 'claimed';
         notification.claimedAt = now();
+        if (!notification.kind) { notification.submissionAttempt = { token: randomUUID(), issued: legacy, settled: false, ...(legacy ? { legacy: true } : {}) }; if (legacy) issuedCount++; }
         nativeNotifications.claim(notification);
         for (const member of notification.members) {
           const task = tasks.get(member.taskKey);
@@ -1839,28 +1921,53 @@ export async function createCore({
           if (task) save('tasks', task);
         }
         save('notifications', notification);
-        const { requestId, alertIds, createdAt, status, delivery, seen, claimedAt, groupKey, readyAt, ...publicValue } = notification;
-        claimed.push(copy({ ...publicValue, members: notification.members.map(({ requestId, ...member }) => member) }));
+        const { requestId, alertIds, createdAt, status, delivery, seen, claimedAt, groupKey, readyAt, submissionAttempt, ...publicValue } = notification;
+        claimed.push(copy({ ...publicValue, ...(submissionAttempt && !legacy ? { attemptToken: submissionAttempt.token } : {}), members: notification.members.map(({ requestId, ...member }) => member) }));
       }
       return claimed;
     },
-    async beginNotificationSubmission(sourceKey, id) {
+    async waitNotificationSubmissionRevocation(sourceKey, id, token, signal) {
       ensureOpen();
-      if (typeof sourceKey !== 'string' || !sourceKey || typeof id !== 'string' || !id || sourceKey.length > 2000 || id.length > 2000) throw new Error('Invalid notification submission scope');
+      const notice = submissionScope(sourceKey, id, token), attempt = notice.submissionAttempt;
+      if (attempt.revoked || attempt.settled) return { id, revoked: attempt.revoked === true };
+      if (submissionWatches.has(token)) throw new Error('Notification submission already has a revocation wait');
+      if ([...submissionWatches.values()].filter(value => value.registrationId === notificationRegistration(notice)).length >= SUBMISSION_LIMIT) throw new Error('Notification revocation wait capacity reached');
+      let resolve;
+      const watch = { registrationId: notificationRegistration(notice), resolve: value => resolve(value) }, promise = new Promise(done => { resolve = done; });
+      submissionWatches.set(token, watch);
+      try { return await waitSubmission(promise, AbortSignal.any([submissionLifetime.signal, ...(signal ? [signal] : [])])); }
+      finally { if (submissionWatches.get(token) === watch) submissionWatches.delete(token); }
+    },
+    async beginNotificationSubmission(sourceKey, id, token) {
+      ensureOpen();
       tick();
-      const source = sources.get(sourceKey), notice = notifications.get(id);
-      if (!source || !notice || notice.sourceKey !== sourceKey || source.descriptor.policy === 'chatgpt-main/1' || notice.kind) throw new Error('Unknown legacy task notification scope');
+      const notice = submissionScope(sourceKey, id, token), source = sources.get(sourceKey), attempt = notice.submissionAttempt;
       expireClaim(notice);
-      const maySubmit = connected(source) && notice.status === 'claimed' && notice.submissionStartedAt == null && notificationEligible(notice);
-      if (maySubmit) { notice.submissionStartedAt = now(); save('notifications', notice); }
-      return { id, maySubmit };
+      const maySubmit = source && source.descriptor.policy !== 'chatgpt-main/1' && connected(source) && notice.status === 'claimed' && !attempt.issued && !attempt.settled && !attempt.revoked && notificationEligible(notice);
+      if (maySubmit) {
+        if ([...notifications.values()].filter(value => notificationRegistration(value) === notificationRegistration(notice) && unsettledSubmission(value)).length >= SUBMISSION_LIMIT) throw new Error('Notification submission revocation capacity reached');
+        const issued = copy(notice); issued.submissionAttempt.issued = true; issued.submissionStartedAt = now();
+        save('notifications', issued); notifications.set(id, issued);
+      }
+      return { id, maySubmit: Boolean(maySubmit) };
     },
     async ackNotification(id, result) {
       ensureOpen();
       maintainNotificationRecords();
-      const notification = notifications.get(id);
+      let notification = notifications.get(id);
       if (!notification) throw new Error('Unknown notification');
-      if (!['submitted', 'failed'].includes(result.status)) throw new Error('Notification result must be submitted or failed');
+      if (!['submitted', 'failed', 'invalidated'].includes(result.status)) throw new Error('Invalid notification submission result');
+      if (result.attemptToken !== undefined || result.status === 'invalidated' || unsettledSubmission(notification)) {
+        if (notification.submissionAttempt?.legacy && result.attemptToken === undefined && ['submitted', 'failed'].includes(result.status)) {
+          if (result.sourceKey !== undefined && result.sourceKey !== notification.sourceKey) throw new Error('Legacy notification receipt source does not match');
+        } else submissionScope(result.sourceKey, id, result.attemptToken);
+        notification = copy(notification);
+        notification.submissionAttempt.settled = true;
+        if (result.status === 'invalidated') { notification.submissionAttempt.revoked = true; notification.status = 'cancelled'; }
+        save('notifications', notification);
+        notifications.set(id, notification); notifySubmission(notification);
+        if (notification.historyPruned) { erase('notifications', id); return { id, status: 'cancelled', delivery: 'unknown', seen: 'unknown' }; }
+      }
       expireClaim(notification);
       const asyncFailure = notification.status === 'submitted' && result.status === 'failed';
       if (notification.status !== 'claimed' && !asyncFailure) return { id, status: notification.status, delivery: notification.delivery, seen: notification.seen };
@@ -1882,6 +1989,8 @@ export async function createCore({
     },
     async close() {
       if (closed) return;
+      submissionLifetime.abort(new Error('Monitoring core closed; submission revocation is unconfirmed'));
+      submissionWatches.clear(); submissionBarriers.clear();
       cancelRound('Monitoring core closed');
       closed = true;
       queue.length = 0;

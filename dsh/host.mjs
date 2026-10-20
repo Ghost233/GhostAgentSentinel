@@ -6,7 +6,7 @@ import { createObservation, hostIdentity } from './observation.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { HIERARCHY_FEATURE } from '../src/hierarchy.mjs'
 import { GS_FEATURE } from '../src/gs-status.mjs'
-import { GS_SUMMARY_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE } from '../src/protocol.mjs'
+import { GS_SUMMARY_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE } from '../src/protocol.mjs'
 import { createHierarchyReader } from './hierarchy-reader.mjs'
 import { readModelDirectory } from '../src/model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
@@ -51,7 +51,7 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
   let client, connectingClient, sourceKey, closed = false, nextRetry = 0, lastHeartbeat = 0, error = '正在连接共享核心'
   let communicationFailure
   let shutdownStatus = 'active', shutdownTimedOut = false, shutdownFailures = 0, shutdownFinalized = false, shutdownTimers = 0, lateSettledRequests = 0
-  let sentTasks = new Map(), sentGaps = new Set(), baselineSent = false, tickPromise, timer, pendingClose, provideDispose, remoteFiber, closeEffectDispose, hierarchySupported = false, gsStatusSupported = false, gsSummarySupported = false, sentHierarchyRevision = -1
+  let sentTasks = new Map(), sentGaps = new Set(), baselineSent = false, tickPromise, timer, pendingClose, provideDispose, remoteFiber, closeEffectDispose, hierarchySupported = false, gsStatusSupported = false, gsSummarySupported = false, submissionRevocationSupported = false, sentHierarchyRevision = -1
   const collector = createObservation({ identity, hierarchy: true, readCatalog(session) {
     if (!ctx.get('subagents')) return undefined
     const projections = ctx.get('sessionProjections')
@@ -157,6 +157,7 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
         hierarchySupported = features?.includes(HIERARCHY_FEATURE) === true
         gsStatusSupported = features?.includes(GS_FEATURE) === true
         gsSummarySupported = features?.includes(GS_SUMMARY_FEATURE) === true
+        submissionRevocationSupported = features?.includes(NOTIFICATION_REVOCATION_FEATURE) === true
         sentHierarchyRevision = -1
         sentTasks = new Map(); sentGaps = new Set(); baselineSent = false
         baseline()
@@ -308,22 +309,32 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       catch (error) {
         const requestFailure = error?.coreRequestFailure
         const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
-          && error?.code !== 'analysis_config_unconfirmed' && requestFailure?.operation === '/v1/notifications/installations/preferences' && requestFailure.kind === 'http' && requestFailure.status >= 400 && requestFailure.status <= 599
+          && !['analysis_config_unconfirmed', 'notification_revocation_unconfirmed'].includes(error?.code) && requestFailure?.operation === '/v1/notifications/installations/preferences' && requestFailure.kind === 'http' && requestFailure.status >= 400 && requestFailure.status <= 599
         const failure = error && typeof error === 'object' ? error : new Error(String(error))
         failure.code ??= 'gateway/internal'; failure.isDSHRemoteError = true
         failure.details = { ...failure.details, saveOutcome: rejected ? 'rejected' : 'unknown' }
         throw failure
       }
     },
-    beginNotificationSubmission(id, signal) { return invoke('beginNotificationSubmission', sourceKey, id, signal) },
+    beginNotificationSubmission(id, attemptToken, signal) {
+      if (!submissionRevocationSupported) return Promise.reject(new Error('共享核心尚不支持通知撤销确认；未提交通知'))
+      return invoke('beginNotificationSubmission', sourceKey, id, attemptToken, signal)
+    },
+    waitNotificationSubmissionRevocation(id, attemptToken, signal) {
+      if (!submissionRevocationSupported) return Promise.reject(new Error('共享核心尚不支持通知撤销确认；未提交通知'))
+      return invoke('waitNotificationSubmissionRevocation', sourceKey, id, attemptToken, signal)
+    },
     async installationNotificationRecords(selection = {}, signal) {
       const health = await installationCall('health', [], signal, false)
       if (!health.features?.includes(INSTALLATION_NOTIFICATION_RECORDS_FEATURE)) throw new Error('共享核心尚不支持本安装通知记录')
       return installationCall('installationNotificationRecords', [selection], signal)
     },
     sourcePlan(signal) { return invoke('sourcePlan', signal) }, configureSources(value, signal) { return invoke('configureSources', value, signal) },
-    claimNotifications(signal) { return invoke('claimNotifications', sourceKey, signal) },
-    ackNotification(id, result, signal) { return invoke('ackNotification', id, result, signal) },
+    claimNotifications(selection, signal) {
+      if (selection?.submissionProtocol !== 1 || Object.keys(selection).length !== 1 || !submissionRevocationSupported) return Promise.reject(new Error('通知客户端或共享核心不支持撤销确认；未领取通知'))
+      return invoke('claimNotifications', sourceKey, signal)
+    },
+    ackNotification(id, result, signal) { return invoke('ackNotification', id, { ...result, sourceKey }, signal) },
     close() {
       if (pendingClose) return pendingClose
       closed = true; shutdownStatus = 'closing'; clearInterval(timer); timer = undefined; lifetime.abort()
