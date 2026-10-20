@@ -43,29 +43,36 @@ async function observe(client, registrationId, taskId, hostRunId = 'host') {
   return sourceKey;
 }
 
-test('installation configuration is independent of collection, uses compare-save, and survives reopening', async t => {
+test('two settings windows save valid offline installation configuration with the last save winning across reopening', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-installation-models-'));
-  let server, client;
-  t.after(async () => { await client?.close(); await server?.close(); await rm(dataDir, { recursive: true, force: true }); });
+  let server, client, peer;
+  t.after(async () => { await peer?.close(); await client?.close(); await server?.close(); await rm(dataDir, { recursive: true, force: true }); });
   await writeFile(join(dataDir, 'analysis-config.json'), JSON.stringify({ llm: { model: 'old-global' } }));
   server = await startServer({ dataDir }); client = await connectCore({ dataDir });
+  peer = await connectCore({ dataDir });
   const first = await client.installationAnalysisConfig('chatgpt:formal');
+  const second = await peer.installationAnalysisConfig('chatgpt:formal');
   const other = await client.installationAnalysisConfig('chatgpt:test');
   assert.deepEqual(first.config, {});
+  assert.deepEqual(second, first);
   assert.deepEqual(other.config, {});
   assert.notEqual(first.revision, other.revision);
-  const config = { llm: { baseUrl: 'http://127.0.0.1:1234', model: 'summary' }, jev: { baseUrl: 'http://localhost:5678', model: 'judge' } };
-  const racing = await Promise.allSettled([
-    client.configureInstallationAnalysis('chatgpt:formal', config, first.revision),
-    client.configureInstallationAnalysis('chatgpt:formal', { llm: { model: 'concurrent' } }, first.revision),
-  ]);
-  const saved = racing.find(value => value.status === 'fulfilled').value;
-  assert.equal(racing.filter(value => value.status === 'fulfilled').length, 1);
-  assert.equal(racing.find(value => value.status === 'rejected').reason.code, 'analysis_config_conflict');
+  const config = { llm: { baseUrl: 'http://127.0.0.1:1', model: 'first-summary' }, jev: { baseUrl: 'http://localhost:1', model: 'first-judge' } };
+  const earlier = await client.configureInstallationAnalysis('chatgpt:formal', config, first.revision);
+  const later = { llm: { baseUrl: 'http://127.0.0.1:1', model: 'last-summary' }, jev: { baseUrl: 'http://localhost:1', model: 'last-judge' } };
+  const saved = await peer.configureInstallationAnalysis('chatgpt:formal', later, second.revision);
   assert.equal(saved.registrationId, 'chatgpt:formal');
   assert.notEqual(saved.revision, first.revision);
+  assert.notEqual(saved.revision, earlier.revision);
+  assert.deepEqual(saved.config, later);
+  assert.deepEqual(await client.installationAnalysisConfig('chatgpt:formal'), saved);
   assert.deepEqual(await client.installationAnalysisConfig('chatgpt:test'), other);
-  await assert.rejects(client.configureInstallationAnalysis('chatgpt:formal', {}, first.revision), error => error.status === 409 && error.code === 'analysis_config_conflict');
+  await assert.rejects(client.configureInstallationAnalysis('chatgpt:formal', { llm: { model: 'must-not-partially-save' }, jev: { baseUrl: 'https://example.com', model: 'invalid' } }, first.revision), error => error.status === 400);
+  await assert.rejects(client.configureInstallationAnalysis('chatgpt:formal', config, ''), error => error.status === 400);
+  await assert.rejects(client.configureInstallationAnalysis('', config, first.revision), error => error.status === 400);
+  assert.deepEqual(await client.installationAnalysisConfig('chatgpt:formal'), saved);
+  assert.deepEqual(await client.analysisConfig(), { llm: { model: 'old-global' } });
+  await peer.close(); peer = undefined;
   await client.close(); await server.close();
   server = await startServer({ dataDir }); client = await connectCore({ dataDir });
   assert.deepEqual(await client.installationAnalysisConfig('chatgpt:formal'), saved);
@@ -86,7 +93,10 @@ test('saving one installation seals only its round and preserves another install
   await until(() => models.held.length === 1, 'the old actual model request is held');
   await observe(client, 'b', 'b-queued');
   const before = await client.snapshot(), beforeB = before.tasks.filter(task => task.id.startsWith('b-'));
+  await client.configureInstallationAnalysis('a', models.config('superseded-a'), oldA.revision);
   const newA = await client.configureInstallationAnalysis('a', models.config('new-a'), oldA.revision);
+  await assert.rejects(client.configureInstallationAnalysis('a', { llm: models.config('invalid-a').llm, jev: { baseUrl: 'https://example.com' } }, oldA.revision), error => error.status === 400);
+  assert.deepEqual(await client.installationAnalysisConfig('a'), newA);
   const switched = await client.snapshot();
   assert.equal(switched.monitoring.pendingCancelledRequests, 1);
   assert.equal(switched.tasks.find(task => task.id === 'a-active').analysis.resultDisposition, 'none');
@@ -100,6 +110,28 @@ test('saving one installation seals only its round and preserves another install
   assert.deepEqual(final.tasks.find(task => task.id === 'b-queued').analysis.configScope, { registrationId: 'b', revision: originalB.revision });
   assert.equal(final.tasks.find(task => task.id === 'b-cooling').analysis.nextEligibleAt, beforeB.find(task => task.id === 'b-cooling').analysis.nextEligibleAt);
   assert.deepEqual(models.calls.filter(call => call.path === '/v1/chat/completions').map(call => call.body.model), ['b-summary', 'old-a-summary', 'b-summary', 'new-a-summary']);
+});
+
+test('stale installation autosaves preserve manual installation and conversation pauses', async t => {
+  const models = await modelFixture(t), dataDir = await mkdtemp(join(tmpdir(), 'sentinel-installation-save-paused-'));
+  const server = await startServer({ dataDir }), client = await connectCore({ dataDir });
+  t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const initial = await client.installationAnalysisConfig('a');
+  await client.configureInstallationAnalysis('a', models.config('old-a'), initial.revision);
+  const paused = await client.setInstallationMonitoring('a', true, (await client.installationMonitoring('a')).revision);
+  const other = await client.setInstallationMonitoring('b', true, (await client.installationMonitoring('b')).revision);
+  await observe(client, 'a', 'installation-paused');
+  await observe(client, 'b', 'other-paused');
+  const source = await client.registerSource({ registrationId: 'a', hostRunId: 'chat-host', name: 'Own paused chat', policy: 'chatgpt-main/1' });
+  await client.ingest(source, { tasks: [{ id: 'chat-paused', lifecycleId: 'life', title: 'Own paused chat', status: 'running' }] });
+  const chat = await client.setConversationMonitoring({ ...await client.conversationMonitoring({ registrationId: 'a', taskId: 'chat-paused' }), paused: true });
+  const saved = await client.configureInstallationAnalysis('a', models.config('new-a'), initial.revision);
+  assert.deepEqual(await client.installationAnalysisConfig('a'), saved);
+  assert.deepEqual(await client.installationMonitoring('a'), paused);
+  assert.deepEqual(await client.installationMonitoring('b'), other);
+  assert.deepEqual(await client.conversationMonitoring({ registrationId: 'a', taskId: 'chat-paused' }), chat);
+  assert.ok((await client.snapshot()).tasks.every(task => task.analysis.state === 'paused'));
+  assert.deepEqual(models.calls, []);
 });
 
 test('normal model HTTP requests use only their installation configuration and expose its version', async t => {

@@ -198,7 +198,7 @@ test('a failed configuration file write leaves its revision usable and does not 
   assert.deepEqual((await client.analysisConfigState()).config, {})
 })
 
-test('Native Host and ClientRemote expose bounded configuration CAS and preserve its conflict code', async t => {
+test('Native Host and ClientRemote accept last valid installation writes with bounded revision tokens', async t => {
   const { req, clientRequire, resolveGatewayBrowserClientPath } = await import('./dsh-native-runtime.mjs')
   const { Context } = req('@deepseek-ai/cordis'), { createAdapter } = await import('../dsh/host.mjs'), { runInNewContext } = await import('node:vm')
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-native-config-'))
@@ -220,10 +220,10 @@ test('Native Host and ClientRemote expose bounded configuration CAS and preserve
   assert.equal(initial.registrationId, 'native-config')
   const configured = await invoke('configureAnalysisIfCurrent', { config: { llm: { model: 'native' } }, revision: initial.revision })
   assert.equal(configured.config.llm.model, 'native')
-  const conflict = await host.typertGateway.dispatchRpc('sentinel/configureAnalysisIfCurrent', { args: { config: {}, revision: initial.revision } }, undefined, peer)
-  assert.equal(conflict.ok, false); assert.equal(conflict.error.code, 'analysis_config_conflict')
+  const oldWindow = await host.typertGateway.dispatchRpc('sentinel/configureAnalysisIfCurrent', { args: { config: { llm: { model: 'native-old-window' } }, revision: initial.revision } }, undefined, peer)
+  assert.equal(oldWindow.ok, true); assert.equal(oldWindow.value.config.llm.model, 'native-old-window')
   for (const revision of ['', 'x'.repeat(2001), {}]) await assert.rejects(invoke('configureAnalysisIfCurrent', { config: {}, revision }), /boundary validation|修订|revision/)
-  assert.deepEqual(await invoke('analysisConfigState'), configured)
+  assert.deepEqual(await invoke('analysisConfigState'), oldWindow.value)
   front = new Context(); front.provide('slots', { inject() { return () => {} } })
   await front.plugin(req('@deepseek-ai/dsh-typert-registry').default)
   front.provide('connection', { registerGenerationSource: () => () => {}, start: () => ({ stop() {} }), rpc: { open: async function *() {}, call: (_, endpoint, payload) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), undefined, peer) } })
@@ -235,15 +235,15 @@ test('Native Host and ClientRemote expose bounded configuration CAS and preserve
   const client = factory(name => name === 'react' ? clientRequire(name) : req(name)); await front.plugin({ inject: client.inject, apply: client.apply })
   while (!front.get('remote.sentinel')) { assert.ok(Date.now() < end, 'actual ClientRemote mount'); await delay(10) }
   const api = front.get('remote.sentinel'), before = await api.analysisConfigState()
-  assert.equal(before.ok, true); assert.deepEqual(before.value, configured)
+  assert.equal(before.ok, true); assert.deepEqual(before.value, oldWindow.value)
   const changed = await api.configureAnalysisIfCurrent({}, configured.revision)
   assert.equal(changed.ok, true); assert.deepEqual(changed.value.config, {})
-  const clientConflict = await api.configureAnalysisIfCurrent({ llm: { model: 'must-not-override' } }, configured.revision)
-  assert.equal(clientConflict.ok, false); assert.equal(clientConflict.error.code, 'analysis_config_conflict')
-  assert.deepEqual((await api.analysisConfigState()).value, changed.value)
+  const clientOldWindow = await api.configureAnalysisIfCurrent({ llm: { model: 'last-window' } }, configured.revision)
+  assert.equal(clientOldWindow.ok, true); assert.equal(clientOldWindow.value.config.llm.model, 'last-window')
+  assert.deepEqual((await api.analysisConfigState()).value, clientOldWindow.value)
   control = await connectCore({ dataDir })
-  assert.deepEqual((await control.installationAnalysisConfig('native-config')), changed.value)
-  assert.deepEqual(await control.analysisConfig(), {}, 'Native installation CAS does not write the old shared slot')
+  assert.deepEqual((await control.installationAnalysisConfig('native-config')), clientOldWindow.value)
+  assert.deepEqual(await control.analysisConfig(), {}, 'Native installation writes do not write the old shared slot')
   const idle = await host.agents.create({ sessionId: 'config-fault-idle', agentOptions: { provider: 'unused', model: 'unused' } }); t.after(() => idle.dispose())
   while (!(await adapter.snapshot()).tasks.some(task => task.id === 'config-fault-idle')) { assert.ok(Date.now() < end, 'Native idle task captured'); await delay(5) }
   const { DatabaseSync } = await import('node:sqlite')
@@ -253,7 +253,7 @@ test('Native Host and ClientRemote expose bounded configuration CAS and preserve
     applicationFailure = await api.configureAnalysisIfCurrent({ llm: { model: 'must-not-persist' } }, changed.value.revision)
     assert.equal(applicationFailure.ok, false)
     assert.match(applicationFailure.error.message, /database is locked/)
-    assert.deepEqual((await api.analysisConfigState()).value, changed.value, 'failed installation persistence retains its readable CAS revision')
+    assert.deepEqual((await api.analysisConfigState()).value, clientOldWindow.value, 'failed installation persistence retains its readable revision')
   } finally { blocker.exec('ROLLBACK'); blocker.close(); blocker = undefined }
   const retried = await api.configureAnalysisIfCurrent({ llm: { model: 'native-recovered' } }, changed.value.revision)
   assert.equal(retried.ok, true); assert.equal(retried.value.config.llm.model, 'native-recovered')

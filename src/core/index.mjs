@@ -1606,9 +1606,9 @@ export async function createCore({
     async installationAnalysisConfig(registrationId) { ensureOpen(); return installationConfig(registrationId); },
     async configureInstallationAnalysis(registrationId, config, revision) {
       ensureOpen();
-      const current = installationConfig(registrationId), normalized = normalizeAnalysisConfig(config);
+      installationConfig(registrationId);
+      const normalized = normalizeAnalysisConfig(config);
       if (typeof revision !== 'string' || !revision || revision.length > 2000) throw new Error('invalid installation configuration revision');
-      if (current.revision !== revision) throw Object.assign(new Error('analysis configuration revision conflict'), { code: 'analysis_config_conflict' });
       const setting = { key: registrationId, registrationId, config: normalized, revision: randomUUID() };
       const affected = new Map();
       for (const original of tasks.values()) {

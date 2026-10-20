@@ -147,7 +147,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   runInNewContext(await readFile(new URL('../dsh/client.js', import.meta.url), 'utf8'), {
     window: { __ModuleLoader__: { load(value) { factory = value.factory } } },
     document: dom.window.document,
-    Notification, setInterval(callback) { const key = ++intervalId; intervals.set(key, callback); return key }, clearInterval(key) { intervals.delete(key) }, setTimeout, clearTimeout, AbortController, Date, console,
+    Notification, setInterval(callback) { const key = ++intervalId; intervals.set(key, callback); return key }, clearInterval(key) { intervals.delete(key) }, setTimeout, clearTimeout, AbortController, URL, Date, console,
   })
   plugin = factory(name => name === 'react' ? clientRequire(name) : req(name))
   clientFiber = ctx.plugin({ inject: plugin.inject, apply: plugin.apply })
@@ -176,8 +176,9 @@ async function waitForDisplayedTask(fixture, title) {
 
 test('native system settings edits only its stable installation through production Remote and Core while monitoring refreshes', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-system-settings-')), host = new Context()
-  let server, core, adapter, f
-  t.after(async () => { await f?.dispose(); await adapter?.close(); await host.fiber.dispose(); await core?.close(); await server?.close(); await rm(dataDir, { recursive: true, force: true }) })
+  let server, core, adapter, f, blocker, saveMode = 'normal'
+  const held = []
+  t.after(async () => { for (const request of held) request.resolve(request.response); blocker?.exec('ROLLBACK'); blocker?.close(); await f?.dispose(); await adapter?.close(); await host.fiber.dispose(); await core?.close(); await server?.close(); await rm(dataDir, { recursive: true, force: true }) })
   server = await startServer({ dataDir }); core = await connectCore({ dataDir })
   const config = name => ({ llm: { baseUrl: 'http://127.0.0.1:1', model: `${name}-summary` }, jev: { baseUrl: 'http://127.0.0.1:1', model: `${name}-judge` } })
   const formal = await core.configureInstallationAnalysis('chatgpt:formal', config('formal'), (await core.installationAnalysisConfig('chatgpt:formal')).revision)
@@ -188,7 +189,14 @@ test('native system settings edits only its stable installation through producti
   for (const name of ['dsh-typert-registry', 'dsh-api-remote-access', 'dsh-api-gateway']) await host.plugin(req(`@deepseek-ai/${name}`).default)
   adapter = createAdapter(host, { dataDir, registrationId: 'dsh:system-settings' }, { flushMs: 10, heartbeatMs: 1000 })
   const { Peer } = req('@deepseek-ai/dsh-client-connection'), peer = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' })
-  f = await client(t, null, 'default', null, true, false, { $nativeSlots: true, $dispatch: (endpoint, payload, signal) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer) })
+  f = await client(t, null, 'default', null, true, false, { $nativeSlots: true, async $dispatch(endpoint, payload, signal) {
+    const response = await host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer)
+    if (endpoint === 'sentinel/configureAnalysisIfCurrent') {
+      if (saveMode === 'hold') return new Promise(resolve => held.push({ response, resolve, signal }))
+      if (saveMode === 'lose') throw new Error('controlled saved response lost')
+    }
+    return response
+  } })
   const entry = f.ctx.slots.entries('settings.section').find(entry => entry.options.id === 'ghost-agent-sentinel')
   assert.ok(entry, 'Sentinel is available from the original system settings list')
   assert.equal(typeof entry.options.label === 'function' ? entry.options.label() : entry.options.label, 'Sentinel')
@@ -214,14 +222,78 @@ test('native system settings edits only its stable installation through producti
   assert.equal(f.plugin.diagnostics().viewInstances, 0, 'Permission does not mount another monitor')
   const inputs = [...settings().querySelectorAll('input')], { Simulate } = clientRequire('react-dom/test-utils')
   assert.deepEqual(inputs.map(input => input.value), ['http://127.0.0.1:1', 'dsh-summary', 'http://127.0.0.1:1', 'dsh-judge'])
-  await f.interact(async () => { inputs[1].value = 'edited-summary'; Simulate.change(inputs[1]); await f.settle() })
+  const original = await core.installationAnalysisConfig('dsh:system-settings')
+  await f.interact(async () => {
+    inputs[3].value = ''; Simulate.change(inputs[3]); Simulate.blur(inputs[3], { relatedTarget: null })
+    inputs[0].value = 'not-a-url'; Simulate.change(inputs[0]); Simulate.blur(inputs[0], { relatedTarget: null }); await f.settle()
+  })
+  assert.deepEqual(await core.installationAnalysisConfig('dsh:system-settings'), original, 'invalid and incomplete groups keep the effective configuration')
+  await f.interact(async () => {
+    inputs[0].value = 'http://127.0.0.1:1'; Simulate.change(inputs[0])
+    inputs[1].value = 'edited-summary'; Simulate.change(inputs[1]); await f.settle()
+  })
+  assert.deepEqual(await core.installationAnalysisConfig('dsh:system-settings'), original, 'typing does not save each key')
+  await f.interact(async () => { Simulate.blur(inputs[0], { relatedTarget: inputs[1] }); await f.settle() })
+  assert.deepEqual(await core.installationAnalysisConfig('dsh:system-settings'), original, 'moving inside one model group does not save')
   await f.mount(); await f.dataReady(); await f.tick()
   assert.equal(inputs[1].value, 'edited-summary', 'monitor snapshots never overwrite the settings draft')
   for (const label of ['通知记录', '连接诊断', '设置']) await f.interact(async () => { Simulate.click([...settings().querySelectorAll('[role=tab]')].find(button => button.textContent === label)); await f.settle() })
   assert.equal(inputs[1].value, 'edited-summary', 'settings tab navigation retains the draft')
-  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
+  await f.interact(async () => { Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle() })
   await f.waitUntil(() => inputs[0].closest('form').textContent.includes('已保存'), 'settings reports the actual public Core save result')
   assert.deepEqual((await core.installationAnalysisConfig('dsh:system-settings')).config, { ...config('dsh'), llm: { baseUrl: 'http://127.0.0.1:1', model: 'edited-summary' } })
+  assert.equal(inputs[3].value, '', 'saving the valid summary group retains the incomplete JEV draft')
+  assert.equal([...settings().querySelectorAll('button')].some(button => /保存分析连接|读取当前配置/.test(button.textContent)), false, 'autosave needs no save or conflict-reload action')
+  assert.deepEqual(await core.installationAnalysisConfig('chatgpt:formal'), formal)
+  assert.deepEqual(await core.installationAnalysisConfig('chatgpt:test'), candidate)
+  const status = input => input.closest('fieldset').querySelector('[role=status]')?.textContent || ''
+  saveMode = 'hold'
+  await f.interact(async () => { inputs[1].value = 'first-completion'; Simulate.change(inputs[1]); Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle() })
+  await f.waitUntil(() => held.length === 1, 'the actual Core save completes while its Remote response is held')
+  assert.match(status(inputs[1]), /正在保存/)
+  await f.interact(async () => {
+    inputs[3].value = 'new-judge'; Simulate.change(inputs[3]); Simulate.blur(inputs[3], { relatedTarget: null })
+    inputs[1].value = 'second-completion'; Simulate.change(inputs[1]); Simulate.blur(inputs[1], { relatedTarget: null })
+    inputs[1].value = 'latest-completion'; Simulate.change(inputs[1]); Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle()
+  })
+  saveMode = 'normal'; held[0].resolve(held[0].response)
+  await f.waitUntil(() => f.plugin.diagnostics().activeRequests === 0, 'completed groups drain after the pending save response')
+  assert.deepEqual((await core.installationAnalysisConfig('dsh:system-settings')).config, {
+    llm: { baseUrl: 'http://127.0.0.1:1', model: 'latest-completion' }, jev: { baseUrl: 'http://127.0.0.1:1', model: 'new-judge' },
+  }, 'rapid edits and the completed peer group both persist')
+  saveMode = 'hold'
+  await f.interact(async () => { inputs[1].value = 'valid-before-draft'; Simulate.change(inputs[1]); Simulate.keyDown(inputs[1], { key: 'Enter' }); await f.settle() })
+  await f.waitUntil(() => held.length === 2, 'a second actual save response is delayed')
+  await f.interact(async () => { inputs[1].value = ''; Simulate.change(inputs[1]); await f.settle() })
+  saveMode = 'normal'; held[1].resolve(held[1].response)
+  await f.waitUntil(() => f.plugin.diagnostics().activeRequests === 0, 'the prior valid save settles without replacing the newer draft')
+  assert.equal(inputs[1].value, ''); assert.match(status(inputs[1]), /草稿/); assert.doesNotMatch(status(inputs[1]), /已保存/)
+  const confirmed = await core.installationAnalysisConfig('dsh:system-settings')
+  const { DatabaseSync } = await import('node:sqlite')
+  blocker = new DatabaseSync(join(dataDir, 'observations.sqlite')); blocker.exec('BEGIN IMMEDIATE')
+  await f.interact(async () => { inputs[1].value = 'retry-summary'; Simulate.change(inputs[1]); Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle() })
+  await f.waitUntil(() => status(inputs[1]).includes('保存失败'), 'an actual Core persistence rejection is shown as failed')
+  assert.match(status(inputs[1]), /database is locked/); assert.equal(inputs[1].value, 'retry-summary')
+  assert.deepEqual(await core.installationAnalysisConfig('dsh:system-settings'), confirmed)
+  blocker.exec('ROLLBACK'); blocker.close(); blocker = undefined
+  saveMode = 'lose'
+  await f.interact(async () => { Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle() })
+  await f.waitUntil(() => f.plugin.diagnostics().activeRequests === 0, 'the response loss finishes at the real ClientRemote boundary')
+  assert.match(status(inputs[1]), /保存结果未知/, 'a lost Remote reply is not a confirmed failure or success')
+  assert.doesNotMatch(status(inputs[1]), /已保存/); assert.equal(inputs[1].value, 'retry-summary')
+  assert.equal((await core.installationAnalysisConfig('dsh:system-settings')).config.llm.model, 'retry-summary', 'the valid offline save can apply even when its response is lost')
+  saveMode = 'normal'
+  await f.interact(async () => { inputs[1].value = 'valid-before-draft'; Simulate.change(inputs[1]); Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle() })
+  await f.waitUntil(() => status(inputs[1]).includes('已保存'), 'a later confirmed edit resolves the unknown outcome')
+  assert.equal((await core.installationAnalysisConfig('dsh:system-settings')).config.llm.model, 'valid-before-draft', 'returning to the last confirmed input still writes after a lost response')
+  await f.interact(async () => {
+    inputs[0].value = ''; Simulate.change(inputs[0]); inputs[1].value = ''; Simulate.change(inputs[1])
+    Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle()
+  })
+  assert.deepEqual((await core.installationAnalysisConfig('dsh:system-settings')).config, {
+    jev: { baseUrl: 'http://127.0.0.1:1', model: 'new-judge' },
+  }, 'clearing both fields removes only the completed model role')
+  assert.match(status(inputs[1]), /已保存/)
   assert.deepEqual(await core.installationAnalysisConfig('chatgpt:formal'), formal)
   assert.deepEqual(await core.installationAnalysisConfig('chatgpt:test'), candidate)
   await f.unmountSettings(); await f.tick()
@@ -232,15 +304,15 @@ test('native system settings edits only its stable installation through producti
   assert.equal(f.ctx.slots.entries('settings.section').length, 0, 'plugin unload reclaims its native settings contribution')
 })
 
-test('closing native settings cancels its own Remote read and plugin disable cancels its save without accepting late results', async t => {
+test('closing native settings cancels its read and plugin reconnection discards old saves and queued groups', async t => {
   const pending = [], current = { registrationId: 'dsh:owned', config: { llm: { baseUrl: 'http://127.0.0.1:1', model: 'current' } }, revision: 'current' }
   let holdRead = true
-  const hold = signal => new Promise(resolve => { pending.push({ signal, resolve }) })
+  const hold = (signal, config) => new Promise(resolve => { pending.push({ signal, config, resolve }) })
   t.after(() => { for (const request of pending) request.resolve({ ok: true, value: current }) })
   const f = await client(t, null, 'denied', null, true, false, {
     $nativeSlots: true,
     async analysisConfigState(signal) { if (holdRead) return hold(signal); return { ok: true, value: current } },
-    async configureAnalysisIfCurrent(_config, _revision, signal) { return hold(signal) },
+    async configureAnalysisIfCurrent(config, _revision, signal) { return hold(signal, config) },
   })
   await f.mountSettings()
   await f.waitUntil(() => pending.length === 1, 'the actual settings starts its own Remote read')
@@ -255,15 +327,32 @@ test('closing native settings cancels its own Remote read and plugin disable can
   const inputs = [...settings.querySelectorAll('input')], { Simulate } = clientRequire('react-dom/test-utils')
   assert.equal(inputs[1].value, 'current')
   await f.interact(async () => { inputs[1].value = 'draft'; Simulate.change(inputs[1]); await f.settle() })
-  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
+  await f.interact(async () => { Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle() })
   await f.waitUntil(() => pending.length === 2, 'the actual settings save entered Remote IO')
+  await f.interact(async () => {
+    inputs[2].value = 'http://127.0.0.1:1'; Simulate.change(inputs[2]); inputs[3].value = 'queued-judge'; Simulate.change(inputs[3])
+    Simulate.blur(inputs[3], { relatedTarget: null }); await f.settle()
+  })
+  assert.match(inputs[1].closest('fieldset').textContent, /正在保存/)
   await f.disable()
   assert.equal(pending[1].signal.aborted, true, 'plugin disable cancels the settings save')
   assert.equal(f.ctx.slots.entries('settings.section').length, 0)
+  assert.match(inputs[1].closest('fieldset').textContent, /保存结果未知/, 'connection closure renders an unconfirmed outcome instead of stale saving status')
+  await f.reinstall(false)
+  assert.equal(pending.length, 2, 'the old queued group is not sent through the new connection')
+  await f.interact(async () => { inputs[3].value = 'new-scope-judge'; Simulate.change(inputs[3]); Simulate.blur(inputs[3], { relatedTarget: null }); await f.settle() })
+  await f.waitUntil(() => pending.length === 3, 'a new user completion can save through the reconnected scope before the old Remote call finishes')
+  const beforeLate = inputs[0].closest('form').textContent
   pending[1].resolve({ ok: true, value: { ...current, revision: 'late-save' } })
   await f.settle()
   assert.equal(inputs[1].value, 'draft')
+  assert.equal(inputs[3].value, 'new-scope-judge')
+  assert.equal(inputs[0].closest('form').textContent, beforeLate, 'an old connection cannot update save status in the reconnected page')
   assert.equal(inputs[0].closest('form').textContent.includes('已保存'), false, 'an aborted late save is never shown as applied')
+  pending[2].resolve({ ok: true, value: { ...current, config: pending[2].config, revision: 'new-scope-saved' } })
+  await f.interact(async () => { await f.settle() })
+  assert.match(inputs[3].closest('fieldset').textContent, /已保存/, 'the new completion survives old-scope cleanup')
+  assert.equal(pending.length, 3)
 })
 
 for (const ending of ['close', 'disable']) test(`native settings ${ending} ignores late notification-permission results`, async t => {
@@ -312,7 +401,7 @@ test('native settings distinguishes denied permission from a rejected request wi
   assert.equal(f.delivered.length, 0)
 })
 
-test('the actual DSH settings form saves its installation CAS through Native Remote and drives only its selected models', async t => {
+test('the actual DSH settings form autosaves groups through Native Remote and drives only its last valid installation models', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-installation-ui-')), host = new Context(), requests = []
   let server, core, adapter, actor, f, clockOffset = 0
   const models = createServer(async (request, response) => {
@@ -354,18 +443,19 @@ test('the actual DSH settings form saves its installation CAS through Native Rem
   const inputs = [...f.dom.window.document.querySelectorAll('input')].filter(input => input.type !== 'checkbox')
   assert.equal(inputs.length, 4)
   await f.interact(async () => { for (let index = 0; index < inputs.length; index++) { inputs[index].value = values[index]; Simulate.change(inputs[index]) }; await f.settle() })
-  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
+  await f.interact(async () => { Simulate.blur(inputs[1], { relatedTarget: inputs[2] }); Simulate.blur(inputs[3], { relatedTarget: null }); await f.settle() })
   await f.waitUntil(() => f.plugin.diagnostics().activeRequests === 0, 'the actual settings save finishes')
   let saved = await core.installationAnalysisConfig('dsh:stable')
   assert.deepEqual(saved.config, config('dsh'), 'the DSH form must configure its stable installation rather than the shared legacy slot')
   assert.match(inputs[0].closest('form').textContent, /已保存；下一轮采用新配置/)
-  await core.configureInstallationAnalysis('dsh:stable', config('dsh'), saved.revision)
-  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
-  assert.match(inputs[0].closest('form').textContent, /conflict|changed|变化|冲突/i, 'a stale panel save exposes the conflict and preserves its draft')
-  assert.equal(inputs[1].value, 'dsh-summary')
-  await f.interact(async () => { Simulate.click([...inputs[0].closest('form').querySelectorAll('button')].find(button => button.textContent === '读取当前配置')); await f.settle() })
-  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
+  await core.configureInstallationAnalysis('dsh:stable', config('other-window'), saved.revision)
+  await f.interact(async () => {
+    inputs[1].value = 'temporary-edit'; Simulate.change(inputs[1])
+    inputs[1].value = 'dsh-summary'; Simulate.change(inputs[1]); Simulate.blur(inputs[1], { relatedTarget: null }); await f.settle()
+  })
   saved = await core.installationAnalysisConfig('dsh:stable')
+  assert.equal(saved.config.llm.model, 'dsh-summary', 'the old window can complete its next valid edit even when returning to its prior input')
+  assert.equal(inputs[1].value, 'dsh-summary')
   assert.match(inputs[0].closest('form').textContent, /已保存；下一轮采用新配置/)
   assert.deepEqual(await core.installationAnalysisConfig('chatgpt:formal'), formal)
   assert.deepEqual(await core.installationAnalysisConfig('chatgpt:test'), candidate)

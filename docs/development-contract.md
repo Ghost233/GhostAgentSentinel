@@ -72,9 +72,9 @@ checks 固定六项 ID：stalled_progress/request_drift/failure_loop/validation_
 
 适配器接缝：`src/core-client.mjs` 导出 `connectCore({dataDir})`，提供上述业务方法对应的 HTTP 方法及 `close()`。close 只关闭客户端；适配器须先 unregisterSource。连接断开后适配器重试 connectCore 和登记／基线，不能依赖旧连接 token 或旧 sourceKey。公开事件验证由主线程完成，业务语义与去重由核心完成。核心默认租约 15 秒，适配器心跳 3 秒；开发默认长等待阈值 5 分钟明确标为待质量验收，不作为任务失败结论。
 
-安装配置使用 `installationAnalysisConfig(registrationId)` 读取 `{registrationId,config,revision}`，使用 `configureInstallationAnalysis(registrationId,config,revision)` 比较保存。HTTP 为 `GET /v1/analysis/installations/config?registrationId=…` 与同路径 POST，写入正文为 `{registrationId,config,revision}`。配置为 `{llm:{baseUrl,model},jev:{baseUrl,model}}`，未设置的项可以省略，只允许回环 HTTP(S)，不包含密钥。同安装的聊天共用配置，不同 registrationId 各自持久保存；未配置安装返回空配置，不回落到旧全局设置。
+安装配置使用 `installationAnalysisConfig(registrationId)` 读取 `{registrationId,config,revision}`，使用 `configureInstallationAnalysis(registrationId,config,revision)` 保存。HTTP 为 `GET /v1/analysis/installations/config?registrationId=…` 与同路径 POST，写入正文为 `{registrationId,config,revision}`。配置为 `{llm:{baseUrl,model},jev:{baseUrl,model}}`，未设置的项可以省略，只允许回环 HTTP(S)，不包含密钥。同安装的聊天共用配置，不同 registrationId 各自持久保存；未配置安装返回空配置，不回落到旧全局设置。
 
-安装配置修订冲突返回 409 和 `analysis_config_conflict`，不修改配置。每次成功写入更换该安装的修订号，并将该安装受影响的配置、任务和通知变化一起持久提交。分析轮次和结果绑定 registrationId、配置修订号及执行材料；保存后取消旧轮次、封存晚到结果，按新配置公平排队。采集、原任务、其它安装与手动暂停保持。响应丢失时保留结果未知，调用方重新读取，不能仅凭值相同推定写入归属。
+同一安装以最后一次有效保存为准，不因另一窗口先保存而拒绝旧修订号；仍校验安装身份、修订号格式和整份配置。每次成功写入更换该安装的修订号，并将该安装受影响的配置、任务和通知变化一起持久提交。无效配置不部分生效。分析轮次和结果绑定 registrationId、配置修订号及执行材料；保存后取消旧轮次、封存晚到结果，按新配置公平排队。采集、原任务、其它安装与手动暂停保持。响应丢失时保留结果未知，调用方重新读取，不能仅凭值相同推定写入归属。安装暂停、会话暂停和旧全局配置各自的修订冲突规则保持。
 
 安装暂停使用 `installationMonitoring(registrationId)` 和 `setInstallationMonitoring(registrationId,paused,revision)`，返回 `{registrationId,paused,revision}`。HTTP 为 `GET /v1/monitoring/installations?registrationId=…` 与同路径 POST，写入正文为 `{registrationId,paused,revision}`。相同目标状态幂等，过期的相反写入返回 409 和 `installation_monitoring_conflict`。DSH 界面只调用所属安装的控制；安装暂停与会话暂停取逻辑或，恢复其中一项不解除另一项，暂停期间仍采集。
 

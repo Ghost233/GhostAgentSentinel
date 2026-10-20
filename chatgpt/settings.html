@@ -10,52 +10,75 @@ body{font:14px/1.55 system-ui;margin:0;padding:16px;color:var(--color-text-prima
 <p class="muted">本安装的所有已监控聊天共用这份模型配置。关闭设置不停止监控。</p>
 <p id="settings-status" role="status" class="muted"></p>
 <form id="settings-form">
-<fieldset><legend>总结模型</legend>
+<fieldset id="settings-llm-group"><legend>总结模型</legend>
 <label>服务地址<input id="settings-llm-url" type="url" placeholder="http://127.0.0.1:端口" autocomplete="off"></label>
 <label>模型 ID（下拉或手填）<input id="settings-llm-model" list="settings-llm-options" autocomplete="off"></label><datalist id="settings-llm-options"></datalist>
 <button id="settings-llm-check" type="button">读取列表／检查连接</button><p id="settings-llm-status" class="muted"></p></fieldset>
-<fieldset><legend>JEV 判断模型</legend>
+<fieldset id="settings-jev-group"><legend>JEV 判断模型</legend>
 <label>服务地址<input id="settings-jev-url" type="url" placeholder="http://127.0.0.1:端口" autocomplete="off"></label>
 <label>模型 ID（下拉或手填）<input id="settings-jev-model" list="settings-jev-options" autocomplete="off"></label><datalist id="settings-jev-options"></datalist>
 <button id="settings-jev-check" type="button">读取列表／检查连接</button><p id="settings-jev-status" class="muted"></p></fieldset>
-<button id="settings-save" type="submit" disabled>保存模型设置</button><button id="settings-reload" type="button">重新读取</button>
+<p class="muted">选定模型或离开模型分组时自动保存；未完成的输入保留为草稿。</p><button id="settings-reload" type="button">重新读取</button>
 </form>
 <script>
 const element=id=>document.querySelector('#'+id),text=(value,max=2000)=>typeof value==='string'?value.slice(0,max):'';
-let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0;
-const pending=new Map(),directoryVersions={llm:0,jev:0};
+let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0,savingGroups=null;
+const pending=new Map(),directoryVersions={llm:0,jev:0},editVersions={llm:0,jev:0},completedVersions={llm:0,jev:0},dirtyRoles=new Set(),queuedGroups=new Map();
 function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);if(entry.method==='tools/call')parent.postMessage({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id,reason}},'*');entry.reject(new Error(reason));}
 function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
 function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
-function renderModelSettings(value){
+function validateModelSettings(value){
   if(!value||!text(value.registrationId)||!text(value.revision)||!value.config||typeof value.config!=='object'||Array.isArray(value.config)||settingsState&&settingsState.registrationId!==value.registrationId)throw new Error('模型配置归属未确认');
-  settingsState=value;
+}
+function renderModelSettings(value){
+  validateModelSettings(value);settingsState=value;
   for(const role of ['llm','jev']){
+    if(dirtyRoles.has(role))continue;
     directoryVersions[role]++;element('settings-'+role+'-options').replaceChildren();element('settings-'+role+'-check').disabled=false;
     element('settings-'+role+'-url').value=value.config[role]?.baseUrl??'';element('settings-'+role+'-model').value=value.config[role]?.model??'';
     element('settings-'+role+'-status').textContent=value.config[role]?'已配置 · 实际分析状态另行核对':'尚未配置';
   }
 }
 async function readModelSettings(){
-  if(stopped||!ready||settingsBusy)return;
-  settingsBusy=true;const version=++settingsVersion;element('settings-save').disabled=true;element('settings-reload').disabled=true;element('settings-status').textContent='正在读取模型设置';
+  if(stopped||document.hidden||!ready||settingsBusy)return;
+  settingsBusy=true;const version=++settingsVersion;element('settings-reload').disabled=true;element('settings-status').textContent='正在读取模型设置';
   try{
     const response=await request('tools/call',{name:'sentinel_model_settings',arguments:{}});
     if(stopped||version!==settingsVersion)return;if(response.isError)throw new Error('模型设置读取失败');
     renderModelSettings(response.structuredContent);element('settings-status').textContent='本安装模型设置';
   }catch(error){if(!stopped&&version===settingsVersion)element('settings-status').textContent='模型设置读取失败 · '+text(error.message);}
-  finally{if(!stopped&&version===settingsVersion){settingsBusy=false;element('settings-save').disabled=!settingsState;element('settings-reload').disabled=false;}}
+  finally{if(!stopped&&version===settingsVersion){settingsBusy=false;element('settings-reload').disabled=false;void saveModelSettings();}}
 }
-async function saveModelSettings(event){
-  event?.preventDefault();if(stopped||!ready||settingsBusy||!settingsState)return;
-  const config={};for(const role of ['llm','jev']){const baseUrl=element('settings-'+role+'-url').value.trim(),model=element('settings-'+role+'-model').value.trim();if(baseUrl||model)config[role]={baseUrl,model};}
-  settingsBusy=true;const version=++settingsVersion;element('settings-save').disabled=true;element('settings-reload').disabled=true;element('settings-status').textContent='正在保存';
+function modelGroup(role){
+  const baseUrl=element('settings-'+role+'-url').value.trim(),model=element('settings-'+role+'-model').value.trim();
+  if(!baseUrl&&!model)return null;
+  let url;try{url=new URL(baseUrl);}catch{throw new Error('请填写完整的本机服务地址和模型 ID');}
+  if(!model||model.length>500||baseUrl.length>2000||!['http:','https:'].includes(url.protocol)||!['127.0.0.1','localhost','[::1]'].includes(url.hostname)||url.username||url.password||url.search||url.hash||!['','/'].includes(url.pathname))throw new Error('请填写有效的本机服务地址和模型 ID');
+  return{baseUrl:url.href.replace(/\/$/,''),model};
+}
+function sameGroup(left,right){return(left?.baseUrl??'')===(right?.baseUrl??'')&&(left?.model??'')===(right?.model??'');}
+function completeModelGroup(role){
+  if(stopped||editVersions[role]===completedVersions[role])return;
+  let group;try{group=modelGroup(role);}catch(error){element('settings-'+role+'-status').textContent='草稿未保存 · '+text(error.message);return;}
+  completedVersions[role]=editVersions[role];
+  queuedGroups.set(role,{group,version:editVersions[role]});return saveModelSettings();
+}
+async function saveModelSettings(){
+  if(stopped||document.hidden||!ready||settingsBusy||!settingsState||!queuedGroups.size)return;
+  const config={...settingsState.config};savingGroups=new Map(queuedGroups);queuedGroups.clear();
+  for(const [role,{group}] of savingGroups){if(group)config[role]=group;else delete config[role];}
+  settingsBusy=true;const version=++settingsVersion;element('settings-reload').disabled=true;element('settings-status').textContent='正在保存';
   try{
     const response=await request('tools/call',{name:'sentinel_save_model_settings',arguments:{config,revision:settingsState.revision}});
-    if(stopped||version!==settingsVersion)return;if(response.isError)throw new Error('保存结果未确认，请重新读取');
-    renderModelSettings(response.structuredContent);element('settings-status').textContent='已保存 · 等待重新分析';
-  }catch(error){if(!stopped&&version===settingsVersion){settingsState=null;element('settings-status').textContent='保存结果未确认 · 请重新读取模型设置；'+text(error.message);}}
-  finally{if(!stopped&&version===settingsVersion){settingsBusy=false;element('settings-save').disabled=!settingsState;element('settings-reload').disabled=false;}}
+    if(stopped||version!==settingsVersion)return;
+    if(response.isError){element('settings-status').textContent='保存失败 · 输入已保留';return;}
+    const value=response.structuredContent;validateModelSettings(value);
+    if(!['llm','jev'].every(role=>sameGroup(value.config[role],config[role])))throw new Error('保存响应内容未确认');
+    settingsState=value;
+    for(const [role,entry] of savingGroups)if(entry.version===editVersions[role]){dirtyRoles.delete(role);element('settings-'+role+'-status').textContent=entry.group?'已配置 · 实际分析状态另行核对':'尚未配置';}
+    element('settings-status').textContent='已保存 · 等待重新分析'+(dirtyRoles.size?' · 仍有未保存草稿':'');
+  }catch(error){if(!stopped&&version===settingsVersion)element('settings-status').textContent='保存结果未确认 · 输入已保留，可重新读取核对；'+text(error.message);}
+  finally{if(!stopped&&version===settingsVersion){savingGroups=null;settingsBusy=false;element('settings-reload').disabled=false;void saveModelSettings();}}
 }
 async function readDirectory(role){
   if(stopped||!ready||element('settings-'+role+'-check').disabled)return;
@@ -73,12 +96,14 @@ async function readDirectory(role){
   }catch(error){if(current())status.textContent='连接检查未确认 · '+text(error.message);}
   finally{if(!stopped&&version===directoryVersions[role])button.disabled=false;}
 }
-element('settings-form').onsubmit=saveModelSettings;element('settings-reload').onclick=readModelSettings;
+element('settings-form').onsubmit=event=>event.preventDefault();element('settings-reload').onclick=readModelSettings;
 for(const role of ['llm','jev']){
   element('settings-'+role+'-check').onclick=()=>readDirectory(role);
-  for(const field of ['url','model'])element('settings-'+role+'-'+field).oninput=()=>{directoryVersions[role]++;element('settings-'+role+'-check').disabled=false;element('settings-'+role+'-status').textContent='参数已改变 · 请重新检查';if(field==='url')element('settings-'+role+'-options').replaceChildren();};
+  element('settings-'+role+'-model').onchange=()=>completeModelGroup(role);
+  element('settings-'+role+'-group').onfocusout=event=>{if(!['url','model','check'].some(field=>event.relatedTarget===element('settings-'+role+'-'+field)))return completeModelGroup(role);};
+  for(const field of ['url','model'])element('settings-'+role+'-'+field).oninput=()=>{editVersions[role]++;dirtyRoles.add(role);directoryVersions[role]++;element('settings-'+role+'-check').disabled=false;element('settings-'+role+'-status').textContent='草稿 · 完成配置后自动保存；请重新检查连接';if(field==='url')element('settings-'+role+'-options').replaceChildren();};
 }
-function visibility(){if(document.hidden)for(const [id,entry] of pending)if(entry.method==='tools/call')cancel(id,entry,'面板已隐藏 · 输入已保留');}
+function visibility(){if(document.hidden){for(const [id,entry] of pending)if(entry.method==='tools/call')cancel(id,entry,'面板已隐藏 · 输入已保留');}else if(settingsState)void saveModelSettings();else void readModelSettings();}
 function teardown(){if(stopped)return;stopped=true;settingsVersion++;for(const [id,entry] of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('message',onMessage);addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
 (async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt-settings',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');await readModelSettings();}catch(error){if(!stopped)element('settings-status').textContent='宿主初始化未完成 · '+text(error.message);}})();

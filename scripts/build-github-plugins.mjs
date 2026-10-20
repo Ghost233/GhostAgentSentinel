@@ -42,7 +42,7 @@ export async function buildGitHubPlugins({ packageRoot, outputRoot } = {}) {
     await writeFile(join(pluginRoot, 'payload.sha256'), archiveSHA256 + '\n')
     await writeFile(join(pluginRoot, 'payload.manifest.sha256'), payload.digest + '\n')
     await writeFile(join(pluginRoot, 'licenses/node-LICENSE'), nodeLicense)
-    await writeFile(join(pluginRoot, 'README.md'), '# ' + displayName + '\n\n从仓库市场安装并在 App 中启用。关闭面板继续观察；停用插件停止观察。首次启用会校验并解压包内运行环境，无需 npm 或独立常驻程序。\n\n安装版本：' + payload.manifest.version + '。在会话面板的“设置”中分别配置总结模型和 JEV。本安装的聊天共用配置，其它安装独立。连接检查只核对在线和模型名称；本轮两个模型实际调用成功后才发布新总结。仅支持已核实版本的 macOS Apple Silicon ChatGPT.app。\n\n安装、资料位置、验收范围和完整清理步骤：' + repository + '/blob/test/docs/chatgpt-github-installation.md\n')
+    await writeFile(join(pluginRoot, 'README.md'), '# ' + displayName + '\n\n从仓库市场安装并在 App 中启用。关闭面板继续观察；停用插件停止观察。首次启用会校验并解压包内运行环境，无需 npm 或独立常驻程序。\n\n安装版本：' + payload.manifest.version + '。在同一插件的全局安装设置面板中分别配置总结模型和 JEV，完成有效模型组编辑后自动保存。本安装的聊天共用配置，其它安装独立。连接检查只核对在线和模型名称；本轮两个模型实际调用成功后才发布新总结。仅支持已核实版本的 macOS Apple Silicon ChatGPT.app。\n\n安装、资料位置、验收范围和完整清理步骤：' + repository + '/blob/test/docs/chatgpt-github-installation.md\n')
     plugins.push({ name, channel, pluginRoot, displayName, serverName })
   }
   return { version: payload.manifest.version, archiveSHA256, manifestSHA256: payload.digest, archiveBytes: bytes.length, plugins }

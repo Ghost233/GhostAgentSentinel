@@ -20,7 +20,7 @@ export async function panelHarness(t, { html = null } = {}) {
   let timerId = 0
   const parent = { postMessage: value => sent.push(value) }
   const document = { hidden: false, querySelector: element, createElement: tag => new Element(tag) }
-  const context = vm.createContext({ parent, document, addEventListener: (event, callback) => handlers.set(event, callback), removeEventListener: event => handlers.delete(event), setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id }, clearTimeout: id => timers.delete(id) })
+  const context = vm.createContext({ parent, document, URL, addEventListener: (event, callback) => handlers.set(event, callback), removeEventListener: event => handlers.delete(event), setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id }, clearTimeout: id => timers.delete(id) })
   const flush = () => new Promise(resolve => setImmediate(resolve))
   const reply = (id, value) => handlers.get('message')({ source: parent, data: { jsonrpc: '2.0', id, result: value } })
   vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], context)

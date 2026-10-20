@@ -108,7 +108,12 @@
           const completion = Promise.resolve().then(() => { abort.signal.throwIfAborted(); return scope.remote[method](...args, abort.signal) }).finally(() => unfinishedCalls.delete(invocation))
           const response = await Promise.race([completion, cancelled])
           if (!scope.active || abort.signal.aborted) throw new Error('观察请求已取消')
-          if (!response?.ok) throw new Error(response?.error?.message || `观察操作失败：${response?.error?.code || method}`)
+          if (!response?.ok) {
+            const error = new Error(response?.error?.message || `观察操作失败：${response?.error?.code || method}`)
+            error.responseReceived = Boolean(response?.error) && response.error.code !== 'gateway/cancelled'
+              && !(response.error.code === 'gateway/internal' && response.error.message?.startsWith('client api: '))
+            throw error
+          }
           return response.value
         } finally {
           clearTimeout(deadline); lifetime.removeEventListener('abort', cancel); signal?.removeEventListener('abort', cancel)
@@ -274,37 +279,80 @@
         }, [sessionId, visible, signal])
         return summary
       }
-      function AnalysisConfig({ config, request = call, onConfig = config => notifyState({ config }), expanded = false }) {
-        const [llmUrl, setLlmUrl] = useState(config?.config?.llm?.baseUrl || '')
-        const [llmModel, setLlmModel] = useState(config?.config?.llm?.model || '')
-        const [jevUrl, setJevUrl] = useState(config?.config?.jev?.baseUrl || '')
-        const [jevModel, setJevModel] = useState(config?.config?.jev?.model || '')
-        const [result, setResult] = useState('')
-        async function save(event) {
-          event.preventDefault(); setResult('正在保存')
-          try {
-            const next = {}
-            if (llmUrl || llmModel) next.llm = { baseUrl: llmUrl.trim(), model: llmModel.trim() }
-            if (jevUrl || jevModel) next.jev = { baseUrl: jevUrl.trim(), model: jevModel.trim() }
-            const saved = await request('configureAnalysisIfCurrent', next, config.revision)
-            onConfig(saved); setResult('已保存；下一轮采用新配置')
-          } catch (error) { setResult(errorText(error)) }
+      function AnalysisConfig({ config, request = call, onConfig = config => notifyState({ config }), expanded = false, signal }) {
+        const [draft, setDraft] = useState(() => Object.fromEntries(['llm', 'jev'].map(role => [role, {
+          baseUrl: config.config?.[role]?.baseUrl || '', model: config.config?.[role]?.model || '',
+        }])))
+        const [results, setResults] = useState({})
+        const edits = useRef({ llm: 0, jev: 0 }), values = useRef(draft), confirmed = useRef(config)
+        const savedEdits = useRef({ llm: 0, jev: 0 }), resultScopes = useRef({}), confirmedScope = useRef(connectionScope)
+        const pending = useRef(new Map()), saving = useRef(false), active = useRef(true), uncertain = useRef(false)
+        useEffect(() => () => { active.current = false; pending.current.clear() }, [])
+        const current = () => active.current && !signal?.aborted
+        function change(role, field, value) {
+          edits.current[role]++; values.current = { ...values.current, [role]: { ...values.current[role], [field]: value } }
+          setDraft(values.current); setResults(previous => ({ ...previous, [role]: '草稿尚未保存' }))
         }
-        async function reload() {
+        async function flush() {
+          if (saving.current) return
+          const scope = connectionScope, valid = () => current() && scope?.active && connectionScope === scope
+          saving.current = true
           try {
-            const current = await request('analysisConfigState')
-            setLlmUrl(current.config?.llm?.baseUrl || ''); setLlmModel(current.config?.llm?.model || '')
-            setJevUrl(current.config?.jev?.baseUrl || ''); setJevModel(current.config?.jev?.model || '')
-            onConfig(current); setResult('已读取本安装当前配置')
-          } catch (error) { setResult(errorText(error)) }
+            while (pending.current.size && valid()) {
+              const [role, edit] = pending.current.entries().next().value; pending.current.delete(role)
+              if (edit.scope !== scope) continue
+              const report = message => { if (valid() && edits.current[role] === edit.version) { resultScopes.current[role] = scope; setResults(previous => ({ ...previous, [role]: message })) } }
+              report('正在保存')
+              try {
+                if (confirmedScope.current !== scope) {
+                  const latest = await request('analysisConfigState')
+                  if (!valid()) break
+                  if (latest?.registrationId !== config.registrationId) throw new Error('安装响应不匹配')
+                  confirmed.current = latest; confirmedScope.current = scope; uncertain.current = false
+                }
+                if (!uncertain.current && savedEdits.current[role] === edit.version && JSON.stringify(confirmed.current.config?.[role]) === JSON.stringify(edit.model)) { report('已保存；下一轮采用新配置'); continue }
+                const next = { ...confirmed.current.config }
+                if (edit.model) next[role] = edit.model; else delete next[role]
+                const saved = await request('configureAnalysisIfCurrent', next, confirmed.current.revision)
+                if (!valid()) break
+                if (saved?.registrationId !== config.registrationId || JSON.stringify(saved.config?.[role]) !== JSON.stringify(edit.model)) throw new Error('安装或模型响应不匹配')
+                confirmed.current = saved; savedEdits.current[role] = edit.version; uncertain.current = false; onConfig(saved); report('已保存；下一轮采用新配置')
+              } catch (error) {
+                if (!valid()) break
+                if (!error.responseReceived) uncertain.current = true
+                report(`${error.responseReceived ? '保存失败' : '保存结果未知'}：${errorText(error)}`)
+              }
+            }
+          } finally {
+            saving.current = false
+            if (!valid()) for (const [role, edit] of pending.current) if (edit.scope === scope) pending.current.delete(role)
+            if (pending.current.size && current() && connectionScope?.active) void flush()
+          }
         }
-        const field = (label, value, set, placeholder) => h('label', null, label,
-          h('input', { value, placeholder, onChange: event => set(event.target.value), autoComplete: 'off' }))
-        return h('details', { open: expanded || undefined }, h('summary', null, '本地分析连接'), h('form', { onSubmit: save },
-          h('p', null, '设置本安装的本机服务地址和模型 ID。未配置时继续采集，语义问题显示不可判断。'),
-          field('总结模型服务', llmUrl, setLlmUrl, 'http://127.0.0.1:端口'), field('总结模型 ID', llmModel, setLlmModel, '模型 ID'),
-          field('JEV 服务', jevUrl, setJevUrl, 'http://127.0.0.1:端口'), field('JEV 模型 ID', jevModel, setJevModel, '模型 ID'),
-          h('button', { type: 'submit' }, '保存分析连接'), h('button', { type: 'button', onClick: reload }, '读取当前配置'), result && h('p', { role: 'status' }, result)))
+        function save(role) {
+          if (!current()) return
+          const scope = connectionScope
+          if (!scope?.active) { setResults(previous => ({ ...previous, [role]: '保存结果未知：观察连接已关闭' })); return }
+          let model = { baseUrl: values.current[role].baseUrl.trim(), model: values.current[role].model.trim() }
+          let url
+          try { url = new URL(model.baseUrl) } catch {}
+          if ((model.baseUrl || model.model) && (!url || !['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+            || url.username || url.password || url.search || url.hash || !['', '/'].includes(url.pathname) || model.baseUrl.length > 2000 || !model.model || model.model.length > 500)) {
+            pending.current.delete(role); setResults(previous => ({ ...previous, [role]: '草稿未保存：请填写有效的本机服务地址和模型 ID' })); return
+          }
+          if (!model.baseUrl && !model.model) model = undefined
+          else model.baseUrl = url.href.replace(/\/$/, '')
+          pending.current.delete(role); pending.current.set(role, { model, version: edits.current[role], scope }); void flush()
+        }
+        const field = (role, name, label, placeholder) => h('label', null, label,
+          h('input', { value: draft[role][name], placeholder, onChange: event => change(role, name, event.target.value), autoComplete: 'off' }))
+        return h('details', { open: expanded || undefined }, h('summary', null, '本地分析连接'), h('form', { onSubmit: event => event.preventDefault() },
+          h('p', null, '填写本机服务地址和模型 ID，完成一组后离开该分组即可自动保存。保存不要求服务在线。'),
+          [['llm', '总结模型'], ['jev', 'JEV']].map(([role, label]) => h('fieldset', { key: role, 'aria-label': label,
+            onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) save(role) },
+            onKeyDown: event => { if (event.key === 'Enter') { event.preventDefault(); save(role) } } },
+          h('legend', null, label), field(role, 'baseUrl', `${label}服务`, 'http://127.0.0.1:端口'), field(role, 'model', `${label}模型 ID`, '模型 ID'),
+          results[role] && h('p', { role: 'status' }, results[role] === '正在保存' && (resultScopes.current[role] !== connectionScope || !connectionScope?.active) ? '保存结果未知：观察连接已关闭' : results[role])))))
       }
       function SettingsPanel() {
         const [tab, setTab] = useState('settings'), [config, setConfig] = useState(null), [error, setError] = useState('')
@@ -354,7 +402,7 @@
               h('button', { key: value, type: 'button', role: 'tab', id: `${id}-${value}-tab`, 'aria-controls': `${id}-${value}-panel`, 'aria-selected': tab === value, onClick: () => setTab(value) }, label))),
           error && h('p', { role: 'alert' }, error),
           h('div', { role: 'tabpanel', id: `${id}-settings-panel`, 'aria-labelledby': `${id}-settings-tab`, hidden: tab !== 'settings' },
-            config ? h(AnalysisConfig, { key: config.registrationId, config, request, onConfig: acceptConfig, expanded: true }) : h('p', null, error ? '尚未读取本安装配置。' : '正在读取本安装配置…'),
+            config ? h(AnalysisConfig, { key: config.registrationId, config, request, onConfig: acceptConfig, expanded: true, signal: lifetime.current.signal }) : h('p', null, error ? '尚未读取本安装配置。' : '正在读取本安装配置…'),
             h('section', { 'aria-label': '桌面通知许可' }, h('h3', null, '桌面通知许可'),
               h('p', { role: 'status', 'data-sentinel-notification-permission': true }, permissionMessage),
               typeof Notification !== 'undefined' && Notification.permission !== 'granted' && h('button', { type: 'button',
