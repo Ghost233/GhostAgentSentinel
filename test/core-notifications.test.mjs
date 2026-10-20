@@ -67,7 +67,7 @@ test('first grounded alert notifies once, merges rounds, and repeats only after 
     assert.equal(first.length, 1);
     assert.deepEqual(first[0].checkIds, ['request_drift']);
     assert.deepEqual(await core.claimNotifications(source), []);
-    const acknowledged = await core.ackNotification(first[0].id, { status: 'submitted' });
+    const acknowledged = await core.ackNotification(first[0].id, { sourceKey: first[0].sourceKey, attemptToken: first[0].attemptToken, status: 'submitted' });
     assert.equal(acknowledged.delivery, 'system-accepted');
     assert.equal(acknowledged.seen, 'unknown');
     const alertId = (await core.snapshot()).tasks[0].alerts[0].id;
@@ -83,8 +83,8 @@ test('first grounded alert notifies once, merges rounds, and repeats only after 
     time += 3_000;
     const repeated = await core.claimNotifications(source);
     assert.equal(repeated.length, 1);
-    await core.ackNotification(repeated[0].id, { status: 'submitted' });
-    await core.ackNotification(first[0].id, { status: 'failed', error: 'Delayed error from the previous attempt' });
+    await core.ackNotification(repeated[0].id, { sourceKey: repeated[0].sourceKey, attemptToken: repeated[0].attemptToken, status: 'submitted' });
+    await core.ackNotification(first[0].id, { sourceKey: first[0].sourceKey, attemptToken: first[0].attemptToken, status: 'failed', error: 'Delayed error from the previous attempt' });
     const delivery = (await core.snapshot()).tasks[0].alerts[0].notification;
     assert.equal(delivery.id, repeated[0].id);
     assert.equal(delivery.status, 'submitted');
@@ -108,7 +108,7 @@ test('notification failure stays visible and does not cause immediate retry; rec
     await waitFor(async () => (await core.snapshot()).tasks[0].alerts.length === 1);
     time += 3_000;
     const [notice] = await core.claimNotifications(source);
-    await core.ackNotification(notice.id, { status: 'failed', error: 'permission denied' });
+    await core.ackNotification(notice.id, { sourceKey: notice.sourceKey, attemptToken: notice.attemptToken, status: 'failed', error: 'permission denied' });
     let state = await core.snapshot();
     assert.equal(state.tasks[0].alerts[0].notification.status, 'failed');
     assert.equal(state.tasks[0].alerts[0].notification.error, 'permission denied');
@@ -180,9 +180,9 @@ test('an asynchronous notification error replaces system acceptance with visible
     await waitFor(async () => (await core.snapshot()).tasks[0].alerts.length === 1);
     time += 3_000;
     const [notice] = await core.claimNotifications(source);
-    await core.ackNotification(notice.id, { status: 'submitted' });
+    await core.ackNotification(notice.id, { sourceKey: notice.sourceKey, attemptToken: notice.attemptToken, status: 'submitted' });
     time++;
-    const failed = await core.ackNotification(notice.id, { status: 'failed', error: 'Native notification failed asynchronously' });
+    const failed = await core.ackNotification(notice.id, { sourceKey: notice.sourceKey, attemptToken: notice.attemptToken, status: 'failed', error: 'Native notification failed asynchronously' });
     assert.equal(failed.status, 'failed');
     let state = await core.snapshot();
     assert.equal(state.tasks[0].alerts[0].notification.status, 'failed');
@@ -216,7 +216,7 @@ test('an abandoned claim expires without immediate resend and late acknowledgeme
     assert.equal(state.tasks[0].alerts[0].notification.delivery, 'unknown');
     assert.equal(state.tasks[0].alerts[0].status, 'attention');
     assert.deepEqual(await core.claimNotifications(source), []);
-    const oldAck = await core.ackNotification(abandoned.id, { status: 'submitted' });
+    const oldAck = await core.ackNotification(abandoned.id, { sourceKey: abandoned.sourceKey, attemptToken: abandoned.attemptToken, status: 'submitted' });
     assert.equal(oldAck.status, 'expired');
     time += 540_000;
     await core.heartbeat(source);
@@ -225,8 +225,8 @@ test('an abandoned claim expires without immediate resend and late acknowledgeme
     const [retried] = await core.claimNotifications(source);
     assert.ok(retried);
     assert.notEqual(retried.id, abandoned.id);
-    await core.ackNotification(retried.id, { status: 'submitted' });
-    await core.ackNotification(abandoned.id, { status: 'failed', error: 'late old client error' });
+    await core.ackNotification(retried.id, { sourceKey: retried.sourceKey, attemptToken: retried.attemptToken, status: 'submitted' });
+    await core.ackNotification(abandoned.id, { sourceKey: abandoned.sourceKey, attemptToken: abandoned.attemptToken, status: 'failed', error: 'late old client error' });
     state = await core.snapshot();
     assert.equal(state.tasks[0].alerts[0].notification.id, retried.id);
     assert.equal(state.tasks[0].alerts[0].notification.status, 'submitted');

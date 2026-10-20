@@ -125,7 +125,7 @@ test('same-conversation alerts update the panel immediately and share a non-slid
   assert.ok(notices[0].body.slice(0, 240).includes(notices[0].taskKey), 'the first surviving observation identity remains system-visible before client truncation')
   assert.ok(notices[0].body.slice(0, 240).includes(sourceKey))
   assert.deepEqual(await f.client.claimNotifications(sourceKey), [], 'the grouped attempt is only claimed once')
-  const ack = await f.client.ackNotification(notices[0].id, { status: 'submitted' })
+  const ack = await f.client.ackNotification(notices[0].id, { sourceKey: notices[0].sourceKey, attemptToken: notices[0].attemptToken, status: 'submitted' })
   assert.equal(ack.delivery, 'system-accepted')
   assert.equal(ack.seen, 'unknown', 'system submission is not evidence that the user saw the notification')
   const after = await f.client.snapshot()
@@ -153,7 +153,7 @@ test('different sources and different confirmed root conversations have separate
       assert.equal(notice.members.length, 2)
       const actors = (await f.client.snapshot()).tasks.filter(task => notice.members.some(member => member.taskKey === task.key))
       assert.ok(actors.every(task => task.sourceKey === source && task.hierarchy.rootSessionId === notice.rootSessionId))
-      await f.client.ackNotification(notice.id, { status: 'submitted' })
+      await f.client.ackNotification(notice.id, { sourceKey: notice.sourceKey, attemptToken: notice.attemptToken, status: 'submitted' })
     }
     assert.deepEqual(await f.client.claimNotifications(source), [])
     all.push(...notices)
@@ -198,7 +198,7 @@ test('an older descendant keeps its verified root execution when the same root s
   const [first] = await f.client.claimNotifications(source)
   assert.equal(first.rootIdentity.runId, 'root-one')
   assert.deepEqual(first.members.map(member => member.taskKey), [older.key])
-  await f.client.ackNotification(first.id, { status: 'submitted' })
+  await f.client.ackNotification(first.id, { sourceKey: first.sourceKey, attemptToken: first.attemptToken, status: 'submitted' })
   f.advance(2000)
   const [second] = await f.client.claimNotifications(source)
   assert.equal(second.rootIdentity.runId, 'root-two')
@@ -307,6 +307,13 @@ for (const boundary of ['request-replaced', 'ended', 'source-disconnected', 'evi
     const f = await fixture(t), source = await f.register()
     f.addProblem('one'); f.addProblem('two'); await f.ingest(source)
     await until(async () => (await f.client.snapshot()).tasks.filter(task => task.gs.light === 'red').length === 2, 'old candidates are initially grounded')
+    let oldAlertIds, oldRequestIds
+    if (boundary === 'request-replaced') {
+      const originalActors = (await f.client.snapshot()).tasks.filter(task => ['one', 'two'].includes(task.id))
+      oldAlertIds = new Set(originalActors.flatMap(task => task.alerts.map(alert => alert.id)))
+      oldRequestIds = new Map(originalActors.map(task => [task.id, new Set(task.alerts.map(alert => alert.requestId))]))
+      f.decide(() => 'unknown')
+    }
     f.advance(2000)
     if (boundary === 'source-disconnected') await f.client.unregisterSource(source)
     else if (boundary === 'evidence-expired') f.advance(86_400_000)
@@ -324,10 +331,29 @@ for (const boundary of ['request-replaced', 'ended', 'source-disconnected', 'evi
     f.advance(1000)
     if (boundary === 'source-disconnected') await assert.rejects(f.client.claimNotifications(source), /not registered or connected/)
     else assert.deepEqual(await f.client.claimNotifications(source), [])
-    f.advance(600_000)
+    const laterAt = f.advance(600_000)
     if (boundary !== 'source-disconnected') assert.deepEqual(await f.client.claimNotifications(source), [], 'a timer must not resurrect the old problem')
+    if (boundary === 'request-replaced') await until(async () => (await f.client.snapshot()).tasks.filter(task => ['one', 'two'].includes(task.id)).every(task => task.analysis.completedAt === laterAt), 'replacement-scope rounds settle before checking current and original candidates separately')
     const snapshot = await f.client.snapshot()
-    assert.ok(snapshot.tasks.filter(task => ['one', 'two'].includes(task.id)).every(task => !task.alerts.some(alert => alert.status === 'attention')))
+    if (oldAlertIds) {
+      const oldAlerts = snapshot.tasks.flatMap(task => task.alerts).filter(alert => oldAlertIds.has(alert.id))
+      assert.equal(oldAlerts.length, oldAlertIds.size, 'the assertion still observes each original alert identity')
+      assert.ok(oldAlerts.every(alert => alert.status !== 'attention'), 'replacement analysis cannot revive an original candidate')
+    }
+    const currentActors = snapshot.tasks.filter(task => ['one', 'two'].includes(task.id))
+    if (boundary === 'request-replaced') {
+      for (const actor of currentActors) {
+        assert.equal(actor.currentRequest, 'Inspect the new scope only.')
+        assert.equal(actor.analysis.completedAt, laterAt)
+        const attention = actor.alerts.filter(alert => alert.status === 'attention')
+        assert.ok(attention.length > 0, 'a new execution without visible activity still exposes its legitimate timed problem')
+        for (const alert of attention) {
+          assert.equal(oldAlertIds.has(alert.id), false)
+          assert.equal(oldRequestIds.get(actor.id).has(alert.requestId), false)
+          assert.equal(alert.checkId, 'long_wait')
+        }
+      }
+    } else assert.ok(currentActors.every(task => !task.alerts.some(alert => alert.status === 'attention')))
   })
 }
 
@@ -338,7 +364,7 @@ test('repeat grouping is due ten minutes after successful submission rather than
   f.advance(3000)
   const [first] = await f.client.claimNotifications(source)
   f.advance(7000)
-  await f.client.ackNotification(first.id, { status: 'submitted' })
+  await f.client.ackNotification(first.id, { sourceKey: first.sourceKey, attemptToken: first.attemptToken, status: 'submitted' })
   const activeAt = f.advance(599_999)
   await f.client.ingest(source, { events: ['one', 'two'].map(id => ({ ...f.event(id, `${id}-continuing`, 'output', `Modified unrelated storage for ${id}.`), capturedAt: activeAt })) })
   assert.deepEqual(await f.client.claimNotifications(source), [], 'ten minutes from candidate or claim is still too early')
@@ -352,8 +378,8 @@ test('repeat grouping is due ten minutes after successful submission rather than
   assert.equal(notices[0].members.length, 2)
   assert.notEqual(notices[0].id, first.id)
   assert.equal(f.requests.length, calls, 'a due reminder does not require an additional model judgment')
-  await f.client.ackNotification(notices[0].id, { status: 'submitted' })
-  await f.client.ackNotification(first.id, { status: 'failed', error: 'late earlier system error' })
+  await f.client.ackNotification(notices[0].id, { sourceKey: notices[0].sourceKey, attemptToken: notices[0].attemptToken, status: 'submitted' })
+  await f.client.ackNotification(first.id, { sourceKey: first.sourceKey, attemptToken: first.attemptToken, status: 'failed', error: 'late earlier system error' })
   for (const actor of (await f.client.snapshot()).tasks.filter(task => ['one', 'two'].includes(task.id))) {
     assert.equal(actor.alerts[0].notification.id, notices[0].id)
     assert.equal(actor.alerts[0].notification.status, 'submitted')
@@ -368,7 +394,7 @@ test('a new problem starts an independent window while a different node retains 
   const old = (await f.client.snapshot()).tasks.find(task => task.id === 'one').alerts[0].id
   f.advance(3000)
   const [first] = await f.client.claimNotifications(source)
-  await f.client.ackNotification(first.id, { status: 'submitted' })
+  await f.client.ackNotification(first.id, { sourceKey: first.sourceKey, attemptToken: first.attemptToken, status: 'submitted' })
   f.advance(60_000)
   f.batch.events.push(f.event('one', 'one-new-request', 'input', 'Inspect new storage only.', { nativeType: 'user/message', inputPhase: 'consumed', sourceKind: 'user', inputOrigin: 'delegated', inherited: false, inputSequence: 2 }, 4000), f.event('one', 'one-new-action', 'output', 'Modified unrelated network.', {}, 4000))
   f.batch.hierarchyContext.instructionBindings.push({ ...f.batch.hierarchyContext.instructionBindings.find(binding => binding.taskId === 'one'), inputRef: ref('one', 'one-new-request') }); f.batch.hierarchyContext.revision++
@@ -390,9 +416,9 @@ test('failed system submission preserves each red alert and does not masquerade 
   await until(async () => (await f.client.snapshot()).tasks.filter(task => task.gs.light === 'red').length === 2, 'grounded concerns are ready')
   f.advance(3000)
   const [notice] = await f.client.claimNotifications(source)
-  const submitted = await f.client.ackNotification(notice.id, { status: 'submitted' })
+  const submitted = await f.client.ackNotification(notice.id, { sourceKey: notice.sourceKey, attemptToken: notice.attemptToken, status: 'submitted' })
   assert.equal(submitted.delivery, 'system-accepted'); assert.equal(submitted.seen, 'unknown')
-  const failed = await f.client.ackNotification(notice.id, { status: 'failed', error: 'native permission failure' })
+  const failed = await f.client.ackNotification(notice.id, { sourceKey: notice.sourceKey, attemptToken: notice.attemptToken, status: 'failed', error: 'native permission failure' })
   assert.equal(failed.delivery, 'failed'); assert.equal(failed.seen, 'unknown')
   for (const actor of (await f.client.snapshot()).tasks.filter(task => ['one', 'two'].includes(task.id))) {
     assert.equal(actor.gs.light, 'red')
@@ -415,14 +441,14 @@ test('an abandoned grouped claim remains delivery unknown and late receipts cann
     assert.equal(actor.alerts[0].notification.seen, 'unknown')
     assert.equal(actor.gs.light, 'red')
   }
-  assert.equal((await f.client.ackNotification(old.id, { status: 'submitted' })).status, 'expired')
+  assert.equal((await f.client.ackNotification(old.id, { sourceKey: old.sourceKey, attemptToken: old.attemptToken, status: 'submitted' })).status, 'expired')
   assert.deepEqual(await f.client.claimNotifications(source), [])
   f.advance(540_000); assert.deepEqual(await f.client.claimNotifications(source), [])
   f.advance(3000)
   const [next] = await f.client.claimNotifications(source)
   assert.notEqual(next.id, old.id)
-  await f.client.ackNotification(next.id, { status: 'submitted' })
-  await f.client.ackNotification(old.id, { status: 'failed', error: 'late old client error' })
+  await f.client.ackNotification(next.id, { sourceKey: next.sourceKey, attemptToken: next.attemptToken, status: 'submitted' })
+  await f.client.ackNotification(old.id, { sourceKey: old.sourceKey, attemptToken: old.attemptToken, status: 'failed', error: 'late old client error' })
   for (const actor of (await f.client.snapshot()).tasks.filter(task => ['one', 'two'].includes(task.id))) {
     assert.equal(actor.alerts[0].notification.id, next.id)
     assert.equal(actor.alerts[0].notification.status, 'submitted')

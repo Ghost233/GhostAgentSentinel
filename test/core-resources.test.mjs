@@ -160,3 +160,40 @@ test('a long active request is unaffected by idle grace and clears its temporary
     assert.equal(counts.temporary.timers.total, 1);
   } finally { if (finish) finish(result(input)); await core.close(); await rm(dataDir, { recursive: true, force: true }); }
 });
+
+test('R10 repeated cancelled callers unregister their actual submission resolvers while one OFF remains pending', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-r10-resolvers-')); let clock = Date.now();
+  const core = await createCore({ dataDir, now: () => clock, leaseMs: 1e9, analyzer: { async analyze(input) {
+    const value = result(input); value.checks[1] = { ...value.checks[1], status: 'attention', reason: 'Observed action', evidenceIds: ['output'], applicability: { state: 'triggered', reason: 'Observed request and output', evidenceIds: ['request-active'] } }; return value;
+  } } });
+  t.after(async () => { await core.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const source = await core.registerSource({ registrationId: 'resolver-owner', hostRunId: 'host', name: 'Own' });
+  await core.ingest(source, { tasks: [task('active')], events: [event('active', clock), { ...event('active', clock), id: 'output', kind: 'output' }] });
+  await waitFor(async () => (await core.snapshot()).tasks[0].alerts.some(alert => alert.status === 'attention'));
+  clock += 3000; const [notice] = await core.claimNotifications(source); await core.beginNotificationSubmission(source, notice.id, notice.attemptToken);
+  for (let i = 0; i < 30; i++) {
+    const abort = new AbortController(), wait = core.waitNotificationSubmissionRevocation(source, notice.id, notice.attemptToken, abort.signal), rejected = assert.rejects(wait);
+    assert.equal((await core.diagnostics()).temporary.submissionRevocationWaits, 1);
+    abort.abort(); await rejected;
+    assert.equal((await core.diagnostics()).temporary.submissionRevocationWaits, 0);
+  }
+  const anchorAbort = new AbortController(), anchor = core.setInstallationNotificationPreference('resolver-owner', 'task-alert', false, anchorAbort.signal), anchorRejected = assert.rejects(anchor, { code: 'notification_revocation_unconfirmed' });
+  for (let i = 0; i < 300; i++) {
+    const abort = new AbortController(), pending = core.setInstallationNotificationPreference('resolver-owner', 'task-alert', false, abort.signal), rejected = assert.rejects(pending, { code: 'notification_revocation_unconfirmed' });
+    let diagnostics = await core.diagnostics();
+    assert.equal(diagnostics.temporary.submissionPreferenceWaits, 2); assert.equal(diagnostics.temporary.submissionPreferenceBarriers, 1);
+    abort.abort(); await rejected;
+    diagnostics = await core.diagnostics();
+    assert.equal(diagnostics.temporary.submissionPreferenceWaits, 1); assert.equal(diagnostics.temporary.submissionPreferenceBarriers, 1); assert.equal(diagnostics.temporary.timers.notificationSubmission, 1);
+  }
+  anchorAbort.abort(); await anchorRejected;
+  const cancelled = await core.diagnostics();
+  assert.equal(cancelled.temporary.submissionPreferenceWaits, 0); assert.equal(cancelled.temporary.submissionPreferenceBarriers, 0); assert.equal(cancelled.temporary.timers.notificationSubmission, 0);
+  assert.equal(cancelled.retained.submissionPermits, 1, 'unconfirmed cancellation is never mistaken for settled permission');
+  const final = core.setInstallationNotificationPreference('resolver-owner', 'task-alert', false);
+  await core.ackNotification(notice.id, { sourceKey: source, attemptToken: notice.attemptToken, status: 'invalidated' });
+  await final; await core.close();
+  const closed = await core.diagnostics();
+  assert.equal(closed.temporary.submissionPreferenceWaits, 0); assert.equal(closed.temporary.submissionPreferenceBarriers, 0); assert.equal(closed.temporary.submissionRevocationWaits, 0); assert.equal(closed.temporary.timers.total, 0);
+  t.diagnostic(JSON.stringify({ cancelledPreferenceCalls: 300, cancelledRevocationCalls: 30, finalWaits: 0, finalBarriers: 0 }));
+});

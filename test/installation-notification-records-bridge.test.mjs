@@ -63,6 +63,12 @@ test('actual MCP and Native Remote read their own produced notification records 
   clock += 3000;
   const peer = new (req('@deepseek-ai/dsh-client-connection').Peer)(ctx, { principal: { kind: 'owner' }, interactions: 'none' });
   const rpc = (method, args = {}) => ctx.typertGateway.dispatchRpc(`sentinel/${method}`, { args }, undefined, peer);
+  const nativeBefore = (await core.installationNotificationRecords('chatgpt:records')).records[0];
+  const wrongNative = await rpc('ackNotification', { id: nativeBefore.id, result: { status: 'failed' } });
+  assert.equal(wrongNative.ok, false, 'the fixed DSH Host source cannot acknowledge a native notice without submissionAttempt owned by another installation');
+  assert.match(wrongNative.error.message, /receipt source does not match/);
+  const nativeAfter = (await core.installationNotificationRecords('chatgpt:records')).records[0];
+  assert.equal(nativeAfter.status, nativeBefore.status); assert.equal(nativeAfter.delivery, nativeBefore.delivery);
   const [notice] = (await rpc('claimNotifications', { notificationClaimSelection: { submissionProtocol: 1 } })).value;
   assert.equal((await rpc('beginNotificationSubmission', { id: notice.id, attemptToken: notice.attemptToken })).value.maySubmit, true);
   await rpc('ackNotification', { id: notice.id, result: { status: 'submitted', attemptToken: notice.attemptToken } });
@@ -73,6 +79,31 @@ test('actual MCP and Native Remote read their own produced notification records 
   assert.equal(record.registrationId, 'dsh:records'); assert.equal(record.mainId, 'dsh-chat'); assert.equal(record.chatTitle, 'Own DSH chat');
   assert.equal(record.kind, 'task-alert'); assert.equal(record.delivery, 'system-accepted'); assert.equal(record.native, null); assert.equal(record.humanSeen, 'unknown');
   assert.ok(!JSON.stringify(result.value).includes(nativeSource));
+  const foreignSource = await core.registerSource({ registrationId: 'dsh:foreign-ack', hostRunId: 'foreign', name: 'Foreign ACK owner' });
+  await core.configureInstallationAnalysis('dsh:foreign-ack', { llm: { baseUrl, model: 'summary' }, jev: { baseUrl, model: 'judge' } }, (await core.installationAnalysisConfig('dsh:foreign-ack')).revision);
+  const raw = async (path, body) => {
+    const response = await fetch(server.url + path, { method: 'POST', headers: { authorization: `Bearer ${server.token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    assert.equal(response.status, 200); return response.json();
+  };
+  const foreignNotice = async (id, legacy) => {
+    await core.ingest(foreignSource, { tasks: [{ id, lifecycleId: 'life', title: id, status: 'running' }], events: ['input', 'output'].map(kind => ({ id: kind, taskId: id, taskLifecycleId: 'life', kind, text: kind, capturedAt: clock, occurredAt: null })) });
+    await until(async () => (await core.snapshot()).tasks.find(task => task.id === id)?.alerts.some(alert => alert.status === 'attention'));
+    clock += 3000;
+    return (legacy ? await raw('/v1/notifications/claim', { sourceKey: foreignSource }) : await core.claimNotifications(foreignSource))[0];
+  };
+  const modern = await foreignNotice('foreign-modern', false);
+  assert.equal((await rpc('ackNotification', { id: modern.id, result: { status: 'submitted' } })).ok, false, 'Host A cannot omit the token to submit B modern claim before begin');
+  assert.equal((await rpc('ackNotification', { id: modern.id, result: { status: 'submitted', attemptToken: modern.attemptToken } })).ok, false, 'Host A fixed source cannot be replaced with B token');
+  assert.equal((await core.installationNotificationRecords('dsh:foreign-ack')).records[0].status, 'claimed');
+  await core.ackNotification(modern.id, { sourceKey: foreignSource, attemptToken: modern.attemptToken, status: 'failed' });
+  const legacy = await foreignNotice('foreign-legacy', true);
+  assert.equal(legacy.attemptToken, undefined);
+  const wrongLegacy = await rpc('ackNotification', { id: legacy.id, result: { status: 'submitted' } });
+  assert.equal(wrongLegacy.ok, false, 'Host A source remains present through HTTP even without a token');
+  assert.match(wrongLegacy.error.message, /source does not match/);
+  assert.equal((await core.installationNotificationRecords('dsh:foreign-ack')).records.find(record => record.id === legacy.id).status, 'claimed');
+  assert.equal((await core.diagnostics()).retained.submissionPermits, 1);
+  assert.equal((await raw('/v1/notifications/ack', { id: legacy.id, result: { status: 'submitted' } })).status, 'submitted', 'the original v0.1.1 receipt without source remains an explicit legacy consumed proof');
   const originalFetch = globalThis.fetch; let recordsRequests = 0;
   globalThis.fetch = async (input, options) => {
     if (typeof input === 'string' && input.startsWith(server.url + '/v1/notifications/installations/records')) recordsRequests++;

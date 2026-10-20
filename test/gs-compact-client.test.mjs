@@ -671,7 +671,7 @@ test('production issue links retain multilevel ownership, short citations and de
   data.advance(3000)
   const claims = await data.core.claimNotifications(data.sourceKey)
   assert.equal(claims.length, 1)
-  await data.core.ackNotification(claims[0].id, { status: 'submitted' })
+  await data.core.ackNotification(claims[0].id, { sourceKey: claims[0].sourceKey, attemptToken: claims[0].attemptToken, status: 'submitted' })
   const f = await mountGS(t, data.service), document = f.dom.window.document
   await f.click(document.querySelector('[data-gs-entry]'))
   const popup = document.querySelector('[role=dialog]'), issues = popup.querySelector('[data-gs-issues]')

@@ -116,7 +116,7 @@ test('production HTTP path extracts cited events, judges drift and creates a sou
   notificationOffset += 3_000
   const notifications = await client.claimNotifications(source)
   assert.equal(notifications.length, 1)
-  await client.ackNotification(notifications[0].id, { status: 'submitted' })
+  await client.ackNotification(notifications[0].id, { sourceKey: notifications[0].sourceKey, attemptToken: notifications[0].attemptToken, status: 'submitted' })
   assert.equal((await client.claimNotifications(source)).length, 0)
   await client.close()
 })

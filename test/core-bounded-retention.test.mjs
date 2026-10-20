@@ -118,7 +118,7 @@ test('graph and grouped notification replay stays bounded, then expired proof an
   clock += 3000
   const notices = await core.claimNotifications(source)
   assert.equal(notices.length, 4)
-  for (const notice of notices) { assert.equal(notice.members.length, 24); await core.ackNotification(notice.id, { status: 'submitted' }) }
+  for (const notice of notices) { assert.equal(notice.members.length, 24); await core.ackNotification(notice.id, { sourceKey: notice.sourceKey, attemptToken: notice.attemptToken, status: 'submitted' }) }
   await core.pause()
   for (const id of children.filter(id => id !== 'node-95')) {
     batch.tasks.find(task => task.id === id).status = 'disposed'

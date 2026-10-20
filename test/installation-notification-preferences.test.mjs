@@ -76,7 +76,7 @@ test('OFF seals a claimed task alert, blocks its late begin and ACK, and ON does
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { id: old.id, maySubmit: false });
   assert.deepEqual(await f.client.beginNotificationSubmission(other, kept.id, kept.attemptToken), { id: kept.id, maySubmit: true });
-  assert.equal((await f.client.ackNotification(old.id, { status: 'submitted' })).status, 'cancelled');
+  assert.equal((await f.client.ackNotification(old.id, { sourceKey: old.sourceKey, attemptToken: old.attemptToken, status: 'submitted' })).status, 'cancelled');
   await f.client.setInstallationNotificationPreference('own', 'task-alert', true);
   f.advance(20 * 60000);
   assert.deepEqual(await f.client.claimNotifications(own), []);
@@ -236,7 +236,7 @@ test('repeated OFF and a later ON retain the same outstanding revocation until i
   assert.equal((await f.client.beginNotificationSubmission(source, notice.id, notice.attemptToken)).maySubmit, false);
   assert.deepEqual(await f.client.claimNotifications(source), []);
   assert.equal((await f.client.beginNotificationSubmission(other, kept.id, kept.attemptToken)).maySubmit, true);
-  await assert.rejects(f.client.ackNotification(notice.id, { sourceKey: other, attemptToken: notice.attemptToken, status: 'invalidated' }), /Unknown legacy/);
+  await assert.rejects(f.client.ackNotification(notice.id, { sourceKey: other, attemptToken: notice.attemptToken, status: 'invalidated' }), /receipt source does not match/);
   await assert.rejects(f.client.ackNotification(notice.id, { status: 'submitted' }), /Invalid notification submission/);
   assert.equal(finished, 0);
   await f.client.ackNotification(notice.id, { sourceKey: source, attemptToken: notice.attemptToken, status: 'invalidated' });
@@ -430,4 +430,134 @@ test('unknown HTTP claim protocol values never downgrade into legacy issued auth
   const [notice] = await f.client.claimNotifications(source);
   assert.equal(typeof notice.attemptToken, 'string');
   assert.equal((await f.client.diagnostics()).retained.submissionPermits, 0, 'modern claim is not itself a permit to construct');
+});
+
+async function submissionFixture(t) {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-r10-submission-')); let clock = Date.now();
+  const core = await createCore({ dataDir, now: () => clock, cooldownMs: 1e9, leaseMs: 1e12, analyzer: { async analyze(input) {
+    return { summary: { currentTask: input.task.currentRequest, currentState: '', recentProgress: '', attention: '' }, checks: ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait'].map(id => ({ id, status: id === 'request_drift' ? 'attention' : 'unknown', reason: 'Observed action', evidenceIds: id === 'request_drift' ? ['output'] : [], applicability: { state: id === 'request_drift' ? 'triggered' : 'not-triggered', reason: 'Controlled request and action', evidenceIds: ['input'] } })), coverage: input.coverage };
+  } } });
+  t.after(async () => { await core.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const registrationId = 'r10-submission', source = await core.registerSource({ registrationId, hostRunId: 'host', name: 'Own' });
+  return { core, source, registrationId, async produce(id) {
+    await core.ingest(source, { tasks: [{ id, lifecycleId: 'life', title: id, status: 'running' }], events: ['input', 'output'].map(kind => ({ id: kind, taskId: id, taskLifecycleId: 'life', kind, text: id + kind, capturedAt: clock, occurredAt: null })) });
+    for (let attempt = 0; attempt < 20; attempt++) {
+      clock += 3000; const claims = await core.claimNotifications(source);
+      if (claims.length) return claims.find(notice => notice.members.some(member => member.name === id));
+      await delay(0);
+    }
+    assert.fail('Actual Core did not produce ' + id);
+  } };
+}
+
+test('R10 modern unissued claims reject unowned ACKs before changing another installation record', async t => {
+  const f = await fixture(t), a = await f.observe('ack-owner-a'), b = await f.observe('ack-owner-b'); f.advance(3000);
+  const [notice] = await f.client.claimNotifications(b);
+  await assert.rejects(f.client.ackNotification(notice.id, { sourceKey: a, status: 'submitted' }), /receipt source does not match/);
+  assert.equal((await f.client.installationNotificationRecords('ack-owner-b')).records[0].status, 'claimed');
+  await assert.rejects(f.client.ackNotification(notice.id, { sourceKey: b, status: 'failed' }), /Invalid notification submission/);
+  await assert.rejects(f.client.ackNotification(notice.id, { sourceKey: b, attemptToken: 'wrong-token', status: 'submitted' }), /Unknown legacy/);
+  await assert.rejects(f.client.ackNotification(notice.id, { sourceKey: a, attemptToken: notice.attemptToken, status: 'submitted' }), /receipt source does not match/);
+  assert.equal((await f.client.installationNotificationRecords('ack-owner-b')).records[0].status, 'claimed');
+  const receipt = await f.client.ackNotification(notice.id, { sourceKey: b, attemptToken: notice.attemptToken, status: 'submitted' });
+  assert.equal(receipt.status, 'submitted'); assert.equal(receipt.delivery, 'system-accepted');
+  assert.equal((await f.client.installationNotificationRecords('ack-owner-a')).records.every(record => record.status !== 'submitted'), true);
+});
+
+test('R10 successor OFF and an earlier OFF both wait for a newly revoked permit after the old barrier resolves', async t => {
+  const f = await submissionFixture(t), { core, source, registrationId } = f;
+  const p = await f.produce('P'); await core.beginNotificationSubmission(source, p.id, p.attemptToken);
+  const completed = [];
+  const off1 = core.setInstallationNotificationPreference(registrationId, 'task-alert', false).then(value => { completed.push('OFF1'); return value; });
+  await core.setInstallationNotificationPreference(registrationId, 'task-alert', true);
+  const q = await f.produce('Q'); await core.beginNotificationSubmission(source, q.id, q.attemptToken);
+  // Deliberately keep ACK(P) and OFF2 in the same synchronous stack.
+  const ackP = core.ackNotification(p.id, { sourceKey: source, attemptToken: p.attemptToken, status: 'invalidated' });
+  const off2 = core.setInstallationNotificationPreference(registrationId, 'task-alert', false).then(value => { completed.push('OFF2'); return value; });
+  await ackP;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(completed, [], 'neither OFF may report success while Q remains revoked and unsettled');
+  assert.equal((await core.installationNotificationPreferences(registrationId)).revocation['task-alert'], 'unconfirmed');
+  assert.equal((await core.diagnostics()).temporary.submissionPreferenceWaits, 2);
+  await core.ackNotification(q.id, { sourceKey: source, attemptToken: q.attemptToken, status: 'invalidated' });
+  const values = await Promise.all([off1, off2]);
+  assert.ok(values.every(value => value.preferences['task-alert'] === false && value.revocation === undefined));
+  assert.equal((await core.diagnostics()).temporary.submissionPreferenceWaits, 0);
+});
+
+test('R10 an OFF never returns success with a revocation introduced between helper completion and its final read', async t => {
+  const f = await submissionFixture(t), { core, source, registrationId } = f;
+  const p = await f.produce('P'); await core.beginNotificationSubmission(source, p.id, p.attemptToken);
+  let succeeded = false, unconfirmed;
+  const off1 = core.setInstallationNotificationPreference(registrationId, 'task-alert', false).then(value => { succeeded = true; return value; }, error => { unconfirmed = error; });
+  await core.setInstallationNotificationPreference(registrationId, 'task-alert', true);
+  const q = await f.produce('Q'); let beginQ, off2;
+  const ackP = core.ackNotification(p.id, { sourceKey: source, attemptToken: p.attemptToken, status: 'invalidated' });
+  queueMicrotask(() => {
+    beginQ = core.beginNotificationSubmission(source, q.id, q.attemptToken);
+    off2 = core.setInstallationNotificationPreference(registrationId, 'task-alert', false);
+  });
+  await ackP; await new Promise(resolve => setImmediate(resolve)); await beginQ;
+  assert.equal(succeeded, false, 'a pending revocation cannot be returned as a successful OFF response');
+  if (unconfirmed) assert.equal(unconfirmed.code, 'notification_revocation_unconfirmed');
+  assert.equal((await core.installationNotificationPreferences(registrationId)).revocation['task-alert'], 'unconfirmed');
+  await core.ackNotification(q.id, { sourceKey: source, attemptToken: q.attemptToken, status: 'invalidated' });
+  await Promise.all([off1, off2]);
+});
+
+for (const state of ['claimed', 'issued', 'submitted', 'cancelled', 'expired', 'pruned']) test('R10 modern ACK ownership remains strict in ' + state + ' state', async t => {
+  const f = await fixture(t), source = await f.observe('ack-matrix-' + state), other = await f.client.registerSource({ registrationId: 'foreign-ack', hostRunId: 'host', name: 'Foreign' }); f.advance(3000);
+  const [notice] = await f.client.claimNotifications(source), owned = { sourceKey: source, attemptToken: notice.attemptToken };
+  if (['issued', 'pruned'].includes(state)) await f.client.beginNotificationSubmission(source, notice.id, notice.attemptToken);
+  if (state === 'submitted') await f.client.ackNotification(notice.id, { ...owned, status: 'submitted' });
+  if (state === 'cancelled') await f.client.ackNotification(notice.id, { ...owned, status: 'invalidated' });
+  if (state === 'expired') { f.advance(60001); await f.client.snapshot(); }
+  if (state === 'pruned') { f.advance(86400001); await f.client.installationNotificationRecords('ack-matrix-' + state); }
+  const before = await f.client.installationNotificationRecords('ack-matrix-' + state);
+  for (const status of ['submitted', 'failed']) for (const identity of [{}, { sourceKey: source }, { sourceKey: other }, { attemptToken: notice.attemptToken }, { sourceKey: source, attemptToken: 'wrong' }, { sourceKey: other, attemptToken: notice.attemptToken }]) {
+    await assert.rejects(f.client.ackNotification(notice.id, { ...identity, status }), identity.sourceKey && identity.sourceKey !== source ? /receipt source does not match/ : /notification submission/);
+  }
+  assert.deepEqual(await f.client.installationNotificationRecords('ack-matrix-' + state), before, 'rejected identity does not alter the owned record or its delivery facts');
+  const result = await f.client.ackNotification(notice.id, { ...owned, status: state === 'issued' || state === 'pruned' ? 'invalidated' : 'submitted' });
+  assert.equal(result.status, state === 'cancelled' || state === 'pruned' || state === 'issued' ? 'cancelled' : state === 'expired' ? 'expired' : 'submitted');
+});
+
+test('R10 repeated barrier wakeups share one four-second request deadline', { timeout: 7000 }, async t => {
+  const f = await submissionFixture(t), { core, source, registrationId } = f;
+  const p = await f.produce('P'); await core.beginNotificationSubmission(source, p.id, p.attemptToken);
+  const started = performance.now();
+  const off1 = core.setInstallationNotificationPreference(registrationId, 'task-alert', false).then(value => ({ value }), error => ({ error }));
+  await core.setInstallationNotificationPreference(registrationId, 'task-alert', true);
+  const q = await f.produce('Q'); await core.beginNotificationSubmission(source, q.id, q.attemptToken);
+  await delay(2200);
+  const ackP = core.ackNotification(p.id, { sourceKey: source, attemptToken: p.attemptToken, status: 'invalidated' });
+  const abort = new AbortController(), off2 = core.setInstallationNotificationPreference(registrationId, 'task-alert', false, abort.signal), rejected2 = assert.rejects(off2, { code: 'notification_revocation_unconfirmed' });
+  await ackP;
+  const outcome = await off1, elapsed = performance.now() - started;
+  assert.equal(outcome.error?.code, 'notification_revocation_unconfirmed');
+  assert.ok(elapsed < 5200, 'waking the old barrier must not restart a fresh four-second deadline');
+  assert.equal((await core.installationNotificationPreferences(registrationId)).revocation['task-alert'], 'unconfirmed');
+  abort.abort(); await rejected2;
+  await core.ackNotification(q.id, { sourceKey: source, attemptToken: q.attemptToken, status: 'invalidated' });
+  const diagnostics = await core.diagnostics();
+  assert.equal(diagnostics.temporary.submissionPreferenceWaits, 0); assert.equal(diagnostics.temporary.submissionPreferenceBarriers, 0); assert.equal(diagnostics.temporary.timers.notificationSubmission, 0);
+  t.diagnostic(JSON.stringify({ totalRequestMs: elapsed, cancelledSecondRequest: true }));
+});
+
+test('R10 an explicitly supplied foreign source cannot alter a retained ordinary legacy receipt without submissionAttempt', async t => {
+  const f = await fixture(t), source = await f.observe('old-consumed-owner'), foreign = await f.client.registerSource({ registrationId: 'foreign-receipt-owner', hostRunId: 'other', name: 'Other' }); f.advance(3000);
+  const [notice] = await f.client.claimNotifications(source);
+  await f.client.ackNotification(notice.id, { sourceKey: source, attemptToken: notice.attemptToken, status: 'submitted' });
+  await f.client.close(); await f.server.close();
+  const db = new DatabaseSync(join(f.dataDir, 'observations.sqlite'));
+  try {
+    const row = db.prepare("SELECT value FROM records WHERE collection='notifications' AND key=?").get(notice.id), value = JSON.parse(row.value);
+    assert.ok(value.ackedAt != null, 'the old-format fixture represents an actually consumed receipt');
+    delete value.submissionAttempt;
+    db.prepare("UPDATE records SET value=? WHERE collection='notifications' AND key=?").run(JSON.stringify(value), notice.id);
+  } finally { db.close(); }
+  await f.restart();
+  await assert.rejects(f.client.ackNotification(notice.id, { sourceKey: foreign, status: 'failed', error: 'foreign late error' }), /receipt source does not match/);
+  assert.equal((await f.client.installationNotificationRecords('old-consumed-owner')).records[0].status, 'submitted');
+  assert.equal((await f.client.ackNotification(notice.id, { status: 'failed', error: 'the original legacy owner reports its actual later browser error' })).status, 'failed', 'the original privileged legacy receipt without source remains supported');
 });

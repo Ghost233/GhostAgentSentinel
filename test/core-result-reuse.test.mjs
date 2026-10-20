@@ -226,7 +226,7 @@ test('reusing a valid alert still permits its timed reminder without another act
   f.advance(3_000)
   const [first] = await f.core.claimNotifications(f.source)
   assert.ok(first)
-  await f.core.ackNotification(first.id, { status: 'submitted' })
+  await f.core.ackNotification(first.id, { sourceKey: first.sourceKey, attemptToken: first.attemptToken, status: 'submitted' })
   f.advance(600_000)
   await f.core.heartbeat(f.source)
   assert.deepEqual(await f.core.claimNotifications(f.source), [])
