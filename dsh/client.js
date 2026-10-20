@@ -308,13 +308,15 @@
       }
       function SettingsPanel() {
         const [tab, setTab] = useState('settings'), [config, setConfig] = useState(null), [error, setError] = useState('')
-        const savedConfig = useRef(null), lifetime = useRef(null)
+        const [permissionMessage, setPermissionMessage] = useState(notificationStatus), [requestingPermission, setRequestingPermission] = useState(false)
+        const savedConfig = useRef(null), lifetime = useRef(null), permissionRequest = useRef(null)
         if (!lifetime.current) lifetime.current = new AbortController()
         const acceptConfig = current => { savedConfig.current = current; setConfig(current) }
         useEffect(() => {
           const abort = lifetime.current
           let loading
           const connect = scope => {
+            permissionRequest.current = null; setRequestingPermission(false); setPermissionMessage(notificationStatus())
             if (!scope?.active) { loading = undefined; setError('观察连接已关闭'); return }
             setError('')
             if (savedConfig.current || loading?.scope === scope) return
@@ -326,6 +328,24 @@
           settingsBindings.add(connect); connect(connectionScope)
           return () => { settingsBindings.delete(connect); abort.abort() }
         }, [])
+        async function permission() {
+          const scope = connectionScope
+          if (typeof Notification === 'undefined' || !scope?.active || permissionRequest.current) return
+          const request = { scope }
+          permissionRequest.current = request; setRequestingPermission(true); setPermissionMessage('正在请求桌面通知许可…')
+          const current = () => !lifetime.current.signal.aborted && scope.active && connectionScope === scope && permissionRequest.current === request
+          try {
+            await Notification.requestPermission()
+            if (!current()) return
+            const message = notificationStatus()
+            setPermissionMessage(message); notifyState({ notification: message }); await pollNotifications()
+          } catch (error) {
+            if (current()) {
+              const message = `${notificationStatus()}；${errorText(error)}`
+              setPermissionMessage(message); notifyState({ notification: message })
+            }
+          } finally { if (current()) { permissionRequest.current = null; setRequestingPermission(false) } }
+        }
         const request = (method, ...args) => scopedCall(connectionScope, method, args, lifetime.current.signal)
         return h('section', { className: 'sentinel-overview', 'data-sentinel-installation-settings': true, 'aria-label': 'Sentinel 安装设置' },
           h('h2', null, 'Sentinel'),
@@ -334,7 +354,11 @@
               h('button', { key: value, type: 'button', role: 'tab', id: `${id}-${value}-tab`, 'aria-controls': `${id}-${value}-panel`, 'aria-selected': tab === value, onClick: () => setTab(value) }, label))),
           error && h('p', { role: 'alert' }, error),
           h('div', { role: 'tabpanel', id: `${id}-settings-panel`, 'aria-labelledby': `${id}-settings-tab`, hidden: tab !== 'settings' },
-            config ? h(AnalysisConfig, { key: config.registrationId, config, request, onConfig: acceptConfig, expanded: true }) : h('p', null, error ? '尚未读取本安装配置。' : '正在读取本安装配置…')),
+            config ? h(AnalysisConfig, { key: config.registrationId, config, request, onConfig: acceptConfig, expanded: true }) : h('p', null, error ? '尚未读取本安装配置。' : '正在读取本安装配置…'),
+            h('section', { 'aria-label': '桌面通知许可' }, h('h3', null, '桌面通知许可'),
+              h('p', { role: 'status', 'data-sentinel-notification-permission': true }, permissionMessage),
+              typeof Notification !== 'undefined' && Notification.permission !== 'granted' && h('button', { type: 'button',
+                disabled: requestingPermission || !connectionScope?.active, onClick: permission }, '启用桌面通知'))),
           h('div', { role: 'tabpanel', id: `${id}-notifications-panel`, 'aria-labelledby': `${id}-notifications-tab`, hidden: tab !== 'notifications' }, h('p', null, '本安装通知记录尚未接入。')),
           h('div', { role: 'tabpanel', id: `${id}-diagnostics-panel`, 'aria-labelledby': `${id}-diagnostics-tab`, hidden: tab !== 'diagnostics' }, h('p', null, '连接诊断尚未接入；模型配置保存不代表连接检查通过。')))
       }

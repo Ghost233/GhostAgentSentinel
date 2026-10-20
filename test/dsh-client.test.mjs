@@ -188,13 +188,30 @@ test('native system settings edits only its stable installation through producti
   for (const name of ['dsh-typert-registry', 'dsh-api-remote-access', 'dsh-api-gateway']) await host.plugin(req(`@deepseek-ai/${name}`).default)
   adapter = createAdapter(host, { dataDir, registrationId: 'dsh:system-settings' }, { flushMs: 10, heartbeatMs: 1000 })
   const { Peer } = req('@deepseek-ai/dsh-client-connection'), peer = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' })
-  f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true, $dispatch: (endpoint, payload, signal) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer) })
+  f = await client(t, null, 'default', null, true, false, { $nativeSlots: true, $dispatch: (endpoint, payload, signal) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer) })
   const entry = f.ctx.slots.entries('settings.section').find(entry => entry.options.id === 'ghost-agent-sentinel')
   assert.ok(entry, 'Sentinel is available from the original system settings list')
   assert.equal(typeof entry.options.label === 'function' ? entry.options.label() : entry.options.label, 'Sentinel')
   await f.mountSettings()
   const settings = () => f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
   await f.waitUntil(() => settings()?.querySelectorAll('input').length === 4, 'settings loads from Core without mounting a monitor or selecting a chat')
+  let permissionRequests = 0
+  f.Notification.requestPermission = async () => { permissionRequests++; f.Notification.permission = 'granted'; return 'granted' }
+  const permissionButton = () => [...settings().querySelectorAll('button')].find(button => button.textContent === '启用桌面通知')
+  assert.ok(permissionButton(), 'The original explicit permission action is available in native settings without a monitor or chat')
+  assert.ok(settings().querySelector('[data-sentinel-notification-permission]').textContent.includes('未授权'))
+  assert.equal(f.plugin.diagnostics().viewInstances, 0)
+  assert.equal((await core.snapshot()).tasks.length, 0)
+  await f.tick()
+  for (const label of ['通知记录', '连接诊断', '设置']) await f.interact(async () => {
+    [...settings().querySelectorAll('[role=tab]')].find(button => button.textContent === label).click(); await f.settle()
+  })
+  assert.equal(permissionRequests, 0, 'Configuration reads, background refresh and tab changes never ask for OS permission')
+  await f.interact(async () => { permissionButton().click(); await f.settle() })
+  assert.equal(permissionRequests, 1)
+  assert.ok(settings().querySelector('[data-sentinel-notification-permission]').textContent.includes('已获授权'))
+  assert.equal(permissionButton(), undefined)
+  assert.equal(f.plugin.diagnostics().viewInstances, 0, 'Permission does not mount another monitor')
   const inputs = [...settings().querySelectorAll('input')], { Simulate } = clientRequire('react-dom/test-utils')
   assert.deepEqual(inputs.map(input => input.value), ['http://127.0.0.1:1', 'dsh-summary', 'http://127.0.0.1:1', 'dsh-judge'])
   await f.interact(async () => { inputs[1].value = 'edited-summary'; Simulate.change(inputs[1]); await f.settle() })
@@ -247,6 +264,52 @@ test('closing native settings cancels its own Remote read and plugin disable can
   await f.settle()
   assert.equal(inputs[1].value, 'draft')
   assert.equal(inputs[0].closest('form').textContent.includes('已保存'), false, 'an aborted late save is never shown as applied')
+})
+
+for (const ending of ['close', 'disable']) test(`native settings ${ending} ignores late notification-permission results`, async t => {
+  let finish, claims = 0
+  const f = await client(t, null, 'default', null, true, false, { $nativeSlots: true,
+    async claimNotifications() { claims++; return { ok: true, value: [] } },
+  })
+  f.Notification.requestPermission = () => new Promise(resolve => { finish = () => { f.Notification.permission = 'granted'; resolve('granted') } })
+  t.after(() => finish?.())
+  await f.mountSettings()
+  const settings = () => f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  const status = () => settings().querySelector('[data-sentinel-notification-permission]').textContent
+  const button = () => [...settings().querySelectorAll('button')].find(button => button.textContent === '启用桌面通知')
+  assert.ok(button(), 'Permission stays in native settings')
+  await f.interact(async () => { button().click(); await f.settle() })
+  assert.equal(typeof finish, 'function')
+  assert.equal(button().disabled, true, 'A pending native permission request cannot be repeated')
+  if (ending === 'close') { await f.unmountSettings(); await f.mountSettings() }
+  else await f.disable()
+  const before = status(), beforeClaims = claims
+  await f.interact(async () => { finish(); await f.settle() })
+  assert.equal(status(), before, 'The ended settings view cannot apply a late result to its UI or a newly opened page')
+  assert.equal(claims, beforeClaims, 'An ended settings action cannot resume notification claims')
+  assert.equal(f.delivered.length, 0)
+  if (ending === 'disable') assert.equal(f.ctx.slots.entries('settings.section').length, 0)
+})
+
+test('native settings distinguishes denied permission from a rejected request without automatic retries', async t => {
+  const f = await client(t, null, 'default', null, true, false, { $nativeSlots: true })
+  await f.mountSettings()
+  const settings = f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  const status = () => settings.querySelector('[data-sentinel-notification-permission]').textContent
+  const button = () => [...settings.querySelectorAll('button')].find(button => button.textContent === '启用桌面通知')
+  let requests = 0
+  f.Notification.requestPermission = async () => { requests++; f.Notification.permission = 'denied'; return 'denied' }
+  assert.ok(button())
+  await f.interact(async () => { button().click(); await f.settle() })
+  assert.ok(status().includes('被拒绝'))
+  assert.equal(f.invoked.filter(method => method === 'claim').length, 0)
+  f.Notification.requestPermission = async () => { requests++; throw new Error('controlled permission request rejected') }
+  await f.interact(async () => { button().click(); await f.settle() })
+  assert.ok(status().includes('被拒绝'))
+  assert.ok(status().includes('controlled permission request rejected'))
+  await f.tick()
+  assert.equal(requests, 2, 'Ordinary refresh does not request permission again')
+  assert.equal(f.delivered.length, 0)
 })
 
 test('the actual DSH settings form saves its installation CAS through Native Remote and drives only its selected models', async t => {
