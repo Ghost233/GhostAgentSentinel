@@ -66,21 +66,100 @@ test('production adapter settings bind the installation independently from colle
   server = await startServer({ dataDir })
   core = await connectCore({ dataDir })
   const token = 'b'.repeat(64)
-  adapter = await startChatGPTAdapter({ core, native: {}, installationId: 'settings-installation', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
-  const rpc = async (name, args = {}) => {
-    const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) })
+  const native = {
+    async sampleHost() { return { available: true, hostRunId: 'settings-host', hostStartedAt: 1, profile: null } },
+    async readEnablement(cwd) { assert.equal(cwd, null); return { user: 'enabled', effective: 'enabled' } },
+  }
+  adapter = await startChatGPTAdapter({ core, native, installationId: 'settings-installation', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
+  const request = async (method, params = {}) => {
+    const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
     assert.equal(response.status, 200)
     const envelope = await response.json()
     assert.ok(!envelope.error, envelope.error?.message)
     assert.ok(!envelope.result?.isError)
-    return envelope.result.structuredContent
+    return envelope.result
   }
+  const rpc = async (name, args = {}) => (await request('tools/call', { name, arguments: args })).structuredContent
+  const tools = (await request('tools/list')).tools
+  const monitor = tools.find(tool => tool.name === 'sentinel_current_chat'), settings = tools.find(tool => tool.name === 'sentinel_model_settings')
+  assert.deepEqual(monitor._meta['openai/ui'].entrypoints, [{ type: 'thread' }])
+  assert.deepEqual(settings._meta['openai/ui'].entrypoints, [{ type: 'global' }])
+  assert.notEqual(monitor._meta.ui.resourceUri, settings._meta.ui.resourceUri)
+  const resources = (await request('resources/list')).resources
+  assert.deepEqual(resources.map(resource => resource.uri).sort(), ['ui://ghost-sentinel/current-chat.html', 'ui://ghost-sentinel/settings.html'])
+  const resource = await request('resources/read', { uri: settings._meta.ui.resourceUri })
+  assert.equal(resource.contents[0].mimeType, 'text/html;profile=mcp-app')
   const first = await rpc('sentinel_model_settings')
   assert.equal(first.registrationId, 'chatgpt:settings-installation')
-  const saved = await rpc('sentinel_save_model_settings', { revision: first.revision, config: state.config })
-  assert.deepEqual(saved.config, state.config)
+  const page = await panelHarness(t, { html: resource.contents[0].text })
+  const reading = page.sent.findLast(row => row.method === 'tools/call')
+  assert.equal(reading.params.name, 'sentinel_model_settings')
+  page.reply(reading.id, { structuredContent: first }); await page.flush()
+  for (const role of ['llm', 'jev']) {
+    page.element('#settings-' + role + '-url').value = state.config[role].baseUrl
+    page.element('#settings-' + role + '-model').value = state.config[role].model
+  }
+  const saving = page.element('#settings-form').onsubmit({ preventDefault() {} }); await page.flush()
+  const change = page.sent.findLast(row => row.method === 'tools/call')
+  assert.equal(change.params.name, 'sentinel_save_model_settings')
+  assert.equal(change.params.arguments.expectedThreadId, undefined)
+  page.reply(change.id, await request('tools/call', change.params)); await saving
+  assert.match(page.element('#settings-status').textContent, /已保存/)
   assert.deepEqual((await core.installationAnalysisConfig('chatgpt:another-installation')).config, {})
   assert.deepEqual((await rpc('sentinel_model_settings')).config, state.config)
+  const monitorPage = await panelHarness(t)
+  await monitorPage.deliver({ summary: '采集失败', identity: { threadId: null }, analysis: { state: 'unknown' } })
+  page.element('#settings-llm-model').value = 'unsubmitted-draft'
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed', params: {} } })
+  await monitorPage.refresh(); await monitorPage.deliver({ summary: '另一条聊天', identity: { threadId: 'other-chat' }, analysis: { state: 'unknown' } })
+  await monitorPage.destroy()
+  assert.equal(page.element('#settings-llm-model').value, 'unsubmitted-draft')
+  const pendingRead = page.element('#settings-reload').onclick(); await page.flush()
+  const lateRead = page.sent.findLast(row => row.method === 'tools/call')
+  page.document.hidden = true
+  page.handlers.get('visibilitychange')()
+  await pendingRead
+  assert.equal(page.sent.findLast(row => row.method === 'notifications/cancelled').params.requestId, lateRead.id)
+  page.reply(lateRead.id, { structuredContent: first }); await page.flush()
+  page.document.hidden = false
+  page.handlers.get('visibilitychange')()
+  assert.equal(page.element('#settings-llm-model').value, 'unsubmitted-draft')
+  const directory = page.element('#settings-llm-check').onclick(); await page.flush()
+  const pendingDirectory = page.sent.findLast(row => row.method === 'tools/call')
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', id: 'settings-close', method: 'ui/resource-teardown', params: {} } })
+  assert.equal(JSON.stringify(page.sent.find(row => row.id === 'settings-close')?.result), '{}')
+  await directory
+  assert.equal(page.sent.findLast(row => row.method === 'notifications/cancelled').params.requestId, pendingDirectory.id)
+  assert.equal(page.timers.size, 0)
+  assert.equal(adapter.diagnostics().closed, false)
+  assert.equal(adapter.diagnostics().trackedThreads, 0)
+})
+
+test('global settings reject untrusted host or plugin qualification before accessing installation configuration', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-settings-qualification-'))
+  let server, core, adapter, enabled = true, available = true
+  t.after(async () => { try { await adapter?.close(); await core?.close(); await server?.close() } finally { await rm(dataDir, { recursive: true, force: true }) } })
+  server = await startServer({ dataDir }); core = await connectCore({ dataDir })
+  const token = 'c'.repeat(64), registrationId = 'chatgpt:qualified-settings'
+  adapter = await startChatGPTAdapter({ core, native: {
+    async sampleHost() { return { available, hostRunId: 'settings-host', hostStartedAt: 1, profile: null } },
+    async readEnablement() { return { user: enabled ? 'enabled' : 'disabled', effective: enabled ? 'enabled' : 'disabled' } },
+  }, installationId: 'qualified-settings', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
+  const rpc = async (name, args = {}) => {
+    const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) })
+    assert.equal(response.status, 200)
+    return (await response.json()).result
+  }
+  const before = (await rpc('sentinel_model_settings')).structuredContent
+  enabled = false
+  assert.equal((await rpc('sentinel_model_settings')).isError, true)
+  assert.equal((await rpc('sentinel_save_model_settings', { revision: before.revision, config: state.config })).isError, true)
+  assert.equal((await rpc('sentinel_model_directory', { baseUrl: 'http://127.0.0.1:1' })).isError, true)
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before)
+  enabled = true; available = false
+  assert.equal((await rpc('sentinel_model_settings')).isError, true)
+  assert.equal((await rpc('sentinel_save_model_settings', { revision: before.revision, config: state.config })).isError, true)
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before)
 })
 
 test('model dropdown checks only directory metadata and preserves the manual model choice', async t => {

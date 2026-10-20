@@ -12,8 +12,8 @@ class Element {
   setAttribute(name, value) { this.attributes.set(name, String(value)) }
   getAttribute(name) { return this.attributes.get(name) ?? null }
 }
-export async function panelHarness(t) {
-  const html = await readFile(new URL('../../chatgpt/panel.html', import.meta.url), 'utf8')
+export async function panelHarness(t, { html = null } = {}) {
+  html ??= await readFile(new URL('../../chatgpt/panel.html', import.meta.url), 'utf8')
   const handlers = new Map(), elements = new Map(), timers = new Map(), sent = []
   for (const match of html.matchAll(/<([a-z0-9]+)\b[^>]*\bid="([^"]+)"[^>]*>/g)) elements.set('#' + match[2], new Element(match[1]))
   const element = key => { assert.ok(elements.has(key), 'actual panel markup contains ' + key); return elements.get(key) }

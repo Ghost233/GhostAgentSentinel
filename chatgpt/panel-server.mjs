@@ -11,6 +11,8 @@ export async function startPanelServer({ read, control, modelSettings, requestNo
   if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid panel display name')
   const title = displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查'
   const html = (await readFile(new URL('./panel.html', import.meta.url), 'utf8')).replace('<title>Sentinel 会话检查</title>', '<title>' + title + '</title>').replace('<h1>Sentinel · 当前会话</h1>', '<h1>' + displayName + ' · 当前会话</h1>'), sockets = new Set(), cleanups = new Set()
+  const settingsTitle = displayName === 'GhostSentinel test' ? 'GhostSentinel 安装设置 test' : displayName + ' 安装设置'
+  const settingsHtml = modelSettings ? (await readFile(new URL('./settings.html', import.meta.url), 'utf8')).replace('<title>Sentinel 安装设置</title>', '<title>' + settingsTitle + '</title>').replace('<h1>Sentinel · 安装设置</h1>', '<h1>' + settingsTitle + '</h1>') : null
   let closed = false, activeRequests = 0, transports = 0
   const server = createServer(async (req, res) => {
     const host = '127.0.0.1:' + server.address().port
@@ -43,10 +45,12 @@ export async function startPanelServer({ read, control, modelSettings, requestNo
       return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
     })
     if (modelSettings) {
+      const settingsUri = 'ui://ghost-sentinel/settings.html'
+      registerAppResource(mcp, 'sentinel-settings', settingsUri, {}, async () => ({ contents: [{ uri: settingsUri, mimeType: RESOURCE_MIME_TYPE, text: settingsHtml }] }))
       const model = z.object({ baseUrl: z.string().min(1).max(2000), model: z.string().min(1).max(2000) }).strict()
       registerAppTool(mcp, 'sentinel_model_settings', {
-        title: '本安装模型设置', description: '读取本安装的总结模型和 JEV 配置，不依赖当前聊天采集。', inputSchema: {},
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+        title: settingsTitle, description: '打开独立安装设置，读取本安装的总结模型和 JEV 配置，不依赖当前聊天采集。', inputSchema: {},
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { resourceUri: settingsUri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'global' }] } },
       }, async () => ({ content: [{ type: 'text', text: '本安装模型设置' }], structuredContent: await modelSettings.read() }))
       registerAppTool(mcp, 'sentinel_save_model_settings', {
         title: '保存本安装模型设置', description: '按读取的配置版本保存，仅影响本安装的分析。',

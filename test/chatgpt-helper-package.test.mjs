@@ -109,7 +109,7 @@ test('isolated Swift contract accepts only control roles and fixed bundle paths'
 })
 
 async function supervise(t, mode) {
-  const output = join(directory, 'signal-' + mode + '.json'), child = spawn(harness, ['supervise', HELPER_NODE, resolve('test/fixtures/chatgpt-helper/signal-child.mjs'), mode, output], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NODE_OPTIONS: '--require /must-not-be-inherited.mjs', NODE_PATH: '/must-not-be-inherited' } })
+  const output = join(directory, 'signal-' + mode + '.json'), child = spawn(harness, ['supervise', process.execPath, resolve('test/fixtures/chatgpt-helper/signal-child.mjs'), mode, output], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NODE_OPTIONS: '--require /must-not-be-inherited.mjs', NODE_PATH: '/must-not-be-inherited' } })
   let stderr = '', stubPID
   child.stderr.on('data', chunk => { stderr += chunk })
   const exit = new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({ code, signal })) })

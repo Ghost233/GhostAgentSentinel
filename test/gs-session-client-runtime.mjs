@@ -20,7 +20,8 @@ export async function mountGS(t, service, sessionId = 'root', surface) {
   const settle = () => commit(async () => { await new Promise(resolve => setTimeout(resolve, surface ? 0 : 15)) })
   const until = async (predicate, label) => { const end = Date.now() + 1500; while (!predicate()) { if (Date.now() > end) throw new Error(label); await settle() } }
   let plugin, factory, timerId = 0, clientFiber, destroyed = false
-  slots.register({ name: 'root', children: { 'conversation.composer.dock': { kind: 'list', scope: 'session' }, 'conversation.session.header.utilities': { kind: 'list', scope: 'session' }, 'sidebar.right.pane.tab': { kind: 'keyed', scope: 'root' } } }, () => null)
+  // The web profile's ui-settings-general provider also declares this root-scoped settings list.
+  slots.register({ name: 'root', children: { 'conversation.composer.dock': { kind: 'list', scope: 'session' }, 'conversation.session.header.utilities': { kind: 'list', scope: 'session' }, 'sidebar.right.pane.tab': { kind: 'keyed', scope: 'root' }, 'settings.section': { kind: 'list', scope: 'root' } } }, () => null)
   slots.register({ name: 'conversation.composer.dock', id: 'activity', order: 0 }, () => h('span', { 'data-native-activity': true }, '1 轮 3 步'))
   class FixtureSlots extends Service {
     constructor(owner) { super(owner, 'slots') }

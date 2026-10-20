@@ -21,7 +21,7 @@ const { JSDOM } = clientRequire('jsdom')
 
 async function client(t, snapshot, permission = 'granted', constructorError = null, nativeRemote = false, mountPane = true, overrides = {}) {
   const ctx = new Context(), registered = [], delivered = [], acknowledged = [], invoked = []
-  let factory, mounted, Panel, plugin, viewRoot, clientFiber
+  let factory, mounted, Panel, plugin, viewRoot, clientFiber, settingsRoot
   const intervals = new Map(); let intervalId = 0
   const dom = new JSDOM('<html><head></head><body><div id="view"></div></body></html>', { pretendToBeVisual: true })
   const originalWindow = globalThis.window, originalDocument = globalThis.document
@@ -55,10 +55,21 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     await commit(async () => { viewRoot?.unmount(); viewRoot = undefined })
     if (plugin) await waitUntil(() => plugin.diagnostics().viewInstances === 0 && plugin.diagnostics().pendingSnapshot === 0, 'Actual sidebar unmount did not release its viewers and snapshot')
   }
+  const mountSettings = async () => {
+    const entry = ctx.slots.entries('settings.section').find(entry => entry.options.id === 'ghost-agent-sentinel')
+    assert.ok(entry, 'The native system settings ledger must expose Sentinel')
+    if (!settingsRoot) {
+      const container = document.createElement('div'); container.id = 'settings-view'; document.body.appendChild(container)
+      settingsRoot = createRoot(container)
+    }
+    await commit(async () => { settingsRoot.render(h(entry.component, { close() {}, ...entry.inject?.() })); await settle() })
+  }
+  const unmountSettings = async () => { await commit(async () => { settingsRoot?.unmount(); settingsRoot = undefined }); document.getElementById('settings-view')?.remove() }
   t.after(async () => {
     const errors = []
     try {
       for (const operation of [
+        unmountSettings,
         unmount,
         () => ctx.fiber.dispose(),
         () => plugin && waitUntil(() => plugin.diagnostics().activeRequests === 0 && plugin.diagnostics().pendingNotification === 0, 'Disposed connection still owns requests'),
@@ -92,9 +103,22 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     async diagnostics() { return { ok: true, value: {} } },
   }
   Object.assign(methods, overrides)
-  ctx.provide('slots', {
+  if (overrides.$nativeSlots) {
+    let rendererFactory
+    runInNewContext(await readFile(req.resolve('@deepseek-ai/dsh-client-ui-renderer/client'), 'utf8'), {
+      window: { __ModuleLoader__: { load(value) { rendererFactory = value.factory } } }, console,
+    })
+    const { SlotRegistry } = rendererFactory(name => /^(react|react-dom)(\/|$)/.test(name) ? clientRequire(name) : req(name))
+    const slots = new SlotRegistry(ctx)
+    slots.register({ name: 'root', children: {
+      'settings.section': { kind: 'list', scope: 'root' },
+      'conversation.composer.dock': { kind: 'list', scope: 'root' },
+      'conversation.session.header.utilities': { kind: 'list', scope: 'root' },
+      'sidebar.right.pane.tab': { kind: 'keyed', scope: 'root' },
+    } }, () => null)
+  } else ctx.provide('slots', {
     inject(_name, install) { install(); return () => {} },
-    register(_options, component) { Panel = component; return () => {} },
+    register(options, component) { if (options.name === 'sidebar.right.pane.tab') Panel = component; return () => {} },
   })
   ctx.provide('sidebarRightTabs', { register(value) { registered.push(value); return () => {} } })
   if (nativeRemote) {
@@ -128,13 +152,15 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   plugin = factory(name => name === 'react' ? clientRequire(name) : req(name))
   clientFiber = ctx.plugin({ inject: plugin.inject, apply: plugin.apply })
   await clientFiber.await()
+  if (overrides.$nativeSlots) Panel = ctx.slots.entries('sidebar.right.pane.tab')[0]?.component
   await waitUntil(() => plugin.diagnostics().backgroundTimer === 1, 'Actual Remote connection did not start background monitoring')
   if (mountPane) { await mount(); await dataReady() }
   else if (!overrides.claimNotifications) await waitUntil(() => plugin.diagnostics().pendingNotification === 0, 'Initial notification claim did not finish')
-  return { ctx, Panel, mounted, registered, delivered, acknowledged, invoked, Notification, plugin, intervals, dom, mount, unmount, settle, waitUntil, dataReady, interact: commit,
+  return { ctx, Panel, mounted, registered, delivered, acknowledged, invoked, Notification, plugin, intervals, dom, mount, unmount, mountSettings, unmountSettings, settle, waitUntil, dataReady, interact: commit,
     async tick() { await commit(async () => { for (const callback of [...intervals.values()]) callback(); await settle() }) },
     async visibility(value) { await commit(async () => { Object.defineProperty(dom.window.document, 'visibilityState', { value, configurable: true }); dom.window.document.dispatchEvent(new dom.window.Event('visibilitychange')); await settle() }) },
     async abortView() { await commit(async () => { tabController.abort(); await settle() }) },
+    async disable() { await commit(async () => { await clientFiber.dispose() }); await waitUntil(() => plugin.diagnostics().activeRequests === 0, 'Disabled client still owns requests') },
     async dispose() { await ctx.fiber.dispose(); await waitUntil(() => plugin.diagnostics().activeRequests === 0 && plugin.diagnostics().pendingSnapshot === 0 && plugin.diagnostics().pendingNotification === 0, 'Disposed connection still owns requests') },
     async reinstall(ready = true) { await commit(async () => { await clientFiber.dispose() }); clientFiber = ctx.plugin({ inject: plugin.inject, apply: plugin.apply }); await clientFiber.await(); await waitUntil(() => plugin.diagnostics().backgroundTimer === 1, 'Replacement Remote connection did not start'); if (ready) await dataReady(); else await settle() },
   }
@@ -147,6 +173,81 @@ async function waitForDisplayedTask(fixture, title) {
     await fixture.settle()
   }
 }
+
+test('native system settings edits only its stable installation through production Remote and Core while monitoring refreshes', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-system-settings-')), host = new Context()
+  let server, core, adapter, f
+  t.after(async () => { await f?.dispose(); await adapter?.close(); await host.fiber.dispose(); await core?.close(); await server?.close(); await rm(dataDir, { recursive: true, force: true }) })
+  server = await startServer({ dataDir }); core = await connectCore({ dataDir })
+  const config = name => ({ llm: { baseUrl: 'http://127.0.0.1:1', model: `${name}-summary` }, jev: { baseUrl: 'http://127.0.0.1:1', model: `${name}-judge` } })
+  const formal = await core.configureInstallationAnalysis('chatgpt:formal', config('formal'), (await core.installationAnalysisConfig('chatgpt:formal')).revision)
+  const candidate = await core.configureInstallationAnalysis('chatgpt:test', config('test'), (await core.installationAnalysisConfig('chatgpt:test')).revision)
+  await core.configureInstallationAnalysis('dsh:system-settings', config('dsh'), (await core.installationAnalysisConfig('dsh:system-settings')).revision)
+  await host.plugin(req('@deepseek-ai/dsh-llm').default)
+  for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop']) await host.plugin(req(`@deepseek-ai/${name}`).default, { agents: [] })
+  for (const name of ['dsh-typert-registry', 'dsh-api-remote-access', 'dsh-api-gateway']) await host.plugin(req(`@deepseek-ai/${name}`).default)
+  adapter = createAdapter(host, { dataDir, registrationId: 'dsh:system-settings' }, { flushMs: 10, heartbeatMs: 1000 })
+  const { Peer } = req('@deepseek-ai/dsh-client-connection'), peer = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' })
+  f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true, $dispatch: (endpoint, payload, signal) => host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer) })
+  const entry = f.ctx.slots.entries('settings.section').find(entry => entry.options.id === 'ghost-agent-sentinel')
+  assert.ok(entry, 'Sentinel is available from the original system settings list')
+  assert.equal(typeof entry.options.label === 'function' ? entry.options.label() : entry.options.label, 'Sentinel')
+  await f.mountSettings()
+  const settings = () => f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  await f.waitUntil(() => settings()?.querySelectorAll('input').length === 4, 'settings loads from Core without mounting a monitor or selecting a chat')
+  const inputs = [...settings().querySelectorAll('input')], { Simulate } = clientRequire('react-dom/test-utils')
+  assert.deepEqual(inputs.map(input => input.value), ['http://127.0.0.1:1', 'dsh-summary', 'http://127.0.0.1:1', 'dsh-judge'])
+  await f.interact(async () => { inputs[1].value = 'edited-summary'; Simulate.change(inputs[1]); await f.settle() })
+  await f.mount(); await f.dataReady(); await f.tick()
+  assert.equal(inputs[1].value, 'edited-summary', 'monitor snapshots never overwrite the settings draft')
+  for (const label of ['通知记录', '连接诊断', '设置']) await f.interact(async () => { Simulate.click([...settings().querySelectorAll('[role=tab]')].find(button => button.textContent === label)); await f.settle() })
+  assert.equal(inputs[1].value, 'edited-summary', 'settings tab navigation retains the draft')
+  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
+  await f.waitUntil(() => inputs[0].closest('form').textContent.includes('已保存'), 'settings reports the actual public Core save result')
+  assert.deepEqual((await core.installationAnalysisConfig('dsh:system-settings')).config, { ...config('dsh'), llm: { baseUrl: 'http://127.0.0.1:1', model: 'edited-summary' } })
+  assert.deepEqual(await core.installationAnalysisConfig('chatgpt:formal'), formal)
+  assert.deepEqual(await core.installationAnalysisConfig('chatgpt:test'), candidate)
+  await f.unmountSettings(); await f.tick()
+  assert.equal((await core.installationMonitoring('dsh:system-settings')).paused, false)
+  assert.equal(adapter.connected, true, 'closing settings leaves the shared observation instance connected')
+  assert.equal(f.delivered.length, 0)
+  await f.disable()
+  assert.equal(f.ctx.slots.entries('settings.section').length, 0, 'plugin unload reclaims its native settings contribution')
+})
+
+test('closing native settings cancels its own Remote read and plugin disable cancels its save without accepting late results', async t => {
+  const pending = [], current = { registrationId: 'dsh:owned', config: { llm: { baseUrl: 'http://127.0.0.1:1', model: 'current' } }, revision: 'current' }
+  let holdRead = true
+  const hold = signal => new Promise(resolve => { pending.push({ signal, resolve }) })
+  t.after(() => { for (const request of pending) request.resolve({ ok: true, value: current }) })
+  const f = await client(t, null, 'denied', null, true, false, {
+    $nativeSlots: true,
+    async analysisConfigState(signal) { if (holdRead) return hold(signal); return { ok: true, value: current } },
+    async configureAnalysisIfCurrent(_config, _revision, signal) { return hold(signal) },
+  })
+  await f.mountSettings()
+  await f.waitUntil(() => pending.length === 1, 'the actual settings starts its own Remote read')
+  await f.unmountSettings()
+  assert.equal(pending[0].signal.aborted, true, 'closing settings cancels its request')
+  assert.equal(f.plugin.diagnostics().backgroundTimer, 1, 'settings closure keeps background observation connected')
+  pending[0].resolve({ ok: true, value: { ...current, config: { llm: { baseUrl: 'http://127.0.0.1:1', model: 'stale' } } } })
+  holdRead = false
+  await f.mountSettings()
+  const settings = f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  await f.waitUntil(() => settings.querySelectorAll('input').length === 4, 'reopening settings reads its current configuration')
+  const inputs = [...settings.querySelectorAll('input')], { Simulate } = clientRequire('react-dom/test-utils')
+  assert.equal(inputs[1].value, 'current')
+  await f.interact(async () => { inputs[1].value = 'draft'; Simulate.change(inputs[1]); await f.settle() })
+  await f.interact(async () => { Simulate.submit(inputs[0].closest('form')); await f.settle() })
+  await f.waitUntil(() => pending.length === 2, 'the actual settings save entered Remote IO')
+  await f.disable()
+  assert.equal(pending[1].signal.aborted, true, 'plugin disable cancels the settings save')
+  assert.equal(f.ctx.slots.entries('settings.section').length, 0)
+  pending[1].resolve({ ok: true, value: { ...current, revision: 'late-save' } })
+  await f.settle()
+  assert.equal(inputs[1].value, 'draft')
+  assert.equal(inputs[0].closest('form').textContent.includes('已保存'), false, 'an aborted late save is never shown as applied')
+})
 
 test('the actual DSH settings form saves its installation CAS through Native Remote and drives only its selected models', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-installation-ui-')), host = new Context(), requests = []

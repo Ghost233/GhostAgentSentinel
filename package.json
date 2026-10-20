@@ -18,7 +18,7 @@
   },
   "dsh": {
     "bundle": { "patch": "./dsh/cordis.patch.yml" },
-    "client": { "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right", "@deepseek-ai/dsh-client-ui-conversation"], "platform": "web", "immediately": true }
+    "client": { "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right", "@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-ui-settings-general"], "platform": "web", "immediately": true }
   },
   "license": "UNLICENSED"
 }

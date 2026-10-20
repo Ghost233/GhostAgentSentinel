@@ -68,6 +68,7 @@
       let summaryTimer, summaryRequest, summaryRefreshRequested = false, entryObservers = 0, footerObservers = 0
       let state = { snapshot: null, snapshotVersion: 0, error: '正在连接共享核心', notification: '', notificationError: '', config: null, sourcePlan: null }
       const subscribers = new Set(), viewers = new Map(), viewBindings = new Map(), notificationCallbacks = new Map()
+      const settingsBindings = new Set()
       const unfinishedCalls = new Set()
       const summaryBindings = new Map()
       let viewListeners = 0
@@ -77,7 +78,7 @@
       const visibleViewers = () => [...viewers.values()].filter(Boolean).length
       function diagnostics() {
         return { viewInstances: viewers.size, visibleViewers: visibleViewers(), snapshotTimer: Number(snapshotTimer !== undefined),
-          backgroundTimer: Number(notificationTimer !== undefined), listeners: subscribers.size + viewListeners,
+          backgroundTimer: Number(notificationTimer !== undefined), listeners: subscribers.size + viewListeners + settingsBindings.size,
           pendingSnapshot: Number(snapshotRequest !== undefined), pendingNotification: Number(notificationRequest !== undefined),
           callbacks: notificationCallbacks.size, activeRequests: connectionScope?.pending.size || 0, unfinishedRequests: unfinishedCalls.size,
           summaryViewers: visibleSummaries().length, summaryTimer: Number(summaryTimer !== undefined), pendingSummary: Number(summaryRequest !== undefined), entryObservers: entryObservers + footerObservers }
@@ -278,7 +279,7 @@
         }, [sessionId, visible, signal])
         return summary
       }
-      function AnalysisConfig({ config }) {
+      function AnalysisConfig({ config, request = call, onConfig = config => notifyState({ config }), expanded = false }) {
         const [llmUrl, setLlmUrl] = useState(config?.config?.llm?.baseUrl || '')
         const [llmModel, setLlmModel] = useState(config?.config?.llm?.model || '')
         const [jevUrl, setJevUrl] = useState(config?.config?.jev?.baseUrl || '')
@@ -290,25 +291,57 @@
             const next = {}
             if (llmUrl || llmModel) next.llm = { baseUrl: llmUrl.trim(), model: llmModel.trim() }
             if (jevUrl || jevModel) next.jev = { baseUrl: jevUrl.trim(), model: jevModel.trim() }
-            const saved = await call('configureAnalysisIfCurrent', next, config.revision)
-            notifyState({ config: saved }); setResult('已保存；下一轮采用新配置')
+            const saved = await request('configureAnalysisIfCurrent', next, config.revision)
+            onConfig(saved); setResult('已保存；下一轮采用新配置')
           } catch (error) { setResult(errorText(error)) }
         }
         async function reload() {
           try {
-            const current = await call('analysisConfigState')
+            const current = await request('analysisConfigState')
             setLlmUrl(current.config?.llm?.baseUrl || ''); setLlmModel(current.config?.llm?.model || '')
             setJevUrl(current.config?.jev?.baseUrl || ''); setJevModel(current.config?.jev?.model || '')
-            notifyState({ config: current }); setResult('已读取本安装当前配置')
+            onConfig(current); setResult('已读取本安装当前配置')
           } catch (error) { setResult(errorText(error)) }
         }
         const field = (label, value, set, placeholder) => h('label', null, label,
           h('input', { value, placeholder, onChange: event => set(event.target.value), autoComplete: 'off' }))
-        return h('details', null, h('summary', null, '本地分析连接'), h('form', { onSubmit: save },
+        return h('details', { open: expanded || undefined }, h('summary', null, '本地分析连接'), h('form', { onSubmit: save },
           h('p', null, '设置本安装的本机服务地址和模型 ID。未配置时继续采集，语义问题显示不可判断。'),
           field('总结模型服务', llmUrl, setLlmUrl, 'http://127.0.0.1:端口'), field('总结模型 ID', llmModel, setLlmModel, '模型 ID'),
           field('JEV 服务', jevUrl, setJevUrl, 'http://127.0.0.1:端口'), field('JEV 模型 ID', jevModel, setJevModel, '模型 ID'),
           h('button', { type: 'submit' }, '保存分析连接'), h('button', { type: 'button', onClick: reload }, '读取当前配置'), result && h('p', { role: 'status' }, result)))
+      }
+      function SettingsPanel() {
+        const [tab, setTab] = useState('settings'), [config, setConfig] = useState(null), [error, setError] = useState('')
+        const savedConfig = useRef(null), lifetime = useRef(null)
+        if (!lifetime.current) lifetime.current = new AbortController()
+        const acceptConfig = current => { savedConfig.current = current; setConfig(current) }
+        useEffect(() => {
+          const abort = lifetime.current
+          let loading
+          const connect = scope => {
+            if (!scope?.active) { loading = undefined; setError('观察连接已关闭'); return }
+            setError('')
+            if (savedConfig.current || loading?.scope === scope) return
+            const request = { scope }; loading = request
+            scopedCall(scope, 'analysisConfigState', [], abort.signal).then(current => {
+              if (!abort.signal.aborted && loading === request) acceptConfig(current)
+            }, failure => { if (!abort.signal.aborted && loading === request) setError(errorText(failure)) }).finally(() => { if (loading === request) loading = undefined })
+          }
+          settingsBindings.add(connect); connect(connectionScope)
+          return () => { settingsBindings.delete(connect); abort.abort() }
+        }, [])
+        const request = (method, ...args) => scopedCall(connectionScope, method, args, lifetime.current.signal)
+        return h('section', { className: 'sentinel-overview', 'data-sentinel-installation-settings': true, 'aria-label': 'Sentinel 安装设置' },
+          h('h2', null, 'Sentinel'),
+          h('div', { role: 'tablist', 'aria-label': 'Sentinel 安装设置页面' },
+            [['settings', '设置'], ['notifications', '通知记录'], ['diagnostics', '连接诊断']].map(([value, label]) =>
+              h('button', { key: value, type: 'button', role: 'tab', id: `${id}-${value}-tab`, 'aria-controls': `${id}-${value}-panel`, 'aria-selected': tab === value, onClick: () => setTab(value) }, label))),
+          error && h('p', { role: 'alert' }, error),
+          h('div', { role: 'tabpanel', id: `${id}-settings-panel`, 'aria-labelledby': `${id}-settings-tab`, hidden: tab !== 'settings' },
+            config ? h(AnalysisConfig, { key: config.registrationId, config, request, onConfig: acceptConfig, expanded: true }) : h('p', null, error ? '尚未读取本安装配置。' : '正在读取本安装配置…')),
+          h('div', { role: 'tabpanel', id: `${id}-notifications-panel`, 'aria-labelledby': `${id}-notifications-tab`, hidden: tab !== 'notifications' }, h('p', null, '本安装通知记录尚未接入。')),
+          h('div', { role: 'tabpanel', id: `${id}-diagnostics-panel`, 'aria-labelledby': `${id}-diagnostics-tab`, hidden: tab !== 'diagnostics' }, h('p', null, '连接诊断尚未接入；模型配置保存不代表连接检查通过。')))
       }
       const enrollmentStatus = { pending: '等待首次连接', connecting: '已连接，等待基线', connected: '已连接', disconnected: '已断开', disabled: '清单项已停用' }
       function SourcePlan({ plan, sources }) {
@@ -692,6 +725,7 @@
             const scope = { remote: connection.get('remote.sentinel'), active: true, abort: new AbortController(), pending: new Set() }
             connectionScope = scope
             notifyState({ notification: notificationStatus(), notificationError: '', config: null })
+            for (const connect of settingsBindings) connect(scope)
             for (const binding of viewBindings.values()) attachView(binding)
             for (const binding of summaryBindings.values()) { binding.update(previous => ({ ...previous, error: '正在读取 GS 摘要' })); attachSummary(binding) }
             void pollNotifications(); reconcileSnapshot(); reconcileSummaries()
@@ -702,6 +736,7 @@
               for (const [notification, callback] of notificationCallbacks) if (callback.scope === scope) releaseNotification(notification)
               if (connectionScope === scope) {
                 clearInterval(notificationTimer); notificationTimer = undefined; connectionScope = undefined
+                for (const connect of settingsBindings) connect(undefined)
                 reconcileSnapshot(); notifyState({ error: '观察连接已关闭', snapshot: null, sourcePlan: null, config: null })
                 for (const binding of summaryBindings.values()) binding.update(previous => ({ ...previous, error: '观察连接已关闭' }))
                 for (const binding of summaryBindings.values()) detachSummary(binding)
@@ -712,6 +747,7 @@
           })
         })
         ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({ name: 'conversation.composer.dock', id: `${id}.gs`, order: 100, label: 'GS' }, GSFooter))
+        ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id, order: 85, label: () => 'Sentinel', inject: () => ({}) }, SettingsPanel))
         ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({ name: 'conversation.session.header.utilities', id: `${id}.gs`, order: 100, label: 'GS' }, GSHeader))
         ctx.inject(['sidebarRightTabs'], child => {
           const dispose = child.get('sidebarRightTabs').register({ id, kind: 'ghost-agent-sentinel', title: () => 'Sentinel',

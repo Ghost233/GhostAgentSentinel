@@ -49,13 +49,28 @@ test('payload is self contained and binds the complete pinned runtime without ol
   assert.equal(value.manifest.node.sha256, PLUGIN_NODE_SHA256)
   assert.equal(hash(await readFile(value.nodePath)), PLUGIN_NODE_SHA256)
   assert.equal((await execute(value.nodePath, ['--version'])).stdout.trim(), 'v24.21.0')
-  for (const path of ['src/daemon.mjs', 'src/server.mjs', 'chatgpt/runtime.mjs', 'chatgpt/lazy-core.mjs', 'chatgpt/plugin-host.mjs', 'chatgpt/plugin-installation.mjs', 'chatgpt/plugin-package.mjs', 'scripts/manage-chatgpt-plugin.mjs', 'chatgpt/panel.html', 'package.json', 'package-lock.json', 'chatgpt/package.json', 'chatgpt/package-lock.json', 'chatgpt/node_modules/@modelcontextprotocol/sdk/package.json']) assert.ok(value.manifest.files[path], path)
+  for (const path of ['src/daemon.mjs', 'src/server.mjs', 'chatgpt/runtime.mjs', 'chatgpt/lazy-core.mjs', 'chatgpt/plugin-host.mjs', 'chatgpt/plugin-installation.mjs', 'chatgpt/plugin-package.mjs', 'scripts/manage-chatgpt-plugin.mjs', 'chatgpt/panel.html', 'chatgpt/settings.html', 'package.json', 'package-lock.json', 'chatgpt/package.json', 'chatgpt/package-lock.json', 'chatgpt/node_modules/@modelcontextprotocol/sdk/package.json']) assert.ok(value.manifest.files[path], path)
   for (const path of Object.keys(value.manifest.files)) assert.doesNotMatch(path, /helper-main|helper-installation|\.swift$|\.plist$|LaunchAgents|^hooks\/|installation\.json|\.mcp\.json/)
   assert.equal((await lstat(value.nodePath)).mode & 0o777, value.manifest.files['runtime/node'].mode)
   assert.equal(value.manifest.files['chatgpt/runtime.mjs'].sourceMode, (await lstat(join(sourceRoot, 'chatgpt/runtime.mjs'))).mode & 0o7777)
   await assert.rejects(inspectPluginPackage(packageRoot, { digest: '0'.repeat(64) }), /digest/)
   assert.equal((await inspectPluginPackage(packageRoot.replace(/^\/private\/var\//, '/var/'), { digest: built.digest })).root, packageRoot)
   t.diagnostic(JSON.stringify({ digest: value.digest, sourceSetSHA256: value.manifest.sourceSetSHA256, fileCount: Object.keys(value.manifest.files).length, nodeSHA256: value.manifest.node.sha256, sources: Object.fromEntries(['chatgpt/runtime.mjs', 'chatgpt/plugin-main.mjs', 'chatgpt/plugin-bridge.mjs', 'chatgpt/plugin-package.mjs', 'chatgpt/plugin-host.mjs', 'chatgpt/plugin-installation.mjs', 'scripts/manage-chatgpt-plugin.mjs'].map(path => [path, value.manifest.files[path]])) }))
+})
+
+test('a self-consistent payload without the global settings resource is incomplete', packageTest, async () => {
+  const manifestPath = join(packageRoot, 'plugin-package.json'), settingsPath = join(packageRoot, 'chatgpt/settings.html')
+  const [manifestBytes, settingsBytes] = await Promise.all([readFile(manifestPath), readFile(settingsPath)])
+  try {
+    const manifest = JSON.parse(manifestBytes)
+    delete manifest.files['chatgpt/settings.html']
+    const sources = Object.fromEntries(Object.entries(manifest.files).filter(([path]) => path !== 'runtime/node' && !path.startsWith('notification/')).map(([path, value]) => [path, { sha256: value.sha256, size: value.size, mode: value.sourceMode }]))
+    manifest.sourceSetSHA256 = hash(JSON.stringify(sources))
+    await writeFile(manifestPath, JSON.stringify(manifest)); await rm(settingsPath)
+    await assert.rejects(inspectPluginPackage(packageRoot), /missing production runtime file: chatgpt\/settings.html/)
+  } finally {
+    await writeFile(settingsPath, settingsBytes, { mode: 0o600 }); await writeFile(manifestPath, manifestBytes)
+  }
 })
 
 test('tampering, missing modules, extra files, modes, unsafe paths and symlinks are rejected', packageTest, async () => {

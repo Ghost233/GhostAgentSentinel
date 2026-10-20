@@ -605,10 +605,15 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
   async function refresh() { if (closed) return; if (refreshPending) return refreshPending; const pending = enqueue(() => collect([], true)); if (!pending) return; refreshPending = pending.finally(() => { refreshPending = null }); return refreshPending }
   let panel
+  async function qualifySettings() {
+    if (closed) throw new Error('观察实例已关闭')
+    const { gap } = await qualification()
+    if (closed || gap && gap !== 'unsupported-host-version') throw new Error('本安装设置资格未确认：' + (gap ?? 'adapter-closed'))
+  }
   const modelSettings = collectMaterials && typeof core.installationAnalysisConfig === 'function' ? {
-    async read() { if (closed) throw new Error('观察实例已关闭'); return core.installationAnalysisConfig('chatgpt:' + installationId) },
-    async save({ config, revision }) { if (closed) throw new Error('观察实例已关闭'); return core.configureInstallationAnalysis('chatgpt:' + installationId, config, revision) },
-    async directory({ baseUrl }, options) { if (closed) throw new Error('观察实例已关闭'); return readModelDirectory(baseUrl, options) },
+    async read() { await qualifySettings(); return core.installationAnalysisConfig('chatgpt:' + installationId) },
+    async save({ config, revision }) { await qualifySettings(); return core.configureInstallationAnalysis('chatgpt:' + installationId, config, revision) },
+    async directory({ baseUrl }, options) { await qualifySettings(); return readModelDirectory(baseUrl, options) },
   } : undefined
   try { panel = await startPanelServer({ read, modelSettings, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }

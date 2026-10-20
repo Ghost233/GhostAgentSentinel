@@ -9,7 +9,7 @@ const root = resolve(process.argv[2] || fileURLToPath(new URL('../', import.meta
 const { bundlePatchPaths, loadOverlayPatches, composeEntries } = await import(pathToFileURL(join(dshRoot, 'deepseek-harness/packages/boot/app-boot/lib/index.js')))
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 assert.equal(manifest.dsh.client.platform, 'web')
-assert.deepEqual(manifest.dsh.client.inject, ['@deepseek-ai/dsh-client-ui-sidebar-right', '@deepseek-ai/dsh-client-ui-conversation'])
+assert.deepEqual(manifest.dsh.client.inject, ['@deepseek-ai/dsh-client-ui-sidebar-right', '@deepseek-ai/dsh-client-ui-conversation', '@deepseek-ai/dsh-client-ui-settings-general'])
 const paths = bundlePatchPaths(root, manifest.dsh.bundle)
 assert.equal(paths.length, 1)
 const entries = composeEntries([paths.flatMap(path => loadOverlayPatches('dsh', path))])

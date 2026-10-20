@@ -7,7 +7,7 @@ import { startServer } from '../src/server.mjs'
 import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 
-test('private production installation retains its notifier bundle and wires native IO without adding another panel entry', async t => {
+test('private production installation retains its notifier bundle and wires native IO alongside monitor and settings entries', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-native-installation-')), notificationBundlePath = join(dir, 'GhostSentinel.app')
   const server = await startServer({ dataDir: join(dir, 'core') }); let runtime
   t.after(async () => { await runtime?.close(); await server.close(); await rm(dir, { recursive: true, force: true }) })
@@ -25,13 +25,14 @@ test('private production installation retains its notifier bundle and wires nati
   for (let wait = 0; !settingsCalls && wait < 100; wait++) await new Promise(resolve => setTimeout(resolve, 2))
   assert.equal(settingsCalls, 1)
   const response = await fetch(runtime.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + config.token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) }).then(value => value.json())
-  assert.equal(response.result.tools.filter(tool => tool._meta?.['openai/ui']?.entrypoints).length, 1)
+  const entries = response.result.tools.filter(tool => tool._meta?.['openai/ui']?.entrypoints)
+  assert.deepEqual(entries.map(tool => [tool.name, tool._meta['openai/ui'].entrypoints]), [['sentinel_current_chat', [{ type: 'thread' }]], ['sentinel_model_settings', [{ type: 'global' }]]])
   assert.ok(response.result.tools.some(tool => tool.name === 'sentinel_request_notification_permission'))
   assert.ok(response.result.tools.some(tool => tool.name === 'sentinel_notification_records'))
   assert.equal(JSON.stringify(response).includes(config.token), false)
 })
 
-test('the production helper starts from private installation configuration and generates only a conversation MCP entry', async t => {
+test('the production helper starts from one private installation and exposes distinct monitor and settings resources', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-installation-'))
   const server = await startServer({ dataDir: join(dir, 'core') })
   let runtime
@@ -49,8 +50,8 @@ test('the production helper starts from private installation configuration and g
   assert.equal(connection.mcpServers.sentinel.http_headers.Authorization, 'Bearer ' + initial.token)
   const response = await fetch(runtime.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + initial.token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) }).then(value => value.json())
   const entries = response.result.tools.filter(tool => tool._meta?.['openai/ui']?.entrypoints)
-  assert.equal(entries.length, 1, 'the write control does not add another visible entry')
-  assert.deepEqual(entries[0]._meta['openai/ui'].entrypoints, [{ type: 'thread' }])
+  assert.deepEqual(entries.map(tool => [tool.name, tool._meta['openai/ui'].entrypoints]), [['sentinel_current_chat', [{ type: 'thread' }]], ['sentinel_model_settings', [{ type: 'global' }]]])
+  assert.notEqual(entries[0]._meta.ui.resourceUri, entries[1]._meta.ui.resourceUri)
   const control = response.result.tools.find(tool => tool.name === 'sentinel_set_chat_analysis')
   assert.deepEqual(control._meta.ui.visibility, ['app'])
   assert.equal(control.annotations.readOnlyHint, false)
