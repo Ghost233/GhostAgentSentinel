@@ -611,8 +611,8 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (closed || gap && gap !== 'unsupported-host-version') throw new Error('本安装设置资格未确认：' + (gap ?? 'adapter-closed'))
   }
   const modelSettings = collectMaterials && typeof core.installationAnalysisConfig === 'function' ? {
-    async read() { await qualifySettings(); return core.installationAnalysisConfig('chatgpt:' + installationId) },
-    async save({ config, revision }) { await qualifySettings(); return core.configureInstallationAnalysis('chatgpt:' + installationId, config, revision) },
+    async read() { await qualifySettings(); await core.health(); await qualifySettings(); return core.installationAnalysisConfig('chatgpt:' + installationId) },
+    async save({ config, revision }) { await qualifySettings(); await core.health(); await qualifySettings(); return core.configureInstallationAnalysis('chatgpt:' + installationId, config, revision) },
     async directory({ baseUrl }, options) { await qualifySettings(); return readModelDirectory(baseUrl, options) },
   } : undefined
   try { panel = await startPanelServer({ read, modelSettings, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }

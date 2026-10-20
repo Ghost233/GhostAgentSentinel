@@ -8,6 +8,8 @@ import { tmpdir } from 'node:os'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
+import { createLazyCore } from '../chatgpt/lazy-core.mjs'
+import { createServer } from 'node:http'
 
 const state = { registrationId: 'chatgpt:installation-a', revision: 'settings-revision-a', config: { llm: { baseUrl: 'http://127.0.0.1:1234', model: 'summary-a' }, jev: { baseUrl: 'http://127.0.0.1:2345', model: 'judge-a' } } }
 
@@ -61,22 +63,23 @@ test('the fixed settings entry saves an installation configuration without needi
 
 test('production adapter settings bind the installation independently from collection and other installations', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-settings-'))
-  let server, core, adapter
-  t.after(async () => { try { await adapter?.close(); await core?.close(); await server?.close() } finally { await rm(dataDir, { recursive: true, force: true }) } })
+  let server, core, lazy, adapter
+  t.after(async () => { try { await adapter?.close(); await lazy?.close(); await core?.close(); await server?.close() } finally { await rm(dataDir, { recursive: true, force: true }) } })
   server = await startServer({ dataDir })
   core = await connectCore({ dataDir })
+  lazy = createLazyCore({ dataDir })
   const token = 'b'.repeat(64)
   const native = {
     async sampleHost() { return { available: true, hostRunId: 'settings-host', hostStartedAt: 1, profile: null } },
     async readEnablement(cwd) { assert.equal(cwd, null); return { user: 'enabled', effective: 'enabled' } },
   }
-  adapter = await startChatGPTAdapter({ core, native, installationId: 'settings-installation', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
+  adapter = await startChatGPTAdapter({ core: lazy, native, installationId: 'settings-installation', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
   const request = async (method, params = {}) => {
     const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
     assert.equal(response.status, 200)
     const envelope = await response.json()
     assert.ok(!envelope.error, envelope.error?.message)
-    assert.ok(!envelope.result?.isError)
+    assert.ok(!envelope.result?.isError, JSON.stringify(envelope.result?.content))
     return envelope.result
   }
   const rpc = async (name, args = {}) => (await request('tools/call', { name, arguments: args })).structuredContent
@@ -137,11 +140,12 @@ test('production adapter settings bind the installation independently from colle
 
 test('global settings reject untrusted host or plugin qualification before accessing installation configuration', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-settings-qualification-'))
-  let server, core, adapter, enabled = true, available = true
-  t.after(async () => { try { await adapter?.close(); await core?.close(); await server?.close() } finally { await rm(dataDir, { recursive: true, force: true }) } })
+  let server, core, lazy, adapter, enabled = false, available = true, connectionAttempts = 0
+  t.after(async () => { try { await adapter?.close(); await lazy?.close(); await core?.close(); await server?.close() } finally { await rm(dataDir, { recursive: true, force: true }) } })
   server = await startServer({ dataDir }); core = await connectCore({ dataDir })
+  lazy = createLazyCore({ dataDir, connect: async options => { connectionAttempts++; return connectCore(options) } })
   const token = 'c'.repeat(64), registrationId = 'chatgpt:qualified-settings'
-  adapter = await startChatGPTAdapter({ core, native: {
+  adapter = await startChatGPTAdapter({ core: lazy, native: {
     async sampleHost() { return { available, hostRunId: 'settings-host', hostStartedAt: 1, profile: null } },
     async readEnablement() { return { user: enabled ? 'enabled' : 'disabled', effective: enabled ? 'enabled' : 'disabled' } },
   }, installationId: 'qualified-settings', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
@@ -150,8 +154,7 @@ test('global settings reject untrusted host or plugin qualification before acces
     assert.equal(response.status, 200)
     return (await response.json()).result
   }
-  const before = (await rpc('sentinel_model_settings')).structuredContent
-  enabled = false
+  const before = await core.installationAnalysisConfig(registrationId)
   assert.equal((await rpc('sentinel_model_settings')).isError, true)
   assert.equal((await rpc('sentinel_save_model_settings', { revision: before.revision, config: state.config })).isError, true)
   assert.equal((await rpc('sentinel_model_directory', { baseUrl: 'http://127.0.0.1:1' })).isError, true)
@@ -160,6 +163,67 @@ test('global settings reject untrusted host or plugin qualification before acces
   assert.equal((await rpc('sentinel_model_settings')).isError, true)
   assert.equal((await rpc('sentinel_save_model_settings', { revision: before.revision, config: state.config })).isError, true)
   assert.deepEqual(await core.installationAnalysisConfig(registrationId), before)
+  assert.equal(connectionAttempts, 0, 'unqualified installation settings never connect Core')
+})
+
+for (const change of ['none', 'disabled', 'closed']) test('cold settings save respects qualification during Core connection: ' + change, { timeout: 10000 }, async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-cold-settings-'))
+  let server, core, lazy, adapter, enabled = true, connected, releaseConnection
+  const modelCalls = [], modelServer = createServer((req, res) => { modelCalls.push({ method: req.method, url: req.url }); res.writeHead(500).end() })
+  await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve))
+  const config = { llm: { baseUrl: 'http://127.0.0.1:' + modelServer.address().port, model: 'summary-a' }, jev: { baseUrl: 'http://127.0.0.1:' + modelServer.address().port, model: 'judge-a' } }
+  const entered = new Promise(resolve => { connected = resolve }), release = new Promise(resolve => { releaseConnection = resolve })
+  t.after(async () => { releaseConnection(); try { await adapter?.close(); await lazy?.close(); await core?.close(); await server?.close() } finally { await new Promise(resolve => modelServer.close(resolve)); await rm(dataDir, { recursive: true, force: true }) } })
+  server = await startServer({ dataDir }); core = await connectCore({ dataDir })
+  const registrationId = 'chatgpt:cold-settings', before = await core.installationAnalysisConfig(registrationId), token = 'd'.repeat(64)
+  let connectionAttempts = 0
+  lazy = createLazyCore({ dataDir, connect: async options => { connectionAttempts++; connected(); await release; return connectCore(options) } })
+  adapter = await startChatGPTAdapter({ core: lazy, native: {
+    async sampleHost() { return { available: true, hostRunId: 'cold-settings-host', hostStartedAt: 1, profile: null } },
+    async readEnablement() { return { user: enabled ? 'enabled' : 'disabled', effective: enabled ? 'enabled' : 'disabled' } },
+  }, installationId: 'cold-settings', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
+  const saving = fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_save_model_settings', arguments: { revision: before.revision, config } } }) }).then(response => response.json()).then(result => ({ result }), error => ({ error }))
+  await entered
+  if (change === 'disabled') enabled = false
+  if (change === 'closed') await adapter.close()
+  releaseConnection()
+  const response = await saving
+  await lazy.health()
+  const after = await core.installationAnalysisConfig(registrationId)
+  if (change === 'none') {
+    assert.equal(response.result?.result?.isError, undefined)
+    assert.deepEqual(after.config, config)
+    assert.equal(adapter.diagnostics().trackedThreads, 0)
+    assert.equal(adapter.diagnostics().openReaders, 0)
+  } else {
+    if (change === 'disabled') assert.equal(response.result?.result?.isError, true)
+    else assert.ok(response.error)
+    assert.deepEqual(after, before, 'revoked settings cannot write after the Core connection completes')
+  }
+  assert.equal(connectionAttempts, 1)
+  assert.deepEqual((await core.snapshot()).sources, [])
+  assert.deepEqual(modelCalls, [], 'settings connection and save never invoke model IO')
+})
+
+test('trusted model directory reads leave cold Core in standby and invoke only the external directory', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-settings-directory-')), calls = []
+  const models = createServer((req, res) => { calls.push({ method: req.method, url: req.url }); res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ id: 'summary-a' }] })) })
+  let adapter, connectionAttempts = 0
+  const lazy = createLazyCore({ dataDir, connect: async () => { connectionAttempts++; throw new Error('model directory must not connect Core') } })
+  t.after(async () => { try { await adapter?.close(); await lazy.close(); await new Promise(resolve => models.close(resolve)) } finally { await rm(dataDir, { recursive: true, force: true }) } })
+  await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
+  const token = 'e'.repeat(64)
+  adapter = await startChatGPTAdapter({ core: lazy, native: {
+    async sampleHost() { return { available: true, hostRunId: 'directory-settings-host', hostStartedAt: 1, profile: null } },
+    async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
+  }, installationId: 'directory-settings', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
+  const result = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_model_directory', arguments: { baseUrl: 'http://127.0.0.1:' + models.address().port } } }) }).then(response => response.json())
+  assert.equal(result.result?.isError, undefined)
+  assert.equal(result.result.structuredContent.models[0].id, 'summary-a')
+  assert.deepEqual(calls, [{ method: 'GET', url: '/v1/models' }])
+  assert.equal(connectionAttempts, 0)
+  assert.equal(adapter.diagnostics().trackedThreads, 0)
+  assert.equal(adapter.diagnostics().openReaders, 0)
 })
 
 test('model dropdown checks only directory metadata and preserves the manual model choice', async t => {
