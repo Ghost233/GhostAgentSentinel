@@ -17,6 +17,10 @@ function parameterCodec(name) {
       if (typeof value !== 'string' || !value || value.length > 2000) throw new Error('分析配置修订令牌无效')
       return value
     }
+    if (name === 'directorySelection') {
+      if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 || typeof value.baseUrl !== 'string' || !value.baseUrl || value.baseUrl.length > 2000 || /[\u0000-\u001f\u007f]/.test(value.baseUrl)) throw new Error('模型目录地址无效')
+      return value
+    }
     if (name === 'id') {
       if (typeof value !== 'string' || !value || value.length > 2000) throw new Error('通知 ID 无效')
       return value
@@ -42,8 +46,8 @@ function parameterCodec(name) {
 
 module.exports = function descriptors() {
   const methods = {
-    snapshot: [], gsSummary: ['sessionId'], diagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'],
-    configureAnalysisIfCurrent: ['config', 'revision'], ackNotification: ['id', 'result'],
+    snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'],
+    configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'],
   }
   return Object.entries(methods).map(([method, parameters]) => ({
     id: `ghost-agent-sentinel#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,

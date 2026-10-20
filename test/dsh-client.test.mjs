@@ -174,6 +174,150 @@ async function waitForDisplayedTask(fixture, title) {
   }
 }
 
+test('native model buttons read candidates and check connections independently without saving drafts or invoking inference', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-model-buttons-')), host = new Context(), calls = []
+  let server, core, adapter, f, unavailable = false
+  const operations = []
+  const models = createServer((request, response) => {
+    calls.push({ method: request.method, path: request.url })
+    response.setHeader('content-type', 'application/json')
+    if (unavailable) { response.writeHead(503).end('{}'); return }
+    response.end(JSON.stringify({ data: [{ id: 'summary-choice', type: 'llm' }, { id: 'judge-choice', source: 'native' }, { id: 'manual-option' }, { id: 'embedding-only', type: 'embedding' }] }))
+  })
+  t.after(async () => { await f?.dispose(); await adapter?.close(); await host.fiber.dispose(); await core?.close(); await server?.close(); models.closeAllConnections(); if (models.listening) await new Promise(resolve => models.close(resolve)); await rm(dataDir, { recursive: true, force: true }) })
+  await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
+  server = await startServer({ dataDir }); core = await connectCore({ dataDir })
+  const registrationId = 'dsh:model-buttons', baseUrl = `http://127.0.0.1:${models.address().port}`
+  const before = await core.installationAnalysisConfig(registrationId)
+  const other = await core.configureInstallationAnalysis('chatgpt:other', { llm: { baseUrl: 'http://localhost:1', model: 'other' } }, (await core.installationAnalysisConfig('chatgpt:other')).revision)
+  await host.plugin(req('@deepseek-ai/dsh-llm').default)
+  for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop']) await host.plugin(req(`@deepseek-ai/${name}`).default, { agents: [] })
+  for (const name of ['dsh-typert-registry', 'dsh-api-remote-access', 'dsh-api-gateway']) await host.plugin(req(`@deepseek-ai/${name}`).default)
+  adapter = createAdapter(host, { dataDir, registrationId }, { flushMs: 10, heartbeatMs: 25 })
+  const { Peer } = req('@deepseek-ai/dsh-client-connection'), peer = new Peer(host, { principal: { kind: 'owner' }, interactions: 'none' })
+  f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true, $dispatch: (endpoint, payload, signal) => { operations.push(endpoint); return host.typertGateway.dispatchRpc(endpoint, JSON.parse(JSON.stringify(payload)), signal, peer) } })
+  await f.mountSettings()
+  await f.waitUntil(() => f.dom.window.document.querySelector('[data-sentinel-installation-settings] input'), 'native installation settings read Core without mounting a monitor')
+  const settings = f.dom.window.document.querySelector('[data-sentinel-installation-settings]'), groups = [...settings.querySelectorAll('fieldset')]
+  const inputs = [...settings.querySelectorAll('input')], { Simulate } = clientRequire('react-dom/test-utils')
+  const button = (role, label) => [...groups[role].querySelectorAll('button')].find(value => value.textContent === label)
+  for (const role of [0, 1]) { assert.ok(button(role, '读取列表')); assert.ok(button(role, '检查连接')) }
+  await f.interact(async () => {
+    inputs[0].value = baseUrl; Simulate.change(inputs[0]); inputs[1].value = 'manual-draft'; Simulate.change(inputs[1])
+    Simulate.blur(inputs[1], { relatedTarget: button(0, '读取列表') }); Simulate.keyDown(button(0, '读取列表'), { key: 'Enter' }); button(0, '读取列表').click(); await f.settle()
+  })
+  await f.waitUntil(() => groups[0].querySelector('select')?.options.length > 1, 'the actual directory GET populates candidates')
+  assert.equal(inputs[1].value, 'manual-draft')
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'reading a list neither selects a model nor saves a completed draft')
+  assert.match(groups[0].querySelector('[data-sentinel-model-list]').textContent, /已读取/)
+  assert.match(groups[0].querySelector('[data-sentinel-model-check]').textContent, /尚未检查/)
+  assert.deepEqual([...groups[0].querySelector('select').options].map(option => option.value), ['', 'summary-choice', 'manual-option'])
+  const switchTab = async label => f.interact(async () => { Simulate.click([...settings.querySelectorAll('[role=tab]')].find(value => value.textContent === label)); await f.settle() })
+  const diagnosticReads = () => operations.filter(value => value === 'sentinel/installationDiagnostics').length
+  settings.scrollTop = 133
+  assert.equal(diagnosticReads(), 0, 'settings and directory reads never start a diagnostics poll')
+  await switchTab('连接诊断')
+  const diagnostic = () => settings.querySelector('[data-sentinel-diagnostics]')
+  await f.waitUntil(() => diagnostic()?.textContent.includes('尚未配置完整'), 'opening diagnostics reads this installation without requiring a selected chat')
+  assert.equal(diagnosticReads(), 1); assert.match(diagnostic().textContent, /不代表采集完整/)
+  await f.tick(); assert.equal(diagnosticReads(), 1, 'background observation refresh never polls installation diagnostics')
+  await f.interact(async () => { [...diagnostic().querySelectorAll('button')].find(value => value.textContent === '刷新诊断').click(); await f.settle() })
+  assert.equal(diagnosticReads(), 2)
+  await switchTab('通知记录'); await switchTab('设置')
+  assert.equal(inputs[1].value, 'manual-draft'); assert.equal(settings.scrollTop, 133)
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'tab navigation and diagnostics keep the unfinished effective configuration unchanged')
+  await f.interact(async () => { Simulate.blur(button(0, '读取列表'), { relatedTarget: null }); Simulate.keyDown(button(0, '检查连接'), { key: 'Enter' }); button(0, '检查连接').click(); await f.settle() })
+  await f.waitUntil(() => groups[0].querySelector('[data-sentinel-model-check]').textContent.includes('未列出'), 'connection check tests the manually entered model independently')
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'checking a connection and leaving its button do not save')
+  const select = groups[0].querySelector('select')
+  await f.interact(async () => { select.value = 'summary-choice'; Simulate.change(select); await f.settle() })
+  await f.waitUntil(() => f.plugin.diagnostics().activeRequests === 0, 'selecting a candidate completes exactly the summary group')
+  assert.deepEqual((await core.installationAnalysisConfig(registrationId)).config, { llm: { baseUrl, model: 'summary-choice' } })
+  assert.match(groups[0].querySelector('[data-sentinel-model-check]').textContent, /尚未检查|重新检查/)
+  await f.interact(async () => { button(0, '检查连接').click(); await f.settle() })
+  await f.waitUntil(() => groups[0].querySelector('[data-sentinel-model-check]').textContent.includes('模型可见'), 'the selected model is checked only by its explicit button')
+  assert.match(groups[0].querySelector('[data-sentinel-model-check]').textContent, /实际分析未验证/)
+  unavailable = true
+  await f.interact(async () => {
+    inputs[2].value = baseUrl; Simulate.change(inputs[2]); inputs[3].value = 'manual-judge'; Simulate.change(inputs[3]); button(1, '读取列表').click(); await f.settle()
+  })
+  await f.waitUntil(() => groups[1].querySelector('[data-sentinel-model-list]').textContent.includes('失败'), 'a directory failure retains the manual model entry')
+  assert.equal(inputs[3].value, 'manual-judge')
+  await f.interact(async () => { Simulate.blur(inputs[3], { relatedTarget: null }); await f.settle() })
+  assert.deepEqual((await core.installationAnalysisConfig(registrationId)).config, { llm: { baseUrl, model: 'summary-choice' }, jev: { baseUrl, model: 'manual-judge' } })
+  assert.deepEqual(await core.installationAnalysisConfig('chatgpt:other'), other)
+  assert.ok(calls.length >= 4); assert.ok(calls.every(call => call.method === 'GET' && call.path === '/v1/models'), 'neither button starts inference or sends chat material')
+  await switchTab('连接诊断')
+  await f.waitUntil(() => diagnostic().textContent.includes('配置完整；在线与实际推理未确认'), 'saved preparation is distinct from a completed model check or successful inference')
+  assert.match(diagnostic().textContent, /尚无保留分析轮次/)
+  const source = (await core.snapshot()).sources.find(value => value.descriptor.registrationId === registrationId)
+  await core.unregisterSource(source.key, 'owned-test-disconnect')
+  await f.waitUntil(() => adapter.diagnostics().adapter.communicationFailure, 'the actual collector observes its revoked source before diagnostics refresh')
+  await f.interact(async () => { [...diagnostic().querySelectorAll('button')].find(value => value.textContent === '刷新诊断').click(); await f.settle() })
+  await f.waitUntil(() => diagnostic().textContent.includes('采集失败'), 'the public installation diagnostics retains the collector failure')
+  assert.match(diagnostic().textContent, /core/)
+  assert.equal(f.plugin.diagnostics().viewInstances, 0)
+})
+
+for (const ending of ['close', 'disable', 'reconnect']) test('native directory and diagnostic requests preserve newer drafts and discard late results after ' + ending, async t => {
+  const pending = [], config = { registrationId: 'dsh:pending-settings', revision: 'pending-revision', config: { llm: { baseUrl: 'http://127.0.0.1:1', model: 'current' } } }
+  const directory = { state: 'online', online: true, complete: true, inferenceVerified: false, checkedAt: 10, models: [{ id: 'current', role: 'summary' }] }
+  const diagnostic = { protocol: 1, registrationId: config.registrationId, generatedAt: 20, configRevision: config.revision,
+    models: { llm: { configured: true }, jev: { configured: false } }, collection: { state: 'failed', sourceCount: 1, connectedSources: 0, lastSeenAt: null, error: { stage: 'core', code: null } },
+    analysis: { counts: { scope: 'active-tasks', total: 1, states: { queued: 1 } }, latest: { state: 'stale', resultDisposition: 'stale', configRevision: 'previous-config', startedAt: 1, completedAt: 2, nextEligibleAt: null, error: null }, latestFailure: { stage: 'summary', code: 'unavailable', at: 2 } } }
+  const hold = (kind, signal) => new Promise(resolve => pending.push({ kind, signal, resolve }))
+  t.after(() => { for (const request of pending) request.resolve({ ok: true, value: request.kind === 'directory' ? directory : diagnostic }) })
+  const f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true,
+    async analysisConfigState() { return { ok: true, value: config } },
+    async modelDirectory(_selection, signal) { return hold('directory', signal) },
+    async installationDiagnostics(signal) { return hold('diagnostic', signal) },
+  })
+  await f.mountSettings()
+  const settings = () => f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  const groups = () => [...settings().querySelectorAll('fieldset')], inputs = () => [...settings().querySelectorAll('input')]
+  const button = label => [...groups()[0].querySelectorAll('button')].find(value => value.textContent === label)
+  const { Simulate } = clientRequire('react-dom/test-utils')
+  await f.waitUntil(() => inputs().length === 4, 'native settings loaded before starting independent reads')
+  await f.interact(async () => { button('读取列表').click(); button('检查连接').click(); await f.settle() })
+  await f.waitUntil(() => pending.length === 2, 'both actual Native Remote operations are in flight')
+  await f.interact(async () => {
+    inputs()[1].value = 'newer-draft'; Simulate.change(inputs()[1]); inputs()[0].value = 'http://localhost:2'; Simulate.change(inputs()[0]); await f.settle()
+  })
+  assert.ok(pending.every(request => request.signal.aborted), 'editing a request input cancels the obsolete directory and connection checks')
+  pending[0].resolve({ ok: true, value: directory }); pending[1].resolve({ ok: true, value: directory })
+  await f.interact(async () => { await f.settle() })
+  assert.equal(inputs()[1].value, 'newer-draft'); assert.equal(groups()[0].querySelector('select').options.length, 1)
+  assert.doesNotMatch(groups()[0].querySelector('[data-sentinel-model-check]').textContent, /服务在线|模型可见/)
+  await f.interact(async () => { button('读取列表').click(); [...settings().querySelectorAll('[role=tab]')].find(value => value.textContent === '连接诊断').click(); await f.settle() })
+  await f.waitUntil(() => pending.length === 4, 'diagnostics is an explicit independent Remote read')
+  if (ending === 'close') await f.unmountSettings()
+  else if (ending === 'disable') { await f.disable(); await f.unmountSettings() }
+  else await f.reinstall(false)
+  assert.equal(pending[2].signal.aborted, true); assert.equal(pending[3].signal.aborted, true)
+  if (ending === 'disable') await f.reinstall(false)
+  await f.mountSettings()
+  pending[2].resolve({ ok: true, value: directory }); pending[3].resolve({ ok: true, value: diagnostic })
+  await f.interact(async () => { await f.settle() })
+  assert.equal(inputs()[1].value, ending === 'reconnect' ? 'newer-draft' : 'current'); assert.equal(groups()[0].querySelector('select').options.length, 1)
+  assert.equal(settings().querySelector('[data-sentinel-diagnostics]').textContent.includes('previous-config'), false)
+  await f.interact(async () => { [...settings().querySelectorAll('[role=tab]')].find(value => value.textContent === '设置').click(); await f.settle() })
+  await f.interact(async () => { [...settings().querySelectorAll('[role=tab]')].find(value => value.textContent === '连接诊断').click(); await f.settle() })
+  await f.waitUntil(() => pending.length === 5, 'the reopened page starts its own diagnostic read')
+  pending[4].resolve({ ok: true, value: { ...diagnostic, registrationId: 'dsh:another-installation' } })
+  await f.interact(async () => { await f.settle() })
+  assert.match(settings().querySelector('[data-sentinel-diagnostics]').textContent, /响应归属未确认/)
+  assert.equal(settings().querySelector('[data-sentinel-diagnostics]').textContent.includes('previous-config'), false)
+  await f.interact(async () => { [...settings().querySelector('[data-sentinel-diagnostics]').querySelectorAll('button')].find(value => value.textContent === '刷新诊断').click(); await f.settle() })
+  await f.waitUntil(() => pending.length === 6, 'a new explicit refresh remains available after rejecting a foreign response')
+  pending[5].resolve({ ok: true, value: diagnostic })
+  await f.interact(async () => { await f.settle() })
+  const text = settings().querySelector('[data-sentinel-diagnostics]').textContent
+  assert.match(text, /最近保留轮次：分析结论已过期；结果：stale/)
+  assert.match(text, /previous-config/); assert.match(text, /最近保留失败：summary · unavailable/)
+  assert.match(text, /采集失败/); assert.match(text, /尚未配置完整/)
+  await f.tick(); assert.equal(pending.length, 6, 'diagnostics has no background polling')
+})
+
 test('native system settings edits only its stable installation through production Remote and Core while monitoring refreshes', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-system-settings-')), host = new Context()
   let server, core, adapter, f, blocker, saveMode = 'normal'

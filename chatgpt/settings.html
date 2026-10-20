@@ -4,26 +4,36 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sentinel 安装设置</title>
 <style>
-body{font:14px/1.55 system-ui;margin:0;padding:16px;color:var(--color-text-primary,#222);background:var(--color-background-primary,#fff)}h1{font-size:18px;margin:0 0 8px}.muted{color:var(--color-text-secondary,#666);font-size:12px}input{display:block;box-sizing:border-box;width:100%;margin:4px 0 8px;padding:6px}button{margin:4px 4px 4px 0;padding:6px 10px}fieldset{margin:12px 0;border:1px solid #8886;border-radius:8px;padding:12px}
+body{font:14px/1.55 system-ui;margin:0;padding:16px;color:var(--color-text-primary,#222);background:var(--color-background-primary,#fff)}h1{font-size:18px;margin:0 0 8px}h2{font-size:15px;margin:12px 0 6px}.muted{color:var(--color-text-secondary,#666);font-size:12px}input,select{display:block;box-sizing:border-box;width:100%;margin:4px 0 8px;padding:6px}button{margin:4px 4px 4px 0;padding:6px 10px}fieldset{margin:12px 0;border:1px solid #8886;border-radius:8px;padding:12px}[role=tab][aria-selected=true]{font-weight:600;border-bottom:2px solid currentColor}
 </style>
 <h1>Sentinel · 安装设置</h1>
 <p class="muted">本安装的所有已监控聊天共用这份模型配置。关闭设置不停止监控。</p>
+<nav role="tablist" aria-label="安装设置"><button id="settings-tab-settings" type="button" role="tab" aria-controls="settings-pane-settings">设置</button><button id="settings-tab-notifications" type="button" role="tab" aria-controls="settings-pane-notifications">通知记录</button><button id="settings-tab-diagnostics" type="button" role="tab" aria-controls="settings-pane-diagnostics">连接诊断</button></nav>
+<section id="settings-pane-settings" role="tabpanel" aria-labelledby="settings-tab-settings">
 <p id="settings-status" role="status" class="muted"></p>
 <form id="settings-form">
 <fieldset id="settings-llm-group"><legend>总结模型</legend>
 <label>服务地址<input id="settings-llm-url" type="url" placeholder="http://127.0.0.1:端口" autocomplete="off"></label>
-<label>模型 ID（下拉或手填）<input id="settings-llm-model" list="settings-llm-options" autocomplete="off"></label><datalist id="settings-llm-options"></datalist>
-<button id="settings-llm-check" type="button">读取列表／检查连接</button><p id="settings-llm-status" class="muted"></p></fieldset>
+<label>模型列表（读取后选定）<select id="settings-llm-options"></select></label><label>模型 ID（手填）<input id="settings-llm-model" autocomplete="off"></label>
+<button id="settings-llm-list" type="button">读取列表</button><button id="settings-llm-check" type="button">检查连接</button><p id="settings-llm-list-status" class="muted"></p><p id="settings-llm-check-status" class="muted"></p><p id="settings-llm-status" class="muted"></p></fieldset>
 <fieldset id="settings-jev-group"><legend>JEV 判断模型</legend>
 <label>服务地址<input id="settings-jev-url" type="url" placeholder="http://127.0.0.1:端口" autocomplete="off"></label>
-<label>模型 ID（下拉或手填）<input id="settings-jev-model" list="settings-jev-options" autocomplete="off"></label><datalist id="settings-jev-options"></datalist>
-<button id="settings-jev-check" type="button">读取列表／检查连接</button><p id="settings-jev-status" class="muted"></p></fieldset>
-<p class="muted">选定模型或离开模型分组时自动保存；未完成的输入保留为草稿。</p><button id="settings-reload" type="button">重新读取</button>
+<label>模型列表（读取后选定）<select id="settings-jev-options"></select></label><label>模型 ID（手填）<input id="settings-jev-model" autocomplete="off"></label>
+<button id="settings-jev-list" type="button">读取列表</button><button id="settings-jev-check" type="button">检查连接</button><p id="settings-jev-list-status" class="muted"></p><p id="settings-jev-check-status" class="muted"></p><p id="settings-jev-status" class="muted"></p></fieldset>
+<p class="muted">从列表选定模型、手填后按 Enter 或离开模型分组时自动保存；未完成的输入保留为草稿。</p><button id="settings-reload" type="button">重新读取</button>
 </form>
+</section>
+<section id="settings-pane-notifications" role="tabpanel" aria-labelledby="settings-tab-notifications" hidden><p id="settings-notifications-status" class="muted"></p></section>
+<section id="settings-pane-diagnostics" role="tabpanel" aria-labelledby="settings-tab-diagnostics" hidden>
+<button id="diagnostics-refresh" type="button">刷新诊断</button><p id="diagnostics-status" class="muted"></p>
+<h2>采集</h2><p id="diagnostics-collection"></p>
+<h2>模型准备</h2><p id="diagnostics-model-llm"></p><p id="diagnostics-llm-check" class="muted"></p><p id="diagnostics-model-jev"></p><p id="diagnostics-jev-check" class="muted"></p>
+<h2>实际分析</h2><p id="diagnostics-analysis"></p><p id="diagnostics-failure" class="muted"></p>
+</section>
 <script>
 const element=id=>document.querySelector('#'+id),text=(value,max=2000)=>typeof value==='string'?value.slice(0,max):'';
-let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0,savingGroups=null;
-const pending=new Map(),directoryVersions={llm:0,jev:0},editVersions={llm:0,jev:0},completedVersions={llm:0,jev:0},dirtyRoles=new Set(),queuedGroups=new Map();
+let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0,savingGroups=null,settingsTab='settings',diagnosticsBusy=false,diagnosticsVersion=0;
+const pending=new Map(),directoryVersions={llm:0,jev:0},directoryRequests={llm:{list:0,check:0},jev:{list:0,check:0}},editVersions={llm:0,jev:0},completedVersions={llm:0,jev:0},dirtyRoles=new Set(),queuedGroups=new Map();
 function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);if(entry.method==='tools/call')parent.postMessage({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id,reason}},'*');entry.reject(new Error(reason));}
 function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
 function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
@@ -34,10 +44,12 @@ function renderModelSettings(value){
   validateModelSettings(value);settingsState=value;
   for(const role of ['llm','jev']){
     if(dirtyRoles.has(role))continue;
-    directoryVersions[role]++;element('settings-'+role+'-options').replaceChildren();element('settings-'+role+'-check').disabled=false;
+    directoryVersions[role]++;element('settings-'+role+'-options').replaceChildren();
+    for(const action of ['list','check']){element('settings-'+role+'-'+action).disabled=false;element('settings-'+role+'-'+action+'-status').textContent=action==='list'?'尚未读取列表':'尚未检查';}
     element('settings-'+role+'-url').value=value.config[role]?.baseUrl??'';element('settings-'+role+'-model').value=value.config[role]?.model??'';
     element('settings-'+role+'-status').textContent=value.config[role]?'已配置 · 实际分析状态另行核对':'尚未配置';
   }
+  renderConnectionChecks();
 }
 async function readModelSettings(){
   if(stopped||document.hidden||!ready||settingsBusy)return;
@@ -80,28 +92,68 @@ async function saveModelSettings(){
   }catch(error){if(!stopped&&version===settingsVersion)element('settings-status').textContent='保存结果未确认 · 输入已保留，可重新读取核对；'+text(error.message);}
   finally{if(!stopped&&version===settingsVersion){savingGroups=null;settingsBusy=false;element('settings-reload').disabled=false;void saveModelSettings();}}
 }
-async function readDirectory(role){
-  if(stopped||!ready||element('settings-'+role+'-check').disabled)return;
-  const baseUrl=element('settings-'+role+'-url').value.trim(),selected=element('settings-'+role+'-model').value.trim(),version=++directoryVersions[role],button=element('settings-'+role+'-check'),status=element('settings-'+role+'-status');
-  button.disabled=true;status.textContent='正在读取模型目录（不调用推理）';
-  const current=()=>!stopped&&version===directoryVersions[role]&&baseUrl===element('settings-'+role+'-url').value.trim()&&selected===element('settings-'+role+'-model').value.trim();
+async function readDirectory(role,action){
+  if(stopped||document.hidden||!ready||element('settings-'+role+'-'+action).disabled)return;
+  const baseUrl=element('settings-'+role+'-url').value.trim(),selected=element('settings-'+role+'-model').value.trim(),version=directoryVersions[role],sequence=++directoryRequests[role][action],button=element('settings-'+role+'-'+action),status=element('settings-'+role+'-'+action+'-status');
+  button.disabled=true;status.textContent=action==='list'?'正在读取候选模型':'正在检查连接（不调用推理）';
+  const current=()=>!stopped&&version===directoryVersions[role]&&sequence===directoryRequests[role][action]&&baseUrl===element('settings-'+role+'-url').value.trim()&&selected===element('settings-'+role+'-model').value.trim();
   try{
     const response=await request('tools/call',{name:'sentinel_model_directory',arguments:{baseUrl}});if(!current())return;
     const value=response.structuredContent;if(response.isError||!value||!Array.isArray(value.models))throw new Error('模型目录读取失败');
-    const options=element('settings-'+role+'-options');options.replaceChildren();
-    for(const model of value.models.slice(0,256))if(text(model.id)&&['unknown',role==='llm'?'summary':'jev'].includes(model.role)){
-      const option=document.createElement('option');option.textContent=model.id+(model.role==='unknown'?'（能力未确认）':'');option.value=model.id;options.append(option);
+    if(action==='list'){
+      const options=element('settings-'+role+'-options'),placeholder=document.createElement('option');placeholder.value='';placeholder.textContent='请选择模型或继续手填';options.replaceChildren(placeholder);
+      for(const model of value.models.slice(0,256))if(text(model.id)&&['unknown',role==='llm'?'summary':'jev'].includes(model.role)){
+        const option=document.createElement('option');option.textContent=model.id+(model.role==='unknown'?'（能力未确认）':'');option.value=model.id;options.append(option);
+      }
+      options.value='';
+      status.textContent=value.state==='online'?'已读取候选模型 · 可继续手填模型 ID':'目录未确认或不可用 · 可手填模型 ID';
+    }else{
+      status.textContent=baseUrl+' · '+(selected||'未填写模型 ID')+' · '+(value.state==='online'?'服务在线 · '+(selected?(value.models.some(model=>model.id===selected)?'模型可见':'所填模型未列出，可手填'):'请填写模型 ID'):value.online?'服务在线 · 模型目录未确认':'服务离线或不可访问')+' · 实际分析未验证';
     }
-    status.textContent=value.state==='online'?'服务在线 · '+(selected?(value.models.some(model=>model.id===selected)?'模型可见':'所选模型未列出，可手填'):'请选择模型或手填 ID')+' · 实际推理能力未验证':value.online?'服务在线 · 模型目录未确认，可手填 ID':'服务离线或不可访问 · 已保存配置不变';
-  }catch(error){if(current())status.textContent='连接检查未确认 · '+text(error.message);}
-  finally{if(!stopped&&version===directoryVersions[role])button.disabled=false;}
+  }catch(error){if(current())status.textContent=(action==='list'?'候选列表读取失败 · 可手填模型 ID；':'连接检查未确认 · ')+text(error.message);}
+  finally{if(!stopped&&sequence===directoryRequests[role][action]){button.disabled=false;if(action==='check')renderConnectionChecks();}}
+}
+function renderConnectionChecks(){for(const role of ['llm','jev'])element('diagnostics-'+role+'-check').textContent='当前表单连接检查：'+(element('settings-'+role+'-check-status').textContent||'尚未检查');}
+function diagnosticError(error){return error?text(error.stage)||'环节未公开' :'';}
+function renderDiagnostics(value){
+  if(!value||value.protocol!==1||!text(value.registrationId)||settingsState&&value.registrationId!==settingsState.registrationId||!value.collection||!['connected','disconnected','unconfirmed','failed'].includes(value.collection.state)||!value.models||!['llm','jev'].every(role=>typeof value.models[role]?.configured==='boolean')||!value.analysis||value.analysis.counts?.scope!=='active-tasks'||!value.analysis.counts.states||typeof value.analysis.counts.states!=='object')throw new Error('本安装诊断结果未确认');
+  const collection=value.collection,analysis=value.analysis,latest=analysis.latest;
+  element('diagnostics-collection').textContent=({connected:'已连接',disconnected:'已断连',unconfirmed:'采集未确认',failed:'采集失败'})[collection.state]+' · '+collection.connectedSources+'/'+collection.sourceCount+' 个来源已连接'+(collection.error?' · '+diagnosticError(collection.error)+' · '+(text(collection.error.code)||'错误未公开'):'');
+  for(const role of ['llm','jev'])element('diagnostics-model-'+role).textContent=(role==='llm'?'总结模型':'JEV')+'已保存配置：'+(value.models[role].configured?'已配置':'未配置')+' · 服务在线与实际分析另行核对';
+  element('diagnostics-analysis').textContent='活动任务：'+analysis.counts.total+' · '+(Object.entries(analysis.counts.states).map(([state,count])=>text(state)+': '+count).join('，')||'无活动任务')+'；'+(latest?'最近保留轮次：'+(text(latest.state)||'未公开')+' · '+(text(latest.resultDisposition)||'结果归属未公开')+(latest.configRevision&&latest.configRevision!==value.configRevision?' · 配置已改变':''):'实际分析：尚无可用轮次');
+  element('diagnostics-failure').textContent=(latest?.error?'最近保留轮次错误：'+diagnosticError(latest.error)+' · '+(text(latest.error.code)||'错误未公开')+'；':'')+(analysis.latestFailure?'最近保留失败：'+diagnosticError(analysis.latestFailure)+' · '+(text(analysis.latestFailure.code)||'错误未公开'):'失败环节：未公开或无保留失败');
+  element('diagnostics-status').textContent='本安装诊断快照 · '+(Number.isFinite(value.generatedAt)?new Date(value.generatedAt).toLocaleString():'时间未公开');renderConnectionChecks();
+}
+async function readDiagnostics(){
+  if(stopped||document.hidden||!ready||settingsTab!=='diagnostics'||diagnosticsBusy)return;
+  diagnosticsBusy=true;const version=++diagnosticsVersion;element('diagnostics-refresh').disabled=true;element('diagnostics-status').textContent='正在读取本安装诊断';
+  for(const field of ['collection','model-llm','model-jev','analysis','failure'])element('diagnostics-'+field).textContent='';
+  try{const response=await request('tools/call',{name:'sentinel_installation_diagnostics',arguments:{}});if(stopped||version!==diagnosticsVersion)return;if(response.isError)throw new Error('诊断读取失败');renderDiagnostics(response.structuredContent);}
+  catch(error){if(!stopped&&version===diagnosticsVersion)element('diagnostics-status').textContent='连接诊断未确认 · '+text(error.message);}
+  finally{if(!stopped&&version===diagnosticsVersion){diagnosticsBusy=false;element('diagnostics-refresh').disabled=false;}}
+}
+function selectSettingsTab(tab){
+  if(stopped)return;settingsTab=tab;
+  for(const name of ['settings','notifications','diagnostics']){element('settings-pane-'+name).hidden=name!==tab;element('settings-tab-'+name).setAttribute('aria-selected',String(name===tab));}
+  if(tab==='diagnostics'){renderConnectionChecks();return readDiagnostics();}
+}
+function markModelDraft(role,field){
+  editVersions[role]++;dirtyRoles.add(role);directoryVersions[role]++;
+  if(element('settings-'+role+'-list').disabled)element('settings-'+role+'-list-status').textContent='输入已改变 · 列表待重读';
+  for(const action of ['list','check'])element('settings-'+role+'-'+action).disabled=false;
+  element('settings-'+role+'-check-status').textContent='内容已改变 · 尚未检查';element('settings-'+role+'-status').textContent='草稿 · 完成配置后自动保存；请重新检查连接';
+  if(field==='url'){element('settings-'+role+'-options').replaceChildren();element('settings-'+role+'-list-status').textContent='服务已改变 · 列表待重读';}else if(field==='model')element('settings-'+role+'-options').value='';
+  renderConnectionChecks();
 }
 element('settings-form').onsubmit=event=>event.preventDefault();element('settings-reload').onclick=readModelSettings;
+for(const tab of ['settings','notifications','diagnostics'])element('settings-tab-'+tab).onclick=()=>selectSettingsTab(tab);
+element('diagnostics-refresh').onclick=readDiagnostics;element('settings-notifications-status').textContent='本安装通知记录尚未接入此页面。';element('diagnostics-status').textContent='尚未读取连接诊断';selectSettingsTab('settings');
 for(const role of ['llm','jev']){
-  element('settings-'+role+'-check').onclick=()=>readDirectory(role);
-  element('settings-'+role+'-model').onchange=()=>completeModelGroup(role);
-  element('settings-'+role+'-group').onfocusout=event=>{if(!['url','model','check'].some(field=>event.relatedTarget===element('settings-'+role+'-'+field)))return completeModelGroup(role);};
-  for(const field of ['url','model'])element('settings-'+role+'-'+field).oninput=()=>{editVersions[role]++;dirtyRoles.add(role);directoryVersions[role]++;element('settings-'+role+'-check').disabled=false;element('settings-'+role+'-status').textContent='草稿 · 完成配置后自动保存；请重新检查连接';if(field==='url')element('settings-'+role+'-options').replaceChildren();};
+  for(const action of ['list','check'])element('settings-'+role+'-'+action).onclick=()=>readDirectory(role,action);
+  element('settings-'+role+'-options').onchange=()=>{const selected=element('settings-'+role+'-options').value;if(!selected)return;element('settings-'+role+'-model').value=selected;markModelDraft(role,'selection');return completeModelGroup(role);};
+  element('settings-'+role+'-group').onfocusout=event=>{if(!['url','model','options','list','check'].some(field=>event.relatedTarget===element('settings-'+role+'-'+field)))return completeModelGroup(role);};
+  element('settings-'+role+'-group').onkeydown=event=>{if(event.key==='Enter'&&['url','model'].some(field=>event.target===element('settings-'+role+'-'+field))){event.preventDefault();return completeModelGroup(role);}};
+  for(const field of ['url','model'])element('settings-'+role+'-'+field).oninput=()=>markModelDraft(role,field);
 }
 function visibility(){if(document.hidden){for(const [id,entry] of pending)if(entry.method==='tools/call')cancel(id,entry,'面板已隐藏 · 输入已保留');}else if(settingsState)void saveModelSettings();else void readModelSettings();}
 function teardown(){if(stopped)return;stopped=true;settingsVersion++;for(const [id,entry] of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}

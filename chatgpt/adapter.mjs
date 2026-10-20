@@ -9,6 +9,7 @@ import { loadCursor, saveCursor } from './cursor-store.mjs'
 import { classifyThread, createDiscovery, nativeStorageRoot } from './discovery.mjs'
 import { openHealthOutbox } from './health-outbox.mjs'
 import { readModelDirectory } from './model-directory.mjs'
+import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
 import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE } from '../src/protocol.mjs'
@@ -115,6 +116,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   let notificationPending = null, notificationError = null
   let qualifiedHost = null
   const threads = new Map(), operations = new Set()
+  const settingsLifetime = new AbortController()
   const delivery = notificationIO ? createNotificationDelivery({ core, native: notificationIO, installationId, qualify: qualifyNotification, now }) : null
   const storageVersion = collectMaterials && nativeOriginVersion === 2 ? 2 : 1
   const discovery = createDiscovery({ native, sessionsRoot, nativeOriginVersion: storageVersion, now })
@@ -607,13 +609,38 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   let panel
   async function qualifySettings() {
     if (closed) throw new Error('观察实例已关闭')
-    const { gap } = await qualification()
+    const qualified = await qualification(), { gap } = qualified
     if (closed || gap && gap !== 'unsupported-host-version') throw new Error('本安装设置资格未确认：' + (gap ?? 'adapter-closed'))
+    return qualified
+  }
+  function settingsRead(requested, action) {
+    const signal = AbortSignal.any([settingsLifetime.signal, ...(requested ? [requested] : [])])
+    return track((async () => {
+      signal.throwIfAborted()
+      await qualifySettings()
+      signal.throwIfAborted()
+      const result = await action(signal)
+      const qualified = await qualifySettings()
+      signal.throwIfAborted()
+      return { result, qualified }
+    })())
   }
   const modelSettings = collectMaterials && typeof core.installationAnalysisConfig === 'function' ? {
     async read() { await qualifySettings(); await core.health(); await qualifySettings(); return core.installationAnalysisConfig('chatgpt:' + installationId) },
     async save({ config, revision }) { await qualifySettings(); await core.health(); await qualifySettings(); return core.configureInstallationAnalysis('chatgpt:' + installationId, config, revision) },
-    async directory({ baseUrl }, options) { await qualifySettings(); return readModelDirectory(baseUrl, options) },
+    async directory({ baseUrl }, { signal } = {}) { return (await settingsRead(signal, signal => readModelDirectory(baseUrl, { signal }))).result },
+    async diagnostics({ signal } = {}) {
+      const { result, qualified } = await settingsRead(signal, async signal => {
+        await core.health(signal)
+        await qualifySettings()
+        signal.throwIfAborted()
+        const [setting, snapshot] = await Promise.all([core.installationAnalysisConfig('chatgpt:' + installationId, signal), core.snapshot(signal)])
+        return { setting, snapshot }
+      })
+      const failures = combineHealth(sourceHealth, availabilityFailure?.health, outboxError, ...[...threads.values()].map(entry => entry.health)).failures.filter(failure => failure.domain === 'collection')
+      const collectionError = qualified.gap ? { stage: 'host-verification', code: qualified.gap } : failures[0]?.error ?? null
+      return projectInstallationDiagnostics(result.setting, result.snapshot, { collectionError, collectionState: qualified.gap ? 'unconfirmed' : null })
+    },
   } : undefined
   try { panel = await startPanelServer({ read, modelSettings, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }
@@ -624,6 +651,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   function close(reason = 'adapter-closed') {
     return closing ??= (async () => {
       closed = true; clearTimeout(timer); timer = null
+      settingsLifetime.abort(new Error('观察实例已关闭'))
       const cancelling = onQualificationLost ? core.cancelPending?.() : null
       const notificationClosing = delivery?.stop().then(result => {
         if (result.errorCode || result.remainingPending !== 0) throw Object.assign(new Error('Native notification cleanup incomplete'), { code: 'notification_cleanup_failed', errorCode: result.errorCode, remainingPending: result.remainingPending })

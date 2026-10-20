@@ -8,6 +8,8 @@ import { HIERARCHY_FEATURE } from '../src/hierarchy.mjs'
 import { GS_FEATURE } from '../src/gs-status.mjs'
 import { GS_SUMMARY_FEATURE } from '../src/protocol.mjs'
 import { createHierarchyReader } from './hierarchy-reader.mjs'
+import { readModelDirectory } from '../src/model-directory.mjs'
+import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 
 export const name = 'ghost-agent-sentinel'
 export const inject = ['agents']
@@ -205,7 +207,7 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
     const signal = requested ? AbortSignal.any([lifetime.signal, requested]) : lifetime.signal
     return call(client, method, ...args, signal)
   }
-  async function installationCall(method, args, requested) {
+  async function installationCall(method, args, requested, scoped = true) {
     if (closed) throw new Error('观察连接已关闭')
     if (!descriptor.enroll) throw new Error('未配置稳定 registrationId；本安装配置身份未确认')
     const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(10000), ...(requested ? [requested] : [])])
@@ -214,7 +216,7 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       if (!target) { target = await track(connect({ dataDir, signal })); temporary = true; settingsClients.add(target) }
       signal.throwIfAborted()
       if (typeof target[method] !== 'function') throw new Error('共享核心尚不支持本安装设置')
-      return await track(target[method](descriptor.registrationId, ...args, signal))
+      return await track(target[method](...(scoped ? [descriptor.registrationId, ...args] : args), signal))
     } catch (error) {
       failure = error
       if (['analysis_config_conflict', 'analysis_config_unconfirmed', 'installation_monitoring_conflict'].includes(error?.code) || Array.isArray(error?.causes)) { error.code ??= 'gateway/internal'; error.isDSHRemoteError = true; error.details = error.causes ? { causes: error.causes } : {} }
@@ -263,6 +265,28 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       return invoke('gsSummary', sourceKey, sessionId, signal)
     },
     pause(signal) { return setInstallationPaused(true, signal) }, resume(signal) { return setInstallationPaused(false, signal) },
+    modelDirectory({ baseUrl }, requested) {
+      if (closed || !descriptor.enroll) return Promise.reject(new Error('本安装设置资格未确认'))
+      const signal = AbortSignal.any([lifetime.signal, ...(requested ? [requested] : [])])
+      return track((async () => {
+        signal.throwIfAborted()
+        const result = await readModelDirectory(baseUrl, { signal })
+        signal.throwIfAborted()
+        if (closed) throw new Error('观察连接已关闭')
+        return result
+      })())
+    },
+    installationDiagnostics(requested) {
+      const signal = AbortSignal.any([lifetime.signal, ...(requested ? [requested] : [])])
+      return track((async () => {
+        const setting = await installationCall('installationAnalysisConfig', [], signal)
+        const snapshot = await installationCall('snapshot', [], signal, false)
+        signal.throwIfAborted()
+        if (closed) throw new Error('观察连接已关闭')
+        const collectionError = communicationFailure?.active ? { stage: 'core', code: communicationFailure.latest.code ?? null } : null
+        return projectInstallationDiagnostics(setting, snapshot, { collectionError })
+      })())
+    },
     analysisConfigState(signal) { return installationCall('installationAnalysisConfig', [], signal) },
     async configureAnalysisIfCurrent(value, revision, signal) {
       try { return await installationCall('configureInstallationAnalysis', [value, revision], signal) }
@@ -296,8 +320,8 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
         const remaining = () => Math.max(1, deadline - Date.now())
         let sealed = false
         try {
-          const results = await waitForShutdown(Promise.allSettled([retiring, tickPromise, disposedReader, disposedProvider, disposedRemote, ...cancelled]), Math.min(closeTimeoutMs, remaining()))
-          for (const result of results) if (result.status === 'rejected') shutdownFailure(result.reason)
+          const results = await waitForShutdown(Promise.allSettled([retiring, tickPromise, disposedReader, disposedProvider, disposedRemote, ...cancelled, ...activeRequests]), Math.min(closeTimeoutMs, remaining()))
+          for (const result of results) if (result.status === 'rejected' && result.reason !== lifetime.signal.reason) shutdownFailure(result.reason)
         } catch (error) { shutdownFailure(error) }
         try {
           if (client && sourceKey) {

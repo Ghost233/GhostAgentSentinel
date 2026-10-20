@@ -70,6 +70,10 @@ export async function startPanelServer({ read, control, modelSettings, requestNo
         title: '读取本机模型列表', description: '仅检查服务在线及模型名称，不调用生成或 JEV 推理。', inputSchema: { baseUrl: z.string().min(1).max(2000) },
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
       }, async (selection, extra) => ({ content: [{ type: 'text', text: '模型目录与在线状态' }], structuredContent: await modelSettings.directory(selection, { signal: extra.signal }) }))
+      if (typeof modelSettings.diagnostics === 'function') registerAppTool(mcp, 'sentinel_installation_diagnostics', {
+        title: '本安装连接诊断', description: '只读核对本安装采集与保留分析状态，不读取聊天或运行模型检查。', inputSchema: z.object({}).strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+      }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装连接诊断' }], structuredContent: await modelSettings.diagnostics({ signal: extra.signal }) }))
     }
     if (typeof control === 'function') registerAppTool(mcp, 'sentinel_set_chat_analysis', {
       title: '设置本聊天分析', description: '仅暂停或恢复当前聊天的监控分析，继续只读采集。',

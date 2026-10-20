@@ -33,6 +33,10 @@
             return value
           }
           if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('观察操作参数必须是对象')
+          if (name === 'directorySelection') {
+            if (Object.keys(value).length !== 1 || typeof value.baseUrl !== 'string' || !value.baseUrl || value.baseUrl.length > 2000 || /[\u0000-\u001f\u007f]/.test(value.baseUrl)) throw new Error('模型目录地址无效')
+            return value
+          }
           if (name === 'result') {
             if (!['submitted', 'failed'].includes(value.status) || Object.keys(value).some(key => !['status', 'error'].includes(key))
               || (value.error !== undefined && (typeof value.error !== 'string' || value.error.length > 500))) throw new Error('通知投递结果无效')
@@ -46,7 +50,7 @@
           return value
         } }) }
       }
-      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], ackNotification: ['id', 'result'] }
+      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'] }
       const descriptors = Object.entries(methods).map(([method, parameters]) => ({
         id: `${id}#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,
         invocation: { kind: 'direct' }, cancellation: { parameter: 'signal' }, parameters: parameters.map(name => ({ name, wire: name, source: 'json', codec: parameterCodec(name) })), result: { mode: 'src-json' },
@@ -278,19 +282,53 @@
         }, [sessionId, visible, signal])
         return summary
       }
-      function AnalysisConfig({ config, request = call, onConfig = config => notifyState({ config }), expanded = false, signal }) {
+      function AnalysisConfig({ config, request = call, onConfig = config => notifyState({ config }), expanded = false, signal, onCheck = () => {} }) {
         const [draft, setDraft] = useState(() => Object.fromEntries(['llm', 'jev'].map(role => [role, {
           baseUrl: config.config?.[role]?.baseUrl || '', model: config.config?.[role]?.model || '',
         }])))
         const [results, setResults] = useState({})
+        const [directories, setDirectories] = useState({}), [checks, setChecks] = useState({}), actions = useRef({})
         const edits = useRef({ llm: 0, jev: 0 }), values = useRef(draft), confirmed = useRef(config)
         const savedEdits = useRef({ llm: 0, jev: 0 }), resultScopes = useRef({}), confirmedScope = useRef(connectionScope)
         const pending = useRef(new Map()), saving = useRef(false), active = useRef(true), uncertain = useRef(false)
-        useEffect(() => () => { active.current = false; pending.current.clear() }, [])
+        useEffect(() => () => { active.current = false; pending.current.clear(); for (const action of Object.values(actions.current)) action.abort.abort(); actions.current = {} }, [])
         const current = () => active.current && !signal?.aborted
         function change(role, field, value) {
           edits.current[role]++; values.current = { ...values.current, [role]: { ...values.current[role], [field]: value } }
           setDraft(values.current); setResults(previous => ({ ...previous, [role]: '草稿尚未保存' }))
+          for (const kind of field === 'baseUrl' ? ['list', 'check'] : ['check']) {
+            const key = `${role}:${kind}`; actions.current[key]?.abort.abort(); delete actions.current[key]
+          }
+          if (field === 'baseUrl') setDirectories(previous => ({ ...previous, [role]: undefined }))
+          setChecks(previous => ({ ...previous, [role]: undefined })); onCheck(role, null)
+        }
+        async function readModels(role, kind) {
+          const key = `${role}:${kind}`, scope = connectionScope
+          if (!current() || !scope?.active || actions.current[key]) return
+          const action = { scope, baseUrl: values.current[role].baseUrl.trim(), model: values.current[role].model.trim(), version: edits.current[role], abort: new AbortController() }
+          actions.current[key] = action
+          const valid = () => current() && scope.active && scope === connectionScope && actions.current[key] === action
+            && action.baseUrl === values.current[role].baseUrl.trim() && (kind === 'list' || action.version === edits.current[role])
+          const update = value => {
+            if (!valid()) return
+            if (kind === 'list') setDirectories(previous => ({ ...previous, [role]: { ...value, scope, baseUrl: action.baseUrl } }))
+            else { setChecks(previous => ({ ...previous, [role]: { ...value, scope } })); onCheck(role, { ...value, scope }) }
+          }
+          update({ loading: true, message: kind === 'list' ? '正在读取列表' : '正在检查连接' })
+          try {
+            const value = await scopedCall(scope, 'modelDirectory', [{ baseUrl: action.baseUrl }], action.abort.signal)
+            if (!valid()) return
+            if (!Array.isArray(value?.models) || !['online', 'offline', 'unconfirmed'].includes(value.state)) throw new Error('模型目录响应未确认')
+            if (kind === 'list') {
+              const models = value.state === 'online' ? value.models.filter(model => ['unknown', role === 'llm' ? 'summary' : 'jev'].includes(model.role)) : []
+              update({ models, message: value.state === 'online' ? `已读取 ${models.length} 个候选模型；尚未检查连接` : `读取列表失败：${value.error?.code || value.state}` })
+            } else {
+              const message = value.state !== 'online' ? `${value.state === 'offline' ? '服务离线' : '服务响应未确认'}；模型可见性未确认${value.error?.code ? ' · ' + value.error.code : ''}`
+                : !action.model ? '服务在线；尚未填写模型 ID' : value.models.some(model => model.id === action.model) ? '服务在线；模型可见' : value.complete ? '服务在线；所填模型未列出，仍可手填' : '服务在线；模型可见性未确认'
+              update({ message: `${message}；实际分析未验证` })
+            }
+          } catch (error) { update({ models: [], message: `${kind === 'list' ? '读取列表失败' : '检查连接失败'}：${errorText(error)}` }) }
+          finally { if (actions.current[key] === action) delete actions.current[key] }
         }
         async function flush() {
           if (saving.current) return
@@ -347,15 +385,72 @@
           h('input', { value: draft[role][name], placeholder, onChange: event => change(role, name, event.target.value), autoComplete: 'off' }))
         return h('details', { open: expanded || undefined }, h('summary', null, '本地分析连接'), h('form', { onSubmit: event => event.preventDefault() },
           h('p', null, '填写本机服务地址和模型 ID，完成一组后离开该分组即可自动保存。保存不要求服务在线。'),
-          [['llm', '总结模型'], ['jev', 'JEV']].map(([role, label]) => h('fieldset', { key: role, 'aria-label': label,
-            onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) save(role) },
-            onKeyDown: event => { if (event.key === 'Enter') { event.preventDefault(); save(role) } } },
-          h('legend', null, label), field(role, 'baseUrl', `${label}服务`, 'http://127.0.0.1:端口'), field(role, 'model', `${label}模型 ID`, '模型 ID'),
-          results[role] && h('p', { role: 'status' }, results[role] === '正在保存' && (resultScopes.current[role] !== connectionScope || !connectionScope?.active) ? '保存结果未知：观察连接已关闭' : results[role])))))
+          [['llm', '总结模型'], ['jev', 'JEV']].map(([role, label]) => {
+            const directory = directories[role], options = directory?.scope === connectionScope && connectionScope?.active ? directory.models || [] : []
+            const check = checks[role]
+            return h('fieldset', { key: role, 'aria-label': label,
+              onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget) && !event.target.closest('button')) save(role) },
+              onKeyDown: event => { if (event.key === 'Enter' && !['BUTTON', 'SELECT'].includes(event.target.tagName)) { event.preventDefault(); save(role) } } },
+            h('legend', null, label), field(role, 'baseUrl', `${label}服务`, 'http://127.0.0.1:端口'),
+            h('label', null, '可选模型', h('select', { 'aria-label': `${label}可选模型`, value: options.some(model => model.id === draft[role].model) ? draft[role].model : '',
+              onChange: event => { change(role, 'model', event.target.value); save(role) } },
+            h('option', { value: '', disabled: true }, '选择模型，或在下方手填'), options.map(model => h('option', { key: model.id, value: model.id }, model.id)))),
+            field(role, 'model', `${label}模型 ID（可手填）`, '模型 ID'),
+            h('button', { type: 'button', disabled: Boolean(directory?.loading && directory.scope === connectionScope), onMouseDown: event => event.preventDefault(), onClick: () => { void readModels(role, 'list') } }, '读取列表'),
+            h('button', { type: 'button', disabled: Boolean(check?.loading && check.scope === connectionScope), onMouseDown: event => event.preventDefault(), onClick: () => { void readModels(role, 'check') } }, '检查连接'),
+            h('p', { 'data-sentinel-model-list': true }, directory ? directory.scope === connectionScope && connectionScope?.active ? directory.message : '列表已过期，请重新读取' : '尚未读取列表'),
+            h('p', { 'data-sentinel-model-check': true }, check ? check.scope === connectionScope && connectionScope?.active ? check.message : '检查已过期，请重新检查连接' : '尚未检查连接；实际分析未验证'),
+            results[role] && h('p', { role: 'status' }, results[role] === '正在保存' && (resultScopes.current[role] !== connectionScope || !connectionScope?.active) ? '保存结果未知：观察连接已关闭' : results[role]))
+          })))
+      }
+      function InstallationDiagnostics({ config, visible, signal, checks }) {
+        const [result, setResult] = useState({}), pending = useRef(null), active = useRef(true)
+        useEffect(() => () => { active.current = false; pending.current?.abort.abort(); pending.current = null }, [])
+        async function refresh() {
+          const scope = connectionScope
+          if (!visible || !config || !scope?.active || pending.current || signal?.aborted) return
+          const action = { scope, abort: new AbortController() }; pending.current = action
+          const current = () => active.current && !signal?.aborted && scope.active && scope === connectionScope && pending.current === action
+          setResult(previous => ({ ...previous, scope, loading: true, error: '' }))
+          try {
+            const value = await scopedCall(scope, 'installationDiagnostics', [], action.abort.signal)
+            if (!current()) return
+            if (value?.protocol !== 1 || value.registrationId !== config.registrationId) throw new Error('安装诊断响应归属未确认')
+            setResult({ scope, value, loading: false, error: '' })
+          } catch (error) { if (current()) setResult({ scope, value: null, loading: false, error: errorText(error) }) }
+          finally { if (pending.current === action) pending.current = null }
+        }
+        useEffect(() => {
+          if (visible && config) void refresh()
+          return () => { pending.current?.abort.abort(); pending.current = null }
+        }, [visible, config?.registrationId])
+        const stale = result.scope && (result.scope !== connectionScope || !connectionScope?.active)
+        const value = stale ? null : result.value, collection = value?.collection, analysis = value?.analysis, latest = analysis?.latest
+        const failure = error => `${error?.stage || '环节未提供'} · ${error?.code || '原因代码未提供'}`
+        return h('section', { 'data-sentinel-diagnostics': true, 'aria-label': '本安装连接诊断' },
+          h('button', { type: 'button', disabled: !config || !connectionScope?.active || Boolean(result.loading && !stale), onClick: () => { void refresh() } }, '刷新诊断'),
+          stale ? h('p', { role: 'status' }, '诊断结果已过期：观察连接已关闭，请重新打开或刷新。')
+            : result.loading ? h('p', { role: 'status' }, '正在读取本安装诊断…') : result.error ? h('p', { role: 'alert' }, `读取诊断失败：${result.error}`) : null,
+          value && h('div', null,
+            h('p', null, `诊断快照：${timeText(value.generatedAt)}${value.configRevision !== config?.revision ? '；配置已更新，请刷新诊断' : ''}`),
+            h('h3', null, '采集'),
+            h('p', null, ({ connected: '来源已连接，不代表采集完整', disconnected: '来源已断开', unconfirmed: '来源或采集范围未确认', failed: '采集失败' })[collection?.state] || '采集状态未确认'),
+            h('p', null, `${collection?.connectedSources ?? 0}/${collection?.sourceCount ?? 0} 个来源已连接；最近联系：${timeText(collection?.lastSeenAt)}`),
+            collection?.error && h('p', null, `采集失败环节：${failure(collection.error)}`),
+            h('h3', null, '已保存模型准备状态'),
+            ['llm', 'jev'].map(role => h('div', { key: role }, h('p', null, `${role === 'llm' ? '总结模型' : 'JEV'}：${value.models?.[role]?.configured ? '配置完整；在线与实际推理未确认' : '尚未配置完整'}`),
+              h('p', null, `当前编辑内容的连接检查：${checks[role] ? checks[role].scope === connectionScope && connectionScope?.active ? checks[role].message : '检查已过期，请重新检查' : '尚未检查当前编辑内容'}`))),
+            h('h3', null, '实际分析'),
+            h('p', null, `当前活动观察对象：${analysis?.counts?.total ?? 0}；${Object.entries(analysis?.counts?.states || {}).map(([state, count]) => `${analysisStatus[state] || state} ${count}`).join(' · ')}`),
+            latest ? h('div', null, h('p', null, `最近保留轮次：${analysisStatus[latest.state] || latest.state || '状态未知'}；结果：${latest.resultDisposition || '未确认'}`),
+              h('p', null, `该轮配置：${latest.configRevision || '未确认'}；开始：${timeText(latest.startedAt)}；完成：${timeText(latest.completedAt)}；下次资格：${timeText(latest.nextEligibleAt)}`),
+              latest.error && h('p', null, `最近保留轮次失败环节：${failure(latest.error)}`)) : h('p', null, '尚无保留分析轮次'),
+            analysis?.latestFailure && h('p', null, `最近保留失败：${failure(analysis.latestFailure)}；${timeText(analysis.latestFailure.at)}`)))
       }
       function SettingsPanel() {
         const [tab, setTab] = useState('settings'), [config, setConfig] = useState(null), [error, setError] = useState('')
         const [permissionMessage, setPermissionMessage] = useState(notificationStatus), [requestingPermission, setRequestingPermission] = useState(false)
+        const [modelChecks, setModelChecks] = useState({})
         const savedConfig = useRef(null), lifetime = useRef(null), permissionRequest = useRef(null)
         if (!lifetime.current) lifetime.current = new AbortController()
         const acceptConfig = current => { savedConfig.current = current; setConfig(current) }
@@ -401,13 +496,14 @@
               h('button', { key: value, type: 'button', role: 'tab', id: `${id}-${value}-tab`, 'aria-controls': `${id}-${value}-panel`, 'aria-selected': tab === value, onClick: () => setTab(value) }, label))),
           error && h('p', { role: 'alert' }, error),
           h('div', { role: 'tabpanel', id: `${id}-settings-panel`, 'aria-labelledby': `${id}-settings-tab`, hidden: tab !== 'settings' },
-            config ? h(AnalysisConfig, { key: config.registrationId, config, request, onConfig: acceptConfig, expanded: true, signal: lifetime.current.signal }) : h('p', null, error ? '尚未读取本安装配置。' : '正在读取本安装配置…'),
+            config ? h(AnalysisConfig, { key: config.registrationId, config, request, onConfig: acceptConfig, expanded: true, signal: lifetime.current.signal, onCheck: (role, value) => setModelChecks(previous => ({ ...previous, [role]: value })) }) : h('p', null, error ? '尚未读取本安装配置。' : '正在读取本安装配置…'),
             h('section', { 'aria-label': '桌面通知许可' }, h('h3', null, '桌面通知许可'),
               h('p', { role: 'status', 'data-sentinel-notification-permission': true }, permissionMessage),
               typeof Notification !== 'undefined' && Notification.permission !== 'granted' && h('button', { type: 'button',
                 disabled: requestingPermission || !connectionScope?.active, onClick: permission }, '启用桌面通知'))),
           h('div', { role: 'tabpanel', id: `${id}-notifications-panel`, 'aria-labelledby': `${id}-notifications-tab`, hidden: tab !== 'notifications' }, h('p', null, '本安装通知记录尚未接入。')),
-          h('div', { role: 'tabpanel', id: `${id}-diagnostics-panel`, 'aria-labelledby': `${id}-diagnostics-tab`, hidden: tab !== 'diagnostics' }, h('p', null, '连接诊断尚未接入；模型配置保存不代表连接检查通过。')))
+          h('div', { role: 'tabpanel', id: `${id}-diagnostics-panel`, 'aria-labelledby': `${id}-diagnostics-tab`, hidden: tab !== 'diagnostics' },
+            h(InstallationDiagnostics, { key: config?.registrationId || 'loading', config, visible: tab === 'diagnostics', signal: lifetime.current.signal, checks: modelChecks })))
       }
       const enrollmentStatus = { pending: '等待首次连接', connecting: '已连接，等待基线', connected: '已连接', disconnected: '已断开', disabled: '清单项已停用' }
       function SourcePlan({ plan, sources }) {
@@ -820,7 +916,7 @@
       const inject = ['slots']
       function apply(ctx) {
         const style = document.createElement('style')
-        style.textContent = '.sentinel-overview{padding:14px;font:13px/1.6 system-ui;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}.sentinel-overview p{margin:8px 0}.sentinel-overview nav{display:flex;flex-direction:column;gap:6px;margin:14px 0}.sentinel-overview button{background:var(--dsw-alias-bg-layer-2);color:inherit;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px;text-align:left;cursor:pointer}.sentinel-overview button[aria-pressed=true]{font-weight:600;border-color:currentColor}.sentinel-overview small,.sentinel-overview footer{display:block;font-size:11px;opacity:.8}.sentinel-overview article{border-top:1px solid var(--dsw-alias-border-l2);padding-top:8px}.sentinel-overview details{margin:10px 0}.sentinel-overview summary{cursor:pointer}.sentinel-overview label{display:block;margin:8px 0}.sentinel-overview input,.sentinel-overview textarea{width:100%;box-sizing:border-box;background:var(--dsw-alias-bg-layer-2);color:inherit;padding:7px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px}.sentinel-controls{display:flex;gap:6px;flex-wrap:wrap}.sentinel-attention{color:#b97925}.sentinel-overview footer{margin-top:18px}'
+        style.textContent = '.sentinel-overview{padding:14px;font:13px/1.6 system-ui;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}.sentinel-overview p{margin:8px 0}.sentinel-overview nav{display:flex;flex-direction:column;gap:6px;margin:14px 0}.sentinel-overview button{background:var(--dsw-alias-bg-layer-2);color:inherit;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px;text-align:left;cursor:pointer}.sentinel-overview button[aria-pressed=true]{font-weight:600;border-color:currentColor}.sentinel-overview small,.sentinel-overview footer{display:block;font-size:11px;opacity:.8}.sentinel-overview article{border-top:1px solid var(--dsw-alias-border-l2);padding-top:8px}.sentinel-overview details{margin:10px 0}.sentinel-overview summary{cursor:pointer}.sentinel-overview label{display:block;margin:8px 0}.sentinel-overview input,.sentinel-overview select,.sentinel-overview textarea{width:100%;box-sizing:border-box;background:var(--dsw-alias-bg-layer-2);color:inherit;padding:7px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px}.sentinel-controls{display:flex;gap:6px;flex-wrap:wrap}.sentinel-attention{color:#b97925}.sentinel-overview footer{margin-top:18px}'
         style.textContent += '.sentinel-gs{position:relative;display:inline-flex;font:12px/1.4 system-ui;color:var(--dsw-alias-label-primary)}.sentinel-gs button{font:inherit;color:inherit;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:4px 6px;cursor:pointer}.sentinel-gs-counts{display:inline-flex;gap:6px}.sentinel-gs-counts>span{display:inline-flex;align-items:center;gap:3px}.sentinel-gs-counts i{width:6px;height:6px;border-radius:50%;background:currentColor}.sentinel-gs-green{color:#378458}.sentinel-gs-yellow{color:#b97925}.sentinel-gs-red{color:#c44b4b}.sentinel-gs-gray{color:#7a8190}.sentinel-gs-popup{box-sizing:border-box;overflow-wrap:anywhere;position:absolute;bottom:calc(100% + 6px);right:0;z-index:1000;width:min(360px,85vw);max-height:60vh;overflow:auto;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);box-shadow:0 6px 24px #0003}.sentinel-gs-popup.sentinel-gs-below{bottom:auto;top:calc(100% + 6px)}.sentinel-gs-popup header{display:flex;justify-content:space-between;gap:8px}.sentinel-gs-popup nav{display:flex;flex-direction:column;gap:4px;margin:8px 0}.sentinel-gs-popup small{display:block;font-size:12px}.sentinel-gs-popup p{font-size:12px;margin:6px 0}.sentinel-gs-popup article{border-top:1px solid var(--dsw-alias-border-l2);padding-top:8px}'
         style.textContent += '.sentinel-tree,.sentinel-tree-node,[data-gs-row]{min-width:0;max-width:100%;box-sizing:border-box}.sentinel-tree button{width:100%;min-width:0;text-align:left;overflow-wrap:anywhere;box-sizing:border-box}.sentinel-node-name{font-size:13px;line-height:1.5}.sentinel-overview .sentinel-node-basis,.sentinel-gs-popup .sentinel-node-basis{font-size:12px;line-height:1.5;opacity:1;color:var(--dsw-alias-label-primary)}.sentinel-gs-counts{flex-wrap:wrap}.sentinel-hide-normal{display:flex;align-items:center;gap:6px;font-size:12px;margin:8px 0}.sentinel-overview .sentinel-hide-normal input{width:auto}.sentinel-tree details{margin:4px 0}.sentinel-tree summary{font-size:12px;cursor:pointer}.sentinel-tree article{font-size:12px;overflow-wrap:anywhere}.sentinel-gs-popup button:focus-visible,.sentinel-overview button:focus-visible{outline:2px solid currentColor;outline-offset:2px}.sentinel-gs-popup header>*{min-width:0}'
         style.textContent += '.sentinel-monitor-header{position:sticky;top:0;z-index:2;background:var(--dsw-alias-bg-layer-2);padding:8px 0;margin:0 0 12px;min-width:0}.sentinel-monitor-title,.sentinel-monitor-lamps{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sentinel-monitor-title{justify-content:space-between}.sentinel-monitor-header .sentinel-monitor-tabs{display:flex;flex-direction:row;gap:6px;margin:8px 0 0}.sentinel-monitor-tabs button{flex:1;text-align:center}.sentinel-monitor-tabs [aria-selected=true]{font-weight:600;border-color:currentColor}.sentinel-gs-popup .sentinel-monitor-header{display:block}.sentinel-issue-evidence small{font-size:11px;line-height:1.45;margin:3px 0;overflow-wrap:anywhere}.sentinel-issue-evidence [data-sentinel-citation]{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.sentinel-focus-summary{border-left:3px solid var(--dsw-alias-border-l2);padding-left:10px}.sentinel-focus-summary>strong{font-size:15px}.sentinel-monitor-header .sentinel-gs-counts{flex-wrap:nowrap}.sentinel-gs-popup [role=tabpanel],.sentinel-overview [role=tabpanel]{min-width:0}[data-gs-issues]:empty{min-height:40px}'

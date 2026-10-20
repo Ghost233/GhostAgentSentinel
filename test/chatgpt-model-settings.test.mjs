@@ -9,9 +9,11 @@ import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { createLazyCore } from '../chatgpt/lazy-core.mjs'
+import { supportedProfile } from '../chatgpt/storage-compatibility.mjs'
 import { createServer } from 'node:http'
 
 const state = { registrationId: 'chatgpt:installation-a', revision: 'settings-revision-a', config: { llm: { baseUrl: 'http://127.0.0.1:1234', model: 'summary-a' }, jev: { baseUrl: 'http://127.0.0.1:2345', model: 'judge-a' } } }
+const diagnostics = { protocol: 1, registrationId: state.registrationId, generatedAt: 123, configRevision: state.revision, models: { llm: { configured: true }, jev: { configured: true } }, collection: { state: 'failed', sourceCount: 1, connectedSources: 0, lastSeenAt: null, error: { stage: 'native-collection', code: 'read-failed' } }, analysis: { counts: { scope: 'active-tasks', total: 1, states: { queued: 1 } }, latest: { state: 'failed', resultDisposition: 'historical', configRevision: 'prior-config', startedAt: 1, completedAt: 2, nextEligibleAt: null, error: { stage: 'jev', code: 'schema-invalid' } }, latestFailure: { stage: 'jev', code: 'schema-invalid', at: 2 } } }
 
 async function settingsPage(t, initial = state) {
   const page = await panelHarness(t, { html: await readFile(new URL('../chatgpt/settings.html', import.meta.url), 'utf8') })
@@ -20,18 +22,177 @@ async function settingsPage(t, initial = state) {
   return page
 }
 
+function leaveModelGroup(page, role) { return page.element('#settings-' + role + '-group').onfocusout({ relatedTarget: null }) }
+
+for (const role of ['llm', 'jev']) test('settings list and connection buttons keep separate results and never save the focused draft: ' + role, async t => {
+  const page = await settingsPage(t), model = page.element('#settings-' + role + '-model'), group = page.element('#settings-' + role + '-group')
+  model.value = 'manual-draft'; model.oninput()
+  const list = page.element('#settings-' + role + '-list'), check = page.element('#settings-' + role + '-check')
+  page.document.activeElement = list
+  group.onfocusout({ relatedTarget: list })
+  const listing = list.onclick(); await page.flush()
+  const first = page.sent.findLast(row => row.params?.name === 'sentinel_model_directory')
+  assert.deepEqual(JSON.parse(JSON.stringify(first.params.arguments)), { baseUrl: state.config[role].baseUrl })
+  page.reply(first.id, { structuredContent: { state: 'online', online: true, inferenceVerified: false, models: [{ id: 'candidate-a', role: role === 'llm' ? 'summary' : 'jev' }, { id: '<manual>', role: 'unknown' }] } }); await listing
+  assert.equal(model.value, 'manual-draft')
+  assert.equal(page.element('#settings-' + role + '-options').children.length, 3)
+  assert.match(page.element('#settings-' + role + '-list-status').textContent, /候选/)
+  assert.match(page.element('#settings-' + role + '-check-status').textContent, /尚未检查/)
+  assert.equal(page.sent.some(row => row.params?.name === 'sentinel_save_model_settings'), false)
+  page.document.activeElement = check
+  group.onfocusout({ relatedTarget: check })
+  const checking = check.onclick(); await page.flush()
+  const second = page.sent.findLast(row => row.params?.name === 'sentinel_model_directory')
+  assert.notEqual(second.id, first.id)
+  page.reply(second.id, { structuredContent: { state: 'online', online: true, inferenceVerified: false, models: [{ id: 'manual-draft', role: 'unknown' }] } }); await checking
+  assert.match(page.element('#settings-' + role + '-check-status').textContent, /模型可见.*分析.*未验证/)
+  assert.ok(page.element('#settings-' + role + '-check-status').textContent.includes(state.config[role].baseUrl))
+  assert.equal(page.element('#settings-' + role + '-options').children.length, 3, 'checking does not replace the independently read candidates')
+  assert.equal(page.sent.some(row => row.params?.name === 'sentinel_save_model_settings'), false)
+})
+
+test('choosing a listed model or pressing Enter in a manual field completes the model group explicitly', async t => {
+  const page = await settingsPage(t), model = page.element('#settings-llm-model'), options = page.element('#settings-llm-options')
+  const listing = page.element('#settings-llm-list').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_model_directory')
+  page.reply(read.id, { structuredContent: { state: 'online', online: true, models: [{ id: 'chosen-summary', role: 'summary' }] } }); await listing
+  assert.equal(model.value, 'summary-a')
+  assert.equal(options.value, '')
+  options.value = 'chosen-summary'; const choosing = options.onchange(); await page.flush()
+  const first = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
+  assert.equal(first.params.arguments.config.llm.model, 'chosen-summary')
+  page.reply(first.id, { structuredContent: { ...state, revision: 'chosen-summary-saved', config: first.params.arguments.config } }); await choosing
+  model.value = 'manual-enter'; model.oninput(); await page.flush()
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_save_model_settings').length, 1)
+  let prevented = false
+  const entering = page.element('#settings-llm-group').onkeydown({ key: 'Enter', target: model, preventDefault() { prevented = true } }); await page.flush()
+  assert.equal(prevented, true)
+  const second = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
+  assert.equal(second.params.arguments.config.llm.model, 'manual-enter')
+  page.reply(second.id, { structuredContent: { ...state, revision: 'manual-enter-saved', config: second.params.arguments.config } }); await entering
+})
+
+test('settings tabs preserve the draft and position while diagnostics read only on demand and never select a tab on response', async t => {
+  const page = await settingsPage(t)
+  assert.equal(page.element('#settings-pane-settings').hidden, false)
+  assert.equal(page.element('#settings-pane-diagnostics').hidden, true)
+  assert.equal(page.sent.some(row => row.params?.name === 'sentinel_installation_diagnostics'), false)
+  const url = page.element('#settings-llm-url'); url.value = 'http://'; url.oninput()
+  page.document.scrollingElement = { scrollTop: 180 }
+  const opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics')
+  assert.deepEqual(JSON.parse(JSON.stringify(read.params.arguments)), {})
+  page.element('#settings-tab-settings').onclick()
+  page.reply(read.id, { structuredContent: diagnostics }); await opening
+  assert.equal(page.element('#settings-pane-settings').hidden, false)
+  assert.equal(page.element('#settings-tab-settings').getAttribute('aria-selected'), 'true')
+  assert.equal(url.value, 'http://')
+  assert.equal(page.document.scrollingElement.scrollTop, 180)
+  assert.match(page.element('#diagnostics-collection').textContent, /采集失败.*native-collection.*read-failed/)
+  assert.match(page.element('#diagnostics-analysis').textContent, /queued.*最近保留.*failed.*historical/)
+  assert.match(page.element('#diagnostics-failure').textContent, /jev.*schema-invalid/)
+  assert.doesNotMatch(page.element('#diagnostics-analysis').textContent, /分析成功/)
+  page.element('#settings-tab-notifications').onclick()
+  assert.equal(page.element('#settings-pane-notifications').hidden, false)
+  assert.match(page.element('#settings-notifications-status').textContent, /尚未接入/)
+  page.element('#settings-tab-settings').onclick()
+  assert.equal(url.value, 'http://')
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_model_settings').length, 1)
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_installation_diagnostics').length, 1)
+  assert.equal(page.timers.size, 0)
+})
+
+test('a rejected diagnostic refresh clears the prior snapshot and never leaves old configured or analysis facts as current', async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics').id, { structuredContent: diagnostics }); await opening
+  const refreshing = page.element('#diagnostics-refresh').onclick(); await page.flush()
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics').id, { isError: true }); await refreshing
+  assert.match(page.element('#diagnostics-status').textContent, /未确认/)
+  assert.doesNotMatch(page.element('#diagnostics-collection').textContent, /read-failed/)
+  assert.doesNotMatch(page.element('#diagnostics-model-llm').textContent, /已配置/)
+  assert.doesNotMatch(page.element('#diagnostics-analysis').textContent, /historical|queued/)
+})
+
+test('directory and connection responses stay independent and reject old service results after edits or disposal', async t => {
+  const page = await settingsPage(t), model = page.element('#settings-llm-model')
+  model.value = 'manual-not-listed'; model.oninput()
+  const listing = page.element('#settings-llm-list').onclick(), checking = page.element('#settings-llm-check').onclick(); await page.flush()
+  const [list, check] = page.sent.filter(row => row.params?.name === 'sentinel_model_directory')
+  page.reply(check.id, { structuredContent: { online: true, state: 'online', models: [{ id: 'another-model', role: 'unknown' }] } }); await checking
+  page.reply(list.id, { structuredContent: { online: true, state: 'online', models: [{ id: 'summary-candidate', role: 'summary' }] } }); await listing
+  assert.equal(model.value, 'manual-not-listed')
+  assert.match(page.element('#settings-llm-check-status').textContent, /未列出.*可手填/)
+  assert.match(page.element('#settings-llm-list-status').textContent, /候选/)
+  const oldCheck = page.element('#settings-llm-check').onclick(); await page.flush()
+  const old = page.sent.findLast(row => row.params?.name === 'sentinel_model_directory')
+  page.element('#settings-llm-url').value = 'http://localhost:1'; page.element('#settings-llm-url').oninput()
+  page.reply(old.id, { structuredContent: { online: true, state: 'online', models: [{ id: 'manual-not-listed', role: 'unknown' }] } }); await oldCheck
+  assert.match(page.element('#settings-llm-check-status').textContent, /尚未检查/)
+  assert.doesNotMatch(page.element('#diagnostics-llm-check').textContent, /服务在线|模型可见/)
+  assert.equal(page.element('#settings-llm-options').children.length, 0)
+  const pendingList = page.element('#settings-llm-list').onclick(); await page.flush()
+  const pending = page.sent.findLast(row => row.params?.name === 'sentinel_model_directory'), listener = page.handlers.get('message')
+  await page.destroy()
+  listener({ source: page.parent, data: { jsonrpc: '2.0', id: pending.id, result: { structuredContent: { online: true, state: 'online', models: [{ id: 'late-model', role: 'summary' }] } } } }); await pendingList
+  assert.equal(page.element('#settings-llm-options').children.length, 0)
+  assert.equal(model.value, 'manual-not-listed')
+  assert.equal(page.timers.size, 0)
+})
+
+test('editing a manual model during a list request keeps the draft and releases the obsolete loading status', async t => {
+  const page = await settingsPage(t), listing = page.element('#settings-llm-list').onclick(); await page.flush()
+  const call = page.sent.findLast(row => row.params?.name === 'sentinel_model_directory')
+  const model = page.element('#settings-llm-model'); model.value = 'new-manual-draft'; model.oninput()
+  page.reply(call.id, { structuredContent: { state: 'online', online: true, models: [{ id: 'old-candidate', role: 'summary' }] } }); await listing
+  assert.equal(model.value, 'new-manual-draft')
+  assert.doesNotMatch(page.element('#settings-llm-list-status').textContent, /正在读取/)
+  assert.equal(page.element('#settings-llm-list').disabled, false)
+  assert.equal(page.sent.some(row => row.params?.name === 'sentinel_save_model_settings'), false)
+})
+
+for (const unsupported of [false, true]) test('unconfigured and unsupported diagnostics retain unknown actual analysis while settings remain usable: ' + unsupported, async t => {
+  const page = await settingsPage(t, { ...state, config: {} }), opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  const value = { ...diagnostics, models: { llm: { configured: false }, jev: { configured: false } }, collection: { state: 'unconfirmed', sourceCount: 0, connectedSources: 0, lastSeenAt: null, error: unsupported ? { stage: 'host-verification', code: 'unsupported-host-version' } : null }, analysis: { counts: { scope: 'active-tasks', total: 0, states: {} }, latest: null, latestFailure: null } }
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics').id, { structuredContent: value }); await opening
+  assert.match(page.element('#diagnostics-model-llm').textContent, /未配置/)
+  assert.match(page.element('#diagnostics-analysis').textContent, /尚无可用轮次/)
+  assert.match(page.element('#diagnostics-collection').textContent, unsupported ? /未确认.*unsupported-host-version/ : /未确认/)
+  assert.doesNotMatch(page.element('#diagnostics-analysis').textContent, /分析成功/)
+  page.element('#settings-tab-settings').onclick()
+  page.element('#settings-llm-url').value = 'http://localhost:1'; page.element('#settings-llm-url').oninput()
+  page.element('#settings-llm-model').value = 'manual-offline'; page.element('#settings-llm-model').oninput()
+  const saving = leaveModelGroup(page, 'llm'); await page.flush()
+  const save = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
+  page.reply(save.id, { structuredContent: { ...state, revision: 'saved-with-unknown-collection', config: save.params.arguments.config } }); await saving
+  assert.match(page.element('#settings-status').textContent, /已保存/)
+})
+
+test('diagnostics reject a foreign installation and ignore a late response after the settings page closes', async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics').id, { structuredContent: { ...diagnostics, registrationId: 'chatgpt:foreign-installation' } }); await opening
+  assert.match(page.element('#diagnostics-status').textContent, /未确认/)
+  assert.equal(page.element('#diagnostics-collection').textContent, '')
+  const refreshing = page.element('#diagnostics-refresh').onclick(); await page.flush()
+  const call = page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics'), listener = page.handlers.get('message'), before = page.element('#diagnostics-status').textContent
+  await page.destroy()
+  listener({ source: page.parent, data: { jsonrpc: '2.0', id: call.id, result: { structuredContent: diagnostics } } }); await refreshing
+  assert.equal(page.element('#diagnostics-status').textContent, before)
+  assert.equal(page.element('#diagnostics-collection').textContent, '')
+  assert.equal(page.timers.size, 0)
+})
+
 test('settings autosave a completed offline model group without saving keystrokes or another incomplete draft', async t => {
   const page = await settingsPage(t)
   page.element('#settings-jev-url').value = 'http://'
   page.element('#settings-jev-url').oninput()
-  page.element('#settings-jev-model').onchange()
+  leaveModelGroup(page, 'jev')
   page.element('#settings-llm-url').value = 'http://127.0.0.1:1'
   page.element('#settings-llm-url').oninput()
   page.element('#settings-llm-model').value = 'manual-offline-summary'
   page.element('#settings-llm-model').oninput()
   await page.flush()
   assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_save_model_settings').length, 0)
-  page.element('#settings-llm-model').onchange()
+  leaveModelGroup(page, 'llm')
   await page.flush()
   const save = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
   assert.deepEqual(JSON.parse(JSON.stringify(save.params.arguments)), { revision: state.revision, config: { llm: { baseUrl: 'http://127.0.0.1:1', model: 'manual-offline-summary' }, jev: state.config.jev } })
@@ -45,10 +206,10 @@ test('settings autosave a completed offline model group without saving keystroke
 
 test('settings retain the latest completed edit while an earlier save is pending and never repaint a newer draft', async t => {
   const page = await settingsPage(t), input = page.element('#settings-llm-model')
-  input.value = 'summary-b'; input.oninput(); input.onchange()
+  input.value = 'summary-b'; input.oninput(); leaveModelGroup(page, 'llm')
   await page.flush()
   const first = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
-  input.value = 'summary-c'; input.oninput(); input.onchange()
+  input.value = 'summary-c'; input.oninput(); leaveModelGroup(page, 'llm')
   page.element('#settings-llm-group').onfocusout({ relatedTarget: null })
   await page.flush()
   assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_save_model_settings').length, 1)
@@ -72,7 +233,7 @@ test('leaving an unchanged group does not save or requeue its already completed 
   page.element('#settings-llm-group').onfocusout({ relatedTarget: null }); await page.flush()
   assert.equal(page.sent.some(row => row.params?.name === 'sentinel_save_model_settings'), false)
   assert.doesNotMatch(page.element('#settings-llm-status').textContent, /草稿/)
-  input.value = 'summary-b'; input.oninput(); input.onchange(); await page.flush()
+  input.value = 'summary-b'; input.oninput(); leaveModelGroup(page, 'llm'); await page.flush()
   const save = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
   page.element('#settings-llm-group').onfocusout({ relatedTarget: null })
   page.reply(save.id, { structuredContent: { ...state, revision: 'same-completed-model', config: save.params.arguments.config } }); await page.flush()
@@ -87,7 +248,7 @@ test('settings preserve edits and position across a late initial read, another r
   page.document.scrollingElement = { scrollTop: 240 }
   const model = page.element('#settings-llm-model')
   page.element('#settings-llm-url').value = 'http://localhost:1'; page.element('#settings-llm-url').oninput()
-  model.value = 'completed-before-read'; model.oninput(); model.onchange()
+  model.value = 'completed-before-read'; model.oninput(); leaveModelGroup(page, 'llm')
   page.reply(initialRead.id, { structuredContent: state }); await page.flush()
   assert.equal(model.value, 'completed-before-read')
   assert.equal(page.element('#settings-llm-url').value, 'http://localhost:1')
@@ -120,7 +281,7 @@ test('a model group cleared before the initial read completes stays cleared and 
 
 for (const failure of ['rejected', 'unclassified', 'timeout', 'wrong-installation', 'wrong-content']) test('settings preserve a failed draft and distinguish unconfirmed writes: ' + failure, async t => {
   const page = await settingsPage(t), input = page.element('#settings-llm-model')
-  input.value = 'unsaved-summary'; input.oninput(); input.onchange(); await page.flush()
+  input.value = 'unsaved-summary'; input.oninput(); leaveModelGroup(page, 'llm'); await page.flush()
   const save = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
   if (failure === 'timeout') [...page.timers.values()].find(timer => timer.delay === 5000).callback()
   else page.reply(save.id, failure === 'rejected' ? { isError: true, structuredContent: { saveOutcome: 'rejected' } } : failure === 'unclassified' ? { isError: true } : { structuredContent: { ...state, registrationId: failure === 'wrong-installation' ? 'chatgpt:another-installation' : state.registrationId, revision: 'unexpected-save', config: failure === 'wrong-content' ? state.config : save.params.arguments.config } })
@@ -133,7 +294,7 @@ for (const failure of ['rejected', 'unclassified', 'timeout', 'wrong-installatio
     page.reply(save.id, { structuredContent: { ...state, revision: 'late-timeout-save', config: save.params.arguments.config } }); await page.flush()
     assert.match(page.element('#settings-status').textContent, /保存结果未确认/, 'a late response after cancellation cannot acknowledge the write')
   }
-  input.value = 'next-completed-summary'; input.oninput(); input.onchange(); await page.flush()
+  input.value = 'next-completed-summary'; input.oninput(); leaveModelGroup(page, 'llm'); await page.flush()
   const next = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
   assert.notEqual(next.id, save.id, 'a subsequent completed edit remains available without throwing away the draft')
   page.reply(next.id, { structuredContent: { ...state, revision: 'next-completed-save', config: next.params.arguments.config } }); await page.flush()
@@ -167,7 +328,7 @@ test('settings save only after leaving a valid group and preserve clearing an op
 
 test('settings reread an unconfirmed write without calling that lost save successful', async t => {
   const page = await settingsPage(t), input = page.element('#settings-llm-model')
-  input.value = 'lost-save'; input.oninput(); input.onchange(); await page.flush()
+  input.value = 'lost-save'; input.oninput(); leaveModelGroup(page, 'llm'); await page.flush()
   const save = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
   ;[...page.timers.values()].find(timer => timer.delay === 5000).callback(); await page.flush()
   const reread = page.element('#settings-reload').onclick(); await page.flush()
@@ -179,10 +340,10 @@ test('settings reread an unconfirmed write without calling that lost save succes
 
 test('settings preserve another completed group and ignore pending saves after disposal', async t => {
   const page = await settingsPage(t), input = page.element('#settings-llm-model')
-  input.value = 'summary-b'; input.oninput(); input.onchange(); await page.flush()
+  input.value = 'summary-b'; input.oninput(); leaveModelGroup(page, 'llm'); await page.flush()
   const first = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
   const judge = page.element('#settings-jev-model')
-  judge.value = 'judge-b'; judge.oninput(); judge.onchange()
+  judge.value = 'judge-b'; judge.oninput(); leaveModelGroup(page, 'jev')
   input.value = ''; input.oninput()
   page.reply(first.id, { structuredContent: { ...state, revision: 'saved-summary-b', config: first.params.arguments.config } }); await page.flush()
   assert.equal(input.value, '')
@@ -200,9 +361,9 @@ test('settings preserve another completed group and ignore pending saves after d
 
 test('hiding settings cancels a pending write without losing a later completed group or writing while hidden', async t => {
   const page = await settingsPage(t), summary = page.element('#settings-llm-model'), judge = page.element('#settings-jev-model')
-  summary.value = 'summary-pending'; summary.oninput(); summary.onchange(); await page.flush()
+  summary.value = 'summary-pending'; summary.oninput(); leaveModelGroup(page, 'llm'); await page.flush()
   const first = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
-  judge.value = 'judge-completed'; judge.oninput(); judge.onchange()
+  judge.value = 'judge-completed'; judge.oninput(); leaveModelGroup(page, 'jev')
   page.document.hidden = true; page.handlers.get('visibilitychange')(); await page.flush()
   assert.equal(page.sent.findLast(row => row.method === 'notifications/cancelled').params.requestId, first.id)
   assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_save_model_settings').length, 1)
@@ -307,7 +468,7 @@ test('production adapter settings bind the installation independently from colle
     page.element('#settings-' + role + '-url').oninput()
     page.element('#settings-' + role + '-model').value = state.config[role].model
     page.element('#settings-' + role + '-model').oninput()
-    const saving = page.element('#settings-' + role + '-model').onchange(); await page.flush()
+    const saving = leaveModelGroup(page, role); await page.flush()
     const change = page.sent.findLast(row => row.method === 'tools/call')
     assert.equal(change.params.name, 'sentinel_save_model_settings')
     assert.equal(change.params.arguments.expectedThreadId, undefined)
@@ -320,7 +481,7 @@ test('production adapter settings bind the installation independently from colle
   peer.reply(peer.sent.findLast(row => row.params?.name === 'sentinel_model_settings').id, { structuredContent: peerState }); await peer.flush()
   for (const [window, model] of [[page, 'earlier-window-summary'], [peer, 'last-window-summary']]) {
     const input = window.element('#settings-llm-model')
-    input.value = model; input.oninput(); const saving = input.onchange(); await window.flush()
+    input.value = model; input.oninput(); const saving = leaveModelGroup(window, 'llm'); await window.flush()
     const change = window.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
     if (window === peer) assert.equal(change.params.arguments.revision, peerState.revision, 'the later window may save the revision it originally read')
     window.reply(change.id, await request('tools/call', change.params)); await saving
@@ -332,7 +493,7 @@ test('production adapter settings bind the installation independently from colle
   const restored = page.element('#settings-llm-model')
   restored.value = 'temporary-summary'; restored.oninput()
   restored.value = 'earlier-window-summary'; restored.oninput()
-  const restoring = restored.onchange(); await page.flush()
+  const restoring = leaveModelGroup(page, 'llm'); await page.flush()
   assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_save_model_settings').length, beforeRestore + 1, 'a new completed edit may intentionally restore this window value over the other window save')
   const restore = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
   assert.equal(restore.params.arguments.config.llm.model, 'earlier-window-summary')
@@ -402,7 +563,7 @@ for (const loss of ['decode', 'transport']) test('Core response ' + loss + ' los
   const page = await panelHarness(t, { html: resource.contents[0].text })
   page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_model_settings').id, await rpc('tools/call', { name: 'sentinel_model_settings', arguments: {} })); await page.flush()
   const complete = async model => {
-    const input = page.element('#settings-llm-model'); input.value = model; input.oninput(); const saving = input.onchange(); await page.flush()
+    const input = page.element('#settings-llm-model'); input.value = model; input.oninput(); const saving = leaveModelGroup(page, 'llm'); await page.flush()
     const call = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings'), result = await rpc('tools/call', call.params)
     page.reply(call.id, result); await saving; await page.flush()
     return result
@@ -493,10 +654,10 @@ for (const change of ['none', 'disabled', 'closed']) test('cold settings save re
   assert.deepEqual(modelCalls, [], 'settings connection and save never invoke model IO')
 })
 
-test('trusted model directory reads leave cold Core in standby and invoke only the external directory', async t => {
+test('actual settings list and check buttons leave cold Core in standby and only GET the external directory', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-settings-directory-')), calls = []
-  const models = createServer((req, res) => { calls.push({ method: req.method, url: req.url }); res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ id: 'summary-a' }] })) })
-  let adapter, connectionAttempts = 0
+  let available = true, adapter, connectionAttempts = 0
+  const models = createServer((req, res) => { calls.push({ method: req.method, url: req.url }); res.writeHead(available ? 200 : 503, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ id: 'summary-a' }] })) })
   const lazy = createLazyCore({ dataDir, connect: async () => { connectionAttempts++; throw new Error('model directory must not connect Core') } })
   t.after(async () => { try { await adapter?.close(); await lazy.close(); await new Promise(resolve => models.close(resolve)) } finally { await rm(dataDir, { recursive: true, force: true }) } })
   await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
@@ -505,13 +666,91 @@ test('trusted model directory reads leave cold Core in standby and invoke only t
     async sampleHost() { return { available: true, hostRunId: 'directory-settings-host', hostStartedAt: 1, profile: null } },
     async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
   }, installationId: 'directory-settings', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
-  const result = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_model_directory', arguments: { baseUrl: 'http://127.0.0.1:' + models.address().port } } }) }).then(response => response.json())
-  assert.equal(result.result?.isError, undefined)
-  assert.equal(result.result.structuredContent.models[0].id, 'summary-a')
-  assert.deepEqual(calls, [{ method: 'GET', url: '/v1/models' }])
+  const rpc = async (method, params) => {
+    const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
+    assert.equal(response.status, 200)
+    return (await response.json()).result
+  }
+  const resource = await rpc('resources/read', { uri: 'ui://ghost-sentinel/settings.html' }), page = await panelHarness(t, { html: resource.contents[0].text })
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_model_settings').id, { structuredContent: state }); await page.flush()
+  const baseUrl = 'http://127.0.0.1:' + models.address().port
+  for (const role of ['llm', 'jev']) {
+    page.element('#settings-' + role + '-url').value = baseUrl; page.element('#settings-' + role + '-url').oninput()
+    const model = page.element('#settings-' + role + '-model'); model.value = 'manual-not-listed'; model.oninput()
+    for (const action of ['list', 'check']) {
+      const button = page.element('#settings-' + role + '-' + action)
+      page.document.activeElement = button
+      page.element('#settings-' + role + '-group').onfocusout({ relatedTarget: button })
+      const reading = button.onclick(); await page.flush()
+      const call = page.sent.findLast(row => row.params?.name === 'sentinel_model_directory')
+      assert.deepEqual(JSON.parse(JSON.stringify(call.params.arguments)), { baseUrl })
+      page.reply(call.id, await rpc('tools/call', call.params)); await reading
+      assert.equal(model.value, 'manual-not-listed')
+      if (action === 'list') {
+        assert.equal(page.element('#settings-' + role + '-options').children.length, 2)
+        assert.match(page.element('#settings-' + role + '-check-status').textContent, /尚未检查/)
+      } else assert.match(page.element('#settings-' + role + '-check-status').textContent, /未列出.*实际分析未验证/)
+    }
+  }
+  available = false
+  const unavailable = page.element('#settings-llm-list').onclick(); await page.flush()
+  const call = page.sent.findLast(row => row.params?.name === 'sentinel_model_directory')
+  page.reply(call.id, await rpc('tools/call', call.params)); await unavailable
+  assert.match(page.element('#settings-llm-list-status').textContent, /不可用.*手填/)
+  assert.equal(page.element('#settings-llm-model').value, 'manual-not-listed')
+  assert.deepEqual(calls, Array.from({ length: 5 }, () => ({ method: 'GET', url: '/v1/models' })))
+  assert.equal(page.sent.some(row => row.params?.name === 'sentinel_save_model_settings'), false)
   assert.equal(connectionAttempts, 0)
   assert.equal(adapter.diagnostics().trackedThreads, 0)
   assert.equal(adapter.diagnostics().openReaders, 0)
+})
+
+test('the actual diagnostics tab reads own failed collection through MCP and Core while unconfigured settings stay usable', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-settings-diagnostics-')), modelCalls = [], token = 'f'.repeat(64)
+  const models = createServer((req, res) => { modelCalls.push({ method: req.method, url: req.url }); res.writeHead(500).end() })
+  await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
+  let server, core, lazy, adapter, threadCalls = 0
+  t.after(async () => { try { await adapter?.close(); await lazy?.close(); await core?.close(); await server?.close(); await new Promise(resolve => models.close(resolve)) } finally { await rm(dataDir, { recursive: true, force: true }) } })
+  server = await startServer({ dataDir }); core = await connectCore({ dataDir }); lazy = createLazyCore({ dataDir })
+  const registrationId = 'chatgpt:settings-diagnostics', own = await core.registerSource({ registrationId, hostRunId: 'own-host', name: 'own', policy: 'chatgpt-main/1' })
+  const other = await core.registerSource({ registrationId: 'another-installation', hostRunId: 'other-host', name: 'other' })
+  for (const [source, id] of [[own, 'own-task'], [other, 'other-task']]) await core.ingest(source, { tasks: [{ id, lifecycleId: 'life', title: id, status: 'running' }] })
+  await core.recordCollectionOutcome({ sourceKey: own, mainId: null, lifecycleId: null, channel: 'directory', roundId: 'metadata-failure', outcome: 'failed', settledAt: Date.now(), error: { stage: 'metadata', code: 'metadata-unavailable' } })
+  adapter = await startChatGPTAdapter({ core: lazy, native: {
+    async sampleHost() { return { available: true, hostRunId: 'qualified-host', hostStartedAt: 1, profile: supportedProfile } },
+    async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
+    async readThread() { threadCalls++; throw new Error('settings diagnostics do not read the current chat') },
+  }, installationId: 'settings-diagnostics', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
+  const rpc = async (method, params) => {
+    const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
+    assert.equal(response.status, 200)
+    const result = (await response.json()).result; assert.ok(!result.isError, JSON.stringify(result)); return result
+  }
+  const tools = (await rpc('tools/list', {})).tools, diagnosticTool = tools.find(tool => tool.name === 'sentinel_installation_diagnostics')
+  assert.deepEqual(diagnosticTool._meta.ui.visibility, ['app']); assert.equal(diagnosticTool.annotations.readOnlyHint, true)
+  const resource = await rpc('resources/read', { uri: 'ui://ghost-sentinel/settings.html' }), page = await panelHarness(t, { html: resource.contents[0].text })
+  const initialRead = page.sent.findLast(row => row.params?.name === 'sentinel_model_settings')
+  page.reply(initialRead.id, await rpc('tools/call', initialRead.params)); await page.flush()
+  const opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === diagnosticTool.name), result = await rpc('tools/call', read.params)
+  page.reply(read.id, result); await opening
+  assert.equal(result.structuredContent.registrationId, registrationId)
+  assert.deepEqual(result.structuredContent.analysis.counts, { scope: 'active-tasks', total: 1, states: { unknown: 1 } })
+  assert.match(page.element('#diagnostics-collection').textContent, /采集失败.*metadata.*metadata-unavailable/)
+  assert.match(page.element('#diagnostics-model-llm').textContent, /未配置/)
+  assert.doesNotMatch(page.element('#diagnostics-analysis').textContent, /分析成功/)
+  page.element('#settings-tab-settings').onclick()
+  page.element('#settings-llm-url').value = 'http://127.0.0.1:' + models.address().port; page.element('#settings-llm-url').oninput()
+  page.element('#settings-llm-model').value = 'manual-offline'; page.element('#settings-llm-model').oninput()
+  const saving = leaveModelGroup(page, 'llm'); await page.flush()
+  const save = page.sent.findLast(row => row.params?.name === 'sentinel_save_model_settings')
+  page.reply(save.id, await rpc('tools/call', save.params)); await saving
+  assert.match(page.element('#settings-status').textContent, /已保存/)
+  assert.equal((await core.installationAnalysisConfig(registrationId)).config.llm.model, 'manual-offline')
+  assert.equal(threadCalls, 0)
+  assert.deepEqual(modelCalls, [])
+  assert.equal((await core.snapshot()).sources.length, 2)
+  assert.equal(page.sent.filter(row => row.params?.name === diagnosticTool.name).length, 1, 'saving and tab changes do not poll diagnostics')
 })
 
 test('model dropdown checks only directory metadata and preserves the manual model choice', async t => {
