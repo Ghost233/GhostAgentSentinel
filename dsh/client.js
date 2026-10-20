@@ -389,7 +389,7 @@
             const directory = directories[role], options = directory?.scope === connectionScope && connectionScope?.active ? directory.models || [] : []
             const check = checks[role]
             return h('fieldset', { key: role, 'aria-label': label,
-              onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget) && !event.target.closest('button')) save(role) },
+              onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) save(role) },
               onKeyDown: event => { if (event.key === 'Enter' && !['BUTTON', 'SELECT'].includes(event.target.tagName)) { event.preventDefault(); save(role) } } },
             h('legend', null, label), field(role, 'baseUrl', `${label}服务`, 'http://127.0.0.1:端口'),
             h('label', null, '可选模型', h('select', { 'aria-label': `${label}可选模型`, value: options.some(model => model.id === draft[role].model) ? draft[role].model : '',

@@ -188,7 +188,7 @@ test('native model buttons read candidates and check connections independently w
   await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
   server = await startServer({ dataDir }); core = await connectCore({ dataDir })
   const registrationId = 'dsh:model-buttons', baseUrl = `http://127.0.0.1:${models.address().port}`
-  const before = await core.installationAnalysisConfig(registrationId)
+  let before = await core.installationAnalysisConfig(registrationId)
   const other = await core.configureInstallationAnalysis('chatgpt:other', { llm: { baseUrl: 'http://localhost:1', model: 'other' } }, (await core.installationAnalysisConfig('chatgpt:other')).revision)
   await host.plugin(req('@deepseek-ai/dsh-llm').default)
   for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-system-prompt', 'dsh-tools', 'dsh-agent', 'dsh-agent-loop']) await host.plugin(req(`@deepseek-ai/${name}`).default, { agents: [] })
@@ -202,6 +202,24 @@ test('native model buttons read candidates and check connections independently w
   const inputs = [...settings.querySelectorAll('input')], { Simulate } = clientRequire('react-dom/test-utils')
   const button = (role, label) => [...groups[role].querySelectorAll('button')].find(value => value.textContent === label)
   for (const role of [0, 1]) { assert.ok(button(role, '读取列表')); assert.ok(button(role, '检查连接')) }
+  await f.interact(async () => {
+    inputs[0].value = baseUrl; Simulate.change(inputs[0]); inputs[1].value = 'keyboard-only-summary'; Simulate.change(inputs[1])
+    Simulate.keyDown(inputs[1], { key: 'Tab' }); Simulate.blur(inputs[1], { relatedTarget: button(0, '读取列表') }); Simulate.focus(button(0, '读取列表'))
+    Simulate.keyDown(button(0, '读取列表'), { key: 'Tab' }); Simulate.blur(button(0, '读取列表'), { relatedTarget: button(0, '检查连接') }); Simulate.focus(button(0, '检查连接'))
+    await f.settle()
+  })
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'tabbing through controls inside the group does not save')
+  await f.interact(async () => {
+    Simulate.keyDown(button(0, '检查连接'), { key: 'Tab' }); Simulate.blur(button(0, '检查连接'), { relatedTarget: inputs[2] }); Simulate.focus(inputs[2]); await f.settle()
+  })
+  assert.deepEqual((await core.installationAnalysisConfig(registrationId)).config, { llm: { baseUrl, model: 'keyboard-only-summary' } }, 'leaving the valid group through its last button completes the manual model edit')
+  assert.deepEqual(calls, [], 'plain keyboard focus traversal never activates a directory GET')
+  assert.match(groups[0].querySelector('[role=status]').textContent, /已保存/)
+  await f.interact(async () => {
+    inputs[0].value = ''; Simulate.change(inputs[0]); inputs[1].value = ''; Simulate.change(inputs[1]); Simulate.blur(inputs[1], { relatedTarget: inputs[2] }); await f.settle()
+  })
+  before = await core.installationAnalysisConfig(registrationId)
+  assert.deepEqual(before.config, {}, 'clearing the optional role retains a separate empty configuration for the action controls')
   await f.interact(async () => {
     inputs[0].value = baseUrl; Simulate.change(inputs[0]); inputs[1].value = 'manual-draft'; Simulate.change(inputs[1])
     Simulate.blur(inputs[1], { relatedTarget: button(0, '读取列表') }); Simulate.keyDown(button(0, '读取列表'), { key: 'Enter' }); button(0, '读取列表').click(); await f.settle()
@@ -226,9 +244,9 @@ test('native model buttons read candidates and check connections independently w
   await switchTab('通知记录'); await switchTab('设置')
   assert.equal(inputs[1].value, 'manual-draft'); assert.equal(settings.scrollTop, 133)
   assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'tab navigation and diagnostics keep the unfinished effective configuration unchanged')
-  await f.interact(async () => { Simulate.blur(button(0, '读取列表'), { relatedTarget: null }); Simulate.keyDown(button(0, '检查连接'), { key: 'Enter' }); button(0, '检查连接').click(); await f.settle() })
+  await f.interact(async () => { Simulate.blur(button(0, '读取列表'), { relatedTarget: button(0, '检查连接') }); Simulate.keyDown(button(0, '检查连接'), { key: 'Enter' }); button(0, '检查连接').click(); await f.settle() })
   await f.waitUntil(() => groups[0].querySelector('[data-sentinel-model-check]').textContent.includes('未列出'), 'connection check tests the manually entered model independently')
-  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'checking a connection and leaving its button do not save')
+  assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'button activation and moving focus within the group do not save')
   const select = groups[0].querySelector('select')
   await f.interact(async () => { select.value = 'summary-choice'; Simulate.change(select); await f.settle() })
   await f.waitUntil(() => f.plugin.diagnostics().activeRequests === 0, 'selecting a candidate completes exactly the summary group')
