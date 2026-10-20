@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
-import { PROTOCOL, normalizeFailureScope } from './protocol.mjs'
+import { PROTOCOL, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
 
 export const defaultDataDir = join(homedir(), '.ghost-agent-sentinel')
 
@@ -149,6 +149,7 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
     installationAnalysisConfig: (registrationId, requestSignal) => call('/v1/analysis/installations/config?' + new URLSearchParams({ registrationId }), undefined, requestSignal),
     configureInstallationAnalysis: (registrationId, config, revision, requestSignal) => call('/v1/analysis/installations/config', { registrationId, config, revision }, requestSignal),
     installationNotificationPreferences: (registrationId, requestSignal) => call('/v1/notifications/installations/preferences?' + new URLSearchParams({ registrationId }), undefined, requestSignal),
+    installationNotificationRecords: async (registrationId, selection = {}, requestSignal) => call('/v1/notifications/installations/records?' + new URLSearchParams({ registrationId, ...normalizeInstallationNotificationRecordsQuery(selection) }), undefined, requestSignal),
     setInstallationNotificationPreference: (registrationId, kind, enabled, requestSignal) => call('/v1/notifications/installations/preferences', { registrationId, kind, enabled }, requestSignal),
     claimNotifications: (sourceKey, requestSignal) => call('/v1/notifications/claim', { sourceKey }, requestSignal),
     beginNotificationSubmission: (sourceKey, id, requestSignal) => call('/v1/notifications/submitting', { sourceKey, id }, requestSignal),

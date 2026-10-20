@@ -6,7 +6,7 @@ const BASELINES = 'native-initial-baselines', MONITORED = 'native-initial-monito
 const copy = value => structuredClone(value);
 
 // Native facts extend the core's notification records; DSH records are untouched.
-export function createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused, chatPaused, taskNoticeEligible, accepted, readReceipt, notificationEnabled = () => true }) {
+export function createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused, chatPaused, taskNoticeEligible, accepted, readReceipt, notificationEnabled = () => true, notificationHistoryGap = () => false, markNotificationHistoryGap = () => {} }) {
   const write = db.prepare('INSERT INTO records(collection,key,value) VALUES(?,?,?) ON CONFLICT(collection,key) DO UPDATE SET value=excluded.value');
   const remove = db.prepare('DELETE FROM records WHERE collection=? AND key=?');
   const saved = db.prepare('SELECT value FROM records WHERE collection=? AND key=?').get('settings', META);
@@ -86,15 +86,9 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
   function prune(current) {
     for (const link of links.values()) if (link.firstFailedAt <= (current ?? now()) - DAY) { if (link.rollupId) markRollupIncomplete(link.rollupId); remove.run(LINKS, link.id); links.delete(link.id); }
     for (const value of rollups.values()) if (value.closedAt && value.closedAt <= (current ?? now()) - DAY) { remove.run(ROLLUPS, value.id); rollups.delete(value.id); }
-    for (const value of notifications.values()) if (native(value) && value.evidenceThrough <= (current ?? now()) - DAY) erase('notifications', value.id);
   }
-  function capacity() {
-    const retained = [...notifications.values()].filter(native);
-    if (retained.length < LIMIT) return true;
-    const oldest = retained.filter(value => !['pending', 'claimed'].includes(value.status) && (!value.native?.nativeRequestId || value.native.pendingCancellation?.pending === false)).sort((a, b) => a.createdAt - b.createdAt)[0];
-    if (oldest) { erase('notifications', oldest.id); return true; }
-    historyGap = true; persist(); return false;
-  }
+  const needsCancellation = value => Boolean(value.native?.nativeRequestId && value.native.pendingCancellation?.pending !== false && value.native.firstDeliveredAt == null && (value.historyPruned || ['submitting', 'unknown', 'accepted', 'failed'].includes(value.native.submission?.state)));
+  const submissionCapacity = value => [...notifications.values()].filter(notice => (sources.get(notice.sourceKey)?.descriptor.registrationId ?? notice.registrationId) === (sources.get(value.sourceKey)?.descriptor.registrationId ?? value.registrationId) && needsCancellation(notice)).length < 1000;
   function source(sourceKey) {
     const value = sources.get(sourceKey);
     if (value?.descriptor.policy !== 'chatgpt-main/1') throw new Error('Native notifications require a known ChatGPT source');
@@ -105,6 +99,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     return Boolean(value && observed && value.descriptor.hostRunId === observed.hostRunId && observed.appRunning === true && observed.pluginEnabled === true && observed.observedAt <= (current ?? now()) && (current ?? now()) - observed.observedAt < leaseMs);
   }
   function scopeEligible(value, current) {
+    if (value.historyPruned) return false;
     const owner = sources.get(value.sourceKey);
     if (!notificationEnabled(owner?.descriptor.registrationId, value.kind)) return false;
     if (!owner || owner.descriptor.policy !== 'chatgpt-main/1' || owner.descriptor.hostRunId !== value.hostRunId || monitoringPaused() || value.evidenceThrough <= (current ?? now()) - DAY) return false;
@@ -123,7 +118,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
   function reconcile(current) {
     prune(current); reconcileRollups();
     for (const value of notifications.values()) {
-      if (!native(value)) continue;
+      if (!native(value) || value.historyPruned) continue;
       const facts = eligibility.get(value.sourceKey);
       const stopped = facts && !qualified(value.sourceKey, current);
       if (!scopeEligible(value, current) || stopped) cancel(value, stopped ? 'Native notification qualification is unavailable' : 'Native notification scope is no longer eligible', current);
@@ -134,7 +129,6 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
   function prepareTask(value, task) {
     const owner = sources.get(task.sourceKey);
     if (owner?.descriptor.policy !== 'chatgpt-main/1') return true;
-    if (!native(value) && !capacity()) return false;
     Object.assign(value, { kind: 'task-alert', hostRunId: owner.descriptor.hostRunId, mainId: task.id, lifecycleId: task.lifecycleId, receiptIds: [], humanSeen: 'unknown' });
     return true;
   }
@@ -150,7 +144,6 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     if (initial && !rollup) { historyGap = true; persist(); }
     const groupKey = JSON.stringify(['monitoring-failure', receipt.sourceKey, receipt.mainId, receipt.lifecycleId, ...(rollup ? [rollup.id] : [])]);
     let value = [...notifications.values()].find(value => value.kind === 'monitoring-failure' && value.groupKey === groupKey && value.status === 'pending' && value.receiptIds.length < 100 && current - value.createdAt < 3000);
-    if (!value && !capacity()) return;
     value = value ? copy(value) : { id: randomUUID(), kind: 'monitoring-failure', sourceKey: receipt.sourceKey, hostRunId: owner.descriptor.hostRunId, mainId: receipt.mainId, lifecycleId: receipt.lifecycleId, groupKey, members: [], receiptIds: [], firstRoundIds: [], evidenceThrough: receipt.firstFailedAt, createdAt: current, readyAt: current, status: 'pending', delivery: 'unknown', seen: 'unknown', humanSeen: 'unknown', claimedAt: null };
     if (!notificationEnabled(owner.descriptor.registrationId, 'monitoring-failure')) { value.status = 'cancelled'; value.error = 'Installation notification preference is disabled'; }
     if (rollup) value.rollupId = rollup.id;
@@ -160,13 +153,15 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     if (rollup) value.body = '首次接入部分聊天时读取失败；同类问题将在会话检查中持续汇总。每个聊天仍保留独立故障回执，当前是否恢复另行显示。';
     const link = { id: receipt.id, sequence: receipt.sequence, firstFailedAt: receipt.firstFailedAt, notificationId: value.id, ...(rollup ? { rollupId: rollup.id } : {}) };
     const previous = { sequence, receiptPrunedThrough, historyGap };
-    let evictedRollup = null;
+    let evictedRollup = null, evictedRegistration = null;
     db.exec('SAVEPOINT native_failure_notice');
     try {
       save('notifications', value); write.run(LINKS, link.id, JSON.stringify(link));
       if (rollup) write.run(ROLLUPS, rollup.id, JSON.stringify({ ...rollup, membersSeen: rollup.membersSeen + 1 }));
       if (links.size >= LIMIT) {
         const oldest = [...links.values()].sort((a, b) => a.sequence - b.sequence)[0];
+        const oldNotice = notifications.get(oldest.notificationId);
+        if (oldNotice) evictedRegistration = sources.get(oldNotice.sourceKey)?.descriptor.registrationId ?? oldNotice.registrationId;
         if (oldest.rollupId && rollups.has(oldest.rollupId)) {
           const previous = rollups.get(oldest.rollupId);
           evictedRollup = { ...previous, ...(rollup?.id === previous.id ? { membersSeen: rollup.membersSeen + 1 } : {}), incomplete: true };
@@ -180,6 +175,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
       if (evictedRollup) rollups.set(evictedRollup.id, evictedRollup);
       if (rollup) rollups.set(rollup.id, { ...rollup, membersSeen: rollup.membersSeen + 1, ...(evictedRollup?.id === rollup.id ? { incomplete: true } : {}) });
     } catch (error) { db.exec('ROLLBACK TO native_failure_notice'); db.exec('RELEASE native_failure_notice'); ({ sequence, receiptPrunedThrough, historyGap } = previous); throw error; }
+    if (evictedRegistration) markNotificationHistoryGap(evictedRegistration);
   }
   function publicRecord(value) {
     return copy({ id: value.id, sequence: value.nativeSequence, sourceKey: value.sourceKey, hostRunId: value.hostRunId, mainId: value.mainId, lifecycleId: value.lifecycleId, kind: value.kind, ...(value.rollupId ? { rollup: rollupRecord(value) } : {}), title: String(value.title ?? '').slice(0, 200), body: String(value.body ?? '').slice(0, 1200), receiptIds: value.receiptIds ?? [], firstRoundIds: value.firstRoundIds ?? [], checkIds: value.checkIds ?? [], alertIds: value.alertIds ?? [], members: (value.members ?? []).map(member => ({ taskKey: member.taskKey, checkIds: member.checkIds ?? [], alertIds: member.alertIds ?? [] })), createdAt: value.createdAt, evidenceThrough: value.evidenceThrough, status: value.status, delivery: value.delivery, humanSeen: 'unknown', waitReason: value.waitReason ?? null, errorCode: value.native?.errorCode ?? (value.error ? 'notification_unavailable' : null), native: value.native ?? null });
@@ -195,6 +191,12 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     const original = notifications.get(result.notificationId), value = original?.rollupId ? copy(original) : original, attempt = value?.native;
     if (!native(value) || !attempt || attempt.attemptId !== result.attemptId) throw new Error('Native notification attempt does not match');
     if (!/^ghostsentinel:[a-f0-9]{24}:.+/.test(result.nativeRequestId) || attempt.nativeRequestId && attempt.nativeRequestId !== result.nativeRequestId) throw new Error('Native notification request does not match');
+    if (value.historyPruned) {
+      if (result.event !== 'pending-cancelled') throw new Error('Native notification history was pruned');
+      if (result.pending) { attempt.pendingCancellation = { pending: true, observedAt: result.observedAt }; save('notifications', value); }
+      else erase('notifications', value.id);
+      return { record: null, maySubmit: false };
+    }
     if (['accepted', 'submission-failed', 'submission-unknown', 'user-action'].includes(result.event) && attempt.submission.state === 'not-attempted') throw new Error('Native submission has not started');
     attempt.nativeRequestId = result.nativeRequestId;
     const transaction = value.rollupId ? { rollups: new Map([...rollups].map(([key, value]) => [key, copy(value)])), sequence, prunedThrough, receiptPrunedThrough, historyGap } : null;
@@ -210,7 +212,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
       if (deferred) { value.status = 'pending'; value.claimedAt = null; value.waitReason = result.reason; }
       else cancel(value, 'Native notification was suppressed');
     } else if (result.event === 'submitting') {
-      maySubmit = value.status === 'claimed' && scopeEligible(value) && qualified(value.sourceKey) && ['authorized', 'provisional'].includes(attempt.authorization.state) && attempt.submission.state === 'not-attempted';
+      maySubmit = value.status === 'claimed' && scopeEligible(value) && qualified(value.sourceKey) && submissionCapacity(value) && ['authorized', 'provisional'].includes(attempt.authorization.state) && attempt.submission.state === 'not-attempted';
       if (maySubmit) maySubmit = beginRollupSubmission(value, observedAt);
       if (maySubmit) {
         attempt.submission = { state: 'submitting', observedAt };
@@ -256,7 +258,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
       throw error;
     }
   }
-  return { touch, removed, registerEnrollment, markMonitored, enrollmentPhase, prepareTask, observeFailure, scopeEligible, qualified, reconcile, cancel, publicRecord, claim, recordResult,
+  return { touch, removed, registerEnrollment, markMonitored, enrollmentPhase, prepareTask, observeFailure, scopeEligible, qualified, reconcile, cancel, publicRecord, claim, recordResult, needsCancellation,
     prepareTouches(values) {
       let next = sequence;
       for (const value of values) if (native(value)) value.nativeSequence = ++next;
@@ -287,10 +289,10 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
       return { ...facts, observedAt: now(), expiresAt: now() + leaseMs };
     },
     records({ sourceKey, afterSequence = 0, limit = 100 }) {
-      source(sourceKey); reconcile();
-      const values = [...notifications.values()].filter(value => native(value) && value.sourceKey === sourceKey && value.nativeSequence > afterSequence).sort((a, b) => a.nativeSequence - b.nativeSequence), page = values.slice(0, limit);
-      return { records: page.map(publicRecord), nextSequence: page.at(-1)?.nativeSequence ?? afterSequence, hasMore: values.length > page.length, historyGap: historyGap || afterSequence < prunedThrough, maximumRecords: LIMIT, qualification: qualified(sourceKey) ? 'confirmed' : 'unconfirmed' };
+      const owner = source(sourceKey); reconcile();
+      const values = [...notifications.values()].filter(value => native(value) && (value.historyPruned ? value.registrationId === owner.descriptor.registrationId : value.sourceKey === sourceKey) && value.nativeSequence > afterSequence).sort((a, b) => a.nativeSequence - b.nativeSequence), page = values.slice(0, limit);
+      return { records: page.filter(value => !value.historyPruned).map(publicRecord), cancellations: page.filter(value => value.historyPruned).map(copy), nextSequence: page.at(-1)?.nativeSequence ?? afterSequence, hasMore: values.length > page.length, historyGap: notificationHistoryGap(owner.descriptor.registrationId), maximumRecords: 1000, qualification: qualified(sourceKey) ? 'confirmed' : 'unconfirmed' };
     },
-    diagnostics: () => ({ nextExpiryAt: links.size ? Math.min(...[...links.values()].map(value => value.firstFailedAt + DAY)) : null, records: [...notifications.values()].filter(native).length, failureLinks: links.size, eligibilitySources: eligibility.size, maximumEligibilitySources: 256, maximumRecords: LIMIT, maximumFailureLinks: LIMIT, maximumReceiptsPerNotice: 100, initialEnrollment: { classificationGap, baselines: baselines.size, monitoredScopes: monitored.size, rollups: rollups.size, maximumBaselines: GROUP_LIMIT, maximumRollups: GROUP_LIMIT, maximumMonitoredScopes: LIMIT, incompleteRollups: [...rollups.values()].filter(value => value.incomplete).length, consumedRollups: [...rollups.values()].filter(value => value.consumed).length }, latestSequence: sequence, prunedThroughSequence: prunedThrough, historyGap }),
+    diagnostics: () => ({ nextExpiryAt: links.size ? Math.min(...[...links.values()].map(value => value.firstFailedAt + DAY)) : null, records: [...notifications.values()].filter(value => native(value) && !value.historyPruned).length, cancellationFences: [...notifications.values()].filter(value => value.historyPruned).length, failureLinks: links.size, eligibilitySources: eligibility.size, maximumEligibilitySources: 256, maximumRecords: 1000, recordLimitScope: 'installation', maximumFailureLinks: LIMIT, maximumReceiptsPerNotice: 100, initialEnrollment: { classificationGap, baselines: baselines.size, monitoredScopes: monitored.size, rollups: rollups.size, maximumBaselines: GROUP_LIMIT, maximumRollups: GROUP_LIMIT, maximumMonitoredScopes: LIMIT, incompleteRollups: [...rollups.values()].filter(value => value.incomplete).length, consumedRollups: [...rollups.values()].filter(value => value.consumed).length }, latestSequence: sequence, prunedThroughSequence: prunedThrough, historyGap }),
   };
 }

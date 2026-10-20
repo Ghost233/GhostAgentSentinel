@@ -215,10 +215,10 @@ test('ChatGPT task alerts retain the three-second window and ten-minute successf
   assert.ok((await f.core.nativeNotificationRecords({ sourceKey: f.sourceKey })).records.every(value => value.native.cancelRequestedAt), 'ended task requests are marked for pending cancellation')
 })
 
-test('native notification and failure-link retention remains capped and exposes omission instead of evicting an active notice silently', async t => {
+test('native notification history retains the latest installation records and exposes the trimmed gap while failure links stay bounded', async t => {
   const f = await fixture(t, { leaseMs: 1e9 }), maximum = (await f.core.diagnostics()).nativeNotifications.maximumRecords
   await f.core.ingest(f.sourceKey, { tasks: Array.from({ length: maximum + 1 }, (_, index) => ({ id: 'main-' + index, lifecycleId: 'one', title: 'Main', status: 'running' })) })
-  for (let index = 0; index <= maximum; index++) await f.core.recordCollectionOutcome({ sourceKey: f.sourceKey, mainId: 'main-' + index, lifecycleId: 'one', channel: 'directory', roundId: 'fault-' + index, outcome: 'failed', settledAt: f.now(), error: { code: 'EIO', stage: 'collection' } })
+  for (let index = 0; index <= maximum; index++) { await f.core.recordCollectionOutcome({ sourceKey: f.sourceKey, mainId: 'main-' + index, lifecycleId: 'one', channel: 'directory', roundId: 'fault-' + index, outcome: 'failed', settledAt: f.now(), error: { code: 'EIO', stage: 'collection' } }); f.advance(1) }
   const retained = (await f.core.diagnostics()).nativeNotifications
   assert.equal(retained.records, maximum)
   assert.ok(retained.failureLinks <= retained.maximumFailureLinks)
@@ -226,7 +226,7 @@ test('native notification and failure-link retention remains capped and exposes 
   assert.equal(firstPage.historyGap, true)
   assert.equal(firstPage.hasMore, true)
   assert.equal(firstPage.records.length, 100)
-  assert.equal(firstPage.records[0].mainId, 'main-0', 'the active first attempt is retained at capacity')
+  assert.equal(firstPage.records[0].mainId, 'main-1', 'the oldest unsent record is actually removed at the installation limit')
   assert.equal(JSON.stringify(firstPage).includes('Bearer'), false)
 })
 

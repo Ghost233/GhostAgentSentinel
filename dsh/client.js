@@ -41,6 +41,10 @@
             return value
           }
           if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('观察操作参数必须是对象')
+          if (name === 'notificationRecordsSelection') {
+            if (Object.keys(value).some(key => key !== 'cursor') || value.cursor !== undefined && (typeof value.cursor !== 'string' || !value.cursor || value.cursor.length > 2000)) throw new Error('通知记录分页参数无效')
+            return value
+          }
           if (name === 'directorySelection') {
             if (Object.keys(value).length !== 1 || typeof value.baseUrl !== 'string' || !value.baseUrl || value.baseUrl.length > 2000 || /[\u0000-\u001f\u007f]/.test(value.baseUrl)) throw new Error('模型目录地址无效')
             return value
@@ -58,7 +62,7 @@
           return value
         } }) }
       }
-      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id'] }
+      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id'], installationNotificationRecords: ['notificationRecordsSelection'] }
       const descriptors = Object.entries(methods).map(([method, parameters]) => ({
         id: `${id}#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,
         invocation: { kind: 'direct' }, cancellation: { parameter: 'signal' }, parameters: parameters.map(name => ({ name, wire: name, source: 'json', codec: parameterCodec(name) })), result: { mode: 'src-json' },
@@ -460,6 +464,64 @@
               latest.error && h('p', null, `最近保留轮次失败环节：${failure(latest.error)}`)) : h('p', null, '尚无保留分析轮次'),
             analysis?.latestFailure && h('p', null, `最近保留失败：${failure(analysis.latestFailure)}；${timeText(analysis.latestFailure.at)}`)))
       }
+      function InstallationNotificationRecords({ registrationId, visible, signal }) {
+        const [result, setResult] = useState({}), pending = useRef(null), active = useRef(true), selection = useRef({}), identity = useRef(null)
+        const shown = useRef(visible), expected = useRef(registrationId); shown.current = visible; expected.current = registrationId
+        function cancel() { const action = pending.current; pending.current = null; action?.abort.abort() }
+        useEffect(() => () => { active.current = false; cancel() }, [])
+        async function read(query) {
+          const scope = connectionScope
+          if (!shown.current || document.visibilityState === 'hidden' || signal?.aborted || !scope?.active || pending.current) return
+          const action = { scope, abort: new AbortController() }; pending.current = action
+          const current = () => active.current && shown.current && document.visibilityState !== 'hidden' && !signal?.aborted && scope.active && scope === connectionScope && pending.current === action
+          setResult(previous => ({ ...previous, loading: true, readScope: scope, error: '' }))
+          try {
+            const value = await scopedCall(scope, 'installationNotificationRecords', [query], action.abort.signal)
+            if (!current()) return
+            const owner = expected.current || identity.current
+            if (!value || typeof value.registrationId !== 'string' || !value.registrationId || owner && value.registrationId !== owner
+              || !Array.isArray(value.records) || value.records.length > 20 || value.retentionMs !== 86400000 || value.maximumRecords !== 1000
+              || typeof value.hasMore !== 'boolean' || typeof value.historyGap !== 'boolean' || value.nextCursor !== null && (typeof value.nextCursor !== 'string' || value.nextCursor.length > 2000)
+              || value.hasMore && !value.nextCursor || value.records.some(record => !record || record.registrationId !== value.registrationId || typeof record.id !== 'string' || !record.id
+                || !['task-alert', 'monitoring-failure'].includes(record.kind) || !Number.isFinite(record.createdAt) || record.humanSeen !== 'unknown')) throw new Error('通知记录响应归属或范围未确认')
+            identity.current = value.registrationId; selection.current = query
+            setResult({ page: { value, scope }, loading: false, error: '' })
+          } catch (error) { if (current()) setResult(previous => ({ ...previous, loading: false, error: `读取通知记录失败：${errorText(error)}` })) }
+          finally { if (pending.current === action) pending.current = null }
+        }
+        useEffect(() => {
+          if (!visible) return
+          void read(selection.current)
+          const hide = () => { if (document.visibilityState === 'hidden' && pending.current) { cancel(); setResult(previous => ({ ...previous, loading: false, error: '读取已暂停；请刷新记录' })) } }
+          document.addEventListener('visibilitychange', hide); viewListeners++
+          return () => { cancel(); document.removeEventListener('visibilitychange', hide); viewListeners-- }
+        }, [visible])
+        const page = result.page, stale = page && (page.scope !== connectionScope || !connectionScope?.active || registrationId && page.value.registrationId !== registrationId)
+        const value = stale ? null : page?.value, loading = result.loading && result.readScope === connectionScope && connectionScope?.active && document.visibilityState !== 'hidden'
+        const cancelled = result.loading && result.readScope && (result.readScope !== connectionScope || !connectionScope?.active)
+        const statusLabel = { pending: '等待投递', claimed: '已领取', submitted: '已提交', failed: '投递失败', expired: '已到期', cancelled: '已取消', grouped: '已合并' }
+        const deliveryLabel = { unknown: '投递结果未知', 'system-accepted': '系统已接受', failed: '投递失败', grouped: '并入其他提醒' }
+        return h('section', { 'data-sentinel-notification-records': true, 'aria-label': '本安装通知记录' },
+          h('p', null, '本安装全部已保留通知，最近 24 小时内最新 1000 条，当前每页最多 20 条。DSH 监控故障投递暂不支持。'),
+          h('button', { type: 'button', disabled: !connectionScope?.active || Boolean(loading), onClick: () => { void read({}) } }, '刷新记录'),
+          h('button', { type: 'button', disabled: !connectionScope?.active || Boolean(loading) || !value?.hasMore, onClick: () => { if (value?.hasMore) void read({ cursor: value.nextCursor }) } }, '较早记录'),
+          loading && h('p', { role: 'status' }, '正在读取通知记录…'),
+          result.error && h('p', { role: 'alert' }, result.error + (value ? '；仍显示上次读取' : '')),
+          stale && h('p', { role: 'status' }, '通知记录已过期或归属未确认，请刷新。'),
+          cancelled && !stale && h('p', { role: 'status' }, '通知记录读取已取消，请刷新。'),
+          value && h('div', null, h('small', null, `${result.error ? '上次读取快照（非最新）' : loading ? '上次读取快照（正在刷新）' : '记录快照'}：${timeText(value.generatedAt)}`),
+            value.historyGap && h('p', { role: 'status' }, '保留记录存在缺口；当前页面不能代表完整历史。'),
+            !value.records.length && h('p', null, '当前页没有保留通知记录。'),
+            value.records.map(record => h('article', { key: record.id, 'data-sentinel-notification-record': record.id },
+              h('h3', null, typeof record.chatTitle === 'string' && record.chatTitle.trim() ? record.chatTitle : '聊天名称未确认'),
+              h('small', null, timeText(record.createdAt)),
+              h('p', null, `${record.kind === 'task-alert' ? '任务告警' : '监控故障'} · ${statusLabel[record.status] || text(record.status) || '状态未确认'} · ${deliveryLabel[record.delivery] || '投递结果未知'} · 实际看见：未知`),
+              h('details', null, h('summary', null, '通知内容与归属'), h('h4', null, text(record.title)), h('p', { style: { whiteSpace: 'pre-wrap' } }, text(record.body)),
+                h('small', null, `来源：${text(record.sourceKey) || '未确认'}；宿主代次：${text(record.hostRunId) || '未确认'}`),
+                h('small', null, `聊天归属：${text(record.mainId) || '未确认'}；执行归属：${text(record.lifecycleId) || '未确认'}`),
+                record.native && typeof record.native === 'object' ? h('details', null, h('summary', null, '原生事实快照'), h('pre', { 'data-sentinel-native-facts': true, style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(record.native, null, 2)))
+                  : h('p', null, '原生投递事实未提供；不据此判断许可、通知中心或实际看见。'))))))
+      }
       function SettingsPanel() {
         const [tab, setTab] = useState('settings'), [config, setConfig] = useState(null), [error, setError] = useState('')
         const [permissionMessage, setPermissionMessage] = useState(notificationStatus), [requestingPermission, setRequestingPermission] = useState(false)
@@ -577,7 +639,8 @@
               h('p', { role: 'status', 'data-sentinel-notification-permission': true }, permissionMessage),
               typeof Notification !== 'undefined' && Notification.permission !== 'granted' && h('button', { type: 'button',
                 disabled: requestingPermission || !connectionScope?.active, onClick: permission }, '启用桌面通知'))),
-          h('div', { role: 'tabpanel', id: `${id}-notifications-panel`, 'aria-labelledby': `${id}-notifications-tab`, hidden: tab !== 'notifications' }, h('p', null, '本安装通知记录尚未接入。')),
+          h('div', { role: 'tabpanel', id: `${id}-notifications-panel`, 'aria-labelledby': `${id}-notifications-tab`, hidden: tab !== 'notifications' },
+            h(InstallationNotificationRecords, { registrationId: config?.registrationId || preferenceIdentity.current, visible: tab === 'notifications', signal: lifetime.current.signal })),
           h('div', { role: 'tabpanel', id: `${id}-diagnostics-panel`, 'aria-labelledby': `${id}-diagnostics-tab`, hidden: tab !== 'diagnostics' },
             h(InstallationDiagnostics, { key: config?.registrationId || 'loading', config, visible: tab === 'diagnostics', signal: lifetime.current.signal, checks: modelChecks })))
       }

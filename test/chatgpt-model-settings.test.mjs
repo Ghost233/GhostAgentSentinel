@@ -11,6 +11,8 @@ import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { createLazyCore } from '../chatgpt/lazy-core.mjs'
 import { supportedProfile } from '../chatgpt/storage-compatibility.mjs'
 import { createServer } from 'node:http'
+import { setTimeout as delay } from 'node:timers/promises'
+import { withModelSummary } from './helpers/model-summary.mjs'
 
 const state = { registrationId: 'chatgpt:installation-a', revision: 'settings-revision-a', config: { llm: { baseUrl: 'http://127.0.0.1:1234', model: 'summary-a' }, jev: { baseUrl: 'http://127.0.0.1:2345', model: 'judge-a' } } }
 const diagnostics = { protocol: 1, registrationId: state.registrationId, generatedAt: 123, configRevision: state.revision, models: { llm: { configured: true }, jev: { configured: true } }, collection: { state: 'failed', sourceCount: 1, connectedSources: 0, lastSeenAt: null, error: { stage: 'native-collection', code: 'read-failed' } }, analysis: { counts: { scope: 'active-tasks', total: 1, states: { queued: 1 } }, latest: { state: 'failed', resultDisposition: 'historical', configRevision: 'prior-config', startedAt: 1, completedAt: 2, nextEligibleAt: null, error: { stage: 'jev', code: 'schema-invalid' } }, latestFailure: { stage: 'jev', code: 'schema-invalid', at: 2 } } }
@@ -24,6 +26,151 @@ async function settingsPage(t, initial = state) {
 }
 
 function leaveModelGroup(page, role) { return page.element('#settings-' + role + '-group').onfocusout({ relatedTarget: null }) }
+
+const installationRecords = { registrationId: state.registrationId, generatedAt: 123, records: [], hasMore: false, nextCursor: null, historyGap: false, retentionMs: 86400000, maximumRecords: 1000 }
+const notificationRecord = { registrationId: state.registrationId, id: 'notice-a', sourceKey: 'source-a', mainId: 'chat-a', lifecycleId: 'run-a', chatTitle: '聊天甲', kind: 'task-alert', createdAt: 100, status: 'submitted', delivery: 'system-accepted', humanSeen: 'unknown', title: '任务疑点', body: '<img src=x onerror=alert(1)>\n原始通知正文', native: null }
+
+test('the notification records tab reads the installation MCP only when opened and never requires a current chat', async t => {
+  const page = await settingsPage(t)
+  assert.equal(page.sent.some(row => row.params?.name === 'sentinel_installation_notification_records'), false)
+  const opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records')
+  assert.ok(read, 'the actual records tab calls the installation records tool')
+  assert.deepEqual(JSON.parse(JSON.stringify(read.params.arguments)), {})
+  assert.equal(page.sent.some(row => ['sentinel_current_chat', 'sentinel_notification_records'].includes(row.params?.name)), false)
+  page.reply(read.id, { structuredContent: installationRecords }); await opening
+  assert.match(page.element('#settings-notifications-status').textContent, /暂无.*通知记录/)
+  assert.equal(page.timers.size, 0)
+})
+
+test('notification rows retain chat and source scope and distinguish native delivery facts from human seeing', async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records')
+  page.reply(read.id, { structuredContent: { ...installationRecords, historyGap: true, records: [
+    { ...notificationRecord, native: { authorization: { state: 'authorized' }, submission: { state: 'accepted' }, deliveredSnapshot: { present: true }, userAction: { action: 'default' } } },
+    { ...notificationRecord, id: 'source-failure', mainId: null, lifecycleId: null, chatTitle: null, kind: 'monitoring-failure', status: 'pending', delivery: 'unknown', native: null },
+  ] } }); await opening
+  const rows = page.element('#settings-notifications-records').children
+  assert.equal(rows.length, 2)
+  assert.match(rows[0].textContent, /聊天甲.*任务告警/)
+  assert.ok(rows[0].textContent.includes(notificationRecord.body), 'the notification body stays literal text')
+  assert.match(rows[0].textContent, /系统已接受.*展示未确认/)
+  assert.match(rows[0].textContent, /系统许可.*已允许.*通知中心快照.*存在.*用户动作.*点击.*用户实际看见.*未确认/)
+  assert.doesNotMatch(rows[0].textContent, /用户已看见|用户已看到/)
+  assert.match(rows[1].textContent, /来源级.*聊天身份未确认.*监控故障/)
+  assert.match(rows[1].textContent, /待投递/)
+  assert.doesNotMatch(rows[1].textContent, /系统许可|通知中心快照|用户动作/)
+  assert.match(page.element('#settings-notifications-gap').textContent, /留存缺口/)
+})
+
+test('notification record pages use only the opaque cursor, replace the bounded page and never fetch ahead', async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  const first = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records')
+  page.reply(first.id, { structuredContent: { ...installationRecords, records: [{ ...notificationRecord, body: '最近一页' }], hasMore: true, nextCursor: 'opaque:created-at/id?+==' } }); await opening
+  assert.equal(page.sent.filter(row => row.params?.name === first.params.name).length, 1)
+  assert.equal(page.element('#settings-notifications-older').hidden, false)
+  const older = page.element('#settings-notifications-older').onclick(); await page.flush()
+  const second = page.sent.findLast(row => row.params?.name === first.params.name)
+  assert.deepEqual(JSON.parse(JSON.stringify(second.params.arguments)), { cursor: 'opaque:created-at/id?+==' })
+  page.reply(second.id, { structuredContent: { ...installationRecords, records: [{ ...notificationRecord, id: 'older-notice', body: '较早一页' }] } }); await older
+  assert.equal(page.element('#settings-notifications-records').children.length, 1)
+  assert.match(page.element('#settings-notifications-records').textContent, /较早一页/)
+  assert.doesNotMatch(page.element('#settings-notifications-records').textContent, /最近一页/)
+  assert.equal(page.element('#settings-notifications-older').hidden, true)
+  const refreshing = page.element('#settings-notifications-refresh').onclick(); await page.flush()
+  const refresh = page.sent.findLast(row => row.params?.name === first.params.name)
+  assert.deepEqual(JSON.parse(JSON.stringify(refresh.params.arguments)), {})
+  page.reply(refresh.id, { structuredContent: installationRecords }); await refreshing
+  assert.equal(page.sent.filter(row => row.params?.name === first.params.name).length, 3)
+  assert.equal(page.timers.size, 0)
+})
+
+for (const boundary of ['foreign-installation', 'foreign-row', 'unbounded-page', 'wrong-retention', 'invented-human-seen']) test('notification records reject an unconfirmed public page without disturbing settings: ' + boundary, async t => {
+  const page = await settingsPage(t), input = page.element('#settings-llm-url'); input.value = 'http://'; input.oninput()
+  const permissionBefore = page.element('#settings-notification-permission-status').textContent
+  const opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records')
+  const value = { ...installationRecords, records: [{ ...notificationRecord }] }
+  if (boundary === 'foreign-installation') value.registrationId = 'chatgpt:foreign'
+  if (boundary === 'foreign-row') value.records[0].registrationId = 'chatgpt:foreign'
+  if (boundary === 'unbounded-page') value.records = Array.from({ length: 21 }, (_, index) => ({ ...notificationRecord, id: 'record-' + index }))
+  if (boundary === 'wrong-retention') value.maximumRecords = 1024
+  if (boundary === 'invented-human-seen') value.records[0].humanSeen = 'seen'
+  page.reply(read.id, { structuredContent: value }); await opening
+  assert.match(page.element('#settings-notifications-status').textContent, /读取未确认/)
+  assert.equal(page.element('#settings-notifications-records').children.length, 0)
+  assert.equal(page.element('#settings-notifications-older').hidden, true)
+  page.element('#settings-tab-settings').onclick()
+  assert.equal(input.value, 'http://')
+  assert.equal(page.element('#settings-notification-task-alert').checked, true)
+  assert.equal(page.element('#settings-notification-permission-status').textContent, permissionBefore)
+})
+
+test('a failed record refresh clears the prior page and leaves model drafts and notification preferences available', async t => {
+  const page = await settingsPage(t), input = page.element('#settings-llm-model'); input.value = 'unsubmitted-draft'; input.oninput()
+  const opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records').id, { structuredContent: { ...installationRecords, records: [notificationRecord], hasMore: true, nextCursor: 'older' } }); await opening
+  const refreshing = page.element('#settings-notifications-refresh').onclick(); await page.flush()
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records').id, { isError: true }); await refreshing
+  assert.match(page.element('#settings-notifications-status').textContent, /读取未确认/)
+  assert.equal(page.element('#settings-notifications-records').children.length, 0)
+  assert.equal(page.element('#settings-notifications-older').hidden, true)
+  page.element('#settings-tab-settings').onclick()
+  assert.equal(input.value, 'unsubmitted-draft')
+  const checkbox = page.element('#settings-notification-monitoring-failure'); checkbox.checked = false; const saving = checkbox.onchange(); await page.flush()
+  const save = page.sent.findLast(row => row.params?.name === 'sentinel_set_installation_notification_preference')
+  page.reply(save.id, { structuredContent: { registrationId: state.registrationId, revision: 'still-usable', preferences: { 'task-alert': true, 'monitoring-failure': false } } }); await saving
+  assert.match(page.element('#settings-notification-monitoring-failure-status').textContent, /已保存/)
+})
+
+for (const transport of ['tool', 'rpc']) for (const unsupported of [true, false]) test('record read errors preserve the known unsupported reason without exposing other error details: ' + transport + '/' + unsupported, async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records')
+  const message = (unsupported ? '共享核心尚不支持本安装通知记录' : 'Unknown internal failure') + '\n at /private/internal-source.mjs:123'
+  if (transport === 'tool') page.reply(read.id, { isError: true, content: [{ type: 'text', text: message }] })
+  else page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', id: read.id, error: { code: -32603, message } } })
+  await opening
+  const status = page.element('#settings-notifications-status').textContent
+  assert.match(status, unsupported ? /共享核心尚不支持本安装通知记录/ : /通知记录读取未确认/)
+  assert.doesNotMatch(status, /private|internal-source|Unknown internal|重开|重试/)
+  assert.equal(page.element('#settings-notifications-records').children.length, 0)
+  page.element('#settings-tab-settings').onclick()
+  assert.equal(page.element('#settings-llm-model').value, 'summary-a')
+})
+
+for (const boundary of ['tab', 'hidden', 'teardown']) test('notification reads cancel and ignore late responses after leaving their visible scope: ' + boundary, async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records'), listener = page.handlers.get('message')
+  if (boundary === 'tab') page.element('#settings-tab-settings').onclick()
+  else if (boundary === 'hidden') { page.document.hidden = true; page.handlers.get('visibilitychange')() }
+  else await page.destroy()
+  await opening
+  const before = page.element('#settings-notifications-status').textContent, reads = page.sent.filter(row => row.params?.name === read.params.name).length
+  assert.ok(page.sent.some(row => row.method === 'notifications/cancelled' && row.params.requestId === read.id))
+  listener({ source: page.parent, data: { jsonrpc: '2.0', id: read.id, result: { structuredContent: { ...installationRecords, records: [notificationRecord] } } } }); await page.flush()
+  assert.equal(page.element('#settings-notifications-records').children.length, 0)
+  assert.equal(page.element('#settings-notifications-status').textContent, before)
+  if (boundary === 'hidden') { page.element('#settings-notifications-refresh').onclick(); page.document.hidden = false; page.handlers.get('visibilitychange')(); await page.flush() }
+  if (boundary !== 'teardown') {
+    assert.equal(page.sent.filter(row => row.params?.name === read.params.name).length, reads, 'hidden or unrelated activity does not automatically fetch records')
+    const reopening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+    const latest = page.sent.findLast(row => row.params?.name === read.params.name); assert.notEqual(latest.id, read.id)
+    page.reply(latest.id, { structuredContent: installationRecords }); await reopening
+  }
+  assert.equal(page.timers.size, 0)
+})
+
+test('the first installation record read can bind identity while model and preference reads are unavailable', async t => {
+  const page = await panelHarness(t, { html: await readFile(new URL('../chatgpt/settings.html', import.meta.url), 'utf8') }), opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records').id, { structuredContent: { ...installationRecords, records: [notificationRecord] } }); await opening
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_model_settings').id, { isError: true })
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_preferences').id, { isError: true }); await page.flush()
+  assert.equal(page.element('#settings-notifications-records').children.length, 1)
+  assert.match(page.element('#settings-status').textContent, /读取失败/)
+  const refreshing = page.element('#settings-notifications-refresh').onclick(); await page.flush()
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records').id, { structuredContent: { ...installationRecords, registrationId: 'chatgpt:foreign' } }); await refreshing
+  assert.match(page.element('#settings-notifications-status').textContent, /读取未确认/)
+})
 
 async function installationNotificationPage(t, { installationId = 'notification-settings', authorization = 'denied' } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-notification-settings-')), token = '7'.repeat(64)
@@ -55,8 +202,91 @@ async function installationNotificationPage(t, { installationId = 'notification-
     const page = await panelHarness(t, { html: resource.contents[0].text })
     await deliver(page, 'sentinel_model_settings'); const notifications = await deliver(page, 'sentinel_installation_notification_preferences'); assert.ok(!notifications.isError, JSON.stringify(notifications)); return page
   }
-  return { dataDir, server, rpc, deliver, open, counts: () => ({ authorizationCalls, settingsCalls, threadCalls }), failAuthorization: () => { authorizationError = true } }
+  return { dataDir, server, core, registrationId: 'chatgpt:' + installationId, rpc, deliver, open, counts: () => ({ authorizationCalls, settingsCalls, threadCalls }), failAuthorization: () => { authorizationError = true } }
 }
+
+test('the actual global records tab reads one produced native notice and accepted receipt through Core HTTP and MCP', async t => {
+  const fixture = await installationNotificationPage(t), sourceKey = await fixture.core.registerSource({ registrationId: fixture.registrationId, hostRunId: 'records-host', name: 'Own source', policy: 'chatgpt-main/1' })
+  await fixture.core.ingest(sourceKey, { tasks: [{ id: 'named-chat', lifecycleId: 'own-run', title: '实际通知聊天', status: 'running' }] })
+  await fixture.core.recordCollectionOutcome({ sourceKey, mainId: 'named-chat', lifecycleId: 'own-run', roundId: 'actual-read-failure', channel: 'directory', outcome: 'failed', settledAt: Date.now(), error: { code: 'EIO', stage: 'collection' } })
+  await fixture.core.setNativeNotificationEligibility({ sourceKey, hostRunId: 'records-host', appRunning: true, pluginEnabled: true })
+  const [notice] = await fixture.core.claimNotifications(sourceKey)
+  assert.ok(notice, 'the public producer creates an actual claimable notification')
+  const emit = fields => fixture.core.recordNativeNotificationResult({ notificationId: notice.id, attemptId: notice.native.attemptId, nativeRequestId: 'ghostsentinel:0123456789abcdef01234567:' + notice.native.attemptId, bundleId: 'com.ghostsentinel.notifications', observedAt: Date.now(), ...fields })
+  await emit({ event: 'authorization', authorization: 'authorized' }); assert.equal((await emit({ event: 'submitting' })).maySubmit, true); await emit({ event: 'accepted' })
+  const response = await fetch(fixture.server.url + '/v1/notifications/installations/records?' + new URLSearchParams({ registrationId: fixture.registrationId }), { headers: { authorization: 'Bearer ' + fixture.server.token } })
+  assert.equal(response.status, 200)
+  const publicPage = await response.json(), page = await fixture.open(), opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  const call = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records')
+  assert.deepEqual(JSON.parse(JSON.stringify(call.params.arguments)), {})
+  const result = await fixture.deliver(page, call.params.name); await opening
+  assert.ok(!result.isError, JSON.stringify(result))
+  assert.deepEqual(result.structuredContent.records, publicPage.records)
+  assert.equal(result.structuredContent.records[0].id, notice.id)
+  assert.equal(result.structuredContent.records[0].humanSeen, 'unknown')
+  assert.equal(page.element('#settings-notifications-records').children.length, 1)
+  assert.match(page.element('#settings-notifications-records').textContent, /实际通知聊天.*监控故障.*系统已接受.*展示未确认/)
+  assert.match(page.element('#settings-notifications-records').textContent, /系统许可.*已允许.*用户实际看见.*未确认/)
+  assert.equal(page.sent.some(row => ['sentinel_current_chat', 'sentinel_notification_records'].includes(row.params?.name)), false)
+  assert.deepEqual(fixture.counts(), { authorizationCalls: 0, settingsCalls: 0, threadCalls: 0 })
+  assert.equal(page.timers.size, 0)
+  t.diagnostic(JSON.stringify({ registrationId: fixture.registrationId, sourceKey, notificationId: notice.id, status: result.structuredContent.records[0].status, delivery: result.structuredContent.records[0].delivery }))
+})
+
+test('the actual installation records page spans chats and both kinds with an isolated opaque older-page cursor', async t => {
+  const fixture = await installationNotificationPage(t, { installationId: 'records-multiple' }), model = createServer(async (request, response) => {
+    let raw = ''; for await (const chunk of request) raw += chunk
+    const body = JSON.parse(raw); response.setHeader('content-type', 'application/json')
+    response.end(JSON.stringify(request.url === '/v1/chat/completions'
+      ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }
+      : { model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'attention' : 'unknown' }])) }))
+  })
+  await new Promise(resolve => model.listen(0, '127.0.0.1', resolve))
+  t.after(async () => { model.closeAllConnections(); await new Promise(resolve => model.close(resolve)) })
+  const baseUrl = 'http://127.0.0.1:' + model.address().port, config = { llm: { baseUrl, model: 'controlled-summary' }, jev: { baseUrl, model: 'controlled-judge' } }
+  await fixture.core.configureInstallationAnalysis(fixture.registrationId, config, (await fixture.core.installationAnalysisConfig(fixture.registrationId)).revision)
+  const sourceKey = await fixture.core.registerSource({ registrationId: fixture.registrationId, hostRunId: 'records-host', name: 'Own native source', policy: 'chatgpt-main/1' }), capturedAt = Date.now()
+  const ref = eventId => ({ taskId: 'alert-chat', lifecycleId: 'native-run', eventId })
+  const event = (id, kind, text, data = {}) => ({ id, taskId: 'alert-chat', taskLifecycleId: 'native-run', kind, text, data, capturedAt, occurredAt: null })
+  await fixture.core.ingest(sourceKey, { tasks: [{ id: 'alert-chat', sessionId: 'alert-chat', lifecycleId: 'native-run', title: '原生任务告警聊天', status: 'running' }], events: [
+    event('start', 'status', 'Execution started', { nativeType: 'task_started', sourceKind: 'chatgpt-native', sourceForm: 'event_msg', runId: 'native-run', turnTrigger: 'composer', status: 'running' }),
+    event('input', 'input', 'Only inspect the existing material', { nativeType: 'item_completed/UserMessage', sourceKind: 'chatgpt-native', sourceForm: 'event_msg/item_completed', runId: 'native-run', messageId: 'native-message', inputOrigin: 'user-entry', inputPhase: 'consumed', inherited: false }),
+    event('output', 'output', 'Changing an unrelated directory'),
+  ], hierarchyContext: { schemaVersion: 1, revision: 1, sessions: [{ sessionId: 'alert-chat' }], activations: [{ taskId: 'alert-chat', lifecycleId: 'native-run', sessionId: 'alert-chat', runId: 'native-run', state: 'running', stateRefs: [ref('start')] }], relations: [], instructionBindings: [{ taskId: 'alert-chat', lifecycleId: 'native-run', inputRef: ref('input'), origin: 'user-entry', phase: 'consumed', originRefs: [ref('start'), ref('input')], ancestorLimitRefs: [] }], coverage: { complete: true, branchGaps: [] } } })
+  const until = async predicate => { const deadline = Date.now() + 3000; while (!await predicate()) { assert.ok(Date.now() < deadline, 'the actual producer must settle a task notification'); await delay(5) } }
+  await until(async () => (await fixture.core.nativeNotificationRecords({ sourceKey })).records.some(record => record.kind === 'task-alert'))
+  await fixture.core.ingest(sourceKey, { tasks: Array.from({ length: 22 }, (_, index) => ({ id: 'failure-chat-' + index, lifecycleId: 'failure-run', title: '故障聊天 ' + index, status: 'running' })) })
+  for (let index = 0; index < 22; index++) await fixture.core.recordCollectionOutcome({ sourceKey, mainId: 'failure-chat-' + index, lifecycleId: 'failure-run', roundId: 'failure-' + index, channel: 'directory', outcome: 'failed', settledAt: Date.now(), error: { code: 'EIO', stage: 'collection' } })
+  const foreign = await fixture.core.registerSource({ registrationId: 'chatgpt:records-multiple-test', hostRunId: 'foreign-host', name: 'Foreign test', policy: 'chatgpt-main/1' })
+  await fixture.core.recordCollectionOutcome({ sourceKey: foreign, mainId: null, lifecycleId: null, roundId: 'foreign-failure', channel: 'directory', outcome: 'failed', settledAt: Date.now(), error: { code: 'EIO', stage: 'collection' } })
+  const dshRegistration = 'dsh:records-multiple-other', dshSource = await fixture.core.registerSource({ registrationId: dshRegistration, hostRunId: 'dsh-host', name: 'Foreign DSH' })
+  await fixture.core.configureInstallationAnalysis(dshRegistration, config, (await fixture.core.installationAnalysisConfig(dshRegistration)).revision)
+  await fixture.core.ingest(dshSource, { tasks: [{ id: 'foreign-dsh-task', sessionId: 'foreign-dsh-chat', lifecycleId: 'dsh-run', title: '外部 DSH 聊天', status: 'running' }], events: ['input', 'output'].map(kind => ({ id: 'dsh-' + kind, taskId: 'foreign-dsh-task', taskLifecycleId: 'dsh-run', kind, text: kind === 'input' ? 'Inspect only' : 'Changing another directory', capturedAt: Date.now(), occurredAt: null })) })
+  await until(async () => (await fixture.core.installationNotificationRecords(dshRegistration, {})).records.some(record => record.kind === 'task-alert' && record.native === null))
+  const page = await fixture.open(), opening = page.element('#settings-tab-notifications').onclick(); await page.flush()
+  const first = (await fixture.deliver(page, 'sentinel_installation_notification_records')).structuredContent; await opening
+  assert.equal(first.records.length, 20)
+  assert.equal(first.hasMore, true)
+  assert.equal(page.element('#settings-notifications-records').children.length, 20)
+  assert.ok(first.records.every(record => record.registrationId === fixture.registrationId && record.sourceKey === sourceKey))
+  const older = page.element('#settings-notifications-older').onclick(); await page.flush()
+  const call = page.sent.findLast(row => row.params?.name === 'sentinel_installation_notification_records')
+  assert.deepEqual(JSON.parse(JSON.stringify(call.params.arguments)), { cursor: first.nextCursor })
+  const second = (await fixture.deliver(page, call.params.name)).structuredContent; await older
+  assert.equal(second.records.length, 3)
+  assert.equal(second.hasMore, false)
+  assert.equal(page.element('#settings-notifications-records').children.length, 3)
+  const records = [...first.records, ...second.records]
+  assert.equal(new Set(records.map(record => record.id)).size, 23)
+  assert.deepEqual([...new Set(records.map(record => record.kind))].sort(), ['monitoring-failure', 'task-alert'])
+  assert.ok(records.every(record => record.mainId && record.chatTitle && record.humanSeen === 'unknown'))
+  assert.match(page.element('#settings-notifications-records').textContent, /原生任务告警聊天.*任务告警/)
+  assert.ok(!JSON.stringify(records).includes(foreign) && !JSON.stringify(records).includes(dshSource))
+  assert.equal(page.sent.filter(row => row.params?.name === call.params.name).length, 2, 'the real page does not fetch beyond the requested older page')
+  assert.deepEqual(fixture.counts(), { authorizationCalls: 0, settingsCalls: 0, threadCalls: 0 })
+  assert.equal(page.timers.size, 0)
+  t.diagnostic(JSON.stringify({ registrationId: fixture.registrationId, sourceKey, excludedSources: [foreign, dshSource], firstPageIds: first.records.map(record => record.id), cursor: first.nextCursor, secondPageIds: second.records.map(record => record.id) }))
+})
 
 test('the actual global settings page independently saves both notification kinds through MCP and Core and retains them on reopen', async t => {
   const fixture = await installationNotificationPage(t), page = await fixture.open()
@@ -305,7 +535,7 @@ test('settings tabs preserve the draft and position while diagnostics read only 
   assert.doesNotMatch(page.element('#diagnostics-analysis').textContent, /分析成功/)
   page.element('#settings-tab-notifications').onclick()
   assert.equal(page.element('#settings-pane-notifications').hidden, false)
-  assert.match(page.element('#settings-notifications-status').textContent, /尚未接入/)
+  assert.match(page.element('#settings-notifications-status').textContent, /正在读取/)
   page.element('#settings-tab-settings').onclick()
   assert.equal(url.value, 'http://')
   assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_model_settings').length, 1)

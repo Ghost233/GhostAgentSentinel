@@ -44,7 +44,7 @@ export function createLazyCore({ dataDir, connect = connectCore, onRetention } =
     })().finally(() => { pending = null; if (requestController === controller) requestController = null })
     return pending
   }
-  const methods = ['registerSource', 'heartbeat', 'nativeOriginFence', 'ingest', 'unregisterSource', 'snapshot', 'failureReceipts', 'recordCollectionOutcome', 'setConversationMonitoring', 'setNativeNotificationEligibility', 'claimNotifications', 'nativeNotificationRecords', 'recordNativeNotificationResult', 'installationAnalysisConfig', 'configureInstallationAnalysis', 'installationNotificationPreferences', 'setInstallationNotificationPreference']
+  const methods = ['registerSource', 'heartbeat', 'nativeOriginFence', 'ingest', 'unregisterSource', 'snapshot', 'failureReceipts', 'recordCollectionOutcome', 'setConversationMonitoring', 'setNativeNotificationEligibility', 'claimNotifications', 'nativeNotificationRecords', 'recordNativeNotificationResult', 'installationAnalysisConfig', 'configureInstallationAnalysis', 'installationNotificationPreferences', 'setInstallationNotificationPreference', 'installationNotificationRecords']
   return {
     ...Object.fromEntries(methods.map(name => [name, async (...args) => {
       const current = client

@@ -7,6 +7,7 @@ export const CHATGPT_MAIN_FEATURE = 'chatgpt-main/1'
 export const CONVERSATION_MONITORING_FEATURE = 'conversation-monitoring/1'
 export const MONITORING_FAILURES_FEATURE = 'monitoring-failures/1'
 export const MONITORING_NOTIFICATIONS_FEATURE = 'monitoring-notifications/1'
+export const INSTALLATION_NOTIFICATION_RECORDS_FEATURE = 'installation-notification-records/1'
 export const INITIAL_ENROLLMENT_ROLLUP_FEATURE = 'monitoring-initial-enrollment-rollup/1'
 export const CHATGPT_INSTALLATION_PURGE_FEATURE = 'chatgpt-installation-purge/1'
 export const CHATGPT_RETENTION_MAINTENANCE_FEATURE = 'chatgpt-retention-maintenance/1'
@@ -41,6 +42,15 @@ export function normalizeInstallationNotificationPreference(value) {
   const input = object(value, 'installation notification preference')
   if (Object.keys(input).some(key => !['registrationId', 'kind', 'enabled'].includes(key)) || !['task-alert', 'monitoring-failure'].includes(input.kind) || typeof input.enabled !== 'boolean') throw new Error('invalid installation notification preference')
   return { registrationId: string(input.registrationId, 'registrationId', 2000), kind: input.kind, enabled: input.enabled }
+}
+
+export function normalizeInstallationNotificationRecordsQuery(value = {}) {
+  const input = object(value, 'installation notification records query')
+  if (Object.keys(input).some(key => !['cursor', 'limit'].includes(key))) throw new Error('unsupported installation notification records query field')
+  const result = { limit: input.limit ?? 20 }
+  if (!Number.isSafeInteger(result.limit) || result.limit < 1 || result.limit > 100) throw new Error('installation notification records limit must be between 1 and 100')
+  if (input.cursor !== undefined) result.cursor = string(input.cursor, 'cursor', 2000)
+  return result
 }
 
 export function normalizeConversationMonitoring(value, control = false) {

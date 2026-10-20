@@ -6,7 +6,7 @@ import { createObservation, hostIdentity } from './observation.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { HIERARCHY_FEATURE } from '../src/hierarchy.mjs'
 import { GS_FEATURE } from '../src/gs-status.mjs'
-import { GS_SUMMARY_FEATURE } from '../src/protocol.mjs'
+import { GS_SUMMARY_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE } from '../src/protocol.mjs'
 import { createHierarchyReader } from './hierarchy-reader.mjs'
 import { readModelDirectory } from '../src/model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
@@ -316,6 +316,11 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       }
     },
     beginNotificationSubmission(id, signal) { return invoke('beginNotificationSubmission', sourceKey, id, signal) },
+    async installationNotificationRecords(selection = {}, signal) {
+      const health = await installationCall('health', [], signal, false)
+      if (!health.features?.includes(INSTALLATION_NOTIFICATION_RECORDS_FEATURE)) throw new Error('共享核心尚不支持本安装通知记录')
+      return installationCall('installationNotificationRecords', [selection], signal)
+    },
     sourcePlan(signal) { return invoke('sourcePlan', signal) }, configureSources(value, signal) { return invoke('configureSources', value, signal) },
     claimNotifications(signal) { return invoke('claimNotifications', sourceKey, signal) },
     ackNotification(id, result, signal) { return invoke('ackNotification', id, result, signal) },

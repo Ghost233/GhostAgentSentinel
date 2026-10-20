@@ -176,6 +176,161 @@ async function waitForDisplayedTask(fixture, title) {
   }
 }
 
+test('controlled notification records UI makes bounded explicit reads and preserves literal facts and other settings', async t => {
+  const calls = [], at = Date.now(), registrationId = 'fixture'
+  const records = Array.from({ length: 20 }, (_, index) => ({ registrationId, id: `record-${index}`, sourceKey: index ? 'source-owned' : null, hostRunId: index ? 'host-owned' : null,
+    mainId: index ? `main-${index}` : null, lifecycleId: index ? `run-${index}` : null, chatTitle: index ? `会话 ${index}` : null, kind: 'task-alert', createdAt: at - index,
+    status: 'submitted', delivery: 'system-accepted', humanSeen: 'unknown', title: '通知标题不能代替聊天名称', body: '<script>NOT_EXECUTED</script>\n正文中的名字不能用于归属', native: index === 1 ? { authorization: { status: 'authorized' }, submission: { state: 'accepted' }, userAction: null } : null }))
+  const latest = { registrationId, generatedAt: at, records, hasMore: true, nextCursor: 'opaque-older-cursor', historyGap: false, retentionMs: 86400000, maximumRecords: 1000 }
+  const older = { ...latest, records: [{ ...records[0], id: 'older-record', createdAt: at - 30 }], hasMore: false, nextCursor: null, historyGap: true }
+  let permissionRequests = 0, writes = 0, unavailable = false
+  const f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true,
+    async installationNotificationPreferences() { return { ok: true, value: { registrationId, preferences: { 'task-alert': true, 'monitoring-failure': true }, revision: 'preferences' } } },
+    async setInstallationNotificationPreference() { writes++; throw new Error('record reads never write preferences') },
+    async installationNotificationRecords(selection, signal) { calls.push({ selection, signal }); return unavailable ? { ok: false, error: { code: 'unsupported', message: '共享核心尚不支持本安装通知记录' } } : { ok: true, value: selection.cursor ? older : latest } },
+  })
+  f.Notification.requestPermission = async () => { permissionRequests++; return 'denied' }
+  await f.mountSettings()
+  const settings = f.dom.window.document.querySelector('[data-sentinel-installation-settings]'), { Simulate } = clientRequire('react-dom/test-utils')
+  const input = settings.querySelectorAll('input')[1]
+  await f.interact(async () => { input.value = 'record-independent-draft'; Simulate.change(input); await f.settle() })
+  settings.scrollTop = 177
+  assert.equal(calls.length, 0, 'mounting settings does not read records')
+  const tab = label => [...settings.querySelectorAll('[role=tab]')].find(value => value.textContent === label)
+  await f.interact(async () => { tab('通知记录').click(); await f.settle() })
+  assert.equal(calls.length, 1, 'opening the records tab starts exactly one installation Remote read')
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].selection)), {})
+  const panel = () => settings.querySelector('[data-sentinel-notification-records]')
+  await f.waitUntil(() => panel()?.querySelectorAll('[data-sentinel-notification-record]').length === 20, 'one bounded page is rendered without scanning later pages')
+  const rows = () => [...panel().querySelectorAll('[data-sentinel-notification-record]')]
+  assert.equal(rows()[0].querySelector('h3').textContent, '聊天名称未确认')
+  assert.match(rows()[0].textContent, /来源：未确认/); assert.match(rows()[0].textContent, /执行归属：未确认/)
+  assert.match(rows()[0].textContent, /实际看见：未知/)
+  assert.equal(rows()[0].querySelector('[data-sentinel-native-facts]'), null)
+  assert.match(rows()[0].textContent, /原生投递事实未提供/)
+  assert.match(rows()[1].querySelector('[data-sentinel-native-facts]').textContent, /authorization/)
+  assert.equal(rows()[0].querySelector('script'), null)
+  assert.ok(rows()[0].textContent.includes(records[0].body), 'notification text is literal, including markup and line breaks')
+  await f.tick(); assert.equal(calls.length, 1, 'the records page never polls')
+  await f.interact(async () => { [...panel().querySelectorAll('button')].find(value => value.textContent === '较早记录').click(); await f.settle() })
+  assert.equal(calls.length, 2); assert.deepEqual(JSON.parse(JSON.stringify(calls[1].selection)), { cursor: 'opaque-older-cursor' })
+  assert.equal(rows().length, 1); assert.equal(rows()[0].getAttribute('data-sentinel-notification-record'), 'older-record', 'pagination replaces the page rather than accumulating an unbounded history')
+  assert.match(panel().textContent, /记录存在缺口/)
+  await f.interact(async () => { tab('设置').click(); await f.settle() })
+  await f.interact(async () => { tab('通知记录').click(); await f.settle() })
+  assert.equal(calls.length, 3); assert.deepEqual(JSON.parse(JSON.stringify(calls[2].selection)), { cursor: 'opaque-older-cursor' }, 'opening again preserves the committed older-page position')
+  assert.equal(rows().length, 1)
+  await f.interact(async () => { [...panel().querySelectorAll('button')].find(value => value.textContent === '刷新记录').click(); await f.settle() })
+  assert.equal(calls.length, 4); assert.deepEqual(JSON.parse(JSON.stringify(calls[3].selection)), {})
+  assert.equal(rows().length, 20)
+  unavailable = true
+  await f.interact(async () => { [...panel().querySelectorAll('button')].find(value => value.textContent === '刷新记录').click(); await f.settle() })
+  assert.match(panel().textContent, /共享核心尚不支持本安装通知记录/)
+  assert.match(panel().textContent, /上次读取快照（非最新）/)
+  assert.equal(rows().length, 20, 'a failed refresh keeps the trusted page and its original read time')
+  assert.ok(panel().textContent.includes(new Date(at).toLocaleString()))
+  await f.visibility('hidden'); await f.visibility('visible')
+  assert.equal(calls.length, 5, 'returning to visibility does not retry a failed record read')
+  assert.match(panel().textContent, /共享核心尚不支持本安装通知记录/, 'a settled capability failure survives visibility changes')
+  await f.interact(async () => { tab('设置').click(); await f.settle() })
+  assert.equal(input.value, 'record-independent-draft'); assert.equal(settings.scrollTop, 177)
+  assert.equal(settings.querySelector('[role=switch]').getAttribute('aria-checked'), 'true')
+  assert.equal(writes, 0); assert.equal(permissionRequests, 0); assert.equal(f.delivered.length, 0); assert.equal(f.acknowledged.length, 0)
+})
+
+test('native notification records release requests and visibility listeners across 100 tab cycles', async t => {
+  let request, reads = 0, f
+  t.after(async () => { await f?.dispose(); request?.resolve({ ok: true, value: {} }); await f?.settle() })
+  f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true,
+    async installationNotificationRecords(selection, signal) { reads++; return new Promise(resolve => { request = { selection, signal, resolve } }) },
+  })
+  const unmountedListeners = f.plugin.diagnostics().listeners
+  await f.mountSettings()
+  await f.waitUntil(() => f.plugin.diagnostics().activeRequests === 0, 'initial settings reads settle before record cycles')
+  const settings = f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  const tab = label => [...settings.querySelectorAll('[role=tab]')].find(value => value.textContent === label)
+  const baseline = f.plugin.diagnostics(), timers = f.intervals.size
+  for (let cycle = 0; cycle < 100; cycle++) {
+    await f.interact(async () => { tab('通知记录').click(); await f.settle() })
+    assert.equal(reads, cycle + 1); assert.deepEqual(JSON.parse(JSON.stringify(request.selection)), {})
+    assert.equal(f.plugin.diagnostics().listeners, baseline.listeners + 1)
+    await f.interact(async () => { tab('设置').click(); await f.settle() })
+    assert.equal(request.signal.aborted, true)
+    request.resolve({ ok: true, value: { registrationId: 'fixture', generatedAt: Date.now(), records: [], hasMore: false, nextCursor: null, historyGap: false, retentionMs: 86400000, maximumRecords: 1000 } })
+    await f.interact(async () => { await f.settle() })
+    const current = f.plugin.diagnostics()
+    assert.equal(current.activeRequests, 0); assert.equal(current.unfinishedRequests, 0)
+    assert.equal(current.listeners, baseline.listeners); assert.equal(f.intervals.size, timers)
+    assert.equal(settings.querySelector('[data-sentinel-notification-records]').textContent.includes('当前页没有保留通知记录'), false, 'a cancelled read never becomes a successful empty page')
+  }
+  assert.equal(f.delivered.length, 0); assert.equal(f.acknowledged.length, 0)
+  await f.unmountSettings()
+  assert.equal(f.plugin.diagnostics().listeners, unmountedListeners)
+})
+
+for (const ending of ['tab', 'hidden', 'close', 'disable', 'reconnect']) test('native record requests reject late and foreign pages after ' + ending, async t => {
+  const requests = [], at = Date.now(), registrationId = 'fixture'
+  const page = body => ({ registrationId, generatedAt: at, records: [{ registrationId, id: body, sourceKey: 'owned-source', mainId: null, lifecycleId: null, chatTitle: null,
+    kind: 'task-alert', createdAt: at, status: 'failed', delivery: 'failed', humanSeen: 'unknown', title: 'Owned notification', body, native: null }],
+    hasMore: false, nextCursor: null, historyGap: false, retentionMs: 86400000, maximumRecords: 1000 })
+  let f
+  t.after(async () => { await f?.dispose(); for (const request of requests) request.resolve({ ok: true, value: page('cleanup') }); await f?.settle() })
+  f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true,
+    async installationNotificationRecords(selection, signal) { return new Promise(resolve => requests.push({ selection, signal, resolve })) },
+  })
+  await f.mountSettings()
+  const settings = () => f.dom.window.document.querySelector('[data-sentinel-installation-settings]'), { Simulate } = clientRequire('react-dom/test-utils')
+  const panel = () => settings().querySelector('[data-sentinel-notification-records]')
+  const tab = label => [...settings().querySelectorAll('[role=tab]')].find(value => value.textContent === label)
+  const refresh = () => [...panel().querySelectorAll('button')].find(value => value.textContent === '刷新记录')
+  const input = () => settings().querySelectorAll('input')[1]
+  await f.waitUntil(() => input(), 'model settings remain independent of a pending record query')
+  await f.interact(async () => { input().value = 'records-lifecycle-draft'; Simulate.change(input()); await f.settle() })
+  const listeners = f.plugin.diagnostics().listeners
+  await f.interact(async () => { tab('通知记录').click(); await f.settle() })
+  await f.waitUntil(() => requests.length === 1, 'the actual Native Remote record query starts only on its tab')
+  assert.equal(f.plugin.diagnostics().listeners, listeners + 1, 'one visible records tab owns one visibility listener')
+  if (ending === 'tab') await f.interact(async () => { tab('设置').click(); await f.settle() })
+  else if (ending === 'hidden') await f.visibility('hidden')
+  else if (ending === 'close') await f.unmountSettings()
+  else if (ending === 'disable') { await f.disable(); await f.unmountSettings(); await f.reinstall(false) }
+  else await f.reinstall(false)
+  assert.equal(requests[0].signal.aborted, true)
+  if (ending === 'close' || ending === 'disable') await f.mountSettings()
+  requests[0].resolve({ ok: true, value: page('LATE-OLD-PAGE') })
+  await f.interact(async () => { await f.settle() })
+  assert.equal(panel().textContent.includes('LATE-OLD-PAGE'), false, 'late records do not repaint a hidden, closed or reconnected page')
+  if (ending === 'hidden') {
+    await f.visibility('visible'); assert.equal(requests.length, 1, 'visibility recovery does not poll or silently resume a cancelled query')
+    await f.interact(async () => { refresh().click(); await f.settle() })
+  } else if (ending === 'reconnect') await f.interact(async () => { refresh().click(); await f.settle() })
+  else await f.interact(async () => { tab('通知记录').click(); await f.settle() })
+  await f.waitUntil(() => requests.length === 2, 'an explicit new open or refresh owns a new request')
+  const foreign = page('FOREIGN-PAGE')
+  if (ending === 'hidden') foreign.records[0].registrationId = 'other-installation'
+  else foreign.registrationId = 'other-installation'
+  requests[1].resolve({ ok: true, value: foreign })
+  await f.interact(async () => { await f.settle() })
+  assert.match(panel().textContent, /响应归属或范围未确认/); assert.equal(panel().textContent.includes('FOREIGN-PAGE'), false)
+  await f.interact(async () => { refresh().click(); await f.settle() })
+  await f.waitUntil(() => requests.length === 3, 'a foreign reply does not disable a later explicit refresh')
+  requests[2].resolve({ ok: true, value: page('CURRENT-OWNED-PAGE') })
+  await f.interact(async () => { await f.settle() })
+  assert.ok(panel().textContent.includes('CURRENT-OWNED-PAGE'))
+  if (ending === 'hidden') {
+    await f.interact(async () => { refresh().click(); await f.settle() })
+    await f.waitUntil(() => requests.length === 4, 'oversized protocol page is tested at the UI boundary without claiming backend retention proof')
+    const oversized = page('OVERSIZED-PAGE'); oversized.records = Array.from({ length: 21 }, (_, index) => ({ ...oversized.records[0], id: `oversized-${index}` }))
+    requests[3].resolve({ ok: true, value: oversized }); await f.interact(async () => { await f.settle() })
+    assert.match(panel().textContent, /响应归属或范围未确认/); assert.equal(panel().textContent.includes('OVERSIZED-PAGE'), false)
+    assert.ok(panel().textContent.includes('CURRENT-OWNED-PAGE'), 'an error retains the last verified page with its original snapshot')
+  }
+  await f.interact(async () => { tab('设置').click(); await f.settle() })
+  if (!['close', 'disable'].includes(ending)) assert.equal(input().value, 'records-lifecycle-draft')
+  assert.equal(f.plugin.diagnostics().listeners, listeners)
+  assert.equal(f.delivered.length, 0); assert.equal(f.acknowledged.length, 0)
+})
+
 test('native task notification preferences persist independently from models and browser permission without a monitor', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-notification-settings-')), host = new Context(), operations = []
   let server, core, adapter, f, blocker, permissionRequests = 0, holdWrites = false, responseFault = null
@@ -825,6 +980,26 @@ test('the actual DSH settings form autosaves groups through Native Remote and dr
   assert.equal(requests.some(request => request.model.startsWith('formal-') || request.model.startsWith('test-')), false)
   const task = (await core.snapshot()).tasks.find(task => task.id === 'dsh-observed')
   assert.deepEqual(task.analysis.configScope, { registrationId: 'dsh:stable', revision: saved.revision })
+  const alertDeadline = Date.now() + 3000
+  while (!(await core.snapshot()).tasks.find(task => task.id === 'dsh-observed')?.alerts.some(alert => alert.status === 'attention')) {
+    assert.ok(Date.now() < alertDeadline, 'the production controlled summary/JEV round creates an owned DSH task alert'); await f.settle()
+  }
+  clockOffset = 3000; f.Notification.permission = 'granted'; await f.tick()
+  await f.waitUntil(() => f.delivered.length === 1 && f.plugin.diagnostics().pendingNotification === 0, 'actual Native claim/begin/browser fixture/ACK completes before reading retained records')
+  const noticeId = f.delivered[0].options.tag.slice('sentinel:'.length)
+  const settings = f.dom.window.document.querySelector('[data-sentinel-installation-settings]')
+  await f.interact(async () => { [...settings.querySelectorAll('[role=tab]')].find(button => button.textContent === '通知记录').click(); await f.settle() })
+  const recordPanel = () => settings.querySelector('[data-sentinel-notification-records]')
+  await f.waitUntil(() => recordPanel()?.querySelector(`[data-sentinel-notification-record="${noticeId}"]`), 'the original Native Host queries the installation-wide public Core history')
+  const page = await core.installationNotificationRecords('dsh:stable', {}), record = page.records.find(record => record.id === noticeId)
+  assert.ok(record); assert.equal(record.registrationId, 'dsh:stable'); assert.equal(record.kind, 'task-alert')
+  assert.equal(record.status, 'submitted'); assert.equal(record.delivery, 'system-accepted'); assert.equal(record.humanSeen, 'unknown'); assert.equal(record.native, null)
+  const row = recordPanel().querySelector(`[data-sentinel-notification-record="${noticeId}"]`)
+  assert.equal(row.querySelector('h3').textContent, record.chatTitle || '聊天名称未确认')
+  assert.ok(row.textContent.includes(record.body)); assert.match(row.textContent, /系统已接受 · 实际看见：未知/)
+  assert.equal(row.querySelector('[data-sentinel-native-facts]'), null); assert.match(row.textContent, /原生投递事实未提供/)
+  assert.deepEqual((await core.installationNotificationRecords('chatgpt:other-records', {})).records, [])
+  await f.tick(); assert.equal(f.delivered.length, 1, 'opening and refreshing a history view does not resubmit a notification')
   await f.tick()
   await f.interact(async () => { Simulate.click([...f.dom.window.document.querySelectorAll('button')].find(button => button.textContent === '暂停分析')); await f.settle() })
   assert.equal((await core.installationMonitoring('dsh:stable')).paused, true)

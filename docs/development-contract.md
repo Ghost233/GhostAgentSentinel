@@ -1,6 +1,6 @@
 # 开发接缝与验收
 
-源码与安装版本：0.1.4，DSH 与 Codex 使用同一版本。本文记录当前开发接缝；实际验证范围及未验项目见 [发布验证范围](release-status.md)。此前正式基线为 0.1.1。
+已发布基线为 0.1.4。本文记录当前开发分支的接缝，不代表已安装版本已经具备新增能力；实际验证范围及未验项目见 [发布验证范围](release-status.md)。此前正式基线为 0.1.1。
 
 ## 范围和分工
 
@@ -94,7 +94,13 @@ Codex 的 app-only `sentinel_installation_diagnostics({})` 与 DSH 的 `installa
 
 Codex 设置使用 app-only 的 `sentinel_installation_notification_preferences` 与 `sentinel_set_installation_notification_preference`；明确申请系统许可使用 `sentinel_request_installation_notification_permission`，不依赖某条聊天或采集恢复，普通读取不申请许可。保存拒写与响应未知沿用模型设置的分类。DSH 在调用浏览器通知前经 `beginNotificationSubmission(sourceKey, id)` 取得一次性资格，客户端不能指定另一来源。已返回资格后的跨窗口关闭与浏览器外部 IO 仍有异步窗口；旧回执不恢复已取消资格，这一窗口尚未作为完全阻断通过验收。
 
-Codex 监控页只提供“当前问题／详情”，不再包含设置表单、系统许可按钮和旧的按执行通知记录界面。历史结果仅在详情呈现；`history.currentStatus` 与 `history.currentSignal` 取当前主聊天执行，不使用所选历史轮次的灯号。无已确认身份不补造运行节点，终止节点退出四灯计数。问题中的通知短标记只反映已有提交事实，不表示用户看见。安装级通知记录界面仍由工单 08 接入，不将旧服务接口或占位 tab 记为完成。
+Codex 监控页只提供“当前问题／详情”，不再包含设置表单、系统许可按钮和旧的按执行通知记录界面。历史结果仅在详情呈现；`history.currentStatus` 与 `history.currentSignal` 取当前主聊天执行，不使用所选历史轮次的灯号。无已确认身份不补造运行节点，终止节点退出四灯计数。问题中的通知短标记只反映已有提交事实，不表示用户看见。
+
+安装通知记录通过 `installationNotificationRecords(registrationId, {cursor?, limit?})` 和 GET `/v1/notifications/installations/records` 读取。Codex 的 app-only `sentinel_installation_notification_records({cursor?})` 与 DSH Remote 的同名安装查询固定所属安装，不依赖当前聊天。实际运行核心须声明 `installation-notification-records/1`；缺少能力时明确报不支持，不以健康状态或客户端同名方法代验。
+
+记录按创建时间与 ID 稳定倒序，回执更新不改变排序。默认每页 20 条、最多 100 条，游标绑定安装并可在核心重开后使用；到期或裁剪造成的缺口单独表达。两类通知在本安装内合计只保留最近 24 小时的最新 1000 条，另一安装的容量和缺口互不影响。仍可能需要取消系统待发请求的旧记录只保留有界、无正文的撤销信息，不进入可见历史，沿原投递 IO 确认取消后删除；晚到回执不恢复已裁剪历史。
+
+两端设置页的通知记录 tab 仅在打开、显式刷新或翻页时读取，不轮询或自动遍历所有记录。每条显示可核实的聊天名称或归属未确认、时间及真实投递事实；DSH 浏览器记录没有原生通知中心事实时保留 `native: null`，`humanSeen` 不因系统接受而改成已看见。关闭、隐藏和断连后取消或封存旧读取，模型草稿与通知开关不受影响。实际宿主候选的集中界面验收仍独立保留。
 
 ## 交付界限
 

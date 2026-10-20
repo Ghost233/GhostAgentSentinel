@@ -25,6 +25,10 @@ function parameterCodec(name) {
       if (typeof value !== 'boolean') throw new Error('通知偏好必须为布尔值')
       return value
     }
+    if (name === 'notificationRecordsSelection') {
+      if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => key !== 'cursor') || value.cursor !== undefined && (typeof value.cursor !== 'string' || !value.cursor || value.cursor.length > 2000)) throw new Error('通知记录游标无效')
+      return value
+    }
     if (name === 'directorySelection') {
       if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 || typeof value.baseUrl !== 'string' || !value.baseUrl || value.baseUrl.length > 2000 || /[\u0000-\u001f\u007f]/.test(value.baseUrl)) throw new Error('模型目录地址无效')
       return value
@@ -57,6 +61,7 @@ module.exports = function descriptors() {
     snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: [], configureSources: ['entries'],
     configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'],
     installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id'],
+    installationNotificationRecords: ['notificationRecordsSelection'],
   }
   return Object.entries(methods).map(([method, parameters]) => ({
     id: `ghost-agent-sentinel#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,

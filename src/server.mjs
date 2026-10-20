@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile, rename, chmod, rm, stat } from 'node:fs/pro
 import { join } from 'node:path'
 import { createCore } from './core/index.mjs'
 import { createAnalyzer } from './analysis/index.mjs'
-import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig, normalizeInstallationNotificationPreference } from './protocol.mjs'
+import { PROTOCOL, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, normalizeSource, normalizeBatch, normalizeAnalysisConfig, normalizeInstallationNotificationPreference } from './protocol.mjs'
 import { normalizeEnrollment } from './enrollment-config.mjs'
 import { HIERARCHY_FEATURE } from './hierarchy.mjs'
 import { GS_FEATURE } from './gs-status.mjs'
@@ -134,7 +134,19 @@ export async function startServer({ dataDir, onIdle, ...options }) {
     if (request.headers.host !== expectedHost || !authorized(request, token)) return send(401, { error: 'private connection required' })
     if (stopping) return send(503, { error: 'core shutting down' })
     try {
-      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: ['installation-monitoring/1', 'installation-model-settings/1', FORK_COMPRESSION_FEATURE, FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE] })
+      if (request.method === 'GET' && request.url === '/v1/health') return send(200, { protocol: PROTOCOL, instanceId, features: ['installation-monitoring/1', 'installation-model-settings/1', INSTALLATION_NOTIFICATION_RECORDS_FEATURE, FORK_COMPRESSION_FEATURE, FORK_CONTEXT_FEATURE, FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, HIERARCHY_FEATURE, GS_FEATURE, GS_SUMMARY_FEATURE, SOURCE_OBSERVATION_FEATURE, CHATGPT_MAIN_FEATURE, CONVERSATION_MONITORING_FEATURE, MONITORING_FAILURES_FEATURE, MONITORING_NOTIFICATIONS_FEATURE, INITIAL_ENROLLMENT_ROLLUP_FEATURE, CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE] })
+      if (request.method === 'GET' && request.url.startsWith('/v1/notifications/installations/records')) {
+        const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
+        if (url.pathname !== '/v1/notifications/installations/records') return send(404, { error: 'unknown endpoint' })
+        if ([...params.keys()].some(key => !['registrationId', 'cursor', 'limit'].includes(key) || params.getAll(key).length !== 1) || !params.has('registrationId')) throw new Error('invalid installation notification records query')
+        const selection = {}
+        if (params.has('cursor')) selection.cursor = params.get('cursor')
+        if (params.has('limit')) {
+          if (!/^\d+$/.test(params.get('limit'))) throw new Error('invalid installation notification records limit')
+          selection.limit = Number(params.get('limit'))
+        }
+        return send(200, await core.installationNotificationRecords(identifier(params.get('registrationId')), selection))
+      }
       if (request.method === 'GET' && request.url.startsWith('/v1/analysis/installations/config')) {
         const url = new URL(request.url, `http://${expectedHost}`), params = url.searchParams
         if (url.pathname !== '/v1/analysis/installations/config') return send(404, { error: 'unknown endpoint' })

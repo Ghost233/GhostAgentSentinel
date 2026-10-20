@@ -76,6 +76,10 @@ export async function startPanelServer({ read, control, modelSettings, installat
       }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装连接诊断' }], structuredContent: await modelSettings.diagnostics({ signal: extra.signal }) }))
     }
     if (installationNotifications) {
+      if (typeof installationNotifications.records === 'function') registerAppTool(mcp, 'sentinel_installation_notification_records', {
+        title: '本安装通知记录', description: '有界读取本安装全部已监控聊天的通知事实，不产生新投递。', inputSchema: z.object({ cursor: z.string().min(1).max(2000).optional() }).strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+      }, async (selection, extra) => ({ content: [{ type: 'text', text: '本安装通知记录' }], structuredContent: await installationNotifications.records(selection, { signal: extra.signal }) }))
       registerAppTool(mcp, 'sentinel_installation_notification_preferences', {
         title: '读取本安装通知偏好', description: '读取任务告警和监控故障投递偏好，系统许可另行表达。', inputSchema: z.object({}).strict(),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },

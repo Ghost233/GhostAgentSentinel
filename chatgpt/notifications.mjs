@@ -18,9 +18,9 @@ export function createNotificationDelivery({ core, native, installationId, quali
   const sameScope = (notice, metadata) => metadata && ['sourceKey', 'hostRunId', 'mainId', 'lifecycleId'].every(key => metadata[key] === notice[key]) && metadata.notificationId === notice.id && metadata.attemptId === notice.native?.attemptId
   async function records(sourceKey) {
     const values = []; let cursor = 0, gap = false
-    for (let page = 0; page < 11; page++) {
+    for (let page = 0; page < 21; page++) {
       const result = await core.nativeNotificationRecords({ sourceKey, afterSequence: cursor, limit: 100 })
-      values.push(...result.records); gap ||= result.historyGap
+      values.push(...result.records, ...(result.cancellations ?? [])); gap ||= result.historyGap
       if (!result.hasMore) return { values, gap }
       cursor = result.nextSequence
     }
@@ -33,6 +33,7 @@ export function createNotificationDelivery({ core, native, installationId, quali
   async function observe(values, snapshot, summary) {
     summary.historyGap ||= snapshot.historyGap === true || snapshot.deliveredHasMore === true
     for (const notice of values) {
+      if (notice.historyPruned) continue
       if (!owned(notice.native?.nativeRequestId)) continue
       const delivered = snapshot.delivered.find(value => value.requestId === notice.native.nativeRequestId && sameScope(notice, value.metadata))
       if (delivered || !snapshot.deliveredHasMore) {

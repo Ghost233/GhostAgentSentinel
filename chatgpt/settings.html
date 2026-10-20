@@ -4,7 +4,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sentinel 安装设置</title>
 <style>
-body{font:14px/1.55 system-ui;margin:0;padding:16px;color:var(--color-text-primary,#222);background:var(--color-background-primary,#fff)}h1{font-size:18px;margin:0 0 8px}h2{font-size:15px;margin:12px 0 6px}.muted{color:var(--color-text-secondary,#666);font-size:12px}input,select{display:block;box-sizing:border-box;width:100%;margin:4px 0 8px;padding:6px}input[type=checkbox]{display:inline-block;width:auto;margin-right:6px}button{margin:4px 4px 4px 0;padding:6px 10px}fieldset{margin:12px 0;border:1px solid #8886;border-radius:8px;padding:12px}[role=tab][aria-selected=true]{font-weight:600;border-bottom:2px solid currentColor}
+body{font:14px/1.55 system-ui;margin:0;padding:16px;color:var(--color-text-primary,#222);background:var(--color-background-primary,#fff)}h1{font-size:18px;margin:0 0 8px}h2{font-size:15px;margin:12px 0 6px}.muted{color:var(--color-text-secondary,#666);font-size:12px}input,select{display:block;box-sizing:border-box;width:100%;margin:4px 0 8px;padding:6px}input[type=checkbox]{display:inline-block;width:auto;margin-right:6px}button{margin:4px 4px 4px 0;padding:6px 10px}fieldset{margin:12px 0;border:1px solid #8886;border-radius:8px;padding:12px}[role=tab][aria-selected=true]{font-weight:600;border-bottom:2px solid currentColor}.notification-record{border-top:1px solid #8886;padding:8px 0}.notification-body{white-space:pre-wrap}
 </style>
 <h1>Sentinel · 安装设置</h1>
 <p class="muted">本安装的所有已监控聊天共用这份模型配置。关闭设置不停止监控。</p>
@@ -32,7 +32,10 @@ body{font:14px/1.55 system-ui;margin:0;padding:16px;color:var(--color-text-prima
 <p class="muted">通知开关与系统许可分别生效；系统允许不代表通知已显示或已被看到。</p>
 </fieldset>
 </section>
-<section id="settings-pane-notifications" role="tabpanel" aria-labelledby="settings-tab-notifications" hidden><p id="settings-notifications-status" class="muted"></p></section>
+<section id="settings-pane-notifications" role="tabpanel" aria-labelledby="settings-tab-notifications" hidden>
+<p class="muted">本安装全部已监控聊天的两类通知，合计保留最近 24 小时内最新 1000 条。</p><button id="settings-notifications-refresh" type="button">刷新记录</button>
+<p id="settings-notifications-status" role="status" class="muted"></p><p id="settings-notifications-gap" role="status" class="muted"></p><div id="settings-notifications-records"></div><button id="settings-notifications-older" type="button" hidden>较早记录</button>
+</section>
 <section id="settings-pane-diagnostics" role="tabpanel" aria-labelledby="settings-tab-diagnostics" hidden>
 <button id="diagnostics-refresh" type="button">刷新诊断</button><p id="diagnostics-status" class="muted"></p>
 <h2>采集</h2><p id="diagnostics-collection"></p>
@@ -41,11 +44,11 @@ body{font:14px/1.55 system-ui;margin:0;padding:16px;color:var(--color-text-prima
 </section>
 <script>
 const element=id=>document.querySelector('#'+id),text=(value,max=2000)=>typeof value==='string'?value.slice(0,max):'';
-let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0,savingGroups=null,settingsTab='settings',diagnosticsBusy=false,diagnosticsVersion=0,installationRegistrationId=null,notificationReadBusy=false,notificationReadVersion=0,permissionBusy=false,permissionVersion=0;
+let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0,savingGroups=null,settingsTab='settings',diagnosticsBusy=false,diagnosticsVersion=0,installationRegistrationId=null,notificationReadBusy=false,notificationReadVersion=0,permissionBusy=false,permissionVersion=0,notificationRecordsBusy=false,notificationRecordsVersion=0,notificationRecordsCursor=null;
 const pending=new Map(),directoryVersions={llm:0,jev:0},directoryRequests={llm:{list:0,check:0},jev:{list:0,check:0}},editVersions={llm:0,jev:0},completedVersions={llm:0,jev:0},dirtyRoles=new Set(),queuedGroups=new Map();
 const notificationKinds=['task-alert','monitoring-failure'],notificationEdits=Object.fromEntries(notificationKinds.map(kind=>[kind,{version:0,dirty:false,saving:false,queued:null}]));
 function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);if(entry.method==='tools/call')parent.postMessage({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id,reason}},'*');entry.reject(new Error(reason));}
-function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
+function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,name:params?.name,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
 function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
 function validateModelSettings(value){
   if(!value||!text(value.registrationId)||!text(value.revision)||!value.config||typeof value.config!=='object'||Array.isArray(value.config)||installationRegistrationId&&installationRegistrationId!==value.registrationId)throw new Error('模型配置归属未确认');
@@ -187,10 +190,44 @@ async function readDiagnostics(){
   catch(error){if(!stopped&&version===diagnosticsVersion)element('diagnostics-status').textContent='连接诊断未确认 · '+text(error.message);}
   finally{if(!stopped&&version===diagnosticsVersion){diagnosticsBusy=false;element('diagnostics-refresh').disabled=false;}}
 }
+function renderInstallationNotificationRecords(value){
+  if(!value||!text(value.registrationId)||installationRegistrationId&&installationRegistrationId!==value.registrationId||!Number.isSafeInteger(value.generatedAt)||value.generatedAt<0||!Array.isArray(value.records)||value.records.length>20||typeof value.hasMore!=='boolean'||typeof value.historyGap!=='boolean'||value.retentionMs!==86400000||value.maximumRecords!==1000||(value.hasMore?!text(value.nextCursor):value.nextCursor!==null))throw new Error('本安装通知记录归属或分页未确认');
+  for(const record of value.records)if(!record||record.registrationId!==value.registrationId||!text(record.id)||!text(record.sourceKey)||!['mainId','lifecycleId','chatTitle'].every(key=>record[key]===null||typeof record[key]==='string')||!notificationKinds.includes(record.kind)||!Number.isSafeInteger(record.createdAt)||record.createdAt<0||typeof record.status!=='string'||typeof record.delivery!=='string'||record.humanSeen!=='unknown'||typeof record.title!=='string'||typeof record.body!=='string'||record.native!==null&&(!record.native||typeof record.native!=='object'||Array.isArray(record.native)))throw new Error('通知记录内容或安装归属未确认');
+  installationRegistrationId=value.registrationId;notificationRecordsCursor=value.nextCursor;
+  const container=element('settings-notifications-records');
+  for(const record of value.records){
+    const row=document.createElement('article'),heading=document.createElement('h2'),status=document.createElement('p'),details=document.createElement('details'),summary=document.createElement('summary');row.className='notification-record';
+    heading.textContent=(record.mainId===null?'来源级 · 聊天身份未确认':text(record.chatTitle)||'聊天名称未确认')+' · '+(record.kind==='task-alert'?'任务告警':'监控故障');
+    status.textContent=new Date(record.createdAt).toLocaleString()+' · '+(({pending:'待投递',claimed:'投递处理中',submitted:'已提交',cancelled:'已取消',expired:'已失效',failed:'投递失败',grouped:'已合并'})[record.status]||'投递状态未确认')+' · '+(({unknown:'投递结果未确认','system-accepted':'系统已接受 · 展示未确认',failed:'投递失败',grouped:'合并处理'})[record.delivery]||'投递结果未确认');
+    summary.textContent='通知原文与投递详情';details.append(summary);
+    for(const [content,className] of [[record.title,''],[record.body,'notification-body'],['来源：'+text(record.sourceKey)+' · 聊天：'+(text(record.mainId)||'身份未确认')+' · 执行：'+(text(record.lifecycleId)||'身份未确认'),'muted']]){const paragraph=document.createElement('p');paragraph.textContent=content;paragraph.className=className;details.append(paragraph);}
+    if(record.native){
+      const native=record.native,paragraph=document.createElement('p');paragraph.className='muted';paragraph.textContent='系统许可：'+(({unknown:'未确认','not-determined':'尚未决定',denied:'未允许',authorized:'已允许',provisional:'临时允许'})[native.authorization?.state]||'未确认')+'；提交：'+(({'not-attempted':'尚未提交',submitting:'提交中',accepted:'系统接受',failed:'失败',unknown:'结果未确认'})[native.submission?.state]||'未确认')+'；通知中心快照：'+(native.deliveredSnapshot?.present===true?'存在':native.deliveredSnapshot?.present===false?'本次快照未见':'未取得')+'；用户动作：'+(({default:'点击',dismiss:'关闭'})[native.userAction?.action]||'未取得');details.append(paragraph);
+    }
+    const seen=document.createElement('p');seen.className='muted';seen.textContent='用户实际看见：未确认';details.append(seen);row.append(heading,status,details);container.append(row);
+  }
+  element('settings-notifications-status').textContent=value.records.length?'本安装通知记录 · 当前页 '+value.records.length+' 条':'暂无本安装通知记录';
+  element('settings-notifications-gap').textContent=value.historyGap?'记录存在留存缺口 · 部分记录已到期或被裁剪':'';element('settings-notifications-older').hidden=!value.hasMore;
+}
+function cancelNotificationRecords(reason){
+  notificationRecordsVersion++;const wasBusy=notificationRecordsBusy;notificationRecordsBusy=false;
+  for(const [id,entry] of pending)if(entry.name==='sentinel_installation_notification_records')cancel(id,entry,reason);
+  element('settings-notifications-refresh').disabled=false;element('settings-notifications-older').disabled=false;
+  if(wasBusy)element('settings-notifications-status').textContent='记录读取已停止 · 可重新打开或刷新';
+}
+async function readInstallationNotificationRecords(cursor=null){
+  if(stopped||document.hidden||!ready||settingsTab!=='notifications'||notificationRecordsBusy)return;
+  notificationRecordsBusy=true;const version=++notificationRecordsVersion,current=()=>!stopped&&!document.hidden&&settingsTab==='notifications'&&version===notificationRecordsVersion;
+  element('settings-notifications-refresh').disabled=true;element('settings-notifications-older').disabled=true;element('settings-notifications-older').hidden=true;element('settings-notifications-records').replaceChildren();element('settings-notifications-gap').textContent='';element('settings-notifications-status').textContent='正在读取本安装通知记录';
+  try{const response=await request('tools/call',{name:'sentinel_installation_notification_records',arguments:cursor?{cursor}:{}});if(!current())return;if(response.isError)throw new Error(response.content?.some(entry=>entry.type==='text'&&text(entry.text).includes('共享核心尚不支持本安装通知记录'))?'共享核心尚不支持本安装通知记录':'通知记录读取未确认');renderInstallationNotificationRecords(response.structuredContent);}
+  catch(error){if(current())element('settings-notifications-status').textContent='通知记录读取未确认'+(text(error.message).includes('共享核心尚不支持本安装通知记录')?' · 共享核心尚不支持本安装通知记录':'');}
+  finally{if(current()){notificationRecordsBusy=false;element('settings-notifications-refresh').disabled=false;element('settings-notifications-older').disabled=false;}}
+}
 function selectSettingsTab(tab){
-  if(stopped)return;settingsTab=tab;
+  if(stopped)return;if(settingsTab==='notifications'&&tab!=='notifications')cancelNotificationRecords('已离开通知记录');settingsTab=tab;
   for(const name of ['settings','notifications','diagnostics']){element('settings-pane-'+name).hidden=name!==tab;element('settings-tab-'+name).setAttribute('aria-selected',String(name===tab));}
   if(tab==='diagnostics'){renderConnectionChecks();return readDiagnostics();}
+  if(tab==='notifications')return readInstallationNotificationRecords();
 }
 function markModelDraft(role,field){
   editVersions[role]++;dirtyRoles.add(role);directoryVersions[role]++;
@@ -204,7 +241,7 @@ element('settings-form').onsubmit=event=>event.preventDefault();element('setting
 element('settings-notification-reload').onclick=readNotificationPreferences;element('settings-notification-permission').onclick=requestInstallationNotificationPermission;renderNotificationPermission(null);
 for(const kind of notificationKinds){const checkbox=element('settings-notification-'+kind);checkbox.disabled=true;checkbox.onchange=()=>{if(stopped||document.hidden||checkbox.disabled)return;const edit=notificationEdits[kind];edit.version++;edit.dirty=true;edit.queued={enabled:checkbox.checked,version:edit.version};element('settings-notification-'+kind+'-status').textContent='正在保存';return saveNotificationPreference(kind);};}
 for(const tab of ['settings','notifications','diagnostics'])element('settings-tab-'+tab).onclick=()=>selectSettingsTab(tab);
-element('diagnostics-refresh').onclick=readDiagnostics;element('settings-notifications-status').textContent='本安装通知记录尚未接入此页面。';element('diagnostics-status').textContent='尚未读取连接诊断';selectSettingsTab('settings');
+element('diagnostics-refresh').onclick=readDiagnostics;element('settings-notifications-refresh').onclick=()=>readInstallationNotificationRecords();element('settings-notifications-older').onclick=()=>notificationRecordsCursor?readInstallationNotificationRecords(notificationRecordsCursor):undefined;element('settings-notifications-older').hidden=true;element('settings-notifications-status').textContent='尚未读取本安装通知记录';element('diagnostics-status').textContent='尚未读取连接诊断';selectSettingsTab('settings');
 for(const role of ['llm','jev']){
   for(const action of ['list','check'])element('settings-'+role+'-'+action).onclick=()=>readDirectory(role,action);
   element('settings-'+role+'-options').onchange=()=>{const selected=element('settings-'+role+'-options').value;if(!selected)return;element('settings-'+role+'-model').value=selected;markModelDraft(role,'selection');return completeModelGroup(role);};
@@ -212,8 +249,8 @@ for(const role of ['llm','jev']){
   element('settings-'+role+'-group').onkeydown=event=>{if(event.key==='Enter'&&['url','model'].some(field=>event.target===element('settings-'+role+'-'+field))){event.preventDefault();return completeModelGroup(role);}};
   for(const field of ['url','model'])element('settings-'+role+'-'+field).oninput=()=>markModelDraft(role,field);
 }
-function visibility(){if(document.hidden){for(const [id,entry] of pending)if(entry.method==='tools/call')cancel(id,entry,'面板已隐藏 · 输入已保留');}else{for(const kind of notificationKinds)void saveNotificationPreference(kind);if(settingsState)void saveModelSettings();else void readModelSettings();}}
-function teardown(){if(stopped)return;stopped=true;settingsVersion++;for(const [id,entry] of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
+function visibility(){if(document.hidden){cancelNotificationRecords('面板已隐藏');for(const [id,entry] of pending)if(entry.method==='tools/call')cancel(id,entry,'面板已隐藏 · 输入已保留');}else{for(const kind of notificationKinds)void saveNotificationPreference(kind);if(settingsState)void saveModelSettings();else void readModelSettings();}}
+function teardown(){if(stopped)return;stopped=true;settingsVersion++;notificationRecordsVersion++;for(const [id,entry] of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('message',onMessage);addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
 (async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt-settings',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');void readNotificationPreferences();await readModelSettings();}catch(error){if(!stopped)element('settings-status').textContent='宿主初始化未完成 · '+text(error.message);}})();
 </script>

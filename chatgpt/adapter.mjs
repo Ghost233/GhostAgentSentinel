@@ -12,7 +12,7 @@ import { readModelDirectory } from './model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
-import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE } from '../src/protocol.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -646,6 +646,15 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     },
   } : undefined
   const installationNotifications = collectMaterials ? {
+    async records(selection = {}, { signal } = {}) {
+      const { result } = await settingsRead(signal, async signal => {
+        const health = await core.health(signal)
+        if (!health.features?.includes(INSTALLATION_NOTIFICATION_RECORDS_FEATURE)) throw new Error('共享核心尚不支持本安装通知记录')
+        await qualifySettings(); signal.throwIfAborted()
+        return core.installationNotificationRecords('chatgpt:' + installationId, selection, signal)
+      })
+      return result
+    },
     async read({ signal } = {}) {
       const { result } = await settingsRead(signal, async signal => {
         await core.health(signal); await qualifySettings(); signal.throwIfAborted()
