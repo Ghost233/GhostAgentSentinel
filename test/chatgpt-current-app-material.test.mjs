@@ -15,6 +15,7 @@ import { decodeJevRequest } from './helpers/jev-wire.mjs'
 import { MaterialProjection, materialRecord } from '../chatgpt/material-projection.mjs'
 
 const at = 1_800_000_000_000, owner = '00000000-0000-4000-8000-000000000163', parent = '00000000-0000-4000-8000-000000000162'
+const app20770 = { appVersion: '26.1013.40934', appBuild: '20770', cliVersion: '0.163.0-alpha.10.2' }
 const row = (ordinal, type, payload, time = at) => JSON.stringify({ ordinal, type, payload, timestamp: new Date(time).toISOString() }) + '\n'
 const header = (id, producer = candidateHostProfile.cliVersion) => ({ id, cwd: '/synthetic-project', originator: 'Codex Desktop', source: 'vscode', cli_version: producer, history_mode: 'paginated' })
 const start = (id, trigger = 'composer') => ({ type: 'task_started', turn_id: id, turn_attribution: { turn_id: id, turn_trigger: trigger } })
@@ -64,6 +65,22 @@ test('the exact current App reaches the production Core HTTP and panel with a ty
   assert.equal(task.events.find(event => event.kind === 'input').authorizationEligible, true)
   assert.equal(task.events.find(event => event.kind === 'output').text, 'The synthetic log has been inspected')
   assert.equal(task.coverage.complete, true)
+})
+
+test('the exact App build 20770 retains main and fork material ownership', async t => {
+  for (const fork of [false, true]) await t.test(fork ? 'fork' : 'main', async t => {
+    const f = await fixture(t, { profile: app20770, fork }), view = await f.caughtUp()
+    assert.equal(view.identity.threadId, owner)
+    assert.equal(view.observation.coverage, 'caught-up')
+    const tasks = (await f.core.snapshot()).tasks
+    assert.equal(tasks.length, 1)
+    const task = tasks[0]
+    assert.equal(task.id, owner)
+    assert.equal(task.currentRequest, 'Inspect only the synthetic log')
+    assert.equal(task.coverage.complete, true)
+    assert.equal(task.instructionContext.userLimitRefs.length, fork ? 1 : 0)
+    assert.ok(task.events.filter(event => event.data?.history).every(event => !task.activity.evidenceIds.includes(event.id)))
+  })
 })
 
 test('verified custom tool input_text arrays become one bounded result without becoming input or verification proof', async t => {
@@ -146,7 +163,7 @@ test('current-producer fork material reaches the production panel with independe
 })
 
 test('nearby or untyped Host profiles do no material IO and keep the qualified owner gray instead of declaring global loss', async t => {
-  for (const profile of [{ ...candidateHostProfile, appBuild: '20587' }, { ...candidateHostProfile, cliVersion: '0.163.0-alpha.10.3' }, { ...candidateHostProfile, appBuild: 20586 }]) await t.test(JSON.stringify(profile), async t => {
+  for (const profile of [{ ...candidateHostProfile, appBuild: '20587' }, { ...candidateHostProfile, cliVersion: '0.163.0-alpha.10.3' }, { ...candidateHostProfile, appBuild: 20586 }, { ...app20770, appBuild: '20771' }, { ...app20770, cliVersion: '0.163.0-alpha.10.3' }, { ...app20770, appBuild: 20770 }]) await t.test(JSON.stringify(profile), async t => {
     const lost = [], f = await fixture(t, { profile, onQualificationLost: reason => lost.push(reason) }), view = await f.read()
     assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'unsupported-host-version')
     assert.equal(f.state.currentRecordReads, 0); assert.equal(f.state.threadReads, 0)
