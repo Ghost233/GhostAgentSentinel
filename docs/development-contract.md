@@ -1,6 +1,6 @@
 # 开发接缝与验收
 
-已发布基线为 0.1.4。本文记录当前开发分支的接缝，不代表已安装版本已经具备新增能力；实际验证范围及未验项目见 [发布验证范围](release-status.md)。此前正式基线为 0.1.1。
+本次发布版本为 0.1.5，上一正式版本为 0.1.4。本文记录当前源码的接缝，不代表已运行的旧进程已经具备新增能力；实际验证范围及未验项目见 [发布验证范围](release-status.md)。用户在了解实机缺口后决定发布，产品规格尚未结项。
 
 ## 范围和分工
 
@@ -19,7 +19,7 @@
 
 2026-10-17，用户选择仓库当前检出的原版子模块作为目标，不修改客户端或 SDK，也不恢复旧扩展。该轮验收输入是上游 `deepseek-ai/deepseek-harness` 的 `1517a4dbca0a2789ff1d41ba439600f8547d23fa`，模块版本为 `0.2.1-alpha.5`。每次验收重新记录实际提交和构建产物；子模块记录不等于原版客户端界面已验收。
 
-DSH 0.1.2 的目标已随子模块更新，具体提交、共享核心回归和独立发布门槛见仓库中的[兼容验证与发布准备](https://github.com/Ghost233/GhostAgentSentinel/blob/test/docs/dsh-0.1.2-compatibility.md)。旧提交的结果保留原范围，不直接记为新目标通过。
+后续已核实的原版宿主证据使用提交 `687f282e8625c6b8d11ff58211a90524be2e4317`，版本为 `0.2.1-rc.2`。具体证据见仓库中的[兼容验证与发布准备](https://github.com/Ghost233/GhostAgentSentinel/blob/test/docs/dsh-0.1.2-compatibility.md)。各次结果保留原范围，不直接记为 0.1.5 的新界面或完整双端验收通过。
 
 | 能力 | 当前范围 |
 | --- | --- |
@@ -76,7 +76,7 @@ checks 固定六项 ID：stalled_progress/request_drift/failure_loop/validation_
 
 同一安装以最后一次有效保存为准，不因另一窗口先保存而拒绝旧修订号；仍校验安装身份、修订号格式和整份配置。每次成功写入更换该安装的修订号，并将该安装受影响的配置、任务和通知变化一起持久提交。无效配置不部分生效。分析轮次和结果绑定 registrationId、配置修订号及执行材料；保存后取消旧轮次、封存晚到结果，按新配置公平排队。采集、原任务、其它安装与手动暂停保持。响应丢失时保留结果未知，调用方重新读取，不能仅凭值相同推定写入归属。安装暂停、会话暂停和旧全局配置各自的修订冲突规则保持。
 
-双端的保存响应用 `saveOutcome` 区分明确拒写与结果未知。只有已确认的配置 HTTP 拒绝才显示保存失败；未确认、混合错误和响应中断保持未知。MCP 的 `isError` 或 Remote 的通用错误本身不能证明配置未写入。缺少结果标记时也按未知处理，保留输入，不自动重试；其它操作的错误语义保持。
+双端的保存响应用 `saveOutcome` 区分明确拒写与结果未知。已确认的配置 HTTP 拒绝，以及请求前已确认能力不足、尚未发出请求，均属于明确拒绝。未确认、混合错误和响应中断保持未知。MCP 的 `isError` 或 Remote 的通用错误本身不能证明配置未写入。缺少结果标记时也按未知处理，保留输入，不自动重试；其它操作的错误语义保持。
 
 安装暂停使用 `installationMonitoring(registrationId)` 和 `setInstallationMonitoring(registrationId,paused,revision)`，返回 `{registrationId,paused,revision}`。HTTP 为 `GET /v1/monitoring/installations?registrationId=…` 与同路径 POST，写入正文为 `{registrationId,paused,revision}`。相同目标状态幂等，过期的相反写入返回 409 和 `installation_monitoring_conflict`。DSH 界面只调用所属安装的控制；安装暂停与会话暂停取逻辑或，恢复其中一项不解除另一项，暂停期间仍采集。
 
@@ -103,6 +103,8 @@ DSH 的每次通知认领附带不透明的 `attemptToken`。客户端建立该�
 Codex 监控页只提供“当前问题／详情”，不再包含设置表单、系统许可按钮和旧的按执行通知记录界面。历史结果仅在详情呈现；`history.currentStatus` 与 `history.currentSignal` 取当前主聊天执行，不使用所选历史轮次的灯号。无已确认身份不补造运行节点，终止节点退出四灯计数。问题中的通知短标记只反映已有提交事实，不表示用户看见。
 
 安装通知记录通过 `installationNotificationRecords(registrationId, {cursor?, limit?})` 和 GET `/v1/notifications/installations/records` 读取。Codex 的 app-only `sentinel_installation_notification_records({cursor?})` 与 DSH Remote 的同名安装查询固定所属安装，不依赖当前聊天。实际运行核心须声明 `installation-notification-records/1`；缺少能力时明确报不支持，不以健康状态或客户端同名方法代验。
+
+Core 客户端从已核实实例的 health 取得能力列表。安装通知读取要求 `installation-notification-records/1`，偏好写入还要求 `notification-submission-revocation/1`。缺少能力时不发送对应请求，返回 `core_feature_unsupported` 及限定操作的 `coreCapabilityFailure`；这不属于传输失败，也不停止其它来源。更新插件文件不会给旧 Core 进程补接口，客户端不自动替换或终止 Core；需要切换时由用户安排维护窗口，等待所有来源停用后旧 Core 自然退出。
 
 记录按创建时间与 ID 稳定倒序，回执更新不改变排序。默认每页 20 条、最多 100 条，游标绑定安装并可在核心重开后使用；到期或裁剪造成的缺口单独表达。两类通知在本安装内合计只保留最近 24 小时的最新 1000 条，另一安装的容量和缺口互不影响。仍可能需要取消系统待发请求的旧记录只保留有界、无正文的撤销信息，不进入可见历史，沿原投递 IO 确认取消后删除；晚到回执不恢复已裁剪历史。
 
@@ -171,6 +173,8 @@ chatgpt-fork-legacy/1 只支持精确 0.162.0-alpha.2 与 0.160.1 的 paginated 
 nativeRecordId 在历史虚拟位置映射前固定，只用于重复采集和首采时间核对，不赋予角色或授权。v1 保留原物理文件及头部身份算法；正式 v2 按规范存储文件名、解压后的原始字节位置和原生类型生成身份，仅移除已核实的 .zst 后缀，压缩、解压与归档移动不产生新身份。文件头摘要作为独立防变检查，不混入新身份刷新首采时间。同一原生记录在原会话和分叉中出现时，正文及 capturedAt 不刷新；任务、执行、当前与历史的引用范围仍各自独立。隐含历史证明复用既有每来源 10000 项账本，最多使用其中 8000 项。跨来源的首采进度另按 registrationId 与 nativeRecordId 保存，全核心最多 10000 项；未到期时仅在首份正文仍可核对时复用时间、正文和证据，正文缺失则保留缺口。24 小时后清除正文定位和精确时间，只保留必要的过期标记。来源正常回收不清除此围栏，按 registration 卸载才移除；容量满时拒绝此前未知身份，不静默淘汰旧身份。过期、裁剪或预算不足后不能通过新容器复活内容。
 
 chatgpt-fork-compression/1 是 v2 材料路径读取前必须确认的能力。生产 startFromInstallation 固定使用 nativeOriginVersion 2；直接适配器调用默认 1 仅保留旧合同，没有用户切换选项。NativeJsonlSource 隐藏 plain／zstd 差异，限定进程级最多 4 个压缩 lease、8 MiB 解码窗口及 64 KiB 待消费解码尾块。源身份和生产者项目资格先核实，再完成单 frame 校验；字典、附加 frame、尾随数据、截断或坏 frame 拒绝。无 checksum 的 frame 只说明格式、长度及 EOF，不宣称 checksum 通过。完整校验后才向材料链重放所需范围，切点之后的内容只作完整性校验。plain 与 zstd 同时存在时，两份候选须独立证明头部与所需前缀等价才能合并。
+
+元数据仍指向 `.jsonl`，且该原路径的 lstat 确认 ENOENT 时，NativeJsonlSource 才尝试同名 `.jsonl.zst`。已有 plain 文件保持优先；权限错误、悬空链接、越界路径和两份文件都缺失继续拒绝。回退保留逻辑存储身份，守卫绑定实际选中的物理文件，并继续核对头部、已确认前缀和完整压缩帧。恢复不重放已确认材料，不刷新首采时间，也不把归档历史算作新活动。
 
 POST /v1/source/native-origin 按 sourceKey 与 key 读取同 registration 的无正文进度。v2 采集批次最多携带 16 份 nativeOrigins，包含头摘要、revision、旧前缀、重新验证的旧前缀及新前缀；前缀由固定 64 KiB block 的 root/count 和末块 length/hash 表达，不保存正文、decoder 或 crypto 内部状态。核心另限 10000 份存储代防变记录。每条 v2 原生事件必须携带 nativeGenerationKey、nativeRecordStart、nativeRecordEnd，身份及范围须与本批完整证明吻合。不同切点并发时，不回退已经确认的较长前缀；旧 revision 扩展明确冲突，适配器返回已确认游标重新核验。
 
