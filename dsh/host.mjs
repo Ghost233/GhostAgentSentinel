@@ -308,8 +308,9 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       try { return await installationCall('setInstallationNotificationPreference', [kind, enabled], signal) }
       catch (error) {
         const requestFailure = error?.coreRequestFailure
+        const unsupported = error?.code === 'core_feature_unsupported' && error.coreCapabilityFailure?.operation === '/v1/notifications/installations/preferences'
         const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
-          && !['analysis_config_unconfirmed', 'notification_revocation_unconfirmed'].includes(error?.code) && requestFailure?.operation === '/v1/notifications/installations/preferences' && requestFailure.kind === 'http' && requestFailure.status >= 400 && requestFailure.status <= 599
+          && (unsupported || !['analysis_config_unconfirmed', 'notification_revocation_unconfirmed'].includes(error?.code) && requestFailure?.operation === '/v1/notifications/installations/preferences' && requestFailure.kind === 'http' && requestFailure.status >= 400 && requestFailure.status <= 599)
         const failure = error && typeof error === 'object' ? error : new Error(String(error))
         failure.code ??= 'gateway/internal'; failure.isDSHRemoteError = true
         failure.details = { ...failure.details, saveOutcome: rejected ? 'rejected' : 'unknown' }

@@ -50,20 +50,27 @@ export class NativeJsonlSource {
     this.rawOffset = 0; this.removed = 0; this.accounted = 0; this.pendingWrite = false; this.inputEnded = false
   }
   async open() {
+    let path = this.source.path
+    try { await fs.lstat(path) }
+    catch (error) {
+      if (error.code !== 'ENOENT' || !path.endsWith('.jsonl')) throw error
+      path += '.zst'
+    }
+    const actual = await fs.realpath(path), root = await fs.realpath(this.source.allowedRoot)
+    if (!actual.startsWith(root + sep) || !/\.jsonl(?:\.zst)?$/.test(actual)) throw fail('record-path-unverified')
+    this.path = path; this.compressed = path.endsWith('.jsonl.zst')
     if (this.compressed && !leases.has(this) && leases.size >= 4) { this.phase = 'queued'; return false }
     this.expected = this.origins ? await this.origins.read(this.key) : null
     if (this.closed) throw fail('reader-closed')
     this.phase = this.compressed && this.validateFrame || !this.compressed && this.expected ? 'validating' : 'replaying'
     this.baseVerified = !this.expected
     if (!this.compressed && this.expected) this.phase = 'validating'
-    const actual = await fs.realpath(this.source.path), root = await fs.realpath(this.source.allowedRoot)
-    if (!actual.startsWith(root + sep) || !/\.jsonl(?:\.zst)?$/.test(actual)) throw fail('record-path-unverified')
     const stat = await fs.lstat(actual)
     if (!stat.isFile() || typeof process.getuid === 'function' && stat.uid !== process.getuid()) throw fail('record-path-unverified')
     this.handle = await fs.open(actual, fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW)
     const opened = await this.handle.stat()
     if (signature(opened) !== signature(stat)) throw fail('record-file-replaced')
-    this.physical = { signature: signature(stat), fileId: `${stat.dev}:${stat.ino}`, pathHash: hash(resolve(this.source.path)) }
+    this.physical = { signature: signature(stat), fileId: `${stat.dev}:${stat.ino}`, pathHash: hash(resolve(path)) }
     if (this.saved?.io?.pathHash === this.physical.pathHash) {
       if (this.saved.io.fileId !== this.physical.fileId) throw fail('record-file-replaced')
       const priorSize = Number(this.saved.io.signature?.split(':')[2])
@@ -117,7 +124,7 @@ export class NativeJsonlSource {
     return { key: this.key, headerHash: this.headerHash, revision: this.expected?.revision ?? 0, base: this.expected?.prefix ?? null, verifiedBase: this.expected ? this.verifiedBase ?? this.expected.prefix : null, next, complete: !this.compressed || this.validated === true }
   }
   async guard() {
-    const [path, opened] = await Promise.all([fs.lstat(this.source.path), this.handle.stat()])
+    const [path, opened] = await Promise.all([fs.lstat(this.path), this.handle.stat()])
     if (!path.isFile() || `${path.dev}:${path.ino}` !== this.physical.fileId || `${opened.dev}:${opened.ino}` !== this.physical.fileId) throw fail('record-file-replaced')
     if (this.compressed && signature(opened) !== this.physical.signature) throw fail('record-rewrite-suspected')
     if (!this.compressed) {

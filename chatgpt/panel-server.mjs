@@ -91,9 +91,10 @@ export async function startPanelServer({ read, control, modelSettings, installat
         try { return { content: [{ type: 'text', text: '通知偏好已保存' }], structuredContent: await installationNotifications.save(change, { signal: extra.signal }) } }
         catch (error) {
           const failure = error?.coreRequestFailure
+          const unsupported = error?.code === 'core_feature_unsupported' && error.coreCapabilityFailure?.operation === '/v1/notifications/installations/preferences'
           const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
-            && error?.code !== 'analysis_config_unconfirmed' && failure?.operation === '/v1/notifications/installations/preferences'
-            && failure.kind === 'http' && failure.status >= 400 && failure.status <= 599
+            && (unsupported || error?.code !== 'analysis_config_unconfirmed' && failure?.operation === '/v1/notifications/installations/preferences'
+              && failure.kind === 'http' && failure.status >= 400 && failure.status <= 599)
           return { isError: true, content: [{ type: 'text', text: String(error?.message ?? error) }], structuredContent: { saveOutcome: rejected ? 'rejected' : 'unknown' } }
         }
       })

@@ -48,6 +48,74 @@ test('plain and zstd observations of one native storage generation preserve reco
   await compressed.close(); assert.equal(compressed.handle, null)
 })
 
+test('a retained plaintext metadata path reads the same archived generation after zstd compaction', async t => {
+  const f = await fixture(t), plain = f.open(false)
+  const expected = await collect(plain)
+  const checkpoint = JSON.parse(JSON.stringify(plain.checkpoint()))
+  await plain.close(); await fs.rm(f.path)
+  const reader = f.open(false), rows = []; let view
+  for (let pump = 0; pump < 20; pump++) {
+    view = await reader.pump(); rows.push(...view.materials, ...view.recentLifecycle)
+    if (['caught-up', 'gap'].includes(view.coverage)) break
+  }
+  assert.equal(view.coverage, 'caught-up', JSON.stringify({ gap: view.gap, error: view.error }))
+  assert.deepEqual(rows.map(row => [row.data?.nativeRecordId ?? row.nativeRecordId, row.text]), expected.map(row => [row.data?.nativeRecordId ?? row.nativeRecordId, row.text]))
+  await reader.close()
+  const restored = f.open(false, checkpoint)
+  assert.deepEqual(await collect(restored), [], 'compaction does not replay acknowledged material')
+  assert.equal(restored.checkpoint().offset, checkpoint.offset)
+})
+
+test('a missing plaintext and compressed record keeps its precise ENOENT failure', async t => {
+  const f = await fixture(t)
+  await fs.rm(f.path); await fs.rm(f.path + '.zst')
+  const view = await f.open(false).pump()
+  assert.equal(view.coverage, 'gap'); assert.equal(view.gap, 'record-source-unavailable')
+  assert.deepEqual(view.error, { code: 'ENOENT' })
+  assert.deepEqual(view.materials, []); assert.deepEqual(view.recentLifecycle, [])
+})
+
+test('an existing plaintext record stays authoritative over a compressed sibling', async t => {
+  const f = await fixture(t)
+  await fs.writeFile(f.path + '.zst', 'invalid compressed sibling')
+  assert.equal((await collect(f.open(false))).length, 4)
+})
+
+test('plaintext permission failure does not select an available compressed sibling', async t => {
+  const f = await fixture(t), lstat = fs.lstat
+  t.mock.method(fs, 'lstat', async (path, ...args) => {
+    if (String(path) === f.path) throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+    return lstat(path, ...args)
+  })
+  const view = await f.open(false).pump()
+  assert.equal(view.coverage, 'gap'); assert.deepEqual(view.error, { code: 'EACCES' })
+  assert.deepEqual(view.materials, []); assert.deepEqual(view.recentLifecycle, [])
+})
+
+test('compressed sibling resolution rejects an escape and a dangling plaintext symlink', async t => {
+  const f = await fixture(t), outside = await fs.mkdtemp(join(tmpdir(), 'sentinel-codec-outside-'))
+  t.after(() => fs.rm(outside, { recursive: true, force: true }))
+  const target = join(outside, 'record.jsonl.zst')
+  await fs.rename(f.path + '.zst', target); await fs.rm(f.path)
+  await fs.symlink(target, f.path + '.zst')
+  const escaped = await f.open(false).pump()
+  assert.equal(escaped.gap, 'record-path-unverified'); assert.deepEqual(escaped.materials, [])
+  await fs.rm(f.path + '.zst'); await fs.copyFile(target, f.path + '.zst')
+  await fs.symlink(join(f.dir, 'missing.jsonl'), f.path)
+  const dangling = await f.open(false).pump()
+  assert.equal(dangling.gap, 'record-source-unavailable'); assert.deepEqual(dangling.error, { code: 'ENOENT' })
+  assert.deepEqual(dangling.materials, [])
+})
+
+test('a compressed sibling with a corrupt frame publishes no material', async t => {
+  const f = await fixture(t)
+  await fs.rm(f.path)
+  const bytes = await fs.readFile(f.path + '.zst'); await fs.writeFile(f.path + '.zst', bytes.subarray(0, bytes.length - 2))
+  const reader = f.open(false), rows = []; let view
+  for (let pump = 0; pump < 20; pump++) { view = await reader.pump(); rows.push(...view.materials, ...view.recentLifecycle); if (view.coverage === 'gap') break }
+  assert.equal(view.gap, 'compressed-data-invalid'); assert.deepEqual(rows, [])
+})
+
 test('high-ratio compressed input counts decoded production independently and releases a partial decoder on close', async t => {
   const f = await fixture(t, 'x'.repeat(3 * 1024 * 1024)), reader = f.open(true)
   let physical = 0, decoded = 0, view
@@ -92,6 +160,18 @@ test('four live compressed leases bound decoder allocation and queued readers re
   for (const reader of readers.slice(4)) { const queued = await reader.pump(); assert.equal(queued.readBytes, 0); assert.equal(queued.decodedBytes, 0); assert.equal(queued.coverage, 'catching-up'); assert.equal(reader.handle, null) }
   await readers[0].close()
   assert.equal((await readers[4].pump()).coverage, 'catching-up'); assert.ok(readers[4].handle)
+})
+
+test('compressed siblings keep the existing four-decoder limit and close queued readers', async t => {
+  const f = await fixture(t, 'x'.repeat(2 * 1024 * 1024))
+  await fs.rm(f.path)
+  const readers = Array.from({ length: 8 }, () => f.open(false))
+  for (const reader of readers.slice(0, 4)) assert.equal((await reader.pump()).coverage, 'catching-up')
+  for (const reader of readers.slice(4)) { const queued = await reader.pump(); assert.equal(queued.readBytes, 0); assert.equal(queued.decodedBytes, 0); assert.equal(reader.handle, null) }
+  await readers[0].close()
+  assert.equal((await readers[4].pump()).coverage, 'catching-up'); assert.ok(readers[4].handle)
+  await Promise.all(readers.map(reader => reader.close()))
+  assert.ok(readers.every(reader => reader.handle === null))
 })
 
 

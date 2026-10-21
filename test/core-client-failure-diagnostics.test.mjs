@@ -8,24 +8,28 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { req } from './dsh-native-runtime.mjs'
 import { createAdapter } from '../dsh/host.mjs'
 import { connectCore } from '../src/core-client.mjs'
+import { INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE } from '../src/protocol.mjs'
+import { startPanelServer } from '../chatgpt/panel-server.mjs'
 
 const { Context } = req('@deepseek-ai/cordis')
 async function until(predicate) {
   const deadline = performance.now() + 5000
   while (!await predicate()) { assert.ok(performance.now() < deadline, 'controlled transport did not reach the expected public state'); await new Promise(resolve => setTimeout(resolve, 5)) }
 }
-async function fixture(t) {
+async function fixture(t, features = []) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-failure-diagnostics-'))
   const token = randomBytes(32).toString('hex'), instanceId = randomUUID(), ctx = new Context()
-  const faults = new Map(), held = new Set(), sockets = new Set(), clients = []
+  const faults = new Map(), hits = new Map(), held = new Set(), sockets = new Set(), clients = []
   const server = createServer(async (request, response) => {
     for await (const _chunk of request) {}
     assert.equal(request.headers.authorization, `Bearer ${token}`)
+    const operation = request.url.split('?')[0]
+    hits.set(operation, (hits.get(operation) ?? 0) + 1)
     const fault = faults.get(request.url.split('?')[0])
     if (fault === 'held') { held.add(response); response.once('close', () => held.delete(response)); return }
     response.setHeader('content-type', 'application/json')
     if (fault) { response.writeHead(fault.status ?? 503); response.end(fault.raw ?? JSON.stringify(fault.body)); return }
-    if (request.url === '/v1/health') response.end(JSON.stringify({ protocol: 1, instanceId, features: [] }))
+    if (request.url === '/v1/health') response.end(JSON.stringify({ protocol: 1, instanceId, features }))
     else if (request.url === '/v1/source/register') response.end(JSON.stringify('owned-source'))
     else if (request.url === '/v1/snapshot') response.end(JSON.stringify({ protocol: 1, generatedAt: Date.now(), monitoring: 'active', sources: [], tasks: [] }))
     else response.end(JSON.stringify({ accepted: 0 }))
@@ -48,8 +52,68 @@ async function fixture(t) {
     await rm(dataDir, { recursive: true, force: true })
   })
   await until(() => adapter.connected && !adapter.diagnostics().adapter.tickInFlight)
-  return { adapter, faults, held, token, async client() { const value = await connectCore({ dataDir }); clients.push(value); return value } }
+  return { adapter, faults, hits, held, token, async client() { const value = await connectCore({ dataDir }); clients.push(value); return value } }
 }
+
+test('an existing older Core rejects unsupported notification settings before sending unknown endpoints', async t => {
+  const f = await fixture(t, ['installation-model-settings/1']), client = await f.client()
+  const before = f.adapter.diagnostics().adapter.communicationFailure
+  for (const operation of ['/v1/notifications/installations/preferences', '/v1/notifications/installations/records']) f.faults.set(operation, { status: 404, body: { error: 'unknown endpoint' } })
+  for (const read of [() => client.installationNotificationPreferences('owned-installation'), () => client.installationNotificationRecords('owned-installation'), () => client.setInstallationNotificationPreference('owned-installation', 'task-alert', false)]) {
+    const error = await read().catch(error => error)
+    assert.equal(error.code, 'core_feature_unsupported')
+    assert.equal(error.coreCapabilityFailure.feature, INSTALLATION_NOTIFICATION_RECORDS_FEATURE)
+    assert.match(error.message, /共享核心.*更新/)
+    assert.equal(error.coreRequestFailure, undefined, 'missing capability is not a transport failure')
+  }
+  assert.equal(f.hits.has('/v1/notifications/installations/preferences'), false)
+  assert.equal(f.hits.has('/v1/notifications/installations/records'), false)
+  assert.equal((await client.snapshot()).monitoring, 'active')
+  assert.equal(f.adapter.connected, true)
+  assert.deepEqual(f.adapter.diagnostics().adapter.communicationFailure, before)
+})
+
+test('notification reads remain available without revocation but changing preferences requires it', async t => {
+  const f = await fixture(t, [INSTALLATION_NOTIFICATION_RECORDS_FEATURE]), client = await f.client()
+  await client.installationNotificationPreferences('owned-installation')
+  await client.installationNotificationRecords('owned-installation')
+  const before = f.hits.get('/v1/notifications/installations/preferences')
+  await assert.rejects(client.setInstallationNotificationPreference('owned-installation', 'task-alert', false), error => error.code === 'core_feature_unsupported' && error.coreCapabilityFailure.feature === NOTIFICATION_REVOCATION_FEATURE)
+  assert.equal(f.hits.get('/v1/notifications/installations/preferences'), before, 'unsupported write must not reach the old Core')
+})
+
+test('current Core notification calls retain normal requests and cancellation semantics', async t => {
+  const f = await fixture(t, [INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE]), client = await f.client()
+  await client.installationNotificationPreferences('owned-installation')
+  await client.installationNotificationRecords('owned-installation')
+  await client.setInstallationNotificationPreference('owned-installation', 'task-alert', false)
+  assert.equal(f.hits.get('/v1/notifications/installations/preferences'), 2)
+  assert.equal(f.hits.get('/v1/notifications/installations/records'), 1)
+  const controller = new AbortController(), reason = new Error('caller stopped')
+  controller.abort(reason)
+  await assert.rejects(client.installationNotificationRecords('owned-installation', {}, controller.signal), error => error === reason)
+  await client.close()
+  await assert.rejects(client.installationNotificationPreferences('owned-installation'), /core client closed/)
+})
+
+test('unsupported notification writes are known rejections in both production bridges', async t => {
+  const f = await fixture(t), client = await f.client()
+  const panel = await startPanelServer({ token: f.token, read: async () => ({}), installationNotifications: {
+    read: () => client.installationNotificationPreferences('owned-installation'),
+    save: ({ kind, enabled }) => client.setInstallationNotificationPreference('owned-installation', kind, enabled),
+  } })
+  t.after(() => panel.close())
+  const response = await fetch(panel.url + '/mcp', { method: 'POST', headers: { authorization: `Bearer ${f.token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_set_installation_notification_preference', arguments: { kind: 'task-alert', enabled: false } } }) })
+  const result = (await response.json()).result
+  assert.equal(result.isError, true)
+  assert.equal(result.structuredContent.saveOutcome, 'rejected')
+  assert.match(result.content[0].text, /共享核心.*更新/)
+  const error = await f.adapter.setInstallationNotificationPreference('task-alert', false).catch(error => error)
+  assert.equal(error.code, 'core_feature_unsupported')
+  assert.equal(error.details.saveOutcome, 'rejected')
+  assert.equal(f.hits.has('/v1/notifications/installations/preferences'), false)
+  assert.equal(f.adapter.connected, true)
+})
 
 test('communication diagnostics retain the first read failure through later source failures and connection recovery', async t => {
   const f = await fixture(t), secret = `Bearer ${f.token}`

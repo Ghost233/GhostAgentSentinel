@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
-import { PROTOCOL, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
+import { PROTOCOL, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
 
 export const defaultDataDir = join(homedir(), '.ghost-agent-sentinel')
 
@@ -47,7 +47,7 @@ async function liveRuntime(dataDir, signal) {
     if (runtime.protocol !== PROTOCOL || !/^http:\/\/127\.0\.0\.1:\d+$/.test(runtime.url) || !/^[a-f0-9]{64}$/.test(runtime.token)) return null
     const health = await request(runtime, '/v1/health', undefined, signal)
     if (health.instanceId !== runtime.instanceId || health.protocol !== PROTOCOL) return null
-    return runtime
+    return { ...runtime, features: Array.isArray(health.features) ? health.features : [] }
   } catch (error) { signal?.throwIfAborted(); return null }
 }
 
@@ -106,6 +106,13 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
   const active = new Map(), tracking = { deadlineTimers: 0 }
   const call = (path, body, requestSignal) => {
     if (closed) return Promise.reject(new Error('core client closed'))
+    if (path.startsWith('/v1/notifications/installations/')) {
+      const required = [INSTALLATION_NOTIFICATION_RECORDS_FEATURE, ...(body === undefined ? [] : [NOTIFICATION_REVOCATION_FEATURE])]
+      const missing = required.find(feature => !runtime.features.includes(feature))
+      if (missing) return Promise.reject(requestSignal?.aborted ? requestSignal.reason : Object.assign(new Error('共享核心尚不支持此通知功能，请先更新共享核心。'), {
+        code: 'core_feature_unsupported', coreCapabilityFailure: Object.freeze({ operation: path.split('?')[0], feature: missing }),
+      }))
+    }
     const controller = new AbortController()
     const combined = requestSignal ? AbortSignal.any([controller.signal, requestSignal]) : controller.signal
     const pending = request(runtime, path, body, combined, tracking)
