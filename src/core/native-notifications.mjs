@@ -41,7 +41,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     return outcome.enrollmentPhase === 'initial-unanchored' && baseline?.complete && baseline.id === owner.descriptor.initialEnrollmentBaseline?.id ? 'initial-unanchored' : 'unknown';
   }
   function rollupKey(receipt, owner) {
-    return JSON.stringify([owner.descriptor.registrationId, receipt.error.stage, receipt.error.category, receipt.error.code, receipt.error.codeHash ?? null, receipt.error.status ?? null]);
+    return JSON.stringify([owner.descriptor.registrationId, ...(receipt.error.code.startsWith('cursor-') && receipt.enrollmentPhase !== 'initial-unanchored' ? ['cursor-recovery', owner.descriptor.hostRunId] : []), receipt.error.stage, receipt.error.category, receipt.error.code, receipt.error.codeHash ?? null, receipt.error.status ?? null]);
   }
   function reconcileRollups() {
     for (const value of rollups.values()) {
@@ -138,10 +138,11 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     const owner = sources.get(receipt.sourceKey);
     if (owner?.descriptor.policy !== 'chatgpt-main/1') return;
     const current = now(), initial = receipt.enrollmentPhase === 'initial-unanchored' && receipt.domain === 'collection' && receipt.mainId !== null && receipt.lifecycleId === null;
-    let rollup = initial ? [...rollups.values()].find(value => value.key === rollupKey(receipt, owner) && !value.closedAt) : null;
-    if (initial && !rollup && rollups.size < GROUP_LIMIT) rollup = { id: randomUUID(), key: rollupKey(receipt, owner), registrationId: owner.descriptor.registrationId, consumed: false, incomplete: false, membersSeen: 0, closedAt: null, attempt: null };
+    const recovery = !initial && receipt.domain === 'collection' && receipt.mainId !== null && receipt.lifecycleId === null && receipt.error.code.startsWith('cursor-');
+    let rollup = initial || recovery ? [...rollups.values()].find(value => value.key === rollupKey(receipt, owner) && !value.closedAt) : null;
+    if ((initial || recovery) && !rollup && rollups.size < GROUP_LIMIT) rollup = { id: randomUUID(), key: rollupKey(receipt, owner), registrationId: owner.descriptor.registrationId, consumed: false, incomplete: false, membersSeen: 0, closedAt: null, attempt: null };
     if (rollup && [...notifications.values()].some(value => value.rollupId === rollup.id && (value.sourceKey !== receipt.sourceKey || value.hostRunId !== owner.descriptor.hostRunId))) rollup = { ...rollup, incomplete: true };
-    if (initial && !rollup) { historyGap = true; persist(); }
+    if ((initial || recovery) && !rollup) { historyGap = true; persist(); }
     const groupKey = JSON.stringify(['monitoring-failure', receipt.sourceKey, receipt.mainId, receipt.lifecycleId, ...(rollup ? [rollup.id] : [])]);
     let value = [...notifications.values()].find(value => value.kind === 'monitoring-failure' && value.groupKey === groupKey && value.status === 'pending' && value.receiptIds.length < 100 && current - value.createdAt < 3000);
     value = value ? copy(value) : { id: randomUUID(), kind: 'monitoring-failure', sourceKey: receipt.sourceKey, hostRunId: owner.descriptor.hostRunId, mainId: receipt.mainId, lifecycleId: receipt.lifecycleId, groupKey, members: [], receiptIds: [], firstRoundIds: [], evidenceThrough: receipt.firstFailedAt, createdAt: current, readyAt: current, status: 'pending', delivery: 'unknown', seen: 'unknown', humanSeen: 'unknown', claimedAt: null };
@@ -150,7 +151,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     value.receiptIds.push(receipt.id); value.firstRoundIds.push(receipt.firstRoundId);
     value.title = 'GhostSentinel · 监控状态提醒';
     value.body = `来源：${value.sourceKey}\n主聊天：${value.mainId ?? '身份未确认'}\n执行：${value.lifecycleId ?? '身份未确认'}\n已记录 ${value.receiptIds.length} 项监控故障（${receipt.domain} / ${receipt.error.category} / ${receipt.error.code}）；请在会话检查核对故障回执，当前是否恢复另行显示。`.slice(0, 1200);
-    if (rollup) value.body = '首次接入部分聊天时读取失败；同类问题将在会话检查中持续汇总。每个聊天仍保留独立故障回执，当前是否恢复另行显示。';
+    if (rollup) value.body = recovery ? `恢复读取进度时出现同类采集故障（${receipt.error.code}）；同轮故障合并提醒，每个聊天仍保留独立回执，当前是否恢复另行显示。` : '首次接入部分聊天时读取失败；同类问题将在会话检查中持续汇总。每个聊天仍保留独立故障回执，当前是否恢复另行显示。';
     const link = { id: receipt.id, sequence: receipt.sequence, firstFailedAt: receipt.firstFailedAt, notificationId: value.id, ...(rollup ? { rollupId: rollup.id } : {}) };
     const previous = { sequence, receiptPrunedThrough, historyGap };
     let evictedRollup = null;

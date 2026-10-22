@@ -54,6 +54,7 @@ export class ForkHistoryReader {
   node(source, saved, history) {
     if (this.nodes.length >= MAX_DEPTH) throw failure('fork-history-depth-limit')
     if (saved && !validForkProof(saved.proof)) this.gap = 'cursor-invalid'
+    if (history && this.source.nativeOriginVersion === 2 && this.origins) source = { ...source, hostRunId: this.source.hostRunId, hostStartedAt: this.source.hostStartedAt }
     const options = { mode: history ? 'history' : 'material', forkSuffix: !history, origins: this.origins }
     const fresh = new BoundedReader(source, null, options)
     const reader = saved?.reader && JSON.stringify(saved.reader) !== JSON.stringify(fresh.checkpoint()) ? new BoundedReader(source, saved.reader, options) : fresh
@@ -87,7 +88,7 @@ export class ForkHistoryReader {
       throw error
     } finally {
       const completedGuard = options.verifyOnly && node.complete
-      if (node.history && node.reader.handle && node.reader.pendingBytes === 0 && (node.source.nativeOriginVersion !== 2 || view?.coverage === 'caught-up' || completedGuard && !node.reader.io?.revalidation)) {
+      if (node.history && node.reader.handle && node.reader.pendingBytes === 0 && (node.source.nativeOriginVersion !== 2 || view?.coverage === 'caught-up' || completedGuard && !node.reader.io?.revalidation && !node.reader.recoveryCheckpoint)) {
         const cursor = completedGuard ? this.position(node, node.ack) : node.reader.checkpoint(), stat = node.reader.stat
         await node.reader.close()
         node.reader = new BoundedReader(node.source, cursor, { mode: 'history', origins: this.origins })
@@ -100,7 +101,18 @@ export class ForkHistoryReader {
     const node = this.nodes[saved.frame]
     if (!Number.isInteger(saved.frame) || !node || node.resolved || !saved.metadata?.record || !saved.metadata?.owner || !Array.isArray(saved.candidates) || saved.candidates.length > MAX_CANDIDATES || !saved.candidates.every(path => typeof path === 'string' && isAbsolute(path)) || !Number.isInteger(saved.index) || saved.index < 0 || saved.index > saved.candidates.length || !Array.isArray(saved.matches) || saved.matches.length > MAX_CANDIDATES || !Array.isArray(saved.seenFiles) || saved.seenFiles.length > MAX_CANDIDATES || !['header', 'prefix', undefined].includes(saved.phase) || saved.probe && (!saved.probe.source || !saved.probe.reader) || saved.phase === 'prefix' && !saved.expectedHeader) { this.gap = 'cursor-invalid'; return }
     const { frame, probe, ...resolution } = saved
-    node.resolution = { ...clone(resolution), seenFiles: new Set(saved.seenFiles), probe: probe ? new BoundedReader(probe.source, probe.reader, { mode: saved.phase === 'header' ? 'header' : 'history-metadata', forkSuffix: saved.phase === 'header', origins: saved.phase === 'header' ? null : this.origins }) : null }
+    let resumed = probe
+    if (probe && this.source.nativeOriginVersion === 2 && this.origins && probe.source.hostRunId !== this.source.hostRunId) {
+      // A pending metadata probe has its previous source, so its old binding
+      // can be checked exactly even before an ancestor origin was accepted.
+      const options = { mode: saved.phase === 'header' ? 'header' : 'history-metadata', forkSuffix: saved.phase === 'header', origins: saved.phase === 'header' ? null : this.origins }
+      const previous = new BoundedReader(probe.source, probe.reader, options)
+      if (previous.gap || previous.scope !== probe.reader.scope || JSON.stringify(probe.source.profile) !== JSON.stringify(this.source.profile)) { this.gap = 'cursor-invalid'; return }
+      const source = { ...probe.source, hostRunId: this.source.hostRunId, hostStartedAt: this.source.hostStartedAt }, fresh = new BoundedReader(source, null, options)
+      resumed = { source, reader: { ...probe.reader, scope: fresh.scope, storageScope: fresh.storageScope } }
+    }
+    if (this.source.nativeOriginVersion === 2 && this.origins) resolution.matches = resolution.matches.map(match => ({ ...match, source: { ...match.source, hostRunId: this.source.hostRunId, hostStartedAt: this.source.hostStartedAt } }))
+    node.resolution = { ...clone(resolution), seenFiles: new Set(saved.seenFiles), probe: resumed ? new BoundedReader(resumed.source, resumed.reader, { mode: saved.phase === 'header' ? 'header' : 'history-metadata', forkSuffix: saved.phase === 'header', origins: saved.phase === 'header' ? null : this.origins }) : null }
   }
 
   async qualify(id, expected = null, candidate = null) {
@@ -378,7 +390,7 @@ export class ForkHistoryReader {
   }
 
   view(output = {}, reason = null) {
-    const current = this.current.reader.view(), revalidating = this.nodes.some(node => node.reader.io?.revalidation), waiting = revalidating || this.budgetWaiting
+    const current = this.current.reader.view(), revalidating = this.nodes.some(node => node.reader.io?.revalidation || node.reader.recoveryCheckpoint), waiting = revalidating || this.budgetWaiting
     const currentBatch = Boolean(output.materials?.length || output.recentLifecycle?.length)
     const complete = this.current.resolved && (!this.current.parent || this.current.parent.complete && this.current.boundaryDelivered) && !waiting && !this.historyGap && (!currentBatch || this.historyVerified)
     const currentWaiting = this.current.reader.io?.revalidation || this.current.pending.length || this.currentGuardedOutput
@@ -537,7 +549,7 @@ export class ForkHistoryReader {
           budget.bytes -= checked.readBytes; output.readBytes += checked.readBytes; budget.decoded -= checked.decodedBytes ?? 0; output.decodedBytes += checked.decodedBytes ?? 0
           if (checked.coverage === 'gap') { this.error = checked.error; throw failure(checked.gap) }
         }
-        if (this.nodes.some(node => node.reader.io?.revalidation)) return await finishCurrent()
+        if (this.nodes.some(node => node.reader.io?.revalidation || node.reader.recoveryCheckpoint)) return await finishCurrent()
         if (this.guardedOutput) {
           const history = ['historyMaterials', 'historyLifecycle', 'historyBoundaries']
           for (const channel of history) output[channel] = this.guardedOutput[channel]
@@ -578,7 +590,7 @@ export class ForkHistoryReader {
           budget.bytes -= guarded.readBytes; output.readBytes += guarded.readBytes; budget.decoded -= guarded.decodedBytes ?? 0; output.decodedBytes += guarded.decodedBytes ?? 0
           if (guarded.coverage === 'gap') { this.error = guarded.error; throw failure(guarded.gap) }
         }
-        if (this.nodes.some(node => node.reader.io?.revalidation)) holdOutput()
+        if (this.nodes.some(node => node.reader.io?.revalidation || node.reader.recoveryCheckpoint)) holdOutput()
         else if (!this.guardedOutput) { this.guardedCheckpoint = null; this.historyVerified = true }
         if (this.closed) return this.view({ readBytes: output.readBytes })
         return await finishCurrent()
@@ -639,7 +651,7 @@ export class ForkHistoryReader {
 
   position(node, cursor) {
     const learned = node.reader.checkpoint()
-    return clone({ ...cursor, ...(node.source.nativeOriginVersion === 2 ? { io: learned.io ?? cursor.io } : {}), fileId: cursor.fileId ?? learned.fileId, attachSize: cursor.attachSize ?? learned.attachSize, knownSize: cursor.knownSize == null && learned.knownSize == null ? null : Math.max(cursor.knownSize ?? 0, learned.knownSize ?? 0) })
+    return clone({ ...cursor, ...(node.source.nativeOriginVersion === 2 ? { scope: learned.scope, storageScope: learned.storageScope, io: learned.io ?? cursor.io } : {}), fileId: cursor.fileId ?? learned.fileId, attachSize: cursor.attachSize ?? learned.attachSize, knownSize: cursor.knownSize == null && learned.knownSize == null ? null : Math.max(cursor.knownSize ?? 0, learned.knownSize ?? 0) })
   }
 
   diagnostics() { return { readers: this.nodes.reduce((sum, node) => sum + Number(Boolean(node.reader.handle)) + Number(Boolean(node.resolution?.probe?.handle)) + Number(Boolean(node.verifier?.handle)), 0), pendingEvents: this.nodes.reduce((sum, node) => sum + node.pending.length, 0), ancestryNodes: this.nodes.length, metadataCalls: this.metadataCalls ?? 0, maximumMetadataCalls: this.maximumMetadataCalls ?? 0, busy: Boolean(this.busy) } }

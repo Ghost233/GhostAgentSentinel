@@ -9,7 +9,7 @@ import { resolve, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { NativeJsonlSource, nativeStorageKey } from './native-jsonl-source.mjs';
 import { nativeRecordIdentity } from '../src/fork-proof.mjs';
-import { normalizeNativePrefix } from '../src/native-origin.mjs';
+import { headerIdentity, normalizeNativePrefix } from '../src/native-origin.mjs';
 import { supportedProfile, supportsHostProfile, supportsStorageProducer, hostProfileKey as profileKey } from './storage-compatibility.mjs';
 
 const values = value => value === none ? [] : isMany(value) ? value.values : [value];
@@ -97,7 +97,14 @@ export class BoundedReader {
     this.hostProfileKey = profileKey(source.profile);
     this.scanOnly = scanOnly; this.scanStart = null; this.coldScan = null; this.coldCheckpoint = null; this.terminalProof = terminalProof; this.successorProof = successorProof;
     this.originIdentity = this.nativeOriginVersion === 2 ? 'native-storage/2:' + nativeStorageKey(source.path) : null;
-    this.scope = digest(JSON.stringify([this.nativeOriginVersion === 2 ? this.originIdentity : typeof source.path === 'string' ? resolve(source.path) : '', source.threadId, source.hostRunId, profileKey(source.profile), ...(this.ordinalMode ? [mode, source.forkedFromId ?? null, this.historyRange, this.nativeOriginVersion === 2 ? null : source.expectedFileId ?? null, source.expectedHeader ?? null] : [])]));
+    const binding = [this.nativeOriginVersion === 2 ? this.originIdentity : typeof source.path === 'string' ? resolve(source.path) : '', source.threadId, source.hostRunId, profileKey(source.profile), ...(this.ordinalMode ? [mode, source.forkedFromId ?? null, this.historyRange, this.nativeOriginVersion === 2 ? null : source.expectedFileId ?? null, source.expectedHeader ?? null] : [])];
+    this.scope = digest(JSON.stringify(binding));
+    this.storageScope = digest(JSON.stringify(binding.filter((_, index) => index !== 2)));
+    // Legacy v2 cursors only stored a Host-bound hash. Rebinding requires the
+    // retained Core origin and a fresh physical/header/prefix verification.
+    const recovering = cursor && this.nativeOriginVersion === 2 && origins && cursor.scope !== this.scope && /^[a-f0-9]{64}$/.test(cursor.scope ?? '') && (cursor.storageScope === undefined || cursor.storageScope === this.storageScope);
+    this.recoveryCheckpoint = recovering ? structuredClone(cursor) : null;
+    this.recoveryFence = null;
     this.state = emptyState();
     this.offset = 0; this.committed = 0; this.pendingBytes = 0;
     this.rolling = Buffer.alloc(0); this.committedTail = Buffer.alloc(0);
@@ -116,10 +123,10 @@ export class BoundedReader {
     else if (cursor && this.materialMode && cursor.nativeOriginVersion !== this.nativeOriginVersion) this.gap = 'cursor-invalid';
     else if (cursor && this.materialMode && cursor.state?.header && cursor.header?.threadId !== source.threadId) this.gap = 'cursor-invalid';
     else if (cursor?.state?.header && cursor.header && !producerAllowed(source, cursor.header.cliVersion)) this.gap = 'cursor-invalid';
-    const pristineV2 = cursor && this.nativeOriginVersion === 2 && cursor.format === 3 && cursor.scope === this.scope && cursor.offset === 0 && cursor.fileId === null && cursor.knownSize === null && cursor.attachSize === null && cursor.state?.header === false && cursor.state?.anchored === false && cursor.state?.phase === 'unknown' && cursor.state?.turnId === null && cursor.gap === null;
+    const pristineV2 = cursor && this.nativeOriginVersion === 2 && cursor.format === 3 && (cursor.scope === this.scope || recovering) && cursor.offset === 0 && cursor.fileId === null && cursor.knownSize === null && cursor.attachSize === null && cursor.state?.header === false && cursor.state?.anchored === false && cursor.state?.phase === 'unknown' && cursor.state?.turnId === null && cursor.gap === null;
     if (cursor && !this.gap && !pristineV2) {
       const s = cursor.state;
-      if (cursor.format !== (this.nativeOriginVersion === 2 ? 3 : 2) || cursor.scope !== this.scope || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || !Number.isSafeInteger(cursor.attachSize) || cursor.attachSize < 0 || !Number.isSafeInteger(cursor.knownSize) || cursor.knownSize < cursor.offset || cursor.knownSize < cursor.attachSize || !/^[0-9a-f]{64}$/.test(cursor.guardHash ?? '') || typeof cursor.fileId !== 'string' || cursor.fileId.length > 100 || this.ordinalMode && !(cursor.nextOrdinal === null && cursor.offset === 0 && s?.header === false) && (!Number.isSafeInteger(cursor.nextOrdinal) || cursor.nextOrdinal < 0) || typeof s?.header !== 'boolean' || typeof s?.anchored !== 'boolean' || !['unknown', 'started', 'completed', 'aborted'].includes(s?.phase) || s.turnId !== null && (typeof s.turnId !== 'string' || s.turnId.length > 128) || s.at !== null && !Number.isSafeInteger(s.at)) {
+      if (cursor.format !== (this.nativeOriginVersion === 2 ? 3 : 2) || cursor.scope !== this.scope && !recovering || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || !Number.isSafeInteger(cursor.attachSize) || cursor.attachSize < 0 || !Number.isSafeInteger(cursor.knownSize) || cursor.knownSize < cursor.offset || cursor.knownSize < cursor.attachSize || !/^[0-9a-f]{64}$/.test(cursor.guardHash ?? '') || typeof cursor.fileId !== 'string' || cursor.fileId.length > 100 || this.ordinalMode && !(cursor.nextOrdinal === null && cursor.offset === 0 && s?.header === false) && (!Number.isSafeInteger(cursor.nextOrdinal) || cursor.nextOrdinal < 0) || typeof s?.header !== 'boolean' || typeof s?.anchored !== 'boolean' || !['unknown', 'started', 'completed', 'aborted'].includes(s?.phase) || s.turnId !== null && (typeof s.turnId !== 'string' || s.turnId.length > 128) || s.at !== null && !Number.isSafeInteger(s.at)) {
         this.gap = 'cursor-invalid';
       } else {
         this.offset = this.committed = cursor.offset; this.fileId = cursor.fileId; this.guardHash = cursor.guardHash; this.attachSize = cursor.attachSize; this.knownSize = cursor.knownSize;
@@ -137,8 +144,9 @@ export class BoundedReader {
     }
     if (successorProof) {
       try {
-        if (this.nativeOriginVersion !== 2 || Object.keys(successorProof).length !== 7 || successorProof.key !== nativeStorageKey(source.path) || !/^[a-f0-9]{64}$/.test(successorProof.headerHash) || [successorProof.turnId, successorProof.previousTurnId].some(id => typeof id !== 'string' || !id || id.length > 128) || successorProof.turnId === successorProof.previousTurnId || !Number.isSafeInteger(successorProof.at) || successorProof.at < source.hostStartedAt + 1000 || !Number.isSafeInteger(successorProof.recordStart) || successorProof.recordStart < 0 || successorProof.prefix.offset <= successorProof.recordStart) throw new Error('invalid successor proof');
+        if (this.nativeOriginVersion !== 2 || Object.keys(successorProof).length !== 7 || successorProof.key !== nativeStorageKey(source.path) || !/^[a-f0-9]{64}$/.test(successorProof.headerHash) || [successorProof.turnId, successorProof.previousTurnId].some(id => typeof id !== 'string' || !id || id.length > 128) || successorProof.turnId === successorProof.previousTurnId || !Number.isSafeInteger(successorProof.at) || successorProof.at < 0 || !recovering && successorProof.at < source.hostStartedAt + 1000 || !Number.isSafeInteger(successorProof.recordStart) || successorProof.recordStart < 0 || successorProof.prefix.offset <= successorProof.recordStart) throw new Error('invalid successor proof');
         normalizeNativePrefix(successorProof.prefix);
+        if (successorProof.at < source.hostStartedAt + 1000) this.successorProof = null;
       } catch { this.gap = 'cursor-invalid'; }
     }
   }
@@ -146,6 +154,7 @@ export class BoundedReader {
   view(reason = null) {
     reason ??= this.closed ? 'reader-closed' : this.gap ?? (this.available === false ? 'source-unavailable' : null);
     const verification = this.nativeOriginVersion === 2 ? { recordRevalidating: Boolean(this.io?.revalidation) } : {};
+    if (this.recoveryCheckpoint && !reason) return { ...verification, coverage: 'catching-up', gap: 'cursor-revalidating', observed: emptyState(), effectivePhase: 'unknown', offset: this.committed, committedOffset: this.committed, pendingBytes: 0, recentLifecycle: [], materials: [], metrics: { ...this.metrics } };
     // ps lstart is precise to one second. Recompute this for restored cursors too.
     const terminalVerified = this.io?.terminalVerified && this.io.baseVerified && !this.io.revalidation && (!this.io.compressed || this.io.validated);
     const terminal = terminalVerified && this.terminalProof?.turnId === this.state.turnId ? this.terminalProof : null;
@@ -331,6 +340,16 @@ export class BoundedReader {
     let readBytes = 0, decodedBytes = 0;
     const previous = this.checkpoint();
     try {
+      if (this.recoveryCheckpoint && !this.recoveryFence) {
+        const saved = this.recoveryCheckpoint, key = nativeStorageKey(this.source.path);
+        const unread = saved.offset === 0 && saved.state?.header === false && saved.state?.anchored === false && saved.state?.phase === 'unknown' && saved.state?.turnId === null && saved.header === null && (!saved.io || saved.io.key === key && saved.io.offset === 0);
+        if (unread) this.recoveryCheckpoint = null;
+        else {
+          const fence = await this.origins.read(key);
+          if (!saved.io || saved.io.key !== key || saved.io.offset !== saved.offset || !saved.header || !fence || fence.key !== key || fence.headerHash !== headerIdentity(saved.header) || fence.prefix.offset < saved.offset) { this.gap = 'cursor-invalid'; return { ...this.view(), readBytes, decodedBytes, nativeOrigins: [] }; }
+          this.recoveryFence = fence;
+        }
+      }
       if (this.coldScan) {
         const scan = await this.coldScan.pump({ budgetBytes, maxEvents, decodedBudgetBytes, verifyOnly }); readBytes = scan.readBytes; decodedBytes = scan.decodedBytes; this.handle = this.coldScan.handle;
         if (scan.coverage === 'gap' && !['start-predates-host', 'host-start-time-overlap'].includes(scan.gap)) { this.gap = scan.gap; this.error = scan.error; await this.coldScan.close(); this.coldScan = null; }
@@ -349,12 +368,14 @@ export class BoundedReader {
         }
         return { ...this.view(), readBytes, decodedBytes, nativeOrigins: [] };
       }
-      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins: this.origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); const header = nativeHeader(row); if (!producerAllowed(this.source, header.cliVersion)) throw Object.assign(new Error('unverified native producer'), { code: 'record-producer-unverified' }); return header; } });
-      const value = await this.io.pump({ physicalBudget: budgetBytes, decodedBudget: decodedBudgetBytes, limit: this.historyRange?.endByteOffset ?? Infinity, verifyOnly }, bytes => {
+      const recoveryFence = this.recoveryFence, origins = recoveryFence ? { read: async key => key === recoveryFence.key ? recoveryFence : this.origins.read(key) } : this.origins;
+      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); const header = nativeHeader(row); if (!producerAllowed(this.source, header.cliVersion)) throw Object.assign(new Error('unverified native producer'), { code: 'record-producer-unverified' }); return header; } });
+      const value = await this.io.pump({ physicalBudget: budgetBytes, decodedBudget: decodedBudgetBytes, limit: this.historyRange?.endByteOffset ?? Infinity, verifyOnly: verifyOnly && !this.recoveryCheckpoint }, bytes => {
         this.attachSize ??= this.io.decodedSize;
         const before = this.offset; this.consume(bytes); return this.offset - before;
       });
       readBytes = value.physicalBytes; decodedBytes = value.decodedBytes; this.ioView = value;
+      if (this.recoveryCheckpoint && this.io.proof()) this.recoveryCheckpoint = null;
       this.handle = this.io.handle; if (!this.handle) return { ...this.view(), coverage: 'catching-up', readBytes, decodedBytes, nativeOrigins: [] }; this.fileId = this.io.physical.fileId;
       this.attachSize ??= value.decodedSize; this.knownSize = value.decodedSize;
       this.stat = value.decodedSize === null ? null : { size: value.decodedSize, mtimeMs: this.io.stat.mtimeMs };
@@ -381,8 +402,9 @@ export class BoundedReader {
   acknowledgeOrigins(fences) { this.io?.acknowledge(fences); }
 
   checkpoint() {
+    if (this.recoveryCheckpoint) return structuredClone(this.recoveryCheckpoint);
     if (this.coldScan) return structuredClone(this.coldCheckpoint);
-    return { format: this.nativeOriginVersion === 2 ? 3 : 2, ...(this.nativeOriginVersion === 2 ? { io: this.io?.checkpoint(this.committed) ?? this.ioCheckpoint ?? null } : {}), ...(this.terminalProof ? { terminalProof: this.terminalProof } : {}), ...(this.successorProof ? { successorProof: this.successorProof } : {}), scope: this.scope, offset: this.committed, attachSize: this.attachSize, knownSize: this.knownSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap, ...(this.ordinalMode ? { nextOrdinal: this.nextOrdinal, forkProvenance: this.forkProvenance, header: this.header ?? null } : {}), ...(this.materialMode ? { header: this.header ?? null, nativeOriginVersion: this.nativeOriginVersion, projectionMode: this.mode, turnTrigger: this.turnTrigger } : {}) };
+    return { format: this.nativeOriginVersion === 2 ? 3 : 2, ...(this.nativeOriginVersion === 2 ? { storageScope: this.storageScope, io: this.io?.checkpoint(this.committed) ?? this.ioCheckpoint ?? null } : {}), ...(this.terminalProof ? { terminalProof: this.terminalProof } : {}), ...(this.successorProof ? { successorProof: this.successorProof } : {}), scope: this.scope, offset: this.committed, attachSize: this.attachSize, knownSize: this.knownSize, fileId: this.fileId, guardHash: this.guardHash, state: { ...this.state }, gap: this.gap, ...(this.ordinalMode ? { nextOrdinal: this.nextOrdinal, forkProvenance: this.forkProvenance, header: this.header ?? null } : {}), ...(this.materialMode ? { header: this.header ?? null, nativeOriginVersion: this.nativeOriginVersion, projectionMode: this.mode, turnTrigger: this.turnTrigger } : {}) };
   }
 
   async close() {
@@ -395,7 +417,7 @@ export class BoundedReader {
       if (coldClosing) await coldClosing; else if (this.io) await ioClosing; else await this.handle?.close(); this.handle = null; this.projection = null;
       this.ioBuffer?.fill(0); this.ioBuffer = null;
       this.rolling.fill(0); this.committedTail.fill(0);
-      this.materials = []; this.recentLifecycle = []; this.turnTrigger = null; this.scanStart = null; this.coldScan = null; this.coldCheckpoint = null; this.terminalProof = null; this.successorProof = null;
+      this.materials = []; this.recentLifecycle = []; this.turnTrigger = null; this.scanStart = null; this.coldScan = null; this.coldCheckpoint = null; this.terminalProof = null; this.successorProof = null; this.recoveryCheckpoint = null; this.recoveryFence = null;
     })();
     return this.closing;
   }

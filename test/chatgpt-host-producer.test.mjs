@@ -74,12 +74,12 @@ test('an admitted Host does not admit an unknown or missing storage producer', a
   })
 })
 
-async function forkFixture(t, producer, { childProducer = currentHost.cliVersion, compressed = false } = {}) {
+async function forkFixture(t, producer, { childProducer = currentHost.cliVersion, compressed = false, largeHistory = false } = {}) {
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-host-fork-')), sessionsRoot = join(dir, 'sessions'), archived = join(dir, 'archived_sessions')
   await fs.mkdir(sessionsRoot); await fs.mkdir(archived)
   const parent = '00000000-0000-4000-8000-000000000162', path = join(sessionsRoot, 'rollout-' + owner + '.jsonl'), parentPath = join(archived, 'rollout-' + parent + '.jsonl' + (compressed ? '.zst' : ''))
   const prefix = row(0, 'session_meta', header(parent, producer)) + row(1, 'event_msg', start('inherited-turn'))
-    + row(2, 'event_msg', user(parent, 'inherited-turn', 'Keep the synthetic inherited limit'))
+    + row(2, 'event_msg', user(parent, 'inherited-turn', 'Keep the synthetic inherited limit'.repeat(largeHistory ? 3000 : 1)))
     + row(3, 'event_msg', { type: 'task_complete', turn_id: 'inherited-turn' })
   await fs.writeFile(parentPath, compressed ? zstdCompressSync(Buffer.from(prefix)) : prefix)
   await fs.writeFile(path, row(4, 'session_meta', { ...header(owner, childProducer), forked_from_id: parent, history_base: { thread_id: parent, end_ordinal_exclusive: 4, end_byte_offset: Buffer.byteLength(prefix) } })
@@ -99,8 +99,61 @@ async function forkFixture(t, producer, { childProducer = currentHost.cliVersion
     }
     return { view, materials, history, boundaries }
   }
-  return { collect }
+  return { collect, reader, source, native, sessionsRoot }
 }
+
+test('a completed native fork resumes its current and ancestor cursors under the new Host without replaying materials', async t => {
+  const f = await forkFixture(t, currentHost.cliVersion)
+  await fs.appendFile(f.source.path, row(7, 'event_msg', { type: 'task_complete', turn_id: 'turn' }))
+  const first = await f.collect(), saved = structuredClone(f.reader.checkpoint())
+  assert.equal(first.view.forkProvenance.complete, true)
+  const fences = new Map(saved.frames.map(frame => {
+    delete frame.reader.storageScope
+    const proof = frame.originProof
+    assert.ok(proof?.complete)
+    return [proof.key, { key: proof.key, headerHash: proof.headerHash, prefix: proof.next, revision: 1 }]
+  }))
+  await f.reader.close()
+  const restored = new ForkHistoryReader({ ...f.source, hostRunId: 'next-host', hostStartedAt: at + 1000 }, saved, { native: f.native, sessionsRoot: f.sessionsRoot, origins: { async read(key) { return fences.get(key) ?? null } } })
+  t.after(() => restored.close())
+  const materials = [], history = []; let view
+  for (let pump = 0; pump < 100; pump++) {
+    view = await restored.pump({ budgetBytes: 4096 })
+    materials.push(...view.materials); history.push(...view.historyMaterials)
+    if (view.coverage === 'caught-up' || view.coverage === 'gap') break
+  }
+  assert.equal(view.gap, null)
+  assert.equal(view.forkProvenance.complete, true)
+  assert.equal(view.effectivePhase, 'completed')
+  assert.deepEqual(materials, []); assert.deepEqual(history, [])
+  assert.deepEqual(restored.checkpoint().deliveryThrough, saved.deliveryThrough)
+})
+
+test('a legacy fork resumes a partially verified ancestor after the Host changes', async t => {
+  const f = await forkFixture(t, currentHost.cliVersion, { largeHistory: true })
+  await fs.appendFile(f.source.path, row(7, 'event_msg', { type: 'task_complete', turn_id: 'turn' }))
+  let saved
+  for (let pump = 0; pump < 10; pump++) {
+    await f.reader.pump({ budgetBytes: 32768 })
+    saved = structuredClone(f.reader.checkpoint())
+    if (saved.resolution?.probe?.reader.offset > 0) break
+  }
+  assert.ok(saved.resolution?.probe?.reader.offset > 0, 'the existing metadata probe is mid-prefix, with no accepted ancestor fence yet')
+  const fences = new Map(saved.frames.filter(frame => frame.originProof).map(frame => [frame.originProof.key, { key: frame.originProof.key, headerHash: frame.originProof.headerHash, prefix: frame.originProof.next, revision: 1 }]))
+  for (const frame of saved.frames) delete frame.reader.storageScope
+  delete saved.resolution.probe.reader.storageScope
+  await f.reader.close()
+  const restored = new ForkHistoryReader({ ...f.source, hostRunId: 'next-host', hostStartedAt: at + 1000 }, saved, { native: f.native, sessionsRoot: f.sessionsRoot, origins: { async read(key) { return fences.get(key) ?? null } } })
+  t.after(() => restored.close())
+  let view
+  for (let pump = 0; pump < 100; pump++) {
+    view = await restored.pump({ budgetBytes: 32768 })
+    if (view.coverage === 'caught-up' || view.coverage === 'gap' || view.forkProvenance.gap) break
+  }
+  assert.equal(view.gap, null)
+  assert.equal(view.forkProvenance.gap, null)
+  assert.equal(view.forkProvenance.complete, true)
+})
 
 test('the candidate Host reads a mixed old-producer ancestor and current-producer suffix without changing either proof mode', async t => {
   const f = await forkFixture(t, supportedProfile.cliVersion), result = await f.collect()
@@ -229,6 +282,76 @@ test('old producer progress is retained within one Host profile and explicitly r
   const independentlyVerified = await collect(f.open({ profile: currentHost }))
   assert.equal(independentlyVerified.view.coverage, 'caught-up')
   assert.deepEqual(independentlyVerified.materials.map(event => event.data.nativeRecordId), first.materials.map(event => event.data.nativeRecordId))
+})
+
+test('a new Host revalidates legacy native progress against its retained origin before resuming', async t => {
+  for (const compressed of [false, true]) await t.test(compressed ? 'zstd' : 'plain', async t => {
+    const f = await fixture(t, { compressed, records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Already captured')) + row(3, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
+    const old = f.open(), first = await collect(old), saved = structuredClone(old.checkpoint()), proof = old.io.proof()
+    delete saved.storageScope // The installed 0.1.6 cursor has only the old Host-bound scope.
+    const unchanged = structuredClone(saved), origins = { async read(key) { assert.equal(key, proof.key); return { key, headerHash: proof.headerHash, prefix: proof.next, revision: 1 } } }
+    await old.close()
+    const restored = f.open({ hostRunId: 'next-host', hostStartedAt: at + 1000 }, saved, { origins })
+    const result = await collect(restored)
+    assert.equal(result.view.gap, null)
+    assert.equal(result.view.effectivePhase, 'completed')
+    assert.equal(restored.checkpoint().offset, saved.offset)
+    assert.deepEqual(result.materials, []); assert.deepEqual(result.lifecycle, [])
+    assert.deepEqual(saved, unchanged, 'recovery never modifies the supplied checkpoint')
+    assert.ok(first.materials.length > 0)
+  })
+})
+
+test('an unread legacy cursor from another Host resumes without inventing prior progress', async t => {
+  const f = await fixture(t, { records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'A newly observed input')) })
+  const initial = f.open(), saved = structuredClone(initial.checkpoint())
+  delete saved.storageScope
+  await initial.close()
+  const restored = f.open({ hostRunId: 'next-host' }, saved, { origins: { async read() { return null } } }), result = await collect(restored)
+  assert.equal(result.view.gap, null)
+  assert.equal(result.view.effectivePhase, 'started')
+  assert.deepEqual(result.materials.map(event => event.text), ['A newly observed input'])
+})
+
+test('Host recovery still rejects a missing origin, wrong storage identity, changed prefix and incompatible profile', async t => {
+  for (const failure of ['missing-origin', 'wrong-storage', 'wrong-header', 'short-prefix', 'rewritten-prefix', 'foreign-chat', 'different-profile']) await t.test(failure, async t => {
+    const f = await fixture(t, { records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Already captured')) + row(3, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
+    const old = f.open(); await collect(old)
+    const saved = structuredClone(old.checkpoint()), proof = old.io.proof()
+    if (failure !== 'different-profile') delete saved.storageScope
+    await old.close()
+    if (failure === 'wrong-storage') saved.io.key = 'f'.repeat(64)
+    if (failure === 'rewritten-prefix') await fs.writeFile(f.plain, f.bytes.toString().replace('Already captured', 'Secretly changed') + '\n')
+    const changes = { hostRunId: 'next-host', hostStartedAt: at + 1000, ...(failure === 'foreign-chat' ? { threadId: 'foreign-chat' } : {}), ...(failure === 'different-profile' ? { profile: supportedProfile } : {}) }
+    const restored = f.open(changes, saved, { origins: { async read(key) { return failure === 'missing-origin' ? null : { key, headerHash: failure === 'wrong-header' ? 'f'.repeat(64) : proof.headerHash, prefix: { ...proof.next, ...(failure === 'short-prefix' ? { offset: 0 } : {}) }, revision: 1 } } } })
+    const result = await collect(restored)
+    assert.equal(result.view.coverage, 'gap')
+    assert.equal(result.view.gap, failure === 'rewritten-prefix' ? 'native_origin_prefix_changed' : 'cursor-invalid')
+    assert.equal(result.view.effectivePhase, 'unknown')
+    assert.deepEqual(result.materials, []); assert.deepEqual(result.lifecycle, [])
+  })
+})
+
+test('a recovered old running cursor stays unknown until a new Host execution is actually observed', async t => {
+  const f = await fixture(t, { records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Old running input')) })
+  const old = f.open(); await collect(old)
+  const saved = structuredClone(old.checkpoint()), proof = old.io.proof()
+  delete saved.storageScope
+  await old.close()
+  const restored = f.open({ hostRunId: 'next-host', hostStartedAt: at + 1000 }, saved, { origins: { async read(key) { return { key, headerHash: proof.headerHash, prefix: proof.next, revision: 1 } } } })
+  let view
+  for (let pump = 0; pump < 5; pump++) { view = await restored.pump(); assert.equal(view.effectivePhase, 'unknown'); assert.deepEqual(view.materials, []) }
+  await fs.appendFile(f.plain, [row(3, 'event_msg', start('next-turn')), row(4, 'event_msg', user(owner, 'next-turn', 'New Host input'))].join('').replaceAll(new Date(at).toISOString(), new Date(at + 4000).toISOString()))
+  const inputs = []
+  for (let pump = 0; pump < 30; pump++) {
+    view = await restored.pump({ anchorTurnId: 'next-turn' })
+    inputs.push(...view.materials.filter(event => event.kind === 'input').map(event => event.text))
+    if (view.effectivePhase === 'started' && view.observed.turnId === 'next-turn') break
+  }
+  assert.equal(view.gap, null)
+  assert.equal(view.effectivePhase, 'started')
+  assert.equal(view.observed.turnId, 'next-turn')
+  assert.deepEqual(inputs, ['New Host input'])
 })
 
 test('a live reader does not accept a different admitted Host or a changed profile reference', async t => {

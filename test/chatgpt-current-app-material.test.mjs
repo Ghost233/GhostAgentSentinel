@@ -46,8 +46,8 @@ async function fixture(t, { profile = candidateHostProfile, suffix = '', records
   await fs.writeFile(path, compressed ? zstdCompressSync(Buffer.from(bytes)) : bytes)
   server = await startServer({ dataDir, now: () => clock, cooldownMs: 0 }); core = await connectCore({ dataDir })
   await configureInstallationModels(core, 'chatgpt:current-app-material', { llm: { baseUrl, model: 'fixed-extractor' }, jev: { baseUrl, model: 'fixed-judge' } })
-  const state = { profile, enabled: true, available: true, threadReads: 0, currentRecordReads: 0 }
-  const native = { async sampleHost() { return { available: state.available, hostRunId: 'current-app-fixture', hostStartedAt: at - 10000, profile: state.profile } }, async readThread(id) { state.threadReads++; return { thread: { id, path: id === owner ? path : parentPath, cwd: '/synthetic-project', parentThreadId: null, forkedFromId: id === owner && fork ? parent : null, source: 'vscode', originator: 'Codex Desktop' }, anchorTurnId: id === owner ? 'turn' : null } }, async readEnablement() { return { user: state.enabled ? 'enabled' : 'disabled', effective: state.enabled ? 'enabled' : 'disabled' } }, async close() {} }
+  const state = { profile, hostRunId: 'current-app-fixture', hostStartedAt: at - 10000, anchorTurnId: 'turn', enabled: true, available: true, threadReads: 0, currentRecordReads: 0 }
+  const native = { async sampleHost() { return { available: state.available, hostRunId: state.hostRunId, hostStartedAt: state.hostStartedAt, profile: state.profile } }, async readThread(id) { state.threadReads++; return { thread: { id, path: id === owner ? path : parentPath, cwd: '/synthetic-project', parentThreadId: null, forkedFromId: id === owner && fork ? parent : null, source: 'vscode', originator: 'Codex Desktop' }, anchorTurnId: id === owner ? state.anchorTurnId : null } }, async readEnablement() { return { user: state.enabled ? 'enabled' : 'disabled', effective: state.enabled ? 'enabled' : 'disabled' } }, async close() {} }
   const open = fs.open, watched = new Set([await fs.realpath(path), await fs.realpath(parentPath)])
   t.mock.method(fs, 'open', async (...args) => { const handle = await open(...args); if (watched.has(String(args[0]))) { const read = handle.read; handle.read = async function (...values) { const got = await read.apply(this, values); state.currentRecordReads += got.bytesRead; return got } }; return handle })
   const reopen = async () => { await adapter?.close(); adapter = await startChatGPTAdapter({ core, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'current-app-material', token: 'c'.repeat(64), pollMs: 0, collectMaterials: true, nativeOriginVersion: 2, now: () => clock, ...(onQualificationLost ? { onQualificationLost } : {}) }) }
@@ -56,6 +56,37 @@ async function fixture(t, { profile = candidateHostProfile, suffix = '', records
   const caughtUp = async () => { let view; for (let i = 0; i < 30; i++) { view = await read(); if (view.observation.coverage === 'caught-up' || view.observation.coverage === 'retained-history' && ['completed', 'aborted'].includes(view.observation.phase) || view.observation.gap?.startsWith('unsupported-') || ['cursor-invalid', 'record-malformed-or-over-limit'].includes(view.observation.gap)) break }; return view }
   return { core, state, path, dir, read, caughtUp, reopen, advance() { clock += 1000 }, get adapter() { return adapter } }
 }
+
+test('production HTTP recovery preserves legacy main and fork captures and accepts the next real execution', async t => {
+  for (const fork of [false, true]) await t.test(fork ? 'fork' : 'main', async t => {
+    const f = await fixture(t, { fork, suffix: row(fork ? 9 : 4, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
+    const before = await f.caughtUp(), prior = (await f.core.snapshot()).tasks.flatMap(task => task.events).map(event => ({ id: event.data.nativeRecordId, capturedAt: event.capturedAt })).sort((a, b) => a.id.localeCompare(b.id))
+    assert.equal(before.observation.phase, 'completed')
+    const cursorPath = join(f.dir, 'adapter', 'cursors', before.identity.cursorKey + '.json')
+    await f.adapter.close()
+    const saved = JSON.parse(await fs.readFile(cursorPath, 'utf8'))
+    for (const reader of fork ? saved.reader.frames.map(frame => frame.reader) : [saved.reader]) delete reader.storageScope
+    await fs.writeFile(cursorPath, JSON.stringify(saved), { mode: 0o600 })
+    f.state.hostRunId = 'reopened-app-fixture'; f.state.hostStartedAt = at + 1000
+    f.advance(); f.advance()
+    await f.reopen()
+    const restored = await f.caughtUp()
+    assert.notEqual(restored.observation.gap, 'cursor-invalid')
+    assert.equal(restored.observation.phase, 'completed')
+    const recovered = await f.core.snapshot()
+    assert.deepEqual(recovered.tasks.flatMap(task => task.events).map(event => ({ id: event.data.nativeRecordId, capturedAt: event.capturedAt })).sort((a, b) => a.id.localeCompare(b.id)), prior, 'old captures are neither replayed nor re-timed into the new source')
+    for (const source of recovered.sources) assert.equal((await f.core.failureReceipts({ sourceKey: source.key })).receipts.length, 0)
+    f.state.anchorTurnId = 'next-turn'; f.advance(); f.advance()
+    const ordinal = fork ? 10 : 5
+    await fs.appendFile(f.path, row(ordinal, 'event_msg', start('next-turn'), at + 4000) + row(ordinal + 1, 'event_msg', user(owner, 'next-turn', 'A genuinely new request'), at + 4000))
+    let next
+    for (let pump = 0; pump < 30; pump++) { next = await f.read(); if (next.execution.lifecycleId === 'next-turn' && next.observation.coverage === 'caught-up') break }
+    assert.equal(next.execution.lifecycleId, 'next-turn')
+    assert.equal(next.execution.status, 'running')
+    const current = (await f.core.snapshot()).tasks.find(task => task.id === owner && task.lifecycleId === 'next-turn')
+    assert.equal(current.currentRequest, 'A genuinely new request')
+  })
+})
 
 test('the exact current App reaches the production Core HTTP and panel with a typed user request', async t => {
   const f = await fixture(t), view = await f.caughtUp(), task = (await f.core.snapshot()).tasks[0]

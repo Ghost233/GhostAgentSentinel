@@ -340,6 +340,70 @@ test('known successful monitoring permanently prevents a later unanchored failur
   assert.equal(receipts.receipts[0].enrollmentPhase, 'established');
 });
 
+test('established chats with invalid restored cursors retain independent receipts but consume one recovery notification', async t => {
+  const f = await fixture(t), sourceKey = await initialEnrollment(f);
+  let submitted = 0;
+  for (let index = 0; index < 6; index++) {
+    const mainId = 'previously-monitored-' + index;
+    await f.core.recordCollectionOutcome({ sourceKey, mainId, lifecycleId: null, channel: 'default', roundId: 'prior-success-' + index, outcome: 'succeeded', settledAt: f.now() });
+    await f.core.recordCollectionOutcome({ sourceKey, mainId, lifecycleId: null, channel: 'default', roundId: 'restore-failure-' + index, outcome: 'failed', settledAt: f.now(), enrollmentPhase: 'established', error: { code: 'cursor-invalid', stage: 'collection' } });
+    const [notice] = await initialClaim(f, sourceKey);
+    assert.ok(notice);
+    const intent = await initialIntent(f, notice);
+    if (intent.maySubmit) {
+      submitted++;
+      await f.core.recordNativeNotificationResult(initialPacket(f, notice, { event: 'accepted' }));
+    } else {
+      assert.equal(intent.record.status, 'grouped');
+      assert.equal(intent.record.native.submission.state, 'not-attempted');
+    }
+    assert.equal(submitted, 1, 'the first failure is immediate; later chats do not cause a notification storm');
+    f.advance(4000); // Grouping is an episode, not a three-second coincidence.
+  }
+  const receipts = await f.core.failureReceipts({ sourceKey }), records = await f.core.nativeNotificationRecords({ sourceKey });
+  assert.equal(receipts.receipts.length, 6);
+  assert.ok(receipts.receipts.every(receipt => receipt.enrollmentPhase === 'established' && receipt.state === 'active'));
+  assert.equal(new Set(records.records.flatMap(record => record.receiptIds)).size, 6);
+  assert.equal(records.records.filter(record => record.delivery === 'system-accepted').length, 1);
+  assert.equal(new Set(records.records.map(record => record.rollup?.id)).size, 1);
+  assert.match(records.records[0].body, /cursor-invalid/);
+  await f.restart();
+  await f.core.recordCollectionOutcome({ sourceKey, mainId: 'later-established', lifecycleId: null, channel: 'default', roundId: 'after-core-restart', outcome: 'failed', settledAt: f.now(), enrollmentPhase: 'established', error: { code: 'cursor-invalid', stage: 'collection' } });
+  const [later] = await initialClaim(f, sourceKey);
+  const intent = await initialIntent(f, later);
+  assert.equal(intent.maySubmit, false);
+  assert.equal(intent.record.status, 'grouped', 'Core restart preserves the consumed attempt');
+});
+
+test('cursor recovery grouping preserves independent installations, Hosts, causes, anchored failures and new episodes', async t => {
+  for (const boundary of ['installation', 'Host', 'cause', 'execution', 'recovered']) await t.test(boundary, async t => {
+    const f = await fixture(t), sourceKey = await initialEnrollment(f);
+    const fail = (key, mainId, roundId, fields = {}) => f.core.recordCollectionOutcome({ sourceKey: key, mainId, lifecycleId: null, channel: 'default', roundId, outcome: 'failed', settledAt: f.now(), enrollmentPhase: 'established', error: { code: 'cursor-invalid', stage: 'collection' }, ...fields });
+    await fail(sourceKey, 'first-chat', 'first-failure');
+    const [first] = await initialClaim(f, sourceKey);
+    assert.equal((await initialIntent(f, first)).maySubmit, true);
+    await f.core.recordNativeNotificationResult(initialPacket(f, first, { event: 'accepted' }));
+    let key = sourceKey, host = 'initial-host', mainId = 'other-chat', fields = {};
+    if (boundary === 'installation') key = await f.core.registerSource({ registrationId: 'chatgpt:other-installation', hostRunId: host, name: 'Other installation', policy: 'chatgpt-main/1' });
+    if (boundary === 'Host') { host = 'other-host'; key = await initialEnrollment(f, host, false); }
+    if (boundary === 'cause') fields = { error: { code: 'cursor-retains-gap', stage: 'collection' } };
+    if (boundary === 'execution') {
+      await f.core.ingest(key, { tasks: [{ id: mainId, lifecycleId: 'verified-run', title: 'Verified execution', status: 'running' }] });
+      fields = { lifecycleId: 'verified-run' };
+    }
+    if (boundary === 'recovered') {
+      f.advance(1);
+      await f.core.recordCollectionOutcome({ sourceKey, mainId: 'first-chat', lifecycleId: null, channel: 'default', roundId: 'recovered', outcome: 'succeeded', settledAt: f.now() });
+      mainId = 'first-chat';
+    }
+    await fail(key, mainId, 'independent-failure', fields);
+    const [notice] = await initialClaim(f, key, host);
+    assert.ok(notice);
+    assert.equal((await initialIntent(f, notice)).maySubmit, true, boundary + ' is not suppressed by another recovery group');
+    if (boundary === 'execution') assert.equal(notice.rollupId, undefined);
+  });
+});
+
 test('summary detail expiry leaves an incomplete consumed marker and never invents recovery or a second first attempt', async t => {
   const f = await fixture(t, { leaseMs: 1e9 }), sourceKey = await initialEnrollment(f);
   await initialFailure(f, sourceKey, 'expired');
