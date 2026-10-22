@@ -370,16 +370,18 @@ export class BoundedReader {
       }
       const recoveryFence = this.recoveryFence, origins = recoveryFence ? { read: async key => key === recoveryFence.key ? recoveryFence : this.origins.read(key) } : this.origins;
       this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); const header = nativeHeader(row); if (!producerAllowed(this.source, header.cliVersion)) throw Object.assign(new Error('unverified native producer'), { code: 'record-producer-unverified' }); return header; } });
-      const value = await this.io.pump({ physicalBudget: budgetBytes, decodedBudget: decodedBudgetBytes, limit: this.historyRange?.endByteOffset ?? Infinity, verifyOnly: verifyOnly && !this.recoveryCheckpoint }, bytes => {
+      const value = await this.io.pump({ physicalBudget: budgetBytes, decodedBudget: decodedBudgetBytes, limit: this.historyRange?.endByteOffset ?? Infinity, verifyOnly: verifyOnly && !this.recoveryCheckpoint && !(this.io.deviceRemapped && !this.io.proof()) }, bytes => {
         this.attachSize ??= this.io.decodedSize;
         const before = this.offset; this.consume(bytes); return this.offset - before;
       });
       readBytes = value.physicalBytes; decodedBytes = value.decodedBytes; this.ioView = value;
+      if (this.io.deviceRemapped && !this.io.proof()) this.recoveryCheckpoint ??= previous;
       if (this.recoveryCheckpoint && this.io.proof()) this.recoveryCheckpoint = null;
       this.handle = this.io.handle; if (!this.handle) return { ...this.view(), coverage: 'catching-up', readBytes, decodedBytes, nativeOrigins: [] }; this.fileId = this.io.physical.fileId;
       this.attachSize ??= value.decodedSize; this.knownSize = value.decodedSize;
       this.stat = value.decodedSize === null ? null : { size: value.decodedSize, mtimeMs: this.io.stat.mtimeMs };
-      if (this.source.expectedFileId && this.source.expectedFileId !== this.fileId) this.gap = 'record-file-replaced';
+      const sameRetainedInode = this.io.expected && this.io.saved?.key === this.io.key && this.source.expectedFileId?.split(':')[1] === this.fileId.split(':')[1];
+      if (this.source.expectedFileId && this.source.expectedFileId !== this.fileId && !sameRetainedInode) this.gap = 'record-file-replaced';
       if (this.historyMode && value.decodedSize !== null && this.historyRange.endByteOffset > value.decodedSize) this.gap = 'history-range-unavailable';
       if (this.historyMode && value.eof && (this.pendingBytes || this.nextOrdinal !== this.historyRange.endOrdinalExclusive)) this.gap = 'history-boundary-unverified';
       if (!this.scanOnly && this.materialMode && !this.historyMode && !this.terminalProof && ['start-predates-host', 'host-start-time-overlap'].includes(this.view().gap)) {

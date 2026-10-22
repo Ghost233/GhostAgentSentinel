@@ -34,7 +34,7 @@ export class NativeJsonlSource {
     this.terminal = source.terminalProof ?? null; this.terminalVerified = !this.terminal
     this.key = nativeStorageKey(source.path); this.validateFrame = validateFrame
     this.resume = checkpoint?.offset ?? 0; this.position = 0; this.phase = this.compressed && validateFrame ? 'validating' : 'replaying'
-    this.saved = checkpoint; this.handle = null; this.decoder = null; this.pending = null
+    this.saved = checkpoint; this.handle = null; this.decoder = null; this.pending = null; this.deviceRemapped = false
     this.rawOffset = 0; this.removed = 0; this.accounted = 0; this.pendingWrite = false; this.inputEnded = false
     this.totalPhysical = 0; this.totalDecoded = 0; this.peakBuffered = 0; this.closed = false
     this.waiters = new Set()
@@ -72,11 +72,14 @@ export class NativeJsonlSource {
     if (signature(opened) !== signature(stat)) throw fail('record-file-replaced')
     this.physical = { signature: signature(stat), fileId: `${stat.dev}:${stat.ino}`, pathHash: hash(resolve(path)) }
     if (this.saved?.io?.pathHash === this.physical.pathHash) {
-      if (this.saved.io.fileId !== this.physical.fileId) throw fail('record-file-replaced')
-      const priorSize = Number(this.saved.io.signature?.split(':')[2])
+      const prior = this.saved.io, previous = prior.fileId?.split(':') ?? []
+      this.deviceRemapped = previous.length === 2 && previous[0] !== String(stat.dev) && previous[1] === String(stat.ino) && prior.signature?.startsWith(prior.fileId + ':') && this.saved.key === this.key && Boolean(this.onHeader && this.expected && this.expected.prefix.offset >= this.resume)
+      if (prior.fileId !== this.physical.fileId && !this.deviceRemapped) throw fail('record-file-replaced')
+      const priorSignature = this.deviceRemapped ? stat.dev + ':' + prior.signature.split(':').slice(1).join(':') : prior.signature
+      const priorSize = Number(priorSignature?.split(':')[2])
       if (!Number.isSafeInteger(priorSize) || stat.size < priorSize) throw fail('record-file-truncated')
-      if ((this.compressed || stat.size === priorSize) && this.saved.io.signature !== this.physical.signature) throw fail('record-rewrite-suspected')
-      if (!this.compressed && stat.size > priorSize && this.expected) { this.physical.signature = this.saved.io.signature; this.revalidation = { target: this.expected.prefix, prefix: new NativePrefix() } }
+      if ((this.compressed || stat.size === priorSize) && priorSignature !== this.physical.signature) throw fail('record-rewrite-suspected')
+      if (!this.compressed && this.expected && (stat.size > priorSize || this.deviceRemapped)) { this.physical.signature = priorSignature; this.revalidation = { target: this.expected.prefix, prefix: new NativePrefix() } }
     }
     this.stat = stat; this.decodedSize = this.compressed ? null : stat.size
     if (!this.compressed && this.expected?.prefix.offset > stat.size) throw fail('native_origin_prefix_changed')

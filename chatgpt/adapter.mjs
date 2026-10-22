@@ -12,7 +12,7 @@ import { readModelDirectory } from './model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
-import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE } from '../src/protocol.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -108,7 +108,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   if (onQualificationLost !== undefined && typeof onQualificationLost !== 'function') throw new Error('invalid qualification loss handler')
   if (initialEnrollmentBaseline !== undefined && (!initialEnrollmentBaseline || typeof initialEnrollmentBaseline.initialize !== 'boolean' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(initialEnrollmentBaseline.id ?? ''))) throw new Error('invalid initial enrollment baseline')
   let baselineInitializationAvailable = initialEnrollmentBaseline?.initialize === true, baselineCoreInstanceId = null
-  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (reason === 'unsupported-host-version') view.summary = '当前 App 版本尚未适配，材料采集已停止'; if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
+  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (reason === 'core-update-required') view.summary = '共享核心需要更新，监控未启动；请待旧核心自然退出后启用新版'; if (reason === 'unsupported-host-version') view.summary = '当前 App 版本尚未适配，材料采集已停止'; if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
   await mkdir(join(dataDir, 'cursors'), { recursive: true, mode: 0o700 })
   const healthOutbox = collectMaterials ? await openHealthOutbox({ dataDir, now }) : null
   let closed = false, closing = null, timer = null, refreshPending = null, source = null, sourceEpoch = 0, registration = null
@@ -127,11 +127,11 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
     required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
     if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
-    if (delivery) required.push('monitoring-notifications/1')
-    const available = Array.isArray(features) && required.every(feature => features.includes(feature))
+    if (delivery) required.push('monitoring-notifications/1', RECOVERY_ROLLUP_FEATURE)
+    const missingFeatures = required.filter(feature => !Array.isArray(features) || !features.includes(feature)), available = missingFeatures.length === 0
     if (available && baselineCoreInstanceId === null) baselineCoreInstanceId = health.instanceId
     else if (available && baselineCoreInstanceId !== health.instanceId) baselineInitializationAvailable = false
-    return { available, instanceId: health.instanceId }
+    return { available, instanceId: health.instanceId, missingFeatures }
   }
 
   async function qualifyNotification(notice) {
@@ -421,7 +421,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       failureStage = 'core-connection'
       const supported = await capability()
       if (closed || epoch !== sourceEpoch) return
-      if (!supported.available) { await stopSource('core-capability-unavailable'); return }
+      if (!supported.available) { await stopSource(supported.missingFeatures.length === 1 && supported.missingFeatures[0] === RECOVERY_ROLLUP_FEATURE ? 'core-update-required' : 'core-capability-unavailable'); return }
       if (coreInstanceId && supported.instanceId && coreInstanceId !== supported.instanceId) {
         try { await stopSource('core-generation-changed') } catch (error) { if (error.status !== 400) throw error }
         if (closed) return

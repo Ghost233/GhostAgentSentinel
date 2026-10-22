@@ -10,6 +10,7 @@ export const MONITORING_NOTIFICATIONS_FEATURE = 'monitoring-notifications/1'
 export const NOTIFICATION_REVOCATION_FEATURE = 'notification-submission-revocation/1'
 export const INSTALLATION_NOTIFICATION_RECORDS_FEATURE = 'installation-notification-records/1'
 export const INITIAL_ENROLLMENT_ROLLUP_FEATURE = 'monitoring-initial-enrollment-rollup/1'
+export const RECOVERY_ROLLUP_FEATURE = 'monitoring-recovery-rollup/1'
 export const CHATGPT_INSTALLATION_PURGE_FEATURE = 'chatgpt-installation-purge/1'
 export const CHATGPT_RETENTION_MAINTENANCE_FEATURE = 'chatgpt-retention-maintenance/1'
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000

@@ -313,6 +313,44 @@ test('an unread legacy cursor from another Host resumes without inventing prior 
   assert.deepEqual(result.materials.map(event => event.text), ['A newly observed input'])
 })
 
+test('a remapped device number revalidates the same inode and retained prefix before resuming', async t => {
+  for (const [compressed, append] of [[false, false], [false, true], [true, false]]) await t.test(`${compressed ? 'zstd' : 'plain'}-${append ? 'appended' : 'unchanged'}`, async t => {
+    const f = await fixture(t, { compressed, records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Existing captured request')) + row(3, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
+    const old = f.open(); await collect(old)
+    const saved = structuredClone(old.checkpoint()), proof = old.io.proof(), previousDevice = String(Number(saved.fileId.split(':')[0]) - 3)
+    saved.fileId = previousDevice + ':' + saved.fileId.split(':')[1]
+    saved.io.io.fileId = saved.fileId
+    saved.io.io.signature = previousDevice + ':' + saved.io.io.signature.split(':').slice(1).join(':')
+    await old.close()
+    if (append && !compressed) await fs.appendFile(f.plain, row(4, 'token_usage_record', {}))
+    const reader = f.open({ hostRunId: 'next-host', hostStartedAt: at + 1000, expectedFileId: saved.fileId }, saved, { origins: { async read(key) { return { key, headerHash: proof.headerHash, prefix: proof.next, revision: 1 } } } })
+    const result = await collect(reader)
+    assert.equal(result.view.gap, null)
+    assert.equal(result.view.coverage, 'caught-up')
+    assert.equal(result.view.effectivePhase, 'completed')
+    assert.deepEqual(result.materials, []); assert.deepEqual(result.lifecycle, [])
+    assert.notEqual(reader.checkpoint().fileId, saved.fileId, 'the verified physical binding is refreshed without changing native record identity')
+  })
+})
+
+test('device rebinding does not accept a different inode, missing fence, truncation or rewritten content', async t => {
+  for (const mutation of ['inode', 'missing-fence', 'truncate', 'rewrite', 'rewrite-and-append']) await t.test(mutation, async t => {
+    const f = await fixture(t, { records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Existing captured request')) + row(3, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
+    const old = f.open(); await collect(old)
+    const saved = structuredClone(old.checkpoint()), proof = old.io.proof(), previousDevice = String(Number(saved.fileId.split(':')[0]) - 3)
+    saved.fileId = previousDevice + ':' + saved.fileId.split(':')[1]; saved.io.io.fileId = saved.fileId; saved.io.io.signature = previousDevice + ':' + saved.io.io.signature.split(':').slice(1).join(':')
+    await old.close()
+    if (mutation === 'inode') { await fs.writeFile(f.plain + '.next', f.bytes); await fs.rename(f.plain + '.next', f.plain) }
+    if (mutation === 'truncate') await fs.truncate(f.plain, f.bytes.length - 1)
+    if (mutation.startsWith('rewrite')) await fs.writeFile(f.plain, f.bytes.toString().replace('Existing captured request', 'Modified captured request') + (mutation.endsWith('append') ? row(4, 'token_usage_record', {}) : ''))
+    const restored = f.open({}, saved, { origins: { async read(key) { return mutation === 'missing-fence' ? null : { key, headerHash: proof.headerHash, prefix: proof.next, revision: 1 } } } }), result = await collect(restored)
+    const expected = mutation === 'truncate' ? 'record-file-truncated' : mutation === 'rewrite' ? 'record-rewrite-suspected' : mutation === 'rewrite-and-append' ? 'native_origin_prefix_changed' : 'record-file-replaced'
+    assert.equal(result.view.gap, expected)
+    assert.equal(result.view.effectivePhase, 'unknown')
+    assert.deepEqual(result.materials, []); assert.deepEqual(result.lifecycle, [])
+  })
+})
+
 test('Host recovery still rejects a missing origin, wrong storage identity, changed prefix and incompatible profile', async t => {
   for (const failure of ['missing-origin', 'wrong-storage', 'wrong-header', 'short-prefix', 'rewritten-prefix', 'foreign-chat', 'different-profile']) await t.test(failure, async t => {
     const f = await fixture(t, { records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Already captured')) + row(3, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })

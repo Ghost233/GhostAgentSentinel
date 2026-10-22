@@ -58,16 +58,25 @@ async function fixture(t, { profile = candidateHostProfile, suffix = '', records
 }
 
 test('production HTTP recovery preserves legacy main and fork captures and accepts the next real execution', async t => {
-  for (const fork of [false, true]) await t.test(fork ? 'fork' : 'main', async t => {
+  for (const fork of [false, true]) for (const recovery of ['Host', 'device-and-Host', 'device']) await t.test(`${fork ? 'fork' : 'main'}-${recovery}`, async t => {
     const f = await fixture(t, { fork, suffix: row(fork ? 9 : 4, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
     const before = await f.caughtUp(), prior = (await f.core.snapshot()).tasks.flatMap(task => task.events).map(event => ({ id: event.data.nativeRecordId, capturedAt: event.capturedAt })).sort((a, b) => a.id.localeCompare(b.id))
     assert.equal(before.observation.phase, 'completed')
     const cursorPath = join(f.dir, 'adapter', 'cursors', before.identity.cursorKey + '.json')
     await f.adapter.close()
     const saved = JSON.parse(await fs.readFile(cursorPath, 'utf8'))
-    for (const reader of fork ? saved.reader.frames.map(frame => frame.reader) : [saved.reader]) delete reader.storageScope
+    for (const frame of fork ? saved.reader.frames : [{ reader: saved.reader }]) {
+      const reader = frame.reader
+      delete reader.storageScope
+      if (recovery.includes('device') && reader.io?.io && reader.fileId) {
+        const previousDevice = String(Number(reader.fileId.split(':')[0]) - 3)
+        reader.fileId = previousDevice + ':' + reader.fileId.split(':')[1]; reader.io.io.fileId = reader.fileId
+        reader.io.io.signature = previousDevice + ':' + reader.io.io.signature.split(':').slice(1).join(':')
+        if (frame.source?.expectedFileId) frame.source.expectedFileId = previousDevice + ':' + frame.source.expectedFileId.split(':')[1]
+      }
+    }
     await fs.writeFile(cursorPath, JSON.stringify(saved), { mode: 0o600 })
-    f.state.hostRunId = 'reopened-app-fixture'; f.state.hostStartedAt = at + 1000
+    if (recovery.includes('Host')) { f.state.hostRunId = 'reopened-app-fixture'; f.state.hostStartedAt = at + 1000 }
     f.advance(); f.advance()
     await f.reopen()
     const restored = await f.caughtUp()

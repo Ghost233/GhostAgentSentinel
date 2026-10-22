@@ -10,6 +10,28 @@ import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.m
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { setTimeout as delay } from 'node:timers/promises'
 
+test('an older Core without recovery rollup support is reported before collection or notification starts', async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-old-recovery-core-')), clock = Date.now()
+  let server, core, adapter, compatible = false, lists = 0
+  t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); await fs.rm(dir, { recursive: true, force: true }) })
+  const thread = { id: 'owned-old-core', path: join(dir, 'main.jsonl'), cwd: dir, source: 'vscode', originator: 'Codex Desktop', parentThreadId: null }
+  await fs.writeFile(thread.path, JSON.stringify({ type: 'session_meta', timestamp: new Date(clock).toISOString(), payload: { id: thread.id } }) + '\n')
+  server = await startServer({ dataDir: join(dir, 'core'), now: () => clock }); core = await connectCore({ dataDir: join(dir, 'core') })
+  const health = core.health
+  core.health = async (...args) => { const value = await health(...args); return { ...value, features: compatible ? value.features : value.features.filter(feature => feature !== 'monitoring-recovery-rollup/1') } }
+  const native = { async sampleHost() { return { available: true, hostRunId: 'owned-host', hostStartedAt: clock - 10000, profile: supportedProfile } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async listThreads() { lists++; return { data: [thread], nextCursor: null } }, async readThread() { return { thread, anchorTurnId: null } }, async close() {} }
+  const notificationIO = { async settings() { return { authorization: 'authorized', observedAt: clock } }, async snapshot() { return { pending: [], delivered: [], actions: [], observedAt: clock } }, async submit() { assert.fail('no system notification is expected') }, async cancel() { return { pendingIds: [], observedAt: clock } }, close() {} }
+  adapter = await startChatGPTAdapter({ core, native, notificationIO, sessionsRoot: dir, dataDir: join(dir, 'adapter'), installationId: 'old-core-notice', token: 'a'.repeat(64), collectMaterials: true, pollMs: 0, now: () => clock })
+  await adapter.refresh()
+  assert.equal(lists, 0, 'an older shared Core cannot silently use the new observer with old notification behavior')
+  const view = await adapter.read({ thread_id: thread.id })
+  assert.equal(view.observation.gap, 'core-update-required')
+  assert.match(view.summary, /共享核心.*更新/)
+  assert.equal((await core.snapshot()).sources.length, 0)
+  compatible = true; await adapter.refresh()
+  assert.ok(lists > 0, 'a compatible Core resumes collection without changing the App or installation')
+})
+
 for (const [anchored, guard] of [[true, null], [false, null], [false, 'recovered-before-claim'], [false, 'paused'], [false, 'project-disabled'], [false, 'project-unknown'], [true, 'already-ended'], [true, 'ended'], [true, 'next-execution']]) test(`a production collection EIO ${anchored ? 'after' : 'before'} its lifecycle anchor respects ${guard ?? 'eligible health notice scope'}`, async t => {
   const clock = Date.now(), dir = await fs.mkdtemp(join(tmpdir(), 'collection-notice-')), token = 'a'.repeat(64), path = join(dir, 'main.jsonl')
   let server, core, adapter, broken = false, project = 'enabled'

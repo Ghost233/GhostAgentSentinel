@@ -340,13 +340,13 @@ test('known successful monitoring permanently prevents a later unanchored failur
   assert.equal(receipts.receipts[0].enrollmentPhase, 'established');
 });
 
-test('established chats with invalid restored cursors retain independent receipts but consume one recovery notification', async t => {
+for (const code of ['cursor-invalid', 'record-file-replaced', 'record-file-truncated', 'native_origin_prefix_changed']) test(`established chats with ${code} retain independent receipts but consume one recovery notification`, async t => {
   const f = await fixture(t), sourceKey = await initialEnrollment(f);
   let submitted = 0;
   for (let index = 0; index < 6; index++) {
     const mainId = 'previously-monitored-' + index;
     await f.core.recordCollectionOutcome({ sourceKey, mainId, lifecycleId: null, channel: 'default', roundId: 'prior-success-' + index, outcome: 'succeeded', settledAt: f.now() });
-    await f.core.recordCollectionOutcome({ sourceKey, mainId, lifecycleId: null, channel: 'default', roundId: 'restore-failure-' + index, outcome: 'failed', settledAt: f.now(), enrollmentPhase: 'established', error: { code: 'cursor-invalid', stage: 'collection' } });
+    await f.core.recordCollectionOutcome({ sourceKey, mainId, lifecycleId: null, channel: 'default', roundId: 'restore-failure-' + index, outcome: 'failed', settledAt: f.now(), enrollmentPhase: 'established', error: { code, stage: 'collection' } });
     const [notice] = await initialClaim(f, sourceKey);
     assert.ok(notice);
     const intent = await initialIntent(f, notice);
@@ -366,9 +366,9 @@ test('established chats with invalid restored cursors retain independent receipt
   assert.equal(new Set(records.records.flatMap(record => record.receiptIds)).size, 6);
   assert.equal(records.records.filter(record => record.delivery === 'system-accepted').length, 1);
   assert.equal(new Set(records.records.map(record => record.rollup?.id)).size, 1);
-  assert.match(records.records[0].body, /cursor-invalid/);
+  assert.ok(records.records[0].body.includes(code));
   await f.restart();
-  await f.core.recordCollectionOutcome({ sourceKey, mainId: 'later-established', lifecycleId: null, channel: 'default', roundId: 'after-core-restart', outcome: 'failed', settledAt: f.now(), enrollmentPhase: 'established', error: { code: 'cursor-invalid', stage: 'collection' } });
+  await f.core.recordCollectionOutcome({ sourceKey, mainId: 'later-established', lifecycleId: null, channel: 'default', roundId: 'after-core-restart', outcome: 'failed', settledAt: f.now(), enrollmentPhase: 'established', error: { code, stage: 'collection' } });
   const [later] = await initialClaim(f, sourceKey);
   const intent = await initialIntent(f, later);
   assert.equal(intent.maySubmit, false);

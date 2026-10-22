@@ -4,6 +4,7 @@ const DAY = 86_400_000, LIMIT = 1024;
 const META = 'native-notification-metadata', LINKS = 'native-notification-links';
 const BASELINES = 'native-initial-baselines', MONITORED = 'native-initial-monitored', ROLLUPS = 'native-initial-rollups', GROUP_LIMIT = 256;
 const copy = value => structuredClone(value);
+const recoveryFailure = receipt => /^(?:cursor-|record-|native_origin_)/.test(receipt.error.code);
 
 // Native facts extend the core's notification records; DSH records are untouched.
 export function createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused, chatPaused, taskNoticeEligible, accepted, readReceipt, notificationEnabled = () => true, notificationHistoryGap = () => false }) {
@@ -41,7 +42,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     return outcome.enrollmentPhase === 'initial-unanchored' && baseline?.complete && baseline.id === owner.descriptor.initialEnrollmentBaseline?.id ? 'initial-unanchored' : 'unknown';
   }
   function rollupKey(receipt, owner) {
-    return JSON.stringify([owner.descriptor.registrationId, ...(receipt.error.code.startsWith('cursor-') && receipt.enrollmentPhase !== 'initial-unanchored' ? ['cursor-recovery', owner.descriptor.hostRunId] : []), receipt.error.stage, receipt.error.category, receipt.error.code, receipt.error.codeHash ?? null, receipt.error.status ?? null]);
+    return JSON.stringify([owner.descriptor.registrationId, ...(recoveryFailure(receipt) && receipt.enrollmentPhase !== 'initial-unanchored' ? [receipt.error.code.startsWith('cursor-') ? 'cursor-recovery' : 'record-recovery', owner.descriptor.hostRunId] : []), receipt.error.stage, receipt.error.category, receipt.error.code, receipt.error.codeHash ?? null, receipt.error.status ?? null]);
   }
   function reconcileRollups() {
     for (const value of rollups.values()) {
@@ -138,7 +139,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     const owner = sources.get(receipt.sourceKey);
     if (owner?.descriptor.policy !== 'chatgpt-main/1') return;
     const current = now(), initial = receipt.enrollmentPhase === 'initial-unanchored' && receipt.domain === 'collection' && receipt.mainId !== null && receipt.lifecycleId === null;
-    const recovery = !initial && receipt.domain === 'collection' && receipt.mainId !== null && receipt.lifecycleId === null && receipt.error.code.startsWith('cursor-');
+    const recovery = !initial && receipt.domain === 'collection' && receipt.mainId !== null && receipt.lifecycleId === null && recoveryFailure(receipt);
     let rollup = initial || recovery ? [...rollups.values()].find(value => value.key === rollupKey(receipt, owner) && !value.closedAt) : null;
     if ((initial || recovery) && !rollup && rollups.size < GROUP_LIMIT) rollup = { id: randomUUID(), key: rollupKey(receipt, owner), registrationId: owner.descriptor.registrationId, consumed: false, incomplete: false, membersSeen: 0, closedAt: null, attempt: null };
     if (rollup && [...notifications.values()].some(value => value.rollupId === rollup.id && (value.sourceKey !== receipt.sourceKey || value.hostRunId !== owner.descriptor.hostRunId))) rollup = { ...rollup, incomplete: true };
