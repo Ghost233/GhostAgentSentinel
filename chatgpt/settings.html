@@ -4,44 +4,51 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sentinel 安装设置</title>
 <style>
-body{font:14px/1.55 system-ui;margin:0;padding:16px;color:var(--color-text-primary,#222);background:var(--color-background-primary,#fff)}h1{font-size:18px;margin:0 0 8px}h2{font-size:15px;margin:12px 0 6px}.muted{color:var(--color-text-secondary,#666);font-size:12px}input,select{display:block;box-sizing:border-box;width:100%;margin:4px 0 8px;padding:6px}input[type=checkbox]{display:inline-block;width:auto;margin-right:6px}button{margin:4px 4px 4px 0;padding:6px 10px}fieldset{margin:12px 0;border:1px solid #8886;border-radius:8px;padding:12px}[role=tab][aria-selected=true]{font-weight:600;border-bottom:2px solid currentColor}.notification-record{border-top:1px solid #8886;padding:8px 0}.notification-body{white-space:pre-wrap}
+:root{color-scheme:light dark;--page:light-dark(#f7f7f8,#18191b);--surface:light-dark(#fff,#222326);--field:light-dark(#fafafa,#2b2c30);--text:light-dark(#242529,#ececef);--muted:light-dark(#676a72,#a6a8b0);--border:light-dark(#dedfe3,#3b3d43);--hover:light-dark(#f0f1f3,#34363b);--focus:light-dark(#4266bb,#94b4ff)}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding:40px 28px 64px;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:var(--page)}main{max-width:960px;margin:0 auto}h1{font-size:24px;line-height:1.3;letter-spacing:-.5px;margin:0 0 8px}h2{font-size:16px;line-height:1.4;margin:0}p{margin:8px 0}.muted{color:var(--muted);font-size:12px;line-height:1.6;overflow-wrap:anywhere}.page-description{font-size:13px;margin:0 0 24px}nav{display:flex;gap:24px;border-bottom:1px solid var(--border);margin-bottom:24px}button{font:inherit;line-height:1.4;cursor:pointer;border:1px solid var(--border);border-radius:7px;padding:8px 12px;color:var(--text);background:var(--surface)}button:hover{background:var(--hover)}button:disabled{opacity:.5;cursor:default}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--focus);outline-offset:2px}[role=tab]{padding:10px 0 12px;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--muted)}[role=tab]:hover{background:transparent;color:var(--text)}[role=tab][aria-selected=true]{color:var(--text);font-weight:600;border-bottom-color:var(--text)}
+.section-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 16px}.section-heading p{margin:0}.model-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}fieldset{min-width:0;margin:0;padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}legend{padding:0 7px;font-size:15px;font-weight:600}label{display:block;font-size:13px;font-weight:500}input,select{display:block;width:100%;min-width:0;margin:6px 0 16px;padding:10px 12px;min-height:40px;font:inherit;line-height:1.4;border:1px solid var(--border);border-radius:7px;color:var(--text);background:var(--field)}input::placeholder{color:var(--muted);opacity:1}select{cursor:pointer}.model-actions{display:flex;flex-wrap:wrap;gap:8px;margin:2px 0 12px}.model-status{border-top:1px solid var(--border);padding-top:10px;margin-top:12px}.model-status p{margin:4px 0}.model-status p:empty{display:none}.save-hint{margin:12px 0 28px}#settings-reload{font-size:12px;padding:6px 10px}
+.notification-settings{margin-top:4px}.notification-description{margin:0 0 16px}.notification-option{display:grid;grid-template-columns:1fr auto;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid var(--border)}.notification-option label{display:flex;align-items:center;gap:10px;font-size:14px}.notification-option input{appearance:auto;display:inline-block;width:16px;min-height:0;height:16px;margin:0;accent-color:var(--text)}.notification-option p{margin:0;text-align:right}.notification-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:12px}.notification-toolbar p{margin:0}.permission{border-top:1px solid var(--border);margin-top:20px;padding-top:20px}.permission h2{font-size:14px}.permission button{margin-top:6px}.tab-card{border:1px solid var(--border);border-radius:12px;padding:20px;background:var(--surface)}.notification-record{border-top:1px solid var(--border);padding:16px 0;overflow-wrap:anywhere}.notification-record:first-child{border-top:0}.notification-record h2{font-size:14px}.notification-body{white-space:pre-wrap}.diagnostic-section{border-top:1px solid var(--border);padding-top:18px;margin-top:18px}.diagnostic-section h2{font-size:14px}.diagnostic-section p{overflow-wrap:anywhere}
+@media(max-width:760px){body{padding:24px 20px 40px}.model-grid{grid-template-columns:1fr;gap:16px}h1{font-size:21px}}@media(max-width:420px){body{padding:20px 14px 32px}fieldset,.tab-card{padding:16px}nav{gap:20px}.section-heading,.notification-toolbar{align-items:flex-start}.notification-toolbar{flex-direction:column;gap:10px}.notification-option{grid-template-columns:1fr;gap:4px}.notification-option p{text-align:left;margin-left:26px}}
 </style>
+<main>
 <h1>Sentinel · 安装设置</h1>
-<p class="muted">本安装的所有已监控聊天共用这份模型配置。关闭设置不停止监控。</p>
+<p class="muted page-description">配置本安装的模型与通知。关闭设置后，监控继续运行。</p>
 <nav role="tablist" aria-label="安装设置"><button id="settings-tab-settings" type="button" role="tab" aria-controls="settings-pane-settings">设置</button><button id="settings-tab-notifications" type="button" role="tab" aria-controls="settings-pane-notifications">通知记录</button><button id="settings-tab-diagnostics" type="button" role="tab" aria-controls="settings-pane-diagnostics">连接诊断</button></nav>
 <section id="settings-pane-settings" role="tabpanel" aria-labelledby="settings-tab-settings">
-<p id="settings-status" role="status" class="muted"></p>
 <form id="settings-form">
+<div class="section-heading"><div><h2>分析模型</h2><p id="settings-status" role="status" class="muted"></p></div><button id="settings-reload" type="button">重新读取</button></div>
+<div class="model-grid">
 <fieldset id="settings-llm-group"><legend>总结模型</legend>
 <label>服务地址<input id="settings-llm-url" type="url" placeholder="http://127.0.0.1:端口" autocomplete="off"></label>
-<label>模型列表（读取后选定）<select id="settings-llm-options"></select></label><label>模型 ID（手填）<input id="settings-llm-model" autocomplete="off"></label>
-<button id="settings-llm-list" type="button">读取列表</button><button id="settings-llm-check" type="button">检查连接</button><p id="settings-llm-list-status" class="muted"></p><p id="settings-llm-check-status" class="muted"></p><p id="settings-llm-status" class="muted"></p></fieldset>
+<label>选择模型<select id="settings-llm-options" aria-describedby="settings-llm-list-status"></select></label><label>模型 ID（也可手填）<input id="settings-llm-model" autocomplete="off" placeholder="输入模型 ID"></label>
+<div class="model-actions"><button id="settings-llm-list" type="button">读取列表</button><button id="settings-llm-check" type="button">检查连接</button></div><div class="model-status"><p id="settings-llm-list-status" class="muted"></p><p id="settings-llm-check-status" class="muted"></p><p id="settings-llm-status" class="muted"></p></div></fieldset>
 <fieldset id="settings-jev-group"><legend>JEV 判断模型</legend>
 <label>服务地址<input id="settings-jev-url" type="url" placeholder="http://127.0.0.1:端口" autocomplete="off"></label>
-<label>模型列表（读取后选定）<select id="settings-jev-options"></select></label><label>模型 ID（手填）<input id="settings-jev-model" autocomplete="off"></label>
-<button id="settings-jev-list" type="button">读取列表</button><button id="settings-jev-check" type="button">检查连接</button><p id="settings-jev-list-status" class="muted"></p><p id="settings-jev-check-status" class="muted"></p><p id="settings-jev-status" class="muted"></p></fieldset>
-<p class="muted">从列表选定模型、手填后按 Enter 或离开模型分组时自动保存；未完成的输入保留为草稿。</p><button id="settings-reload" type="button">重新读取</button>
+<label>选择模型<select id="settings-jev-options" aria-describedby="settings-jev-list-status"></select></label><label>模型 ID（也可手填）<input id="settings-jev-model" autocomplete="off" placeholder="输入模型 ID"></label>
+<div class="model-actions"><button id="settings-jev-list" type="button">读取列表</button><button id="settings-jev-check" type="button">检查连接</button></div><div class="model-status"><p id="settings-jev-list-status" class="muted"></p><p id="settings-jev-check-status" class="muted"></p><p id="settings-jev-status" class="muted"></p></div></fieldset>
+</div>
+<p class="muted save-hint">选定模型或完成编辑后自动保存，未完成的输入保留为草稿。</p>
 </form>
-<fieldset><legend>桌面通知</legend>
-<p class="muted">只控制本安装的桌面投递。关闭后仍继续采集、分析和显示问题；重新开启不补发关闭期间的历史通知。</p>
-<p id="settings-notification-status" role="status" class="muted"></p>
-<label><input id="settings-notification-task-alert" type="checkbox" disabled>任务告警</label><p id="settings-notification-task-alert-status" role="status" class="muted"></p>
-<label><input id="settings-notification-monitoring-failure" type="checkbox" disabled>监控故障</label><p id="settings-notification-monitoring-failure-status" role="status" class="muted"></p>
-<button id="settings-notification-reload" type="button">重新读取通知设置</button>
-<h2>系统通知许可</h2><p id="settings-notification-permission-status" role="status" class="muted"></p><button id="settings-notification-permission" type="button">请求系统通知许可</button>
-<p class="muted">通知开关与系统许可分别生效；系统允许不代表通知已显示或已被看到。</p>
+<fieldset class="notification-settings"><legend>桌面通知</legend>
+<p class="muted notification-description">关闭只停止桌面提醒，监控照常运行。重新开启不补发历史通知。</p>
+<div class="notification-option"><label><input id="settings-notification-task-alert" type="checkbox" disabled>任务告警</label><p id="settings-notification-task-alert-status" role="status" class="muted"></p></div>
+<div class="notification-option"><label><input id="settings-notification-monitoring-failure" type="checkbox" disabled>监控故障</label><p id="settings-notification-monitoring-failure-status" role="status" class="muted"></p></div>
+<div class="notification-toolbar"><p id="settings-notification-status" role="status" class="muted"></p><button id="settings-notification-reload" type="button">刷新通知设置</button></div>
+<div class="permission"><h2>系统通知许可</h2><p id="settings-notification-permission-status" role="status" class="muted"></p><button id="settings-notification-permission" type="button">请求系统通知许可</button>
+<p class="muted">系统允许不代表通知已显示或已被看到。</p></div>
 </fieldset>
 </section>
-<section id="settings-pane-notifications" role="tabpanel" aria-labelledby="settings-tab-notifications" hidden>
+<section id="settings-pane-notifications" class="tab-card" role="tabpanel" aria-labelledby="settings-tab-notifications" hidden>
 <p class="muted">本安装全部已监控聊天的两类通知，合计保留最近 24 小时内最新 1000 条。</p><button id="settings-notifications-refresh" type="button">刷新记录</button>
 <p id="settings-notifications-status" role="status" class="muted"></p><p id="settings-notifications-gap" role="status" class="muted"></p><div id="settings-notifications-records"></div><button id="settings-notifications-older" type="button" hidden>较早记录</button>
 </section>
-<section id="settings-pane-diagnostics" role="tabpanel" aria-labelledby="settings-tab-diagnostics" hidden>
+<section id="settings-pane-diagnostics" class="tab-card" role="tabpanel" aria-labelledby="settings-tab-diagnostics" hidden>
 <button id="diagnostics-refresh" type="button">刷新诊断</button><p id="diagnostics-status" class="muted"></p>
-<h2>采集</h2><p id="diagnostics-collection"></p>
-<h2>模型准备</h2><p id="diagnostics-model-llm"></p><p id="diagnostics-llm-check" class="muted"></p><p id="diagnostics-model-jev"></p><p id="diagnostics-jev-check" class="muted"></p>
-<h2>实际分析</h2><p id="diagnostics-analysis"></p><p id="diagnostics-failure" class="muted"></p>
+<div class="diagnostic-section"><h2>采集</h2><p id="diagnostics-collection"></p></div>
+<div class="diagnostic-section"><h2>模型准备</h2><p id="diagnostics-model-llm"></p><p id="diagnostics-llm-check" class="muted"></p><p id="diagnostics-model-jev"></p><p id="diagnostics-jev-check" class="muted"></p></div>
+<div class="diagnostic-section"><h2>实际分析</h2><p id="diagnostics-analysis"></p><p id="diagnostics-failure" class="muted"></p></div>
 </section>
+</main>
 <script>
 const element=id=>document.querySelector('#'+id),text=(value,max=2000)=>typeof value==='string'?value.slice(0,max):'';
 let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0,savingGroups=null,settingsTab='settings',diagnosticsBusy=false,diagnosticsVersion=0,installationRegistrationId=null,notificationReadBusy=false,notificationReadVersion=0,permissionBusy=false,permissionVersion=0,notificationRecordsBusy=false,notificationRecordsVersion=0,notificationRecordsCursor=null;
@@ -49,7 +56,8 @@ const pending=new Map(),directoryVersions={llm:0,jev:0},directoryRequests={llm:{
 const notificationKinds=['task-alert','monitoring-failure'],notificationEdits=Object.fromEntries(notificationKinds.map(kind=>[kind,{version:0,dirty:false,saving:false,queued:null}]));
 function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);if(entry.method==='tools/call')parent.postMessage({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id,reason}},'*');entry.reject(new Error(reason));}
 function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,name:params?.name,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
-function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
+function applyHostTheme(context){if(['light','dark'].includes(context?.theme))document.documentElement.style.colorScheme=context.theme;}
+function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');}else if(message.method==='ui/notifications/host-context-changed')applyHostTheme(message.params);return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
 function validateModelSettings(value){
   if(!value||!text(value.registrationId)||!text(value.revision)||!value.config||typeof value.config!=='object'||Array.isArray(value.config)||installationRegistrationId&&installationRegistrationId!==value.registrationId)throw new Error('模型配置归属未确认');
   installationRegistrationId=value.registrationId;
@@ -252,6 +260,6 @@ for(const role of ['llm','jev']){
 function visibility(){if(document.hidden){cancelNotificationRecords('面板已隐藏');for(const [id,entry] of pending)if(entry.method==='tools/call')cancel(id,entry,'面板已隐藏 · 输入已保留');}else{for(const kind of notificationKinds)void saveNotificationPreference(kind);if(settingsState)void saveModelSettings();else void readModelSettings();}}
 function teardown(){if(stopped)return;stopped=true;settingsVersion++;notificationRecordsVersion++;for(const [id,entry] of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('message',onMessage);addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
-(async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt-settings',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');void readNotificationPreferences();await readModelSettings();}catch(error){if(!stopped)element('settings-status').textContent='宿主初始化未完成 · '+text(error.message);}})();
+(async()=>{try{const result=await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt-settings',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;applyHostTheme(result.hostContext);ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');void readNotificationPreferences();await readModelSettings();}catch(error){if(!stopped)element('settings-status').textContent='宿主初始化未完成 · '+text(error.message);}})();
 </script>
 </html>

@@ -27,6 +27,22 @@ async function settingsPage(t, initial = state) {
 
 function leaveModelGroup(page, role) { return page.element('#settings-' + role + '-group').onfocusout({ relatedTarget: null }) }
 
+test('host theme changes update settings controls without reloading configuration or losing a draft', async t => {
+  const page = await settingsPage(t), style = {}
+  page.document.documentElement = { style }
+  page.element('#settings-llm-model').value = 'unfinished-model'
+  page.element('#settings-llm-model').oninput()
+  const calls = page.sent.length
+  for (const theme of ['dark', 'light']) {
+    page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed', params: { theme } } })
+    assert.equal(style.colorScheme, theme)
+    assert.equal(page.element('#settings-llm-model').value, 'unfinished-model')
+    assert.equal(page.sent.length, calls, 'changing theme performs no model, configuration or notification request')
+  }
+  page.handlers.get('message')({ source: {}, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed', params: { theme: 'dark' } } })
+  assert.equal(style.colorScheme, 'light', 'an unrelated window cannot change the settings theme')
+})
+
 const installationRecords = { registrationId: state.registrationId, generatedAt: 123, records: [], hasMore: false, nextCursor: null, historyGap: false, retentionMs: 86400000, maximumRecords: 1000 }
 const notificationRecord = { registrationId: state.registrationId, id: 'notice-a', sourceKey: 'source-a', mainId: 'chat-a', lifecycleId: 'run-a', chatTitle: '聊天甲', kind: 'task-alert', createdAt: 100, status: 'submitted', delivery: 'system-accepted', humanSeen: 'unknown', title: '任务疑点', body: '<img src=x onerror=alert(1)>\n原始通知正文', native: null }
 
