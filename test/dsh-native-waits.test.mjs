@@ -70,6 +70,7 @@ async function fixture(t, beforeAdapter = () => {}, judgment = 'clear', waitForO
   await until(() => adapter.connected, 'native wait adapter connected')
   if (deferAnalysis) await adapter.pause()
   models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk
     const body = JSON.parse(raw)
     modelCalls.push({ path: request.url, model: body.model, inputChars: raw.length })

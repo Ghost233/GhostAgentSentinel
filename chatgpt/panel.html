@@ -5,8 +5,10 @@
 <style>
 :root{font:13px/1.5 system-ui;color-scheme:light dark}body{margin:0;padding:14px;overflow-wrap:anywhere}h1{font-size:14px;margin:0 0 8px}p{margin:5px 0}#summary{font-weight:600;font-size:14px}#analysis,.muted{color:GrayText;font-size:12px}.issue{padding:10px 0;border-bottom:1px solid color-mix(in srgb,GrayText 22%,transparent)}h2{font-size:13px;margin:0 0 4px}.evidence{white-space:pre-line;font-size:12px;color:GrayText;line-height:1.45;margin-top:5px}details{margin-top:12px}summary{cursor:pointer;font-size:12px;color:GrayText}.check{padding:8px 0;border-bottom:1px solid color-mix(in srgb,GrayText 15%,transparent)}.check-status{font-size:12px;font-weight:400;margin-left:8px;color:GrayText}#coverage,#technical,#observation,#execution{white-space:pre-line}#error{color:GrayText;font-size:12px}.history-entry{display:block;width:100%;text-align:left;margin:5px 0;padding:6px 8px;font:inherit;border:1px solid GrayText;border-radius:5px;background:transparent;color:inherit;overflow-wrap:anywhere}.history-entry[aria-current=true]{border-width:2px;font-weight:600}
 #gs-bar{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;padding:10px 0;background:var(--color-background-primary,Canvas);border-bottom:1px solid color-mix(in srgb,GrayText 20%,transparent)}#gs-bar strong{font-size:13px;margin-right:auto}#gs-bar span{font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}#monitor-tabs{display:flex;gap:18px;margin:10px 0 14px}#monitor-tabs button{border:0;border-bottom:2px solid transparent;padding:6px 0;background:transparent;color:GrayText;font:inherit;cursor:pointer}#monitor-tabs button[aria-selected=true]{border-bottom-color:currentColor;color:inherit;font-weight:600}
+#refresh{padding:3px 7px;border:1px solid color-mix(in srgb,GrayText 35%,transparent);border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:12px;cursor:pointer}
 </style>
-<header id="gs-bar" aria-label="GS · 当前主聊天"><strong>GS</strong><span id="gs-green" aria-label="正常">🟢 0</span><span id="gs-yellow" aria-label="观察">🟡 0</span><span id="gs-red" aria-label="告警">🔴 0</span><span id="gs-gray" aria-label="不可判断">⚪ 0</span></header>
+<header id="gs-bar" aria-label="GS · 当前主聊天"><strong>GS</strong><span id="gs-green" aria-label="正常">🟢 0</span><span id="gs-yellow" aria-label="观察">🟡 0</span><span id="gs-red" aria-label="告警">🔴 0</span><span id="gs-gray" aria-label="不可判断">⚪ 0</span><button id="refresh" type="button">刷新</button></header>
+<p id="availability" class="muted" role="status" hidden></p>
 <nav id="monitor-tabs" role="tablist" aria-label="会话检查"><button id="monitor-tab-issues" type="button" role="tab" aria-controls="issues">当前问题</button><button id="monitor-tab-details" type="button" role="tab" aria-controls="monitor-details">详情</button></nav>
 <section id="issues" role="tabpanel" aria-labelledby="monitor-tab-issues" aria-label="需要关注的问题"></section>
 <section id="monitor-details" role="tabpanel" aria-labelledby="monitor-tab-details" hidden>
@@ -55,7 +57,8 @@ function renderGS(view,signal='gray'){
 renderGS(null);
 function reset(collapse=true){
   controlState=null;element('pause').hidden=true;element('pause').disabled=false;
-  for(const name of ['identity','coverage','observation','technical','error','health','execution','record-status','current-request','current-activity','inheritance','history-gap','model-status','model-summary-text'])element(name).textContent='';
+  for(const name of ['identity','coverage','observation','technical','error','health','execution','record-status','current-request','current-activity','inheritance','history-gap','model-status','model-summary-text','availability'])element(name).textContent='';
+  element('availability').hidden=true;
   element('model-summary').hidden=true;element('model-summary-evidence').replaceChildren();
   element('last-summary').hidden=true;element('last-summary-time').textContent='';element('last-summary-text').textContent='';element('last-summary-evidence').replaceChildren();
   element('current-facts').hidden=true;
@@ -109,6 +112,7 @@ function render(view){
   const identity=text(view.identity?.threadId,128);
   if(!identity){
     clearView('当前会话未确认');
+    if(view.observation?.gap==='observer-unavailable'){element('availability').textContent=text(view.summary)||'观察服务尚未就绪，等待数据';element('availability').hidden=false;}
     const gaps=[...list(view.discovery?.gaps),view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
     for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
     if(gaps.length)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
@@ -209,6 +213,7 @@ function completeOperation(){
 function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');return;}if(message.method==='ui/notifications/host-context-changed'){generation++;clearView('会话已变化，重新核对中');clearTimeout(timer);timer=null;if(ready&&!busy)void refresh();}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
 addEventListener('message',onMessage);
 async function refresh(){if(stopped||document.hidden||busy||!ready)return;busy=true;const g=generation;try{const response=await request('tools/call',{name:'sentinel_current_chat',arguments:readArguments()});if(stopped||g!==generation)return;if(response.isError)throw new Error('当前检查读取失败');render(response.structuredContent);}catch(error){if(!stopped&&g===generation){clearView('本次读取失败，当前状态不可判断');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}}finally{completeOperation();}}
+element('refresh').onclick=()=>refresh();
 async function setPaused(){
   if(stopped||busy||!ready||!controlState)return;
   const state=controlState,g=generation;clearTimeout(timer);timer=null;busy=true;element('pause').disabled=true;

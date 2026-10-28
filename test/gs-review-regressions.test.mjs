@@ -18,6 +18,7 @@ async function fixture(t, { models = false, hold = false, drift = 'attention' } 
   })
   if (models) {
     modelServer = createServer(async (req, res) => {
+      if (req.method === 'GET') return res.writeHead(404, { 'content-type': 'application/json' }).end('{}');
       let raw = ''; for await (const chunk of req) raw += chunk
       const body = JSON.parse(raw); requests.push({ path: req.url, body })
       res.setHeader('content-type', 'application/json')

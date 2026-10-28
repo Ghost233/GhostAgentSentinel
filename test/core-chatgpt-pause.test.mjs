@@ -59,6 +59,7 @@ async function analysisFixture(t, { hold = true, choice = 'clear' } = {}) {
   let clock = Date.now(), holding = hold, decision = choice, core
   const requests = [], held = [], chats = new Map()
   const provider = createServer(async (req, res) => {
+    if (req.method === 'GET') { res.writeHead(404, { 'content-type': 'application/json' }); res.end('{"error":{"code":"not_found"}}'); return; }
     let raw = ''; for await (const chunk of req) raw += chunk
     const body = JSON.parse(raw); requests.push({ path: req.url, body })
     res.setHeader('content-type', 'application/json')

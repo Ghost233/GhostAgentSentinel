@@ -55,6 +55,47 @@ export async function createCore({
   const sources = new Map();
   const tasks = new Map();
   const events = new Map();
+  const eventsByTask = new Map(), eventsBySource = new Map();
+  let timeConditionInputs = new WeakMap();
+  let nextEventExpiryAt = Infinity;
+  const indexEvent = event => {
+    const task = tasks.get(event.taskKey);
+    if (task) timeConditionInputs.delete(task);
+    for (const [index, key] of [[eventsByTask, event.taskKey], [eventsBySource, tasks.get(event.taskKey)?.sourceKey]]) {
+      if (!index.has(key)) index.set(key, { rows: new Map(), values: null });
+      const group = index.get(key);
+      group.rows.set(event.key, event);
+      group.values = null;
+    }
+    nextEventExpiryAt = Math.min(nextEventExpiryAt, event.capturedAt + DAY);
+  };
+  const unindexEvent = event => {
+    if (!event) return;
+    const task = tasks.get(event.taskKey);
+    if (task) timeConditionInputs.delete(task);
+    for (const [index, key] of [[eventsByTask, event.taskKey], [eventsBySource, tasks.get(event.taskKey)?.sourceKey]]) {
+      const group = index.get(key);
+      if (!group) continue;
+      group.rows.delete(event.key);
+      group.values = null;
+      if (!group.rows.size) index.delete(key);
+    }
+    if (event.capturedAt + DAY === nextEventExpiryAt) nextEventExpiryAt = 0;
+  };
+  const indexedEvents = (index, key, sorted = false) => {
+    const group = index.get(key);
+    if (!group) return [];
+    if (!group.values) {
+      group.values = [...group.rows.values()];
+      if (sorted) group.values.sort((a, b) => a.capturedAt - b.capturedAt || a.sequence - b.sequence);
+    }
+    return group.values;
+  };
+  const rebuildEventIndex = () => {
+    eventsByTask.clear(); eventsBySource.clear(); nextEventExpiryAt = Infinity;
+    timeConditionInputs = new WeakMap();
+    for (const event of events.values()) indexEvent(event);
+  };
   const notifications = new Map();
   const submissionWatches = new Map(), submissionBarriers = new Map();
   const submissionLifetime = new AbortController();
@@ -76,6 +117,7 @@ export async function createCore({
     else if (row.collection === 'settings' && row.key === 'enrollment') enrollment = { ...value, managed: value.managed ?? (value.configuredAt !== null) };
     else collections[row.collection]?.set(row.key, value);
   }
+  rebuildEventIndex();
   const nativeProgress = createNativeCaptureProgress({ db, seed: (function* () {
     for (const source of sources.values()) if (source.descriptor.policy === 'chatgpt-main/1') for (const capture of source.hierarchyEvidenceCaptures ?? []) if (capture.nativeHistorical !== undefined) yield { registrationId: source.descriptor.registrationId, nativeRecordId: capture.nativeOriginId, firstCapturedAt: capture.capturedAt, locator: { sourceKey: source.key, taskId: capture.taskId, lifecycleId: capture.lifecycleId, eventId: capture.eventId } };
   })() });
@@ -85,6 +127,7 @@ export async function createCore({
   let active = null;
   let pendingCancelledRequests = 0;
   let cancelledRound = null;
+  const inferenceLifetime = new AbortController();
   const analysisAdmission = () => {
     const unsettledCalls = (active ? 1 : 0) + pendingCancelledRequests;
     return { limit: 1, unsettledCalls, blocked: unsettledCalls >= 1 };
@@ -97,6 +140,8 @@ export async function createCore({
   let idleNotified = false;
   const queue = [];
   const queued = new Set();
+  const prefillQueue = new Set();
+  let prefillAttempts = new WeakMap();
   const pendingPrunedTasks = new Set();
   const pendingPrunedSources = new Set();
   let nativeNotifications;
@@ -108,6 +153,7 @@ export async function createCore({
   };
   const save = (collection, value) => {
     rememberNativeRow(collection, value.key ?? value.id);
+    if (collection === 'events') indexEvent(value);
     if (collection === 'notifications') {
       if (unsettledSubmission(value) && value.status !== 'claimed') value.submissionAttempt.revoked = true;
       nativeNotifications?.touch(value);
@@ -118,21 +164,18 @@ export async function createCore({
   };
   const erase = (collection, key) => {
     if (collection === 'notifications' && unsettledSubmission(notifications.get(key))) return retireNotification(notifications.get(key), now());
+    const event = collection === 'events' ? events.get(key) : null;
     rememberNativeRow(collection, key); if (collection === 'notifications') nativeNotifications?.removed(notifications.get(key)); remove.run(collection, key); collections[collection].delete(key);
+    if (event) unindexEvent(event);
   };
-  const taskEvents = (task, read) => read ? read.eventsByTask.get(task.key) ?? [] : Array.from(events.values()).filter(event => event.taskKey === task.key).sort((a, b) => a.capturedAt - b.capturedAt || a.sequence - b.sequence);
+  const taskEvents = (task, read) => read ? read.eventsByTask.get(task.key) ?? [] : indexedEvents(eventsByTask, task.key, true);
   const projectionRead = () => {
     const bySource = new Map(), eventsByTask = new Map();
     for (const task of tasks.values()) {
-      if (!bySource.has(task.sourceKey)) bySource.set(task.sourceKey, { tasks: [], events: [], instruction: null });
+      if (!bySource.has(task.sourceKey)) bySource.set(task.sourceKey, { tasks: [], events: indexedEvents(eventsBySource, task.sourceKey), instruction: null });
       bySource.get(task.sourceKey).tasks.push(task);
-      eventsByTask.set(task.key, []);
+      eventsByTask.set(task.key, taskEvents(task));
     }
-    for (const event of events.values()) {
-      eventsByTask.get(event.taskKey)?.push(event);
-      bySource.get(tasks.get(event.taskKey)?.sourceKey)?.events.push(event);
-    }
-    for (const retained of eventsByTask.values()) retained.sort((a, b) => a.capturedAt - b.capturedAt || a.sequence - b.sequence);
     return { bySource, eventsByTask };
   };
   const connected = source => source?.status === 'connected';
@@ -331,7 +374,7 @@ export async function createCore({
     const owner = sources.get(task.sourceKey), context = owner?.hierarchyContext;
     if (!context) return null;
     const current = now();
-    const source = read?.bySource.get(task.sourceKey) ?? { tasks: [...tasks.values()].filter(item => item.sourceKey === task.sourceKey), events: [...events.values()].filter(event => tasks.get(event.taskKey)?.sourceKey === task.sourceKey) };
+    const source = read?.bySource.get(task.sourceKey) ?? { tasks: [...tasks.values()].filter(item => item.sourceKey === task.sourceKey), events: indexedEvents(eventsBySource, task.sourceKey) };
     if (!source.instruction || current < source.instructionAt || current >= source.instruction.validUntil) source.instruction = createInstructionLookup(context, source.tasks, source.events, current, owner.descriptor.policy);
     source.instructionAt = current;
     source.instruction.forkCaptureBudgetExceeded = owner.forkCaptureBudgetExceeded === true;
@@ -348,14 +391,24 @@ export async function createCore({
   };
   const resultKeyFor = (task, context, read) => {
     context ??= contextFor(task, read);
-    const coverage = coverageFor(task, read), input = { task: { id: task.id, lifecycleId: task.lifecycleId, status: task.status, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt }, source: sources.get(task.sourceKey)?.descriptor, events: publicEvents(task, context, read).filter(event => !historical(event)), coverage };
+    const coverage = coverageFor(task, read), scope = resultScopeFor(task, read, coverage);
+    const contextKey = context && [context.binding, context.inheritedEvents.map(event => [eventRef(event), event.capturedAt]), context.gaps];
+    const key = fingerprint([task.revision, scope, contextKey]);
+    let cached = timeConditionInputs.get(task);
+    if (!cached || cached.key !== key) {
+      const input = { task: { id: task.id, lifecycleId: task.lifecycleId, status: task.status, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt }, source: sources.get(task.sourceKey)?.descriptor, events: publicEvents(task, context, read).filter(event => !historical(event)), coverage };
+      cached = { key, input, inputs: input.events.filter(event => event.kind === 'input') };
+      timeConditionInputs.set(task, cached);
+    }
+    // Time and instruction eligibility still advance; only unchanged bodies are reused.
+    if (context) for (const event of cached.inputs) event.authorizationEligible = context.eligible(event);
     const currentAnalyzer = analyzerFor(task);
-    return fingerprint([task.revision, resultScopeFor(task, read), typeof currentAnalyzer?.timeConditions === 'function' ? currentAnalyzer.timeConditions(input, now()) : analysisTimeConditions(input, now()), context && [context.binding, context.inheritedEvents.map(event => [eventRef(event), event.capturedAt]), context.gaps]]);
+    return fingerprint([task.revision, scope, typeof currentAnalyzer?.timeConditions === 'function' ? currentAnalyzer.timeConditions(cached.input, now()) : analysisTimeConditions(cached.input, now()), contextKey]);
   };
-  const resultScopeFor = (task, read) => {
+  const resultScopeFor = (task, read, coverage) => {
     const source = sources.get(task.sourceKey), activation = source?.hierarchyContext?.activations.find(item => item.taskId === task.id && item.lifecycleId === task.lifecycleId);
     const parent = source?.hierarchyContext?.relations.find(item => item.kind === 'delegation' && (item.childSessionId === task.sessionId || item.childActivationRef?.taskId === task.id && item.childActivationRef?.lifecycleId === task.lifecycleId));
-    return fingerprint([task.requestId, task.contextFingerprint, task.status, activation?.sessionId, activation?.runId, parent?.parentSessionId, source?.descriptor, coverageFor(task, read), configScopeFor(task)]);
+    return fingerprint([task.requestId, task.contextFingerprint, task.status, activation?.sessionId, activation?.runId, parent?.parentSessionId, source?.descriptor, coverage ?? coverageFor(task, read), configScopeFor(task)]);
   };
   const resultDispositionFor = (task, context, read) => {
     if (!task.resultScope || !task.analysis.summary) return task.resultScope != null || task.analysis.completedAt != null || ['analysis_expired', 'evidence_expired'].includes(task.analysis.error?.code) ? 'invalid' : 'none';
@@ -495,7 +548,13 @@ export async function createCore({
     controller.abort(error);
     const task = tasks.get(round.taskKey);
     if (task) {
+      if (round.kind === 'prefill') {
+        task.analysis.prefill = { state: 'cancelled', throughRevision: round.revision, updatedAt: now() };
+        if (persist) save('tasks', task);
+        return;
+      }
       task.analysis.state = 'interrupted';
+      delete task.analysis.modelState;
       task.analysis.error = { code: 'cancelled', message: reason };
       task.analysis.cancelledComputeMayContinue = true;
       task.analysis.nextEligibleAt = now();
@@ -516,6 +575,7 @@ export async function createCore({
       if (task.status !== 'unknown') task.lastKnownStatus = task.status;
       task.status = 'unknown';
       task.baselineConfirmed = false;
+      if (task.analysis.prefill?.state === 'prefilling') task.analysis.prefill.state = 'unknown';
       task.analysis.state = interrupted ? 'interrupted' : task.analysis.completedAt ? 'stale' : 'unknown';
       if (interrupted) task.analysis.error = { code: 'analysis_interrupted', message: reason };
       invalidateAlerts(task, 'source-disconnected');
@@ -602,21 +662,24 @@ export async function createCore({
     failureStore.prune(current);
     const cutoff = current - DAY;
     const expiredByTask = new Map();
-    for (const event of events.values()) {
-      if (event.capturedAt > cutoff) continue;
-      if (!expiredByTask.has(event.taskKey)) expiredByTask.set(event.taskKey, new Set());
-      expiredByTask.get(event.taskKey).add(event.id);
-      erase('events', event.key);
+    if (current >= nextEventExpiryAt) {
+      let next = Infinity;
+      for (const event of events.values()) {
+        if (event.capturedAt > cutoff) { next = Math.min(next, event.capturedAt + DAY); continue; }
+        if (!expiredByTask.has(event.taskKey)) expiredByTask.set(event.taskKey, new Set());
+        expiredByTask.get(event.taskKey).add(event.id);
+        erase('events', event.key);
+      }
+      nextEventExpiryAt = next;
     }
     for (const task of tasks.values()) {
       let changed = pendingPrunedTasks.has(task.key);
       if (task.analysis.lastSuccessfulSummary?.expiresAt <= current) { delete task.analysis.lastSuccessfulSummary; changed = true; }
       const expired = new Set(expiredByTask.get(task.key) ?? []);
-      const retained = new Set(taskEvents(task).map(event => event.id));
       const references = [task.requestId, ...(task.analysis.inputEventIds ?? []),
         ...task.analysis.checks.flatMap(check => check.evidenceIds ?? []),
         ...task.alerts.flatMap(alert => [...(alert.evidenceIds ?? []), ...(alert.recoveryEvidenceIds ?? [])])];
-      for (const id of references) if (id && !retained.has(id)) expired.add(id);
+      for (const id of references) if (id && !events.has(identity(task.sourceKey, task.id, task.lifecycleId, id))) expired.add(id);
       if (expired.size > 0) {
         pendingPrunedTasks.add(task.key);
         cancelRound('Analysis evidence expired after 24 hours', task);
@@ -681,7 +744,7 @@ export async function createCore({
         changed = true;
       }
       if (changed) pendingPrunedTasks.add(task.key);
-      if (!liveIdentity(task) && task.updatedAt <= cutoff && taskEvents(task).length === 0) {
+      if (!liveIdentity(task) && task.updatedAt <= cutoff && !eventsByTask.has(task.key)) {
         erase('tasks', task.key);
         pendingPrunedTasks.delete(task.key);
       } else if (changed) {
@@ -966,6 +1029,7 @@ export async function createCore({
       error = Object.assign(new Error('Analysis inputs expired before the response completed'), { code: 'evidence_expired' });
     }
     const completedAt = now();
+    delete task.analysis.modelState;
     task.analysis.completedAt = completedAt;
     task.analysis.through = round.through;
     task.analysis.throughRevision = round.revision;
@@ -1020,6 +1084,51 @@ export async function createCore({
     tick();
   }
 
+  function makeRound(task, kind) {
+    const capturedEvents = publicEvents(task).filter(event => !historical(event));
+    const instruction = contextFor(task);
+    const roundContext = instruction && copy({ binding: instruction.binding, inheritedEvents: instruction.inheritedEvents.map(({ key, taskKey, sequence, ...event }) => event), gaps: instruction.gaps });
+    const source = sources.get(task.sourceKey);
+    return {
+      id: randomUUID(), kind,
+      taskKey: task.key, requestId: task.requestId, revision: task.revision, configScope: configScopeFor(task), observedAt: now(), resultKey: resultKeyFor(task), resultScope: resultScopeFor(task),
+      through: capturedEvents.length ? Math.max(...capturedEvents.map(event => event.capturedAt)) : null,
+      controller: new AbortController(), transportController: new AbortController(), cancelled: false,
+      input: { task: copy({ key: task.key, id: task.id, lifecycleId: task.lifecycleId, title: task.title, status: task.status, currentRequest: task.currentRequest, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt, lastActivity: task.lastActivity, activeAlerts: task.alerts.filter(alert => alert.status === 'attention' && alert.requestId === task.requestId).map(({ id, checkId, reason, evidenceIds }) => ({ id, checkId, reason, evidenceIds })) }), source: copy(source.descriptor), events: capturedEvents, coverage: coverageFor(task), ...(roundContext ? { instructionContext: roundContext } : {}) },
+    };
+  }
+
+  function wantsPrefill(task, current) {
+    if (closed || paused || !task || !usable(task) || observationOnly(task) || taskPaused(task) || task.requestId == null) return false;
+    const currentAnalyzer = analyzerFor(task);
+    if (typeof currentAnalyzer?.prefill !== 'function') return false;
+    if (!task.analysis.error && task.analysis.completedAt != null && task.analysis.throughRevision === task.revision) return false;
+    const previous = prefillAttempts.get(task);
+    return previous?.analyzer !== currentAnalyzer || current >= previous.retryAt && !(previous.state === 'completed' && previous.revision === task.revision);
+  }
+
+  function completePrefill(round, result, error) {
+    if (round.cancelled) {
+      pendingCancelledRequests = Math.max(0, pendingCancelledRequests - 1);
+      if (cancelledRound === round) cancelledRound = null;
+      if (!closed) tick();
+      return;
+    }
+    if (closed || active !== round) return;
+    active = null;
+    const task = tasks.get(round.taskKey), current = now();
+    if (task && usable(task) && task.requestId === round.requestId) {
+      if (!error && !['completed', 'unsupported', 'skipped'].includes(result?.state)) error = new Error('Prefill adapter did not confirm a supported outcome');
+      const state = error ? 'failed' : result.state;
+      const attempt = error ? Math.min(32, (prefillAttempts.get(task)?.attempt ?? 0) + 1) : 0;
+      prefillAttempts.set(task, { analyzer: round.analyzer, revision: round.revision, state, attempt, retryAt: state === 'completed' ? current : current + Math.min(900_000, Math.max(1_000, cooldownMs) * 2 ** Math.max(0, attempt - 1)) });
+      task.analysis.prefill = { state, throughRevision: round.revision, updatedAt: current, ...(error ? { error: failureErrorInfo(error) } : {}),
+        ...(state === 'completed' && result.receipt ? { receipt: copy(result.receipt) } : {}) };
+      save('tasks', task);
+    }
+    tick();
+  }
+
   function startNext() {
     if (closed || paused || active || pendingCancelledRequests > 0) return;
     while (queue.length > 0) {
@@ -1030,17 +1139,7 @@ export async function createCore({
       const currentAnalyzer = analyzerFor(task);
       if (!currentAnalyzer) continue;
       if (now() < (task.analysis.nextEligibleAt ?? 0)) continue;
-      const capturedEvents = publicEvents(task).filter(event => !historical(event));
-      const instruction = contextFor(task);
-      const roundContext = instruction && copy({ binding: instruction.binding, inheritedEvents: instruction.inheritedEvents.map(({ key, taskKey, sequence, ...event }) => event), gaps: instruction.gaps });
-      const source = sources.get(task.sourceKey);
-      const round = {
-        id: randomUUID(),
-        taskKey: key, requestId: task.requestId, revision: task.revision, configScope: configScopeFor(task), observedAt: now(), resultKey: resultKeyFor(task), resultScope: resultScopeFor(task),
-        through: capturedEvents.length ? Math.max(...capturedEvents.map(event => event.capturedAt)) : null,
-        controller: new AbortController(), transportController: new AbortController(), cancelled: false,
-        input: { task: copy({ key: task.key, id: task.id, lifecycleId: task.lifecycleId, title: task.title, status: task.status, currentRequest: task.currentRequest, currentRequestId: task.requestId, requestStartedAt: task.requestStartedAt, lastActivity: task.lastActivity, activeAlerts: task.alerts.filter(alert => alert.status === 'attention' && alert.requestId === task.requestId).map(({ id, checkId, reason, evidenceIds }) => ({ id, checkId, reason, evidenceIds })) }), source: copy(source.descriptor), events: capturedEvents, coverage: coverageFor(task), ...(roundContext ? { instructionContext: roundContext } : {}) },
-      };
+      const round = makeRound(task, 'analysis');
       active = round;
       task.analysis.state = 'analyzing';
       task.analysis.startedAt = round.observedAt;
@@ -1048,9 +1147,39 @@ export async function createCore({
       task.analysis.error = null;
       if (round.configScope) task.analysis.configScope = round.configScope;
       save('tasks', task);
-      Promise.resolve().then(() => round.cancelled ? null : currentAnalyzer.analyze(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal }))
+      const onState = state => {
+        if (!['prefilling', 'generating', 'judging', 'unknown', 'cancel_requested'].includes(state) || closed || round.cancelled || active !== round) return;
+        const currentTask = tasks.get(round.taskKey);
+        if (!currentTask || currentTask.analysis.modelState === state) return;
+        currentTask.analysis.modelState = state;
+        save('tasks', currentTask);
+      };
+      Promise.resolve().then(() => round.cancelled ? null : currentAnalyzer.analyze(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal, lifetimeSignal: inferenceLifetime.signal, onState }))
         .then(result => round.cancelled ? null : validateResult(result, round))
         .then(result => completeRound(round, result, null), error => completeRound(round, null, error));
+      break;
+    }
+    if (active) return;
+    while (prefillQueue.size) {
+      const key = prefillQueue.keys().next().value;
+      prefillQueue.delete(key);
+      const task = tasks.get(key);
+      if (!wantsPrefill(task, now())) continue;
+      const round = makeRound(task, 'prefill');
+      round.analyzer = analyzerFor(task);
+      active = round;
+      task.analysis.prefill = { state: 'prefilling', throughRevision: round.revision, updatedAt: round.observedAt };
+      save('tasks', task);
+      const onState = state => {
+        if (!['prefilling', 'unknown', 'cancel_requested'].includes(state) || closed || round.cancelled || active !== round) return;
+        const currentTask = tasks.get(round.taskKey);
+        if (!currentTask || currentTask.analysis.prefill?.state === state) return;
+        currentTask.analysis.prefill = { state, throughRevision: round.revision, updatedAt: now() };
+        save('tasks', currentTask);
+      };
+      // The adapter promise owns the admission through real native release, not HTTP disconnect.
+      Promise.resolve().then(() => round.cancelled ? null : round.analyzer.prefill(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal, lifetimeSignal: inferenceLifetime.signal, onState }))
+        .then(result => completePrefill(round, result, null), error => completePrefill(round, null, error));
       break;
     }
   }
@@ -1100,7 +1229,7 @@ export async function createCore({
         }
         continue;
       }
-      if (!usable(task) || paused || active?.taskKey === task.key) continue;
+      if (!usable(task) || paused || active?.taskKey === task.key && active.kind !== 'prefill') continue;
       if (!analyzerFor(task)) {
         task.analysis.state = 'unavailable';
         task.analysis.error = { code: 'analyzer_unconfigured', message: 'Inference dependencies are not configured' };
@@ -1134,6 +1263,8 @@ export async function createCore({
     nativeNotifications.reconcile(current);
     for (const task of tasks.values()) if (usable(task) && !observationOnly(task) && !paused && !taskPaused(task) && !['unknown', 'failed', 'stale', 'interrupted'].includes(task.analysis.state) && !task.analysis.checks.some(check => check.judgmentState === 'failed')) makeNotification(task, task.alerts.filter(alert => alert.status === 'attention'));
     scheduleIdle();
+    for (const key of prefillQueue.keys()) if (!wantsPrefill(tasks.get(key), current)) prefillQueue.delete(key);
+    for (const task of tasks.values()) if (wantsPrefill(task, current) && (active?.taskKey !== task.key || active.revision !== task.revision)) prefillQueue.add(task.key);
     startNext();
     if (wakeTimer) clearTimeout(wakeTimer);
     wakeTimer = null;
@@ -1506,6 +1637,7 @@ export async function createCore({
             if (collections[collection]) { if (value === null) collections[collection].delete(key); else collections[collection].set(key, JSON.parse(value)); }
             else if (collection === 'settings' && key === 'enrollment' && value !== null) enrollment = JSON.parse(value);
           }
+          rebuildEventIndex();
           sequence = transaction.sequence;
           // Cancellation of an own model call cannot be undone. Restored
           // content stays intact; its result remains conservatively unknown.
@@ -1554,10 +1686,11 @@ export async function createCore({
         return { installationId, registrationId, status: 'failed', logical: { status: errors.length > 1 ? 'unknown' : 'retained', removed: empty, remaining: errors.length > 1 ? null : counts }, physical: { status: 'not-attempted', secureDelete: true }, errors, retryable: true };
       }
       for (const [collection, entries] of Object.entries(selected)) for (const [key] of entries) collections[collection].delete(key);
+      rebuildEventIndex();
       installationAnalyzers.delete(registrationId);
       for (const apply of publish) apply();
       enrollment = nextEnrollment;
-      for (const key of taskKeys) { queued.delete(key); pendingPrunedTasks.delete(key); }
+      for (const key of taskKeys) { queued.delete(key); prefillQueue.delete(key); pendingPrunedTasks.delete(key); }
       for (let index = queue.length - 1; index >= 0; index--) if (taskKeys.has(queue[index])) queue.splice(index, 1);
       for (const key of sourceKeys) pendingPrunedSources.delete(key);
       let physical, errors = [];
@@ -1634,8 +1767,8 @@ export async function createCore({
         notificationBindings: [...tasks.values()].filter(task => task.notificationBinding).length, notificationBindingEvidenceRefs: [...tasks.values()].reduce((count, task) => count + (task.notificationBinding?.evidenceRefs.length ?? 0), 0), notificationMemberships: [...notifications.values()].reduce((count, notification) => count + notificationMembers(notification).length, 0) };
       const diagnostics = {
         protocol: 1, pid: process.pid, generatedAt: now(), closed, failureReceipts: failureStore.diagnostics(), nativeNotifications: nativeNotifications.diagnostics(),
-        runtime: { connectedSources: closed ? 0 : Array.from(sources.values()).filter(connected).length, activeAnalyses: active ? 1 : 0, cancelledUnsettledRequests: pendingCancelledRequests, unsettledAnalysisCalls: admission.unsettledCalls, analysisAdmissionLimit: admission.limit, analysisAdmissionBlocked: admission.blocked },
-        temporary: { queueKeys: queue.length, queueMemberships: queued.size, timers, pendingNotificationWindows: [...notifications.values()].filter(notification => notification.status === 'pending').length, submissionRevocationWaits: submissionWatches.size, submissionPreferenceWaits: [...submissionBarriers.values()].reduce((count, value) => count + value.waiters.size, 0), submissionPreferenceBarriers: submissionBarriers.size },
+        runtime: { connectedSources: closed ? 0 : Array.from(sources.values()).filter(connected).length, activeAnalyses: active && active.kind !== 'prefill' ? 1 : 0, activePrefills: active?.kind === 'prefill' ? 1 : 0, cancelledUnsettledRequests: pendingCancelledRequests, unsettledAnalysisCalls: admission.unsettledCalls, analysisAdmissionLimit: admission.limit, analysisAdmissionBlocked: admission.blocked },
+        temporary: { queueKeys: queue.length, queueMemberships: queued.size, prefillQueueKeys: prefillQueue.size, timers, pendingNotificationWindows: [...notifications.values()].filter(notification => notification.status === 'pending').length, submissionRevocationWaits: submissionWatches.size, submissionPreferenceWaits: [...submissionBarriers.values()].reduce((count, value) => count + value.waiters.size, 0), submissionPreferenceBarriers: submissionBarriers.size },
         retained: { submissionPermits: [...notifications.values()].filter(unsettledSubmission).length, submissionLimitPerInstallation: SUBMISSION_LIMIT, retentionMs: DAY, sources: sources.size, tasks: tasks.size, events: events.size, alerts: Array.from(tasks.values()).reduce((count, task) => count + task.alerts.length, 0), notifications: notifications.size, sourceGapRecords: Array.from(sources.values()).reduce((count, source) => count + (source.gapRecords?.length ?? 0), 0), taskGapRecords: Array.from(tasks.values()).reduce((count, task) => count + (task.gapRecords?.length ?? 0), 0), hierarchyEvidenceIdentities: Array.from(sources.values()).reduce((count, source) => count + (source.hierarchyEvidenceCaptures?.length ?? 0), 0), hierarchyEvidenceIdentityLimitPerSource: HIERARCHY_CAPTURE_LIMIT, nativeOriginFences: nativeOrigins.diagnostics(), nativeCaptureProgress: nativeProgress.diagnostics(locator => locator && events.get(identity(locator.sourceKey, locator.taskId, locator.lifecycleId, locator.eventId))), ...metadata },
         configuration: { sourcePlanEntries: enrollment.entries.length, conversationMonitoringScopes: conversationSettings.size, conversationMonitoringLimit: CONVERSATION_MONITORING_LIMIT, pausedConversations: [...conversationSettings.values()].filter(setting => setting.paused).length }, memory: process.memoryUsage(),
       };
@@ -1643,7 +1776,7 @@ export async function createCore({
       const deadline = at => { if (Number.isSafeInteger(at) && at >= 0) nextExpiryAt = nextExpiryAt === null ? at : Math.min(nextExpiryAt, at); };
       const captured = at => { if (Number.isSafeInteger(at) && at >= 0) deadline(at + DAY); };
       const gaps = values => { for (const gap of values ?? []) if (!['Core restarted; source baseline is unknown', 'Earlier evidence expired after 24 hours', HIERARCHY_CAPTURE_GAP].includes(gap.reason)) captured(gap.at); };
-      for (const event of events.values()) captured(event.capturedAt);
+      deadline(nextEventExpiryAt);
       for (const task of tasks.values()) {
         if (task.analysis.summary) captured(task.analysis.summaryAt ?? task.analysis.completedAt);
         if (task.analysis.lastSuccessfulSummary) deadline(task.analysis.lastSuccessfulSummary.expiresAt);
@@ -1749,6 +1882,7 @@ export async function createCore({
       cancelRound('Monitoring is paused');
       queue.length = 0;
       queued.clear();
+      prefillQueue.clear();
       for (const task of tasks.values()) {
         task.analysis.queuedAt = null;
         if (usable(task)) task.analysis.state = 'paused';
@@ -1859,6 +1993,7 @@ export async function createCore({
       for (const original of tasks.values()) {
         if (sources.get(original.sourceKey)?.descriptor.registrationId !== registrationId) continue;
         const task = copy(original);
+        delete task.analysis.prefill;
         task.analysis.queuedAt = null; task.resultKey = null; task.resultScope = null;
         task.analysis.checks = unknownChecks('Installation inference configuration changed; waiting for current analysis');
         task.analysis.retryAttempt = 0;
@@ -1902,7 +2037,9 @@ export async function createCore({
       analyzer = nextAnalyzer;
       queue.length = 0;
       queued.clear();
+      prefillQueue.clear(); prefillAttempts = new WeakMap();
       for (const task of tasks.values()) {
+        delete task.analysis.prefill;
         task.analysis.queuedAt = null;
         task.resultKey = null;
         task.resultScope = null;
@@ -2008,10 +2145,14 @@ export async function createCore({
       submissionWatches.clear(); submissionBarriers.clear();
       cancelRound('Monitoring core closed');
       closed = true;
+      inferenceLifetime.abort(new Error('Monitoring core closed; native custody remains with the provider'));
       queue.length = 0;
       queued.clear();
+      prefillQueue.clear(); prefillAttempts = new WeakMap();
       pendingPrunedTasks.clear();
       pendingPrunedSources.clear();
+      timeConditionInputs = new WeakMap();
+      eventsByTask.clear(); eventsBySource.clear();
       clearInterval(interval);
       if (wakeTimer) clearTimeout(wakeTimer);
       if (idleTimer) clearTimeout(idleTimer);

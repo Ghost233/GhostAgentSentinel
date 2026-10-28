@@ -18,6 +18,7 @@ async function until(predicate, label) {
 async function modelFixture(t, { holdModels = [] } = {}) {
   const calls = [], held = [];
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); calls.push({ path: request.url, body });
     response.setHeader('content-type', 'application/json');

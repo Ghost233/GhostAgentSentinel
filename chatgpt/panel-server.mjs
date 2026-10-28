@@ -6,13 +6,117 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
 import { z } from 'zod'
 
+export async function createPanelMCPServer({ read, control, modelSettings, installationNotifications, requestNotifications, notificationRecords, forwardTool, resources, displayName = 'Sentinel' }) {
+  if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid panel display name')
+  const title = displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查'
+  const html = (resources?.html ?? await readFile(new URL('./panel.html', import.meta.url), 'utf8')).replace('<title>Sentinel 会话检查</title>', '<title>' + title + '</title>').replace('<h1>Sentinel · 当前会话</h1>', '<h1>' + displayName + ' · 当前会话</h1>')
+  const settingsTitle = displayName === 'GhostSentinel test' ? 'GhostSentinel 安装设置 test' : displayName + ' 安装设置'
+  const settingsHtml = modelSettings || forwardTool ? (resources?.settingsHtml ?? await readFile(new URL('./settings.html', import.meta.url), 'utf8')).replace('<title>Sentinel 安装设置</title>', '<title>' + settingsTitle + '</title>').replace('<h1>Sentinel · 安装设置</h1>', '<h1>' + settingsTitle + '</h1>') : null
+  const mcp = new McpServer({ name: 'ghost-sentinel-chatgpt', version: '0.1.0-dev.1' })
+  const registerTool = (server, name, options, handler) => registerAppTool(server, name, options, forwardTool ? (selection, extra) => forwardTool(name, selection, extra) : handler)
+  const uri = 'ui://ghost-sentinel/current-chat.html'
+  registerAppResource(mcp, 'sentinel-current-chat', uri, {}, async () => ({ contents: [{ uri, mimeType: RESOURCE_MIME_TYPE, text: html }] }))
+  registerTool(mcp, 'sentinel_current_chat', {
+    title, description: '只读查看当前本机主会话及24小时内已监控执行的检查结果。',
+    inputSchema: { executionKey: z.string().min(1).max(256).optional(), historyCursor: z.string().min(1).max(256).optional(), expectedThreadId: z.string().min(1).max(128).optional() },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    _meta: { ui: { resourceUri: uri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'thread' }] } },
+  }, async (selection, extra) => {
+    const view = await read(extra._meta, selection)
+    return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
+  })
+  if (modelSettings || forwardTool) {
+    const settingsUri = 'ui://ghost-sentinel/settings.html'
+    registerAppResource(mcp, 'sentinel-settings', settingsUri, {}, async () => ({ contents: [{ uri: settingsUri, mimeType: RESOURCE_MIME_TYPE, text: settingsHtml }] }))
+    const model = z.object({ baseUrl: z.string().min(1).max(2000), model: z.string().min(1).max(2000) }).strict()
+    registerTool(mcp, 'sentinel_model_settings', {
+      title: settingsTitle, description: '打开独立安装设置，读取本安装的总结模型和 JEV 配置，不依赖当前聊天采集。', inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { resourceUri: settingsUri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'global' }] } },
+    }, async () => ({ content: [{ type: 'text', text: '本安装模型设置' }], structuredContent: await modelSettings.read() }))
+    registerTool(mcp, 'sentinel_save_model_settings', {
+      title: '保存本安装模型设置', description: '按读取的配置版本保存，仅影响本安装的分析。',
+      inputSchema: { revision: z.string().min(1).max(2000), config: z.object({ llm: model.optional(), jev: model.optional() }).strict() },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false }, _meta: { ui: { visibility: ['app'] } },
+    }, async change => {
+      try { return { content: [{ type: 'text', text: '模型设置已保存' }], structuredContent: await modelSettings.save(change) } }
+      catch (error) {
+        const failure = error?.coreRequestFailure
+        const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
+          && error?.code !== 'analysis_config_unconfirmed' && failure?.operation === '/v1/analysis/installations/config'
+          && failure.kind === 'http' && failure.status >= 400 && failure.status <= 599
+        return { isError: true, content: [{ type: 'text', text: String(error?.message ?? error) }], structuredContent: { saveOutcome: rejected ? 'rejected' : 'unknown' } }
+      }
+    })
+    if (forwardTool || typeof modelSettings?.directory === 'function') registerTool(mcp, 'sentinel_model_directory', {
+      title: '读取本机模型列表', description: '仅检查服务在线及模型名称，不调用生成或 JEV 推理。', inputSchema: { baseUrl: z.string().min(1).max(2000) },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+    }, async (selection, extra) => ({ content: [{ type: 'text', text: '模型目录与在线状态' }], structuredContent: await modelSettings.directory(selection, { signal: extra.signal }) }))
+    if (forwardTool || typeof modelSettings?.diagnostics === 'function') registerTool(mcp, 'sentinel_installation_diagnostics', {
+      title: '本安装连接诊断', description: '只读核对本安装采集与保留分析状态，不读取聊天或运行模型检查。', inputSchema: z.object({}).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+    }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装连接诊断' }], structuredContent: await modelSettings.diagnostics({ signal: extra.signal }) }))
+  }
+  if (installationNotifications || forwardTool) {
+    if (forwardTool || typeof installationNotifications?.records === 'function') registerTool(mcp, 'sentinel_installation_notification_records', {
+      title: '本安装通知记录', description: '有界读取本安装全部已监控聊天的通知事实，不产生新投递。', inputSchema: z.object({ cursor: z.string().min(1).max(2000).optional() }).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+    }, async (selection, extra) => ({ content: [{ type: 'text', text: '本安装通知记录' }], structuredContent: await installationNotifications.records(selection, { signal: extra.signal }) }))
+    registerTool(mcp, 'sentinel_installation_notification_preferences', {
+      title: '读取本安装通知偏好', description: '读取任务告警和监控故障投递偏好，系统许可另行表达。', inputSchema: z.object({}).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+    }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装通知偏好' }], structuredContent: await installationNotifications.read({ signal: extra.signal }) }))
+    registerTool(mcp, 'sentinel_set_installation_notification_preference', {
+      title: '保存本安装通知偏好', description: '仅改变本安装对应类别的桌面通知，不暂停采集或分析。', inputSchema: { kind: z.enum(['task-alert', 'monitoring-failure']), enabled: z.boolean() },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+    }, async (change, extra) => {
+      try { return { content: [{ type: 'text', text: '通知偏好已保存' }], structuredContent: await installationNotifications.save(change, { signal: extra.signal }) } }
+      catch (error) {
+        const failure = error?.coreRequestFailure
+        const unsupported = error?.code === 'core_feature_unsupported' && error.coreCapabilityFailure?.operation === '/v1/notifications/installations/preferences'
+        const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
+          && (unsupported || error?.code !== 'analysis_config_unconfirmed' && failure?.operation === '/v1/notifications/installations/preferences'
+            && failure.kind === 'http' && failure.status >= 400 && failure.status <= 599)
+        return { isError: true, content: [{ type: 'text', text: String(error?.message ?? error) }], structuredContent: { saveOutcome: rejected ? 'rejected' : 'unknown' } }
+      }
+    })
+    if (forwardTool || typeof installationNotifications?.requestPermission === 'function') registerTool(mcp, 'sentinel_request_installation_notification_permission', {
+      title: '允许本安装桌面通知', description: '由明确用户动作请求系统许可，不依赖当前聊天。', inputSchema: z.object({}).strict(),
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+    }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装系统通知许可' }], structuredContent: await installationNotifications.requestPermission({ signal: extra.signal }) }))
+  }
+  if (forwardTool || typeof control === 'function') registerTool(mcp, 'sentinel_set_chat_analysis', {
+    title: '设置本聊天分析', description: '仅暂停或恢复当前聊天的监控分析，继续只读采集。',
+    inputSchema: { paused: z.boolean(), expectedThreadId: z.string().min(1).max(128), revision: z.string().min(1).max(2000) },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    _meta: { ui: { visibility: ['app'] } },
+  }, async (change, extra) => {
+    const view = await control(extra._meta, change)
+    return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
+  })
+  if (forwardTool || typeof requestNotifications === 'function') registerTool(mcp, 'sentinel_request_notification_permission', {
+    title: '允许桌面通知', description: '在当前聊天身份核实后请求 GhostSentinel 自己的系统通知许可。',
+    inputSchema: { expectedThreadId: z.string().min(1).max(128) },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+  }, async (change, extra) => {
+    const view = await requestNotifications(extra._meta, change)
+    return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
+  })
+  if (forwardTool || typeof notificationRecords === 'function') registerTool(mcp, 'sentinel_notification_records', {
+    title: '本聊天通知记录', description: '只读核对当前聊天及所选执行的系统通知事实。',
+    inputSchema: { expectedThreadId: z.string().min(1).max(128), executionKey: z.string().min(1).max(256).optional(), beforeSequence: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional() },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+  }, async (selection, extra) => {
+    const result = await notificationRecords(extra._meta, selection)
+    return { content: [{ type: 'text', text: '本聊天通知记录' }], structuredContent: result }
+  })
+  return mcp
+}
+
 export async function startPanelServer({ read, control, modelSettings, installationNotifications, requestNotifications, notificationRecords, runtimeStatus, displayName = 'Sentinel', token, port = 0 }) {
   if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) throw new Error('installation authentication is required')
   if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid panel display name')
-  const title = displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查'
-  const html = (await readFile(new URL('./panel.html', import.meta.url), 'utf8')).replace('<title>Sentinel 会话检查</title>', '<title>' + title + '</title>').replace('<h1>Sentinel · 当前会话</h1>', '<h1>' + displayName + ' · 当前会话</h1>'), sockets = new Set(), cleanups = new Set()
-  const settingsTitle = displayName === 'GhostSentinel test' ? 'GhostSentinel 安装设置 test' : displayName + ' 安装设置'
-  const settingsHtml = modelSettings ? (await readFile(new URL('./settings.html', import.meta.url), 'utf8')).replace('<title>Sentinel 安装设置</title>', '<title>' + settingsTitle + '</title>').replace('<h1>Sentinel · 安装设置</h1>', '<h1>' + settingsTitle + '</h1>') : null
+  const resources = { html: await readFile(new URL('./panel.html', import.meta.url), 'utf8'), settingsHtml: modelSettings ? await readFile(new URL('./settings.html', import.meta.url), 'utf8') : null }
+  const sockets = new Set(), cleanups = new Set()
   let closed = false, activeRequests = 0, transports = 0
   const server = createServer(async (req, res) => {
     const host = '127.0.0.1:' + server.address().port
@@ -32,102 +136,7 @@ export async function startPanelServer({ read, control, modelSettings, installat
     if (req.url !== '/mcp') return res.writeHead(404, { 'content-type': 'application/json' }).end('{"error":"Not found"}')
     if (closed) return res.writeHead(503).end()
     activeRequests++
-    const mcp = new McpServer({ name: 'ghost-sentinel-chatgpt', version: '0.1.0-dev.1' })
-    const uri = 'ui://ghost-sentinel/current-chat.html'
-    registerAppResource(mcp, 'sentinel-current-chat', uri, {}, async () => ({ contents: [{ uri, mimeType: RESOURCE_MIME_TYPE, text: html }] }))
-    registerAppTool(mcp, 'sentinel_current_chat', {
-      title, description: '只读查看当前本机主会话及24小时内已监控执行的检查结果。',
-      inputSchema: { executionKey: z.string().min(1).max(256).optional(), historyCursor: z.string().min(1).max(256).optional(), expectedThreadId: z.string().min(1).max(128).optional() },
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
-      _meta: { ui: { resourceUri: uri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'thread' }] } },
-    }, async (selection, extra) => {
-      const view = await read(extra._meta, selection)
-      return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
-    })
-    if (modelSettings) {
-      const settingsUri = 'ui://ghost-sentinel/settings.html'
-      registerAppResource(mcp, 'sentinel-settings', settingsUri, {}, async () => ({ contents: [{ uri: settingsUri, mimeType: RESOURCE_MIME_TYPE, text: settingsHtml }] }))
-      const model = z.object({ baseUrl: z.string().min(1).max(2000), model: z.string().min(1).max(2000) }).strict()
-      registerAppTool(mcp, 'sentinel_model_settings', {
-        title: settingsTitle, description: '打开独立安装设置，读取本安装的总结模型和 JEV 配置，不依赖当前聊天采集。', inputSchema: {},
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { resourceUri: settingsUri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'global' }] } },
-      }, async () => ({ content: [{ type: 'text', text: '本安装模型设置' }], structuredContent: await modelSettings.read() }))
-      registerAppTool(mcp, 'sentinel_save_model_settings', {
-        title: '保存本安装模型设置', description: '按读取的配置版本保存，仅影响本安装的分析。',
-        inputSchema: { revision: z.string().min(1).max(2000), config: z.object({ llm: model.optional(), jev: model.optional() }).strict() },
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false }, _meta: { ui: { visibility: ['app'] } },
-      }, async change => {
-        try { return { content: [{ type: 'text', text: '模型设置已保存' }], structuredContent: await modelSettings.save(change) } }
-        catch (error) {
-          const failure = error?.coreRequestFailure
-          const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
-            && error?.code !== 'analysis_config_unconfirmed' && failure?.operation === '/v1/analysis/installations/config'
-            && failure.kind === 'http' && failure.status >= 400 && failure.status <= 599
-          return { isError: true, content: [{ type: 'text', text: String(error?.message ?? error) }], structuredContent: { saveOutcome: rejected ? 'rejected' : 'unknown' } }
-        }
-      })
-      if (typeof modelSettings.directory === 'function') registerAppTool(mcp, 'sentinel_model_directory', {
-        title: '读取本机模型列表', description: '仅检查服务在线及模型名称，不调用生成或 JEV 推理。', inputSchema: { baseUrl: z.string().min(1).max(2000) },
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
-      }, async (selection, extra) => ({ content: [{ type: 'text', text: '模型目录与在线状态' }], structuredContent: await modelSettings.directory(selection, { signal: extra.signal }) }))
-      if (typeof modelSettings.diagnostics === 'function') registerAppTool(mcp, 'sentinel_installation_diagnostics', {
-        title: '本安装连接诊断', description: '只读核对本安装采集与保留分析状态，不读取聊天或运行模型检查。', inputSchema: z.object({}).strict(),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
-      }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装连接诊断' }], structuredContent: await modelSettings.diagnostics({ signal: extra.signal }) }))
-    }
-    if (installationNotifications) {
-      if (typeof installationNotifications.records === 'function') registerAppTool(mcp, 'sentinel_installation_notification_records', {
-        title: '本安装通知记录', description: '有界读取本安装全部已监控聊天的通知事实，不产生新投递。', inputSchema: z.object({ cursor: z.string().min(1).max(2000).optional() }).strict(),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
-      }, async (selection, extra) => ({ content: [{ type: 'text', text: '本安装通知记录' }], structuredContent: await installationNotifications.records(selection, { signal: extra.signal }) }))
-      registerAppTool(mcp, 'sentinel_installation_notification_preferences', {
-        title: '读取本安装通知偏好', description: '读取任务告警和监控故障投递偏好，系统许可另行表达。', inputSchema: z.object({}).strict(),
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
-      }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装通知偏好' }], structuredContent: await installationNotifications.read({ signal: extra.signal }) }))
-      registerAppTool(mcp, 'sentinel_set_installation_notification_preference', {
-        title: '保存本安装通知偏好', description: '仅改变本安装对应类别的桌面通知，不暂停采集或分析。', inputSchema: { kind: z.enum(['task-alert', 'monitoring-failure']), enabled: z.boolean() },
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
-      }, async (change, extra) => {
-        try { return { content: [{ type: 'text', text: '通知偏好已保存' }], structuredContent: await installationNotifications.save(change, { signal: extra.signal }) } }
-        catch (error) {
-          const failure = error?.coreRequestFailure
-          const unsupported = error?.code === 'core_feature_unsupported' && error.coreCapabilityFailure?.operation === '/v1/notifications/installations/preferences'
-          const rejected = !(error instanceof AggregateError) && !Array.isArray(error?.errors) && !Array.isArray(error?.causes)
-            && (unsupported || error?.code !== 'analysis_config_unconfirmed' && failure?.operation === '/v1/notifications/installations/preferences'
-              && failure.kind === 'http' && failure.status >= 400 && failure.status <= 599)
-          return { isError: true, content: [{ type: 'text', text: String(error?.message ?? error) }], structuredContent: { saveOutcome: rejected ? 'rejected' : 'unknown' } }
-        }
-      })
-      if (typeof installationNotifications.requestPermission === 'function') registerAppTool(mcp, 'sentinel_request_installation_notification_permission', {
-        title: '允许本安装桌面通知', description: '由明确用户动作请求系统许可，不依赖当前聊天。', inputSchema: z.object({}).strict(),
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
-      }, async (_selection, extra) => ({ content: [{ type: 'text', text: '本安装系统通知许可' }], structuredContent: await installationNotifications.requestPermission({ signal: extra.signal }) }))
-    }
-    if (typeof control === 'function') registerAppTool(mcp, 'sentinel_set_chat_analysis', {
-      title: '设置本聊天分析', description: '仅暂停或恢复当前聊天的监控分析，继续只读采集。',
-      inputSchema: { paused: z.boolean(), expectedThreadId: z.string().min(1).max(128), revision: z.string().min(1).max(2000) },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
-      _meta: { ui: { visibility: ['app'] } },
-    }, async (change, extra) => {
-      const view = await control(extra._meta, change)
-      return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
-    })
-    if (typeof requestNotifications === 'function') registerAppTool(mcp, 'sentinel_request_notification_permission', {
-      title: '允许桌面通知', description: '在当前聊天身份核实后请求 GhostSentinel 自己的系统通知许可。',
-      inputSchema: { expectedThreadId: z.string().min(1).max(128) },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
-    }, async (change, extra) => {
-      const view = await requestNotifications(extra._meta, change)
-      return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
-    })
-    if (typeof notificationRecords === 'function') registerAppTool(mcp, 'sentinel_notification_records', {
-      title: '本聊天通知记录', description: '只读核对当前聊天及所选执行的系统通知事实。',
-      inputSchema: { expectedThreadId: z.string().min(1).max(128), executionKey: z.string().min(1).max(256).optional(), beforeSequence: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional() },
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
-    }, async (selection, extra) => {
-      const result = await notificationRecords(extra._meta, selection)
-      return { content: [{ type: 'text', text: '本聊天通知记录' }], structuredContent: result }
-    })
+    const mcp = await createPanelMCPServer({ read, control, modelSettings, installationNotifications, requestNotifications, notificationRecords, displayName, resources })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
     transports++
     let done = false

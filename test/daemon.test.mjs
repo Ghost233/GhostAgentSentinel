@@ -83,6 +83,7 @@ test('two independent clients share one real daemon; last source exit cleans run
 
 test('production HTTP path extracts cited events, judges drift and creates a source-specific notification', async t => {
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let body = ''; for await (const part of request) body += part
     const input = JSON.parse(body)
     response.setHeader('content-type', 'application/json')
@@ -269,6 +270,7 @@ test('an installation configuration storage failure retains its revision and per
   const requests = []
   t.after(async () => { const errors = []; for (const cleanup of [() => blocker?.close(), () => client?.close(), () => server?.close(), async () => { models?.closeAllConnections(); if (models?.listening) await new Promise(resolve => models.close(resolve)) }, () => rm(dataDir, { recursive: true, force: true })]) { try { await cleanup() } catch (error) { errors.push(error) } }; if (errors.length) throw new AggregateError(errors) })
   models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     const chunks = []; for await (const chunk of request) chunks.push(chunk)
     const body = JSON.parse(Buffer.concat(chunks)); requests.push({ path: request.url, model: body.model })
     response.setHeader('content-type', 'application/json')
@@ -310,6 +312,7 @@ for (const cleanupAlsoFails of [false, true]) test(`legacy configuration chmod f
   const restore = () => { filesystem.chmod = originalChmod; filesystem.rm = originalRm; syncBuiltinESMExports() }
   t.after(async () => { restore(); const errors = []; for (const cleanup of [() => client?.close(), () => server?.close(), async () => { models?.closeAllConnections(); if (models?.listening) await new Promise(resolve => models.close(resolve)) }, () => rm(dataDir, { recursive: true, force: true })]) { try { await cleanup() } catch (error) { errors.push(error) } }; if (errors.length) throw new AggregateError(errors) })
   models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     const chunks = []; for await (const chunk of request) chunks.push(chunk)
     const body = JSON.parse(Buffer.concat(chunks)); requests.push({ path: request.url, model: body.model })
     response.setHeader('content-type', 'application/json')

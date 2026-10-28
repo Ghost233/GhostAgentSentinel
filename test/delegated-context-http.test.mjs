@@ -14,6 +14,7 @@ async function fixture(t, { sameId = false, holdChild = false } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-context-http-')), requests = [], held = []
   let clock = Date.now(), server
   const models = createServer(async (req, res) => {
+    if (req.method === 'GET') return res.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let body = ''; for await (const chunk of req) body += chunk
     const wire = JSON.parse(body), json = req.url === '/v1/systemone' ? decodeJevRequest(wire) : wire; requests.push({ path: req.url, body: json })
     res.setHeader('content-type', 'application/json')

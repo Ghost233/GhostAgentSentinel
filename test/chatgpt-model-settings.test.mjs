@@ -251,6 +251,7 @@ test('the actual global records tab reads one produced native notice and accepte
 
 test('the actual installation records page spans chats and both kinds with an isolated opaque older-page cursor', async t => {
   const fixture = await installationNotificationPage(t, { installationId: 'records-multiple' }), model = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk
     const body = JSON.parse(raw); response.setHeader('content-type', 'application/json')
     response.end(JSON.stringify(request.url === '/v1/chat/completions'
@@ -479,6 +480,20 @@ for (const loss of ['decode', 'transport']) test('notification settings distingu
   const reading = page.element('#settings-notification-reload').onclick(); await page.flush()
   await fixture.deliver(page, 'sentinel_installation_notification_preferences'); await reading
   assert.match(page.element('#settings-notification-task-alert-status').textContent, /保存结果未确认/)
+})
+
+for (const role of ['llm', 'jev']) test('settings list includes dual-capability models without mixing exclusive roles: ' + role, async t => {
+  const page = await settingsPage(t)
+  const listing = page.element('#settings-' + role + '-list').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_model_directory')
+  page.reply(read.id, { structuredContent: { state: 'online', online: true, inferenceVerified: false, models: [
+    { id: 'dual', role: 'multiple', roles: ['summary', 'jev'] },
+    { id: 'text', role: 'summary' }, { id: 'judge', role: 'jev' },
+    { id: 'embedding', role: 'embedding' }, { id: 'unknown', role: 'unknown' },
+  ] } }); await listing
+  const options = page.element('#settings-' + role + '-options').children
+  assert.deepEqual([...options].slice(1).map(option => option.value), ['dual', role === 'llm' ? 'text' : 'judge', 'unknown'])
+  assert.equal(page.sent.some(row => row.params?.name === 'sentinel_save_model_settings'), false)
 })
 
 for (const role of ['llm', 'jev']) test('settings list and connection buttons keep separate results and never save the focused draft: ' + role, async t => {

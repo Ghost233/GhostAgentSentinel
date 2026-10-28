@@ -37,9 +37,9 @@ async function setup(t) {
     await core.close(); await rm(dir, { recursive: true, force: true })
   })
   function track(child) { children.push(child); child.ended = once(child, 'close'); child.errors = ''; child.stderr.on('data', bytes => { child.errors += bytes }); return child }
-  async function owner() {
+  async function owner(timeoutMs = 5000) {
     const child = track(spawn(process.execPath, [new URL('./fixtures/chatgpt-plugin-bridge/owner.mjs', import.meta.url).pathname, prepared.configPath, statePath, callsPath], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }))
-    const [identity] = await bounded(once(child, 'message'), 'owner did not start: ' + child.errors)
+    const [identity] = await bounded(once(child, 'message'), 'owner did not start: ' + child.errors, timeoutMs)
     return { child, identity }
   }
   function bridge({ launchOwner = false, faults = false } = {}) {
@@ -65,6 +65,60 @@ async function setup(t) {
   return { ...prepared, dir, statePath, callsPath, pidsPath, faultPath, auditPath, owner, bridge }
 }
 
+test('cold observation data does not block the MCP UI and later reads recover without reconnecting', async t => {
+  const env = await setup(t), input = new PassThrough(), output = new PassThrough()
+  const startupBarrier = join(env.dir, 'hold-startup')
+  await writeFile(startupBarrier, 'held')
+  await writeFile(join(env.dir, 'resource-main.jsonl'), resourceMaterial({ at: Date.now(), cwd: env.dir, producerVersion: supportedProfile.cliVersion }))
+  let ownerStarting, bridge, launches = 0, sequence = 0, ownerReady = false
+  const request = async (method, params = {}) => {
+    const reply = once(output, 'data')
+    input.write(JSON.stringify({ jsonrpc: '2.0', id: ++sequence, method, params }) + '\n')
+    return JSON.parse((await bounded(reply, 'local MCP UI did not respond while data was pending'))[0])
+  }
+  try {
+    bridge = await startPluginBridge({ configPath: env.configPath, input, output, startOwner() { launches++; ownerStarting = env.owner(15000).then(value => { ownerReady = true; return value }); ownerStarting.catch(() => {}); return Promise.resolve() } })
+    const initialized = await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'pending-data-regression', version: '1' } })
+    assert.equal(initialized.result.protocolVersion, '2025-06-18')
+    input.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n')
+    const resource = await request('resources/read', { uri: 'ui://ghost-sentinel/current-chat.html' })
+    assert.match(resource.result.contents[0].text, /id="refresh"/)
+    const waiting = await request('tools/call', { name: 'sentinel_current_chat', arguments: {} })
+    assert.equal(waiting.result.structuredContent.signal, 'gray')
+    assert.equal(waiting.result.structuredContent.observation.gap, 'observer-unavailable')
+    assert.equal(ownerReady, false, 'handshake and page reads finish while observer startup is still held')
+    await rm(startupBarrier)
+    const owner = await ownerStarting
+    const recovered = await request('tools/call', { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'resource-main' } })
+    assert.equal(recovered.result.structuredContent.identity.threadId, 'resource-main')
+    const paused = await request('tools/call', { name: 'sentinel_set_chat_analysis', arguments: { paused: true, expectedThreadId: 'resource-main', revision: recovered.result.structuredContent.monitoring.revision }, _meta: { thread_id: 'resource-main' } })
+    assert.equal(paused.result.structuredContent.monitoring.paused, true)
+    assert.equal(bridge.runId, owner.identity.runId)
+    assert.equal(launches, 1)
+  } finally { await rm(startupBarrier, { force: true }); await bridge?.close(); await ownerStarting?.catch(() => {}) }
+})
+
+test('an unavailable observer retains local resources, gray reads and rejected writes without launch loops', async t => {
+  const env = await setup(t), input = new PassThrough(), output = new PassThrough()
+  let launches = 0, sequence = 0
+  const bridge = await startPluginBridge({ configPath: env.configPath, input, output, startOwner() { launches++; return Promise.resolve() } })
+  const request = async (method, params = {}) => {
+    const reply = once(output, 'data')
+    input.write(JSON.stringify({ jsonrpc: '2.0', id: ++sequence, method, params }) + '\n')
+    return JSON.parse((await bounded(reply, 'unavailable observer closed the local MCP UI', 2000))[0])
+  }
+  try {
+    assert.ok((await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'missing-data-regression', version: '1' } })).result)
+    input.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n')
+    assert.ok((await request('resources/read', { uri: 'ui://ghost-sentinel/settings.html' })).result.contents.length)
+    for (let n = 0; n < 2; n++) assert.equal((await request('tools/call', { name: 'sentinel_current_chat', arguments: {} })).result.structuredContent.signal, 'gray')
+    const write = await request('tools/call', { name: 'sentinel_set_chat_analysis', arguments: { paused: true, expectedThreadId: 'unknown-main', revision: 'unknown' } })
+    assert.equal(write.result.isError, true)
+    assert.equal(launches, 1)
+    input.end(); await bounded(bridge.closed, 'pending-data MCP retained its process on EOF')
+  } finally { await bridge.close() }
+})
+
 for (const kind of ['control', 'health-timeout', 'health-network', 'health-expired-success', 'health-identity', 'health-401', 'health-403', 'health-404', 'health-503']) test(`initial handshake with ${kind} never launches a second healthy owner`, async t => {
   const env = await setup(t), owner = await env.owner()
   assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
@@ -72,10 +126,10 @@ for (const kind of ['control', 'health-timeout', 'health-network', 'health-expir
   const transport = new StdioClientTransport({ command: process.execPath, args: [new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url).pathname, env.configPath, env.faultPath, env.auditPath], stderr: 'pipe' })
   transport.stderr.on('data', () => {})
   const client = new Client({ name: 'initial-handshake-feedback', version: '1' })
-  const started = performance.now(), soft = ['control', 'health-timeout', 'health-network'].includes(kind)
+  const started = performance.now(), soft = ['control', 'health-timeout', 'health-network'].includes(kind), pendingData = kind === 'health-expired-success'
   try {
     const connecting = bounded(client.connect(transport), 'initial handshake exceeded its original five-second startup budget')
-    if (soft) {
+    if (soft || pendingData) {
       await connecting
       assert.ok(performance.now() - started < 5000)
       assert.ok((await client.listTools()).tools.some(tool => tool.name === 'sentinel_current_chat'))
@@ -85,7 +139,7 @@ for (const kind of ['control', 'health-timeout', 'health-network', 'health-expir
     assert.equal(facts.filter(fact => fact.event === 'mcp-request' && fact.method === 'initialize').length, soft ? 1 : 0, 'the handshake request is sent once, only after owner qualification')
     assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
     assert.equal(owner.child.exitCode, null)
-    if (!soft) {
+    if (!soft && !pendingData) {
       assert.ok(facts.some(fact => fact.event === 'bridge-start-failed'))
       assert.equal(facts.filter(fact => fact.event === 'bridge-ready').length, 0, 'an inadmissible owner cannot open stdio')
     }
@@ -98,7 +152,7 @@ for (const kind of ['control', 'health-timeout', 'health-network', 'health-expir
   }
 })
 
-for (const fault of [{ kind: 'persistent-health-network' }, { kind: 'persistent-health-timeout' }, { startup: ['health-network', 'health-503'] }]) test(`initial handshake bounds ${JSON.stringify(fault)} without launching or sending initialize`, async t => {
+for (const fault of [{ kind: 'persistent-health-network' }, { kind: 'persistent-health-timeout' }, { startup: ['health-network', 'health-503'] }]) test(`initial handshake separates unavailable data from untrusted identity: ${JSON.stringify(fault)}`, async t => {
   const env = await setup(t), owner = await env.owner()
   assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
   await writeFile(env.faultPath, JSON.stringify(fault))
@@ -107,10 +161,17 @@ for (const fault of [{ kind: 'persistent-health-network' }, { kind: 'persistent-
   const client = new Client({ name: 'initial-handshake-budget', version: '1' })
   try {
     // Process spawning is outside the bridge's measured five-second budget.
-    await assert.rejects(bounded(client.connect(transport), 'unavailable initial handshake failed to close', 8000), /Connection closed/)
+    const connecting = bounded(client.connect(transport), 'initial handshake did not settle', 8000)
+    if (fault.startup) await assert.rejects(connecting, /Connection closed/)
+    else {
+      await connecting
+      assert.ok((await client.readResource({ uri: 'ui://ghost-sentinel/current-chat.html' })).contents.length)
+      assert.equal((await client.callTool({ name: 'sentinel_current_chat', arguments: {} })).structuredContent.signal, 'gray')
+    }
     const facts = (await readFile(env.auditPath, 'utf8')).trim().split('\n').map(JSON.parse)
     const failure = facts.find(fact => fact.event === 'bridge-start-failed')
-    assert.ok(failure.elapsedMs <= 5000, 'the startup health wait keeps the original five-second ceiling')
+    if (fault.startup) assert.ok(failure.elapsedMs <= 5000, 'a hard identity failure retains its original ceiling')
+    else assert.equal(failure, undefined, 'missing data no longer closes the local MCP entry')
     assert.equal(facts.filter(fact => fact.event === 'unexpected-owner-launch').length, 0)
     assert.equal(facts.filter(fact => fact.event === 'mcp-request').length, 0, 'initialize has not been forwarded or replayed')
     if (fault.startup) { assert.equal(facts.filter(fact => fact.event === 'health-fault').length, 2); assert.ok(failure.elapsedMs < 2000, 'a hard status after a soft failure is not retried') }
@@ -337,7 +398,8 @@ test('real stdio MCP initialization, app tools, resource and current-chat metada
 test('two simultaneous stdio connections start one independent observer, retain it on EOF and both exit after disable', async t => {
   const env = await setup(t), first = env.bridge({ launchOwner: true }), second = env.bridge({ launchOwner: true })
   await Promise.all([first, second].map(bridge => bridge.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'two-clients', version: '1' } })))
-  const identity = await resolvePluginOwner({ configPath: env.configPath })
+  let identity
+  await bounded((async () => { while (!(identity = await resolvePluginOwner({ configPath: env.configPath }))) await delay(10) })(), 'shared observer did not publish after the UI handshake')
   assert.ok(identity)
   assert.notEqual(identity.pid, first.child.pid); assert.notEqual(identity.pid, second.child.pid)
   const connected = await Promise.all([first, second].map(bridge => bridge.request('tools/list')))

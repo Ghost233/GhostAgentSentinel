@@ -6,6 +6,21 @@ const ids = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_co
 const result = id => ({ signal: 'gray', summary: id ? id + ' 执行开始' : '无法确认当前观察', identity: { threadId: id }, observation: { coverage: 'caught-up', gap: null }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
 const material = (id = 'main-a', signal = 'red') => ({ ...result(id), signal, summary: '当前修改可能偏离请求', analysis: { connected: true, state: 'cooldown', resultDisposition: 'current', summary: '本轮六项检查已更新', waitMs: 0, lagMs: 2500, coverage: { complete: true, gaps: [] }, checks: ids.map(checkId => ({ id: checkId, status: checkId === 'request_drift' ? 'attention' : 'clear', reason: '已核对现有材料' })), issues: [{ checkId: 'request_drift', reason: '用户只要求改文字，代理却更改了数据层', evidence: [{ text: '<img src=x onerror="alert(1)"> 只改按钮文字', reference: 'record:private-evidence-id' }] }] }, discovery: { complete: false, directoryComplete: true, counts: { main: 3, fork: 1, child: 2, remote: 0, cloud: 0, unknown: 1 }, tracked: 3, connected: 1, currentIncluded: true, gaps: ['fork-coverage-pending'] } })
 
+test('missing observation data stays visible and refreshes automatically or manually in the same page', async t => {
+  const page = await harness(t)
+  const waiting = { signal: 'gray', summary: '观察服务尚未就绪，等待数据', observation: { coverage: 'unavailable', gap: 'observer-unavailable' }, analysis: { state: 'unknown', checks: [] } }
+  await page.deliver(waiting)
+  assert.equal(page.element('#availability').hidden, false)
+  assert.match(page.element('#availability').textContent, /等待数据/)
+  await page.refresh(); await page.deliver(waiting)
+  const before = page.sent.filter(row => row.params?.name === 'sentinel_current_chat').length
+  const refreshing = page.element('#refresh').onclick(); await page.flush()
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_current_chat').length, before + 1)
+  await page.deliver(result('main-a')); await refreshing
+  assert.equal(page.element('#availability').hidden, true)
+  assert.match(page.element('#identity').textContent, /main-a/)
+})
+
 test('a completed model summary keeps literal evidence and disappears when the next result is pending or failed', async t => {
   const page = await harness(t), view = material('main-a', 'gray')
   view.analysis.generated = { text: '正在核对按钮文案。尚未得到验证结果。', evidence: [{ text: '<button> 已修改', reference: 'native:current-evidence' }] }

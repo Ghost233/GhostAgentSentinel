@@ -1,6 +1,6 @@
 {
   "name": "ghost-sentinel",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "ChatGPT.app 本机主聊天及分叉的只读检查",
   "author": {
     "name": "Ghost233",

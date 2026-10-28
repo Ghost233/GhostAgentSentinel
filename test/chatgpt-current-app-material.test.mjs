@@ -29,6 +29,7 @@ async function fixture(t, { profile = candidateHostProfile, suffix = '', records
   await Promise.all([fs.mkdir(sessionsRoot), fs.mkdir(archived), fs.mkdir(dataDir)])
   let server, core, adapter
   const wire = createServer(async (req, res) => {
+    if (req.method === 'GET') return res.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let body = ''; for await (const chunk of req) body += chunk
     res.setHeader('content-type', 'application/json')
     if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] }))

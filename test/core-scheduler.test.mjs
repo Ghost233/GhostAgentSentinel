@@ -28,7 +28,11 @@ test('shared FIFO coalesces queued material while each completed task cools inde
     await waitFor(() => calls.length === 1);
     assert.equal(calls[0].task.id, 'a');
     await core.ingest(source, { events: [event('b-new', 'b', ++time, 'B latest evidence'), event('a-new', 'a', ++time, 'A latest evidence')] });
+    assert.deepEqual(calls[0].events.map(value => value.id), ['a-input'], 'new material must not mutate the active round');
     assert.equal((await core.snapshot()).monitoring.queueLength, 1);
+    await core.heartbeat(source);
+    await core.claimNotifications(source);
+    assert.equal(calls.length, 1, 'control requests must not start another call before the active one finishes');
     releases.shift()();
     await waitFor(() => calls.length === 2);
     assert.equal(calls[1].task.id, 'b');

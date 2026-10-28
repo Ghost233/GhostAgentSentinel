@@ -18,6 +18,7 @@ test('an actual legacy core preserves consumed root input while accepted, notice
   const dataDir = await mkdtemp(join(tmpdir(), 'gs-legacy-')), ctx = new Context(), streams = new Map(), modelRequests = [], batches = []
   let core, adapter, root, activation, closed = false
   const modelServer = createServer(async (request, response) => {
+    if (request.method === 'GET') { response.writeHead(404, { 'content-type': 'application/json' }); response.end('{"error":{"code":"not_found"}}'); return; }
     let body = ''; for await (const chunk of request) body += chunk
     const json = JSON.parse(body); modelRequests.push(json)
     response.setHeader('content-type', 'application/json')

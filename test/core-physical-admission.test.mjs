@@ -19,6 +19,7 @@ async function fixture(t, { honorAbort = false } = {}) {
   const calls = [], held = [], requests = []
   let core, source, clock = Date.now(), liveHttp = 0, peakHttp = 0, draining = false
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') { response.writeHead(404, { 'content-type': 'application/json' }); response.end('{"error":{"code":"not_found"}}'); return; }
     liveHttp++; peakHttp = Math.max(peakHttp, liveHttp)
     let raw = ''; for await (const chunk of request) raw += chunk
     const body = JSON.parse(raw); requests.push({ path: request.url, body })

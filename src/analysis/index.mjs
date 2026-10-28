@@ -2,6 +2,8 @@ import { eventRef, referenceKey } from '../instruction-context.mjs';
 import { inferenceEndpoint, requestInference } from './http.mjs';
 import { renderJevRequest } from './jev-rendering.mjs';
 import { userWait, userWaitDuration, userWaitThresholdAt } from '../gs-status.mjs';
+import { createHash } from 'node:crypto';
+import { discoverGMDPrefill, createGMDOperation } from './gmd-prefill-client.mjs';
 
 export const CHECK_IDS = Object.freeze([
   'stalled_progress', 'request_drift', 'failure_loop',
@@ -19,10 +21,40 @@ export class AnalysisError extends Error {
 }
 
 export function createAnalyzer(config = {}) {
+  config = { ...config, llm: config.llm && { ...config.llm }, jev: config.jev && { ...config.jev } };
   for (const name of ['llm', 'jev']) if (config[name]?.baseUrl) inferenceEndpoint(config[name], '/');
-  return {
-    timeConditions(input, now) { return analysisTimeConditions(input, now, config.longWaitMs ?? 300_000); },
-    async analyze(input, { signal, transportSignal } = {}) {
+  const capabilities = new Map();
+  const digest = value => createHash('sha256').update(value).digest('hex');
+  async function modelRequest(role, input, body, options, prefill = false) {
+    const mode = role === 'llm' ? 'chat_max_tokens_zero' : 'systemone_state';
+    const path = role === 'llm' ? '/v1/chat/completions' : '/v1/systemone';
+    const timeoutMs = role === 'llm' ? config.llmTimeoutMs ?? 120_000 : config.jevTimeoutMs ?? 30_000;
+    let cached = capabilities.get(role);
+    if (!cached || performance.now() - cached.at >= 30_000) {
+      const signals = [options.signal, options.transportSignal, options.lifetimeSignal].filter(Boolean);
+      cached = { value: await discoverGMDPrefill(config[role], { mode, signal: signals.length ? AbortSignal.any(signals) : undefined }), at: performance.now() };
+      capabilities.set(role, cached);
+    }
+    if (!cached.value.supported) {
+      if (prefill) return { state: 'unsupported', reason: cached.value.reason };
+      return { payload: await requestInference(config[role], path, body, { ...options, timeoutMs, stage: role }), receipt: null };
+    }
+    const owner = input.source?.descriptor ?? input.source;
+    const requestId = Object.hasOwn(input.task, 'currentRequestId') ? input.task.currentRequestId : input.events.findLast(event => event.kind === 'input')?.id;
+    if (!owner?.registrationId || !input.task.key || !requestId) throw new AnalysisError('configuration', role, 'GMD 缓存操作缺少已确认的安装、任务或请求身份');
+    const cacheSalt = 'sentinel:' + digest(JSON.stringify(['analysis-cache/1', owner.registrationId, input.task.key, input.task.lifecycleId, requestId,
+      role, inferenceEndpoint(config[role], '/'), config[role].model, role === 'llm' ? digest(EXTRACTION_INSTRUCTIONS) : 'jev-rendered-time/1']));
+    const operation = createGMDOperation(config[role], { mode, capability: cached.value,
+      body: { ...body, stream: false, cache_salt: cacheSalt, ...(prefill ? { max_tokens: 0 } : {}) } });
+    const response = await operation.execute({ ...options, timeoutMs });
+    if (prefill) return { state: 'completed', receipt: operation.snapshot() };
+    return { payload: response, receipt: operation.snapshot() };
+  }
+  async function runAnalysis(input, { signal, transportSignal, lifetimeSignal, onState } = {}, prewarming = false) {
+      if (lifetimeSignal) {
+        signal = signal ? AbortSignal.any([signal, lifetimeSignal]) : lifetimeSignal;
+        if (transportSignal) transportSignal = AbortSignal.any([transportSignal, lifetimeSignal]);
+      }
       signal?.throwIfAborted();
       const now = config.now?.() ?? Date.now();
       const dependencies = ['llm', 'jev'].filter(name => !config[name]?.baseUrl || !config[name]?.model).map(name => `${name}_unconfigured`);
@@ -63,6 +95,9 @@ export function createAnalyzer(config = {}) {
       if (hasRequestAnchor && !latestInput) {
         coverage.complete = false;
         coverage.gaps.push('current_request_evidence_missing');
+        result.summary.currentTask = typeof input.task.currentRequest === 'string' && input.task.currentRequest.trim() ? input.task.currentRequest : '当前请求未确认';
+        result.summary.attention = '当前请求证据缺失，语义分析不可判断';
+        return prewarming ? { state: 'skipped' } : result;
       }
       if (latestInput && !latestInput.text.trim()) {
         coverage.complete = false;
@@ -71,16 +106,16 @@ export function createAnalyzer(config = {}) {
         for (const check of checks) if (check.id !== 'long_wait') check.reason = coverage.verificationGaps.length && ['validation_cost', 'validation_gap'].includes(check.id) ? `${reason}；${check.reason}` : reason;
         result.summary.currentTask = '当前请求正文不可用';
         result.summary.attention = reason + (longWait.status === 'attention' ? `；${longWait.reason}` : '');
-        return result;
+        return prewarming ? { state: 'skipped' } : result;
       }
       if (dependencies.length) {
         for (const check of checks) if (check.id !== 'long_wait') check.reason = coverage.verificationGaps.length && ['validation_cost', 'validation_gap'].includes(check.id) ? `本地摘取模型或 JEV 未配置；${check.reason}` : '本地摘取模型或 JEV 未配置';
         result.summary.attention = '本地摘取模型或 JEV 未配置，语义分析不可判断';
-        return result;
+        return prewarming ? { state: 'skipped' } : result;
       }
       if (!events.length) {
         result.summary.attention = '本轮没有仍在保留期限内的任务证据';
-        return result;
+        return prewarming ? { state: 'skipped' } : result;
       }
       const catalog = evidenceCatalog(events, latestInput);
       const messages = [
@@ -92,9 +127,11 @@ export function createAnalyzer(config = {}) {
         coverage.complete = false;
         coverage.gaps.push('analysis_input_budget');
         result.summary.attention = '本轮证据超过摘取预算，语义分析不可判断';
-        return result;
+        return prewarming ? { state: 'skipped' } : result;
       }
-      const llm = await requestInference(config.llm, '/v1/chat/completions', llmRequest, { signal, transportSignal, timeoutMs: config.llmTimeoutMs ?? 120_000, stage: 'llm' });
+      const options = { signal, transportSignal, lifetimeSignal, onState };
+      if (prewarming) return modelRequest('llm', input, llmRequest, options, true);
+      const { payload: llm, receipt: llmReceipt } = await modelRequest('llm', input, llmRequest, options);
       const message = llm.choices?.[0];
       if (message?.finish_reason !== 'stop' || typeof message?.message?.content !== 'string' || !message.message.content.trim()) throw new AnalysisError('incomplete_response', 'llm', '摘取响应未完整结束或达到输出上限');
       let extracted;
@@ -110,6 +147,7 @@ export function createAnalyzer(config = {}) {
       const progress = facts.filter(fact => ['result', 'diagnosis'].includes(fact.kind)).slice(-2);
       if (progress.length) result.summary.recentProgress = `可见结果/诊断摘录：${progress.map(fact => fact.quote).join('；')}`;
       result.usage = { llm: llm.usage ?? null, jev: null };
+      if (llmReceipt) result.usage.gmd = { llm: llmReceipt };
       const candidates = buildCandidates(events, facts, latestInput, coverage, checks);
       if (!Object.keys(candidates).length) {
         result.summary.attention = '当前材料或采集覆盖不足，本轮完整总结未发布，语义项目不可判断';
@@ -153,7 +191,7 @@ export function createAnalyzer(config = {}) {
         result.summary.attention = '本轮证据及恢复材料超过判断预算，语义分析不可判断';
         return result;
       }
-      const jev = await requestInference(config.jev, '/v1/systemone', renderedJevRequest, { signal, transportSignal, timeoutMs: config.jevTimeoutMs ?? 30_000, stage: 'jev' });
+      const { payload: jev, receipt: jevReceipt } = await modelRequest('jev', input, renderedJevRequest, options);
       for (const [id, candidate] of Object.entries(candidates)) {
         const answer = jev.answers?.[id];
         if (answer?.type !== 'choice' || !['attention', 'clear', 'unknown'].includes(answer.choice)) throw new AnalysisError('invalid_decision', 'jev', `JEV 缺少有效判断：${id}`);
@@ -173,10 +211,15 @@ export function createAnalyzer(config = {}) {
       }
       signal?.throwIfAborted();
       result.usage.jev = jev.usage ?? null;
+      if (jevReceipt) { result.usage.gmd ??= {}; result.usage.gmd.jev = jevReceipt; }
       result.summary.generated = generatedSummary;
       result.summary.attention = checks.filter(check => check.status === 'attention').map(check => check.reason).join('；') || '本轮未形成有足够依据的提醒；不可判断项目仍显示未知';
       return result;
-    },
+  }
+  return {
+    timeConditions(input, now) { return analysisTimeConditions(input, now, config.longWaitMs ?? 300_000); },
+    analyze(input, options) { return runAnalysis(input, options); },
+    prefill(input, options) { return runAnalysis(input, options, true); },
   };
 }
 

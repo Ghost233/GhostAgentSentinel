@@ -81,6 +81,7 @@ async function fixture(t, faults = {}) {
   let mode = 'normal', held
   const modelCalls = []
   models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk
     const wire = JSON.parse(raw), body = request.url === '/v1/systemone' ? decodeJevRequest(wire) : wire; modelCalls.push({ path: request.url, body })
     response.setHeader('content-type', 'application/json')

@@ -363,7 +363,7 @@
             if (!valid()) return
             if (!Array.isArray(value?.models) || !['online', 'offline', 'unconfirmed'].includes(value.state)) throw new Error('模型目录响应未确认')
             if (kind === 'list') {
-              const models = value.state === 'online' ? value.models.filter(model => ['unknown', role === 'llm' ? 'summary' : 'jev'].includes(model.role)) : []
+              const models = value.state === 'online' ? value.models.filter(model => ['unknown', role === 'llm' ? 'summary' : 'jev'].includes(model.role) || model.role === 'multiple' && Array.isArray(model.roles) && model.roles.includes(role === 'llm' ? 'summary' : 'jev')) : []
               update({ models, message: value.state === 'online' ? `已读取 ${models.length} 个候选模型；尚未检查连接` : `读取列表失败：${value.error?.code || value.state}` })
             } else {
               const message = value.state !== 'online' ? `${value.state === 'offline' ? '服务离线' : '服务响应未确认'}；模型可见性未确认${value.error?.code ? ' · ' + value.error.code : ''}`

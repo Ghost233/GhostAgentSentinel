@@ -70,6 +70,10 @@ test('five native delegation levels, siblings and a real fork reach GS through t
   const frontend = await mountGS(t, adapter, child.session.id)
   await frontend.until(() => frontend.dom.window.document.querySelector('[data-gs-count="gray"]')?.textContent === '4', 'native GS current counts')
   await frontend.click(frontend.dom.window.document.querySelector('[data-gs-entry]'))
+  await frontend.click(frontend.dom.window.document.querySelector('[data-gs-tab="details"]'))
+  await frontend.until(() => frontend.dom.window.document.querySelector('[data-gs-scope-tree]'), 'native GS details tree')
+  await frontend.click(frontend.dom.window.document.querySelector('[data-gs-scope-tree] > summary'))
+  await frontend.until(() => frontend.dom.window.document.querySelectorAll('[data-gs-node]').length === 4, 'native GS descendant rows')
   assert.equal(frontend.dom.window.document.querySelectorAll('[data-gs-node]').length, 4)
   assert.equal(frontend.dom.window.document.querySelector('[data-gs-scope]').dataset.gsScope, child.session.id)
   const selected = frontend.dom.window.document.querySelectorAll('[data-gs-node]')[3]

@@ -1,6 +1,6 @@
 # 开发接缝与验收
 
-本次发布版本为 0.1.8，上一正式版本为 0.1.7。本文记录当前源码的接缝，不代表已运行的旧进程已经具备新增能力；实际验证范围及未验项目见 [发布验证范围](release-status.md)。用户在了解实机缺口后决定发布，产品规格尚未结项。
+本次发布版本为 0.1.9，上一正式版本为 0.1.8。本文记录当前源码的接缝，不代表已运行的旧进程已经具备新增能力；实际验证范围及未验项目见 [发布验证范围](release-status.md)。用户要求三方完善并开启预填入口后发布、下载测试，当前不修改运行中的应用、Core 或模型服务，产品规格尚未结项。
 
 ## 范围和分工
 
@@ -50,7 +50,9 @@
 
 用户已确认首版沿用聊天和工具现有的版本、验证范围与退出结果。缺失时显示不可判断，六项检测全部保留。额外读取工作区的版本指纹采集后置；适配器不主动读取工作区来补全证据。
 
-分析模块导出 `createAnalyzer(config)`，对象提供 `analyze({task,source,events,coverage},{signal})`。返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`；summary 保留 currentTask/currentState/recentProgress/attention 字符串。执行短总结使用可选的 `summary.generated = {text,evidenceIds,evidenceRefs}`，只在本轮总结模型和 JEV 实际调用成功且输出、引用合法后赋值。text 为附依据的 1～2 句，最多 600 字符单元；任一环节失败或未完成均不发布新总结。
+分析模块导出 `createAnalyzer(config)`，对象提供 `analyze({task,source,events,coverage},options)`、`prefill(input,options)` 与 `timeConditions(input,now)`。options 支持业务取消、传输停止和观察实例生命周期信号，以及模型状态回调。analyze 返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`；summary 保留 currentTask/currentState/recentProgress/attention 字符串。执行短总结使用可选的 `summary.generated = {text,evidenceIds,evidenceRefs}`，只在本轮总结模型和 JEV 实际调用成功且输出、引用合法后赋值。text 为附依据的 1～2 句，最多 600 字符单元；任一环节失败或未完成均不发布新总结。
+
+预填只在服务明确声明支持 `gmd-prefill/1` 时走零输出路径。完整分析优先；已经开始的预填持有调用资格到可信结束与释放，模型等待不阻塞采集、控制接口和维护。后台预填 A 后，完整分析冻结 A＋B 并直接正预算生成，不再补发一次 A＋B 零预算请求。每安装、任务、执行、当前请求和模型角色隔离缓存；请求字节、凭证、路由与代次固定。取消封存结果，失联不新建操作来重执行。确认未提交的 `bound`／`identity_only` 证明只解除本操作资格，不是冷回退；原生已释放但结果不可恢复时保留 `result_unavailable`，不重新生成。完整协议和证据边界见仓库中的[预填契约](https://github.com/Ghost233/GhostAgentSentinel/blob/main/docs/gmd-prefill-contract.md)。
 
 checks 固定六项 ID：stalled_progress/request_drift/failure_loop/validation_cost/validation_gap/long_wait，每项 `{id,status,reason,evidenceIds}`，status 是 attention/clear/unknown。evidenceIds 必须属于本轮对应任务，unknown 不算正常，confidence 不表示准确率。未配置推理时返回明确依赖状态，不能发语义成功告警。旧总结受原历史与保留期规则管理，不能充当本轮结果。
 

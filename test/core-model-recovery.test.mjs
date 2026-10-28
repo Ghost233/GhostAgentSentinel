@@ -16,6 +16,7 @@ test('offline analysis backs off per object and resumes the same models without 
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-model-recovery-')), calls = [];
   let clock = Date.now(), offline = true;
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); calls.push({ path: request.url, model: body.model });
     response.setHeader('content-type', 'application/json');

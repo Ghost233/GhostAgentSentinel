@@ -131,7 +131,7 @@ test('Native Remote installation diagnostics retain the real failed model stage 
   assert.equal(view.analysis.latestFailure.code, 'http_error')
   assert.ok(Number.isSafeInteger(view.analysis.latestFailure.at))
   assert.ok(!JSON.stringify(view).includes('PRIVATE'))
-  assert.deepEqual(modelCalls, [['POST', '/v1/chat/completions']], 'reading diagnostics adds no directory or inference request')
+  assert.deepEqual(modelCalls, [['GET', '/api/v1/models'], ['POST', '/v1/chat/completions']], 'analysis discovers prefill once; reading diagnostics adds no directory or inference request')
   const changed = await control.configureInstallationAnalysis('dsh:diagnostics', { llm: { baseUrl, model: 'new-summary' }, jev: { baseUrl, model: 'new-judge' } }, saved.revision)
   const retained = (await ctx.typertGateway.dispatchRpc('sentinel/installationDiagnostics', { args: {} }, undefined, peer)).value
   assert.equal(retained.configRevision, changed.revision)
@@ -144,5 +144,5 @@ test('Native Remote installation diagnostics retain the real failed model stage 
   assert.equal(disconnected.collection.state, 'failed')
   assert.deepEqual(disconnected.collection.error, { stage: 'core', code: null })
   assert.ok(disconnected.collection.connectedSources > 0, 'a different retained source connection cannot hide the adapter failure')
-  assert.deepEqual(modelCalls, [['POST', '/v1/chat/completions']])
+  assert.deepEqual(modelCalls, [['GET', '/api/v1/models'], ['POST', '/v1/chat/completions'], ['GET', '/api/v1/models']], 'a new configuration rechecks capability without starting another model round during cooldown')
 })

@@ -32,6 +32,7 @@ for (const holdPending of [false, true]) test(`a real fork binding transition up
     if (failures.length) throw new AggregateError(failures, 'fork analysis transition cleanup failed')
   })
   models = createServer(async (req, res) => {
+    if (req.method === 'GET') return res.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let body = ''; for await (const chunk of req) body += chunk
     const wire = JSON.parse(body), json = req.url === '/v1/systemone' ? decodeJevRequest(wire) : wire
     requests.push({ path: req.url, body: json })

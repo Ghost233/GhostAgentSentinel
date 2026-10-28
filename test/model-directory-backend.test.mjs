@@ -30,7 +30,7 @@ async function nativeHost(t, connect) {
   return { adapter, rpc: (method, args = {}, signal) => ctx.typertGateway.dispatchRpc(`sentinel/${method}`, { args }, signal, peer) }
 }
 async function directory(t, reply) {
-  const calls = [], server = createServer((request, response) => { calls.push([request.method, request.url]); reply(response) })
+  const calls = [], server = createServer((request, response) => { calls.push([request.method, request.url]); reply(response, request) })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) })
   return { calls, baseUrl: `http://127.0.0.1:${server.address().port}` }
@@ -67,6 +67,24 @@ test('Native Remote reads a bounded GET-only model directory without connecting 
   const invalid = await host.rpc('modelDirectory', { directorySelection: { baseUrl: 'https://example.com' } })
   assert.equal(invalid.ok, false)
   assert.deepEqual(models.calls, [['GET', '/v1/models']])
+})
+
+test('Codex and native DSH return the same explicit GMD dual capabilities without Core or inference', async t => {
+  const native = await nativeHost(t, async () => { throw new Error('Own Core unavailable') }), app = await codex(t)
+  const models = await directory(t, (response, request) => response.end(JSON.stringify(request.url === '/v1/models'
+    ? { data: [{ id: 'dual', source: 'native', owned_by: 'ghostmodeldeck' }] }
+    : { source: 'ghost-model-deck', models: [
+      { key: 'dual', type: 'llm', source: 'ghost-model-deck', loaded_instances: [{ id: 'dual' }] },
+      { key: 'dual', type: 'decision', source: 'ghost-model-deck', loaded_instances: [{ id: 'dual' }] },
+    ] })))
+  const dsh = (await native.rpc('modelDirectory', { directorySelection: { baseUrl: models.baseUrl } })).value
+  const chatgpt = (await app.rpc(models.baseUrl)).structuredContent
+  for (const result of [dsh, chatgpt]) {
+    assert.equal(result.state, 'online'); assert.equal(result.inferenceVerified, false)
+    assert.deepEqual(result.models, [{ id: 'dual', role: 'multiple', roles: ['summary', 'jev'] }])
+  }
+  assert.equal(app.coreCalls(), 0)
+  assert.deepEqual(models.calls, [['GET', '/v1/models'], ['GET', '/api/v1/models'], ['GET', '/v1/models'], ['GET', '/api/v1/models']])
 })
 
 test('Native directory caller cancellation and Host close release requests and seal late model metadata', async t => {

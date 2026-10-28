@@ -6,10 +6,13 @@ import { supportedProfile } from '../../../chatgpt/bounded-reader.mjs'
 
 const [configPath, statePath, callsPath] = process.argv.slice(2)
 const config = JSON.parse(await readFile(configPath, 'utf8'))
-let closed = false
+let closed = false, firstEnablement = true
 const native = {
   async sampleHost() { return { available: true, hostRunId: 'bridge-test-host', hostStartedAt: 1, profile: supportedProfile } },
-  async readEnablement() { const enabled = JSON.parse(await readFile(statePath, 'utf8')); return { user: enabled ? 'enabled' : 'disabled', effective: enabled ? 'enabled' : 'disabled' } },
+  async readEnablement() {
+    if (firstEnablement) { firstEnablement = false; while (await stat(join(config.sessionsRoot, 'hold-startup')).then(() => true, () => false)) await delay(10) }
+    const enabled = JSON.parse(await readFile(statePath, 'utf8')); return { user: enabled ? 'enabled' : 'disabled', effective: enabled ? 'enabled' : 'disabled' }
+  },
   async listThreads() { return { data: [], nextCursor: null } },
   async readThread(id) {
     await appendFile(callsPath, id + '\n')

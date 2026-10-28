@@ -38,6 +38,7 @@ async function withModels(t, extraction, choices = {}, handler) {
   let fixtureEvents = new Map();
   let rawFixtureEvents = [];
   const server = createServer(async (req, res) => {
+    if (req.method === 'GET') { res.writeHead(404, { 'content-type': 'application/json' }); res.end('{"error":{"code":"not_found"}}'); return; }
     let body = '';
     for await (const chunk of req) body += chunk;
     const wire = JSON.parse(body);

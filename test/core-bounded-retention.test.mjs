@@ -23,6 +23,7 @@ test('graph and grouped notification replay stays bounded, then expired proof an
   let clock = Date.now(), core, source, llmCalls = 0, jevCalls = 0, largestRequest = 0, modelWork = 0, completionStarted, completionElapsed, completionReads = 0
   const samples = []
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     modelWork++
     try {
       let raw = ''; for await (const chunk of request) raw += chunk

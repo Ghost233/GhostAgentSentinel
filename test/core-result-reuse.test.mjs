@@ -21,6 +21,7 @@ async function fixture(t) {
     if (failures.length) throw new AggregateError(failures, 'Public Core/model HTTP cleanup failed')
   })
   modelServer = createServer(async (req, res) => {
+    if (req.method === 'GET') { res.writeHead(404, { 'content-type': 'application/json' }); res.end('{"error":{"code":"not_found"}}'); return; }
     let raw = ''; for await (const chunk of req) raw += chunk
     const wire = JSON.parse(raw), body = req.url === '/v1/systemone' ? decodeJevRequest(wire) : wire; requests.push({ path: req.url, body })
     res.setHeader('content-type', 'application/json')

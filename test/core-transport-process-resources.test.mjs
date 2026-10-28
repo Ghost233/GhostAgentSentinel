@@ -20,6 +20,7 @@ test('ordinary replacements retain one submitted HTTP call, while owner stop rel
   let client, runtime, source, draining = false, modelWork = 0, peak = 0, stoppedAt
   const jobs = [], forcedCleanup = []
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk
     const body = JSON.parse(raw)
     modelWork++; peak = Math.max(peak, modelWork)

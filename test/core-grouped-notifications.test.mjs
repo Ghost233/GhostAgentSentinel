@@ -22,6 +22,7 @@ async function fixture(t) {
   const capturedAt = Date.now() - 10_000, requests = [], sourceKeys = []
   let clock = Date.now(), server, client, modelRequests = 0, decision = () => 'attention'
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     modelRequests++
     try {
       let raw = ''; for await (const chunk of request) raw += chunk
@@ -44,7 +45,7 @@ async function fixture(t) {
           cleanup.core = { ...value.runtime, queueKeys: value.temporary.queueKeys, queueMemberships: value.temporary.queueMemberships, httpRequests: value.http.activeRequests }
           return value.runtime.activeAnalyses === 0 && value.runtime.cancelledUnsettledRequests === 0
         }, 'notification fixture analysis settles naturally')
-        assert.deepEqual(cleanup.core, { connectedSources: 0, activeAnalyses: 0, cancelledUnsettledRequests: 0, unsettledAnalysisCalls: 0, analysisAdmissionLimit: 1, analysisAdmissionBlocked: false, queueKeys: 0, queueMemberships: 0, httpRequests: 0 })
+        assert.deepEqual(cleanup.core, { connectedSources: 0, activeAnalyses: 0, activePrefills: 0, cancelledUnsettledRequests: 0, unsettledAnalysisCalls: 0, analysisAdmissionLimit: 1, analysisAdmissionBlocked: false, queueKeys: 0, queueMemberships: 0, httpRequests: 0 })
       },
       async () => { await client?.close(); if (client) { cleanup.client = client.transportDiagnostics(); assert.deepEqual(cleanup.client, { closed: true, pendingRequests: 0, deadlineTimers: 0 }) } },
       async () => { await server?.close(); if (server) { await assert.rejects(stat(join(dataDir, 'runtime.json')), { code: 'ENOENT' }); await assert.rejects(stat(join(dataDir, 'core.lock')), { code: 'ENOENT' }); cleanup.coreClosed = true } },

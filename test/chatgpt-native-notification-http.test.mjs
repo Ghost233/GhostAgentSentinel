@@ -150,6 +150,7 @@ async function until(predicate, label) {
 async function provider(t, { failFirst = false, attention = false } = {}) {
   let calls = 0
   const server = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk
     response.setHeader('content-type', 'application/json')
     if (++calls === 1 && failFirst) { response.writeHead(503).end('{"error":{"code":"controlled"}}'); return }

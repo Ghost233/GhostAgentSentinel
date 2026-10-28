@@ -17,6 +17,7 @@ async function fixture(t) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-successful-summary-')), calls = [], held = [];
   let clock = Date.now(), mode = 'success', text = '已核对本轮观察材料。', server, client;
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); calls.push({ path: request.url, model: body.model });
     response.setHeader('content-type', 'application/json');

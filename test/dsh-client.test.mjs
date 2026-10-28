@@ -486,7 +486,10 @@ test('native model buttons read candidates and check connections independently w
     calls.push({ method: request.method, path: request.url })
     response.setHeader('content-type', 'application/json')
     if (unavailable) { response.writeHead(503).end('{}'); return }
-    response.end(JSON.stringify({ data: [{ id: 'summary-choice', type: 'llm' }, { id: 'judge-choice', source: 'native' }, { id: 'manual-option' }, { id: 'embedding-only', type: 'embedding' }] }))
+    response.end(JSON.stringify(request.url === '/api/v1/models' ? { source: 'ghost-model-deck', models: [
+      { key: 'dual-choice', type: 'llm', source: 'ghost-model-deck', loaded_instances: [{ id: 'dual-choice' }] },
+      { key: 'dual-choice', type: 'decision', source: 'ghost-model-deck', loaded_instances: [{ id: 'dual-choice' }] },
+    ] } : { data: [{ id: 'summary-choice', type: 'llm' }, { id: 'judge-choice', source: 'native' }, { id: 'dual-choice', source: 'native', owned_by: 'ghostmodeldeck' }, { id: 'manual-option' }, { id: 'embedding-only', type: 'embedding' }] }))
   })
   t.after(async () => { await f?.dispose(); await adapter?.close(); await host.fiber.dispose(); await core?.close(); await server?.close(); models.closeAllConnections(); if (models.listening) await new Promise(resolve => models.close(resolve)); await rm(dataDir, { recursive: true, force: true }) })
   await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
@@ -533,7 +536,10 @@ test('native model buttons read candidates and check connections independently w
   assert.deepEqual(await core.installationAnalysisConfig(registrationId), before, 'reading a list neither selects a model nor saves a completed draft')
   assert.match(groups[0].querySelector('[data-sentinel-model-list]').textContent, /已读取/)
   assert.match(groups[0].querySelector('[data-sentinel-model-check]').textContent, /尚未检查/)
-  assert.deepEqual([...groups[0].querySelector('select').options].map(option => option.value), ['', 'summary-choice', 'manual-option'])
+  assert.deepEqual([...groups[0].querySelector('select').options].map(option => option.value), ['', 'summary-choice', 'dual-choice', 'manual-option'])
+  await f.interact(async () => { inputs[2].value = baseUrl; Simulate.change(inputs[2]); button(1, '读取列表').click(); await f.settle() })
+  await f.waitUntil(() => groups[1].querySelector('select').options.length > 1, 'the JEV list shares the explicitly declared dual-capability model')
+  assert.deepEqual([...groups[1].querySelector('select').options].map(option => option.value), ['', 'judge-choice', 'dual-choice', 'manual-option'])
   const switchTab = async label => f.interact(async () => { Simulate.click([...settings.querySelectorAll('[role=tab]')].find(value => value.textContent === label)); await f.settle() })
   const diagnosticReads = () => operations.filter(value => value === 'sentinel/installationDiagnostics').length
   settings.scrollTop = 133
@@ -568,7 +574,7 @@ test('native model buttons read candidates and check connections independently w
   await f.interact(async () => { Simulate.blur(inputs[3], { relatedTarget: null }); await f.settle() })
   assert.deepEqual((await core.installationAnalysisConfig(registrationId)).config, { llm: { baseUrl, model: 'summary-choice' }, jev: { baseUrl, model: 'manual-judge' } })
   assert.deepEqual(await core.installationAnalysisConfig('chatgpt:other'), other)
-  assert.ok(calls.length >= 4); assert.ok(calls.every(call => call.method === 'GET' && call.path === '/v1/models'), 'neither button starts inference or sends chat material')
+  assert.ok(calls.length >= 4); assert.ok(calls.every(call => call.method === 'GET' && ['/v1/models', '/api/v1/models'].includes(call.path)), 'neither button starts inference or sends chat material')
   await switchTab('连接诊断')
   await f.waitUntil(() => diagnostic().textContent.includes('配置完整；在线与实际推理未确认'), 'saved preparation is distinct from a completed model check or successful inference')
   assert.match(diagnostic().textContent, /尚无保留分析轮次/)
@@ -929,6 +935,7 @@ test('the actual DSH settings form autosaves groups through Native Remote and dr
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-installation-ui-')), host = new Context(), requests = []
   let server, core, adapter, actor, f, clockOffset = 0
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const bytes of request) raw += bytes
     const body = JSON.parse(raw); requests.push({ path: request.url, model: body.model })
     response.setHeader('content-type', 'application/json')
@@ -1948,6 +1955,7 @@ for (const mode of ['one Host', 'different Hosts', 'unconfirmed timeout']) test(
   let time = Date.now(), core, server, adapter, secondAdapter, a, b, held, release, releaseInvalidation, invalidationEntered = false;
   const trace = [], acknowledgements = [], modelRequests = [];
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const bytes of request) raw += bytes;
     const body = JSON.parse(raw); modelRequests.push({ path: request.url, model: body.model });
     response.setHeader('content-type', 'application/json');

@@ -20,6 +20,7 @@ test('actual MCP and Native Remote read their own produced notification records 
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-records-bridge-')), token = 'a'.repeat(64);
   let clock = Date.now(), codex, dsh, enabled = true;
   const models = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw);
     response.setHeader('content-type', 'application/json');

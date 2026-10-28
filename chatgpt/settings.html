@@ -168,7 +168,7 @@ async function readDirectory(role,action){
     const value=response.structuredContent;if(response.isError||!value||!Array.isArray(value.models))throw new Error('模型目录读取失败');
     if(action==='list'){
       const options=element('settings-'+role+'-options'),placeholder=document.createElement('option');placeholder.value='';placeholder.textContent='请选择模型或继续手填';options.replaceChildren(placeholder);
-      for(const model of value.models.slice(0,256))if(text(model.id)&&['unknown',role==='llm'?'summary':'jev'].includes(model.role)){
+      for(const model of value.models.slice(0,256))if(text(model.id)&&(['unknown',role==='llm'?'summary':'jev'].includes(model.role)||model.role==='multiple'&&Array.isArray(model.roles)&&model.roles.includes(role==='llm'?'summary':'jev'))){
         const option=document.createElement('option');option.textContent=model.id+(model.role==='unknown'?'（能力未确认）':'');option.value=model.id;options.append(option);
       }
       options.value='';

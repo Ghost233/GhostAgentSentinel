@@ -212,6 +212,7 @@ test('completed summaries and a cancelled analysis cannot restore purged install
   const f = await fixture(t), held = []
   let holdJudgment = false, completedLate = 0
   const model = createServer(async (req, res) => {
+    if (req.method === 'GET') return res.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let body = ''; for await (const chunk of req) body += chunk
     const wire = JSON.parse(body)
     res.setHeader('content-type', 'application/json')

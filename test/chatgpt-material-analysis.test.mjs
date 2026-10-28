@@ -50,6 +50,7 @@ async function modelIO(t, { choice = 'clear', failure = false, hold = false } = 
   let requestReached
   const reached = new Promise(resolve => { requestReached = resolve })
   const server = createServer(async (req, res) => {
+    if (req.method === 'GET') { res.writeHead(404, { 'content-type': 'application/json' }); res.end('{"error":{"code":"not_found"}}'); return; }
     let body = ''; for await (const chunk of req) body += chunk
     const wire = JSON.parse(body), decoded = req.url === '/v1/systemone' ? decodeJevRequest(wire) : wire
     requests.push({ path: req.url, body: decoded }); requestReached()

@@ -3,6 +3,7 @@ import { withModelSummary } from './model-summary.mjs';
 
 export async function controlledModelService(t) {
   const server = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw);
     response.setHeader('content-type', 'application/json');

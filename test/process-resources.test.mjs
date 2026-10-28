@@ -171,6 +171,7 @@ async function inferenceFixture() {
   let heldLabel = 'process-a', started = 0, cancelled = 0, completed = 0
   const held = new Set(), sockets = new Set()
   const server = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     const chunks = []
     for await (const chunk of request) chunks.push(chunk)
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))

@@ -19,6 +19,7 @@ const summaryText = '已核对所请求日志并找到最新记录。';
 async function models(t, { extraction, judgment } = {}) {
   const requests = [];
   const server = createServer(async (request, response) => {
+    if (request.method === 'GET') { response.writeHead(404, { 'content-type': 'application/json' }); response.end('{"error":{"code":"not_found"}}'); return; }
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw);
     requests.push({ path: request.url, body });

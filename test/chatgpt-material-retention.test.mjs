@@ -237,6 +237,7 @@ test('a lost core HTTP receipt replays native materials with their first capture
 async function controlledModels(t, choice = 'clear') {
   const requests = []
   const server = createServer(async (req, res) => {
+    if (req.method === 'GET') return res.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let text = ''; for await (const chunk of req) text += chunk
     const body = JSON.parse(text), decoded = req.url === '/v1/systemone' ? decodeJevRequest(body) : body
     requests.push({ path: req.url, body: decoded })

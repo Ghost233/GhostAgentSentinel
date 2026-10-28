@@ -8,15 +8,16 @@ const publicReceipt = ({ causeKey, ...value }) => copy(value);
 const identifier = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
 const CATEGORIES = new Map([
   ['timeout', ['deadline', 'timeout', 'ETIMEDOUT']],
-  ['transport', ['network', 'http_error', 'metadata-unavailable', 'metadata-send-failed', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN']],
+  ['transport', ['network', 'http_error', 'gmd_http', 'metadata-unavailable', 'metadata-send-failed', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN']],
   ['protocol', ['invalid_json', 'invalid_response', 'invalid_model', 'unexpected_stream', 'incomplete_response', 'invalid_extraction', 'invalid_summary', 'invalid_decision', 'invalid-lifecycle-record', 'unsupported-record-type', 'unsupported-event-type', 'metadata-rpc-error', 'metadata-invalid-response']],
+  ['protocol', ['gmd_binding_mismatch', 'gmd_invalid_evidence', 'gmd_response_limit', 'gmd_operation_reentry']],
   ['cancelled', ['cancelled']],
   ['evidence', ['invalid_evidence']], ['expired', ['evidence_expired', 'analysis_expired']],
-  ['configuration', ['configuration', 'analysis_config_conflict']],
+  ['configuration', ['configuration', 'analysis_config_conflict', 'prefill_unsupported', 'gmd_clock_expired']],
   ['persistence', ['monitoring_outbox_capacity']],
   ['collection', ['native_capture_capacity', 'native_capture_body_unavailable', 'compressed-data-invalid', 'native_origin_prefix_changed', 'native_origin_header_changed']],
   ['collection', ['EACCES', 'EPERM', 'ENOENT', 'ESTALE', 'EIO', 'ENOTDIR', 'EISDIR', 'EMFILE', 'ENFILE', 'ELOOP', 'ENOSPC', 'EROFS', 'record-source-unavailable', 'record-identity-changed', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'cursor-anchor-changed', 'record-malformed-or-over-limit', 'cursor-invalid', 'cursor-retains-gap', 'observation-unavailable', 'cursor-unavailable', 'record-path-unverified']],
-  ['other', ['analysis_failed', 'collection_failed', 'unrecognized_error']],
+  ['other', ['analysis_failed', 'collection_failed', 'unrecognized_error', 'gmd_operation_failed', 'gmd_not_admitted']],
 ].flatMap(([category, codes]) => codes.map(code => [code, category])));
 const STAGES = new Set(['llm', 'jev', 'configuration', 'collection', 'metadata', 'projection', 'persistence', 'core']);
 export function failureErrorInfo(error = {}) {

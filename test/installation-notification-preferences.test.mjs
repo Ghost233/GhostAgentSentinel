@@ -17,6 +17,7 @@ async function until(predicate) { const end = Date.now() + 3000; while (!await p
 async function fixture(t) {
   let clock = Date.now();
   const model = createServer(async (request, response) => {
+    if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw);
     response.setHeader('content-type', 'application/json');

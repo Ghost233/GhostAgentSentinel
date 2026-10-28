@@ -122,13 +122,14 @@ async function existing(config, owner, port, ownership) {
   return runtime
 }
 
-export async function resolvePluginOwner({ configPath } = {}) {
+export async function resolvePluginOwner({ configPath, includeStarting = false } = {}) {
   if (typeof configPath !== 'string' || !isAbsolute(configPath)) throw new Error('explicit private configuration path required')
   const config = await readPrivateConfig(configPath), info = await lstat(config.dataDir)
   if (!info.isDirectory() || info.mode & 0o077 || typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('private installation directory required')
   const owner = await record(join(config.dataDir, 'runtime.lock/owner.json'))
   if (!owner) return null
   const runtime = await existing(config, owner, config.port ?? 0, 'plugin')
+  if (runtime === null && includeStarting) return { ...owner, starting: true }
   return runtime && !runtime.dead ? { ...runtime, token: config.token } : null
 }
 

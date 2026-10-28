@@ -24,6 +24,7 @@ test('an actual settled model HTTP failure remains readable after the next round
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-failure-core-'))
   let calls = 0, core
   const model = createServer(async (req, res) => {
+    if (req.method === 'GET') { res.writeHead(404, { 'content-type': 'application/json' }); res.end('{"error":{"code":"not_found"}}'); return; }
     let body = ''; for await (const chunk of req) body += chunk
     res.setHeader('content-type', 'application/json')
     if (++calls === 1) { res.writeHead(503).end('{"error":{"code":"controlled"}}'); return }

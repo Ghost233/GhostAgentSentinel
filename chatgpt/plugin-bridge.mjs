@@ -5,11 +5,81 @@ import { once } from 'node:events'
 import { setTimeout as delay } from 'node:timers/promises'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { resolvePluginOwner } from './runtime.mjs'
+import { loadInstallationConfig, resolvePluginOwner } from './runtime.mjs'
 
 async function startOwner(configPath) {
   const child = spawn(process.execPath, [new URL('./plugin-main.mjs', import.meta.url).pathname, '--config', configPath], { detached: true, stdio: 'ignore' })
   await once(child, 'spawn'); child.unref()
+}
+
+// The package can serve its own UI before observation data is available.
+// No user data or writes pass this connection until the owner is verified.
+async function startPendingBridge({ configPath, input, output }) {
+  const { createPanelMCPServer } = await import('./panel-server.mjs')
+  const config = await loadInstallationConfig(configPath)
+  const displayName = config.pluginId === 'ghost-sentinel-test@ghostsentinel' ? 'GhostSentinel test' : config.pluginId === 'ghost-sentinel@ghostsentinel' ? 'GhostSentinel' : 'Sentinel'
+  const lifetime = new AbortController(), operations = new Set()
+  let owner, stopped = false, closing, timer, sequence = 0, finished
+  const closed = new Promise(resolve => { finished = resolve })
+  const unavailable = name => {
+    const summary = '观察服务尚未就绪，等待数据；可自动或手动刷新'
+    if (name === 'sentinel_current_chat') return { content: [{ type: 'text', text: summary }], structuredContent: {
+      signal: 'gray', summary, observation: { coverage: 'unavailable', gap: 'observer-unavailable' },
+      analysis: { state: 'unknown', summary: '尚无可用检查结果', checks: [] },
+    } }
+    if (name === 'sentinel_model_settings') return { content: [{ type: 'text', text: summary }], structuredContent: { state: 'unavailable', reason: 'observer-unavailable' } }
+    return { isError: true, content: [{ type: 'text', text: summary }], structuredContent: { saveOutcome: 'unknown' } }
+  }
+  async function qualified() {
+    if (stopped) return null
+    try {
+      const current = await resolvePluginOwner({ configPath, includeStarting: true })
+      if (stopped) return null
+      if (owner && (current?.runId !== owner.runId || current.pid !== owner.pid || owner.url && current.starting)) { void close('owner-ended'); return null }
+      if (current) owner = current
+      return current
+    } catch (error) {
+      if (error.code !== 'plugin_owner_health_unavailable') void close('owner-unconfirmed')
+      return null
+    }
+  }
+  const mcp = await createPanelMCPServer({ displayName, async forwardTool(name, selection, extra) {
+    if (stopped || operations.size >= 32 || sequence >= Number.MAX_SAFE_INTEGER) return unavailable(name)
+    const operation = new AbortController(); operations.add(operation)
+    try {
+      const current = await qualified()
+      if (!current || current.starting || stopped) return unavailable(name)
+      const signal = AbortSignal.any([extra.signal, operation.signal, lifetime.signal, AbortSignal.timeout(5000)])
+      const response = await fetch(current.url + '/mcp', { method: 'POST', redirect: 'error', signal,
+        headers: { authorization: 'Bearer ' + current.token, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-03-26' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: ++sequence, method: 'tools/call', params: { name, arguments: selection, ...(extra._meta ? { _meta: extra._meta } : {}) } }),
+      })
+      if (!response.ok) { await response.body?.cancel(); return unavailable(name) }
+      const chunks = []; let bytes = 0
+      for await (const chunk of response.body) { bytes += chunk.length; if (bytes > 1024 * 1024) throw new Error('response over limit'); chunks.push(chunk) }
+      const message = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      const after = await qualified()
+      if (!after || after.starting || stopped || !Array.isArray(message.result?.content)) return unavailable(name)
+      return message.result
+    } catch { return unavailable(name) }
+    finally { operations.delete(operation) }
+  } })
+  function close(reason = 'connection-closed') {
+    if (closing) return closing
+    stopped = true; clearTimeout(timer); lifetime.abort()
+    for (const operation of operations) operation.abort()
+    input.off('end', eof); input.off('close', eof); output.off('error', failed)
+    closing = Promise.resolve().then(() => mcp.close()).then(() => { finished({ reason }); return { reason } }, error => { finished({ reason }); throw error })
+    return closing
+  }
+  const eof = () => { void close('stdio-eof') }, failed = () => { void close('transport-unavailable') }
+  async function watch() { await qualified(); if (!stopped) timer = setTimeout(watch, owner?.url ? 1000 : 250) }
+  input.once('end', eof); input.once('close', eof); output.once('error', failed)
+  mcp.server.onclose = eof
+  try { await mcp.connect(new StdioServerTransport(input, output, { maxBufferSize: 1024 * 1024 })); void watch() }
+  catch (error) { await close('connection-start-failed'); throw error }
+  if (input.destroyed || input.readableEnded || output.destroyed) await close('stdio-eof')
+  return { get runId() { return owner?.runId ?? null }, get pid() { return owner?.pid ?? null }, closed, close }
 }
 
 // A per-chat protocol connection only; collection belongs to plugin-main.
@@ -18,15 +88,18 @@ export async function startPluginBridge({ configPath, input = process.stdin, out
   let owner, launched = false, unavailable
   while (!owner) {
     // Do not start another fixed 750 ms health probe beyond the startup budget.
-    if (Date.now() + 750 > deadline) throw unavailable ?? new Error('plugin observation did not start')
+    if (Date.now() + 750 > deadline) return startPendingBridge({ configPath, input, output })
     try { owner = await resolvePluginOwner({ configPath }) }
     catch (error) {
       if (error.code !== 'plugin_owner_health_unavailable') throw error
       unavailable = error
     }
-    if (Date.now() > deadline) throw unavailable ?? new Error('plugin observation did not start')
+    if (Date.now() > deadline) return startPendingBridge({ configPath, input, output })
     if (owner) break
-    if (!unavailable && !launched) { await launch(configPath); launched = true }
+    if (!unavailable && !launched) {
+      await launch(configPath); launched = true
+      return startPendingBridge({ configPath, input, output })
+    }
     await delay(25)
   }
   const stdio = new StdioServerTransport(input, output, { maxBufferSize: 1024 * 1024 })
