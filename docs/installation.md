@@ -1,6 +1,6 @@
 # 安装与逐后台接入
 
-本轮 DSH 与 Codex 的安装版本统一为 0.2.0。本文说明 DSH 安装方式，Codex 使用 [GitHub 安装说明](chatgpt-github-installation.md)。Codex 的添加路径为“插件 → 个人 → GhostSentinel（或 GhostSentinel test）→ 添加”。自动检查、原版宿主证据和仍未完成的实机项目见 [发布验证范围](release-status.md)。
+本轮 DSH 与 Codex 的安装版本统一为 0.2.1。本文说明 DSH 安装方式，Codex 使用 [GitHub 安装说明](chatgpt-github-installation.md)。Codex 的添加路径为“插件 → 个人 → GhostSentinel（或 GhostSentinel test）→ 添加”。自动检查、原版宿主证据和仍未完成的实机项目见 [发布验证范围](release-status.md)。
 
 每份独立 DSH 配置启用一次 Sentinel；同一配置的多个窗口共用 Host 时无需重复安装。使用同一监控数据目录的后台共用一个核心，各安装分别保存模型配置和分析暂停状态。
 
@@ -8,7 +8,7 @@
 
 安装前请阅读本版的验证范围；版本号不表示所有宿主场景均已实机验证。
 
-1. 从 [GitHub 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases) 下载 `ghost-agent-sentinel-0.2.0.tgz` 和 `SHA256SUMS`。
+1. 从 [GitHub 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases) 下载 `ghost-agent-sentinel-0.2.1.tgz` 和 `SHA256SUMS`。
 2. 校验下载文件，在长期保留的空目录中解压。
 3. 在已有 DSH 实例的“插件 → 安装第三方插件”中选择解压后的 `package` 目录，安装并启用 `ghost-agent-sentinel`。
 4. 在右侧“新标签页 → Sentinel”打开全局总览，核对来源清单。聊天输入框下方的 `GS` 打开当前会话检查；只读会话使用顶部备用入口。
@@ -17,11 +17,11 @@ macOS 解压示例：
 
 ```sh
 shasum -a 256 -c SHA256SUMS
-mkdir sentinel-0.2.0
-tar -xzf ghost-agent-sentinel-0.2.0.tgz -C sentinel-0.2.0
+mkdir sentinel-0.2.1
+tar -xzf ghost-agent-sentinel-0.2.1.tgz -C sentinel-0.2.1
 ```
 
-选择 `sentinel-0.2.0/package`，不要选择 `.tgz` 文件。目录安装可能使用 link，安装后需要保留目录。本包没有 npm 运行依赖或安装脚本，普通用户无需运行 `npm install`。
+选择 `sentinel-0.2.1/package`，不要选择 `.tgz` 文件。目录安装可能使用 link，安装后需要保留目录。本包没有 npm 运行依赖或安装脚本，普通用户无需运行 `npm install`。
 
 升级时保留旧目录，在另一空目录解压新版本，再通过 DSH 安装入口升级。安装器要求重开或已确认模块缓存仍旧时，先核对运行任务和未保存输入，再正常关闭并重开同一配置；仅看到版本号改变不能证明新模块已加载。
 
@@ -33,7 +33,7 @@ tar -xzf ghost-agent-sentinel-0.2.0.tgz -C sentinel-0.2.0
 
 ## 宿主兼容性
 
-DSH Host 需要 Node.js 22.13 或更新版本，支持内置 `node:sqlite`，并提供本包使用的 DSH SDK、React、右侧标签页及会话入口。0.2.0 以原版宿主公开能力为准，不修改客户端或 SDK；最终测试输入和结果须按候选另行记录。既有证据的目标为提交 `687f282e8625c6b8d11ff58211a90524be2e4317`、版本 `0.2.1-rc.2`，不代表本轮新界面已经实测。
+DSH Host 需要 Node.js 22.13 或更新版本，支持内置 `node:sqlite`，并提供本包使用的 DSH SDK、React、右侧标签页及会话入口。0.2.1 以原版宿主公开能力为准，不修改客户端或 SDK；最终测试输入和结果须按候选另行记录。既有证据的目标为提交 `687f282e8625c6b8d11ff58211a90524be2e4317`、版本 `0.2.1-rc.2`，不代表本轮新界面已经实测。
 
 | 能力 | 要求与缺失时的表现 |
 |---|---|
