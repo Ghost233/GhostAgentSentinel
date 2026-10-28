@@ -86,6 +86,9 @@ test('cold observation data does not block the MCP UI and later reads recover wi
     const waiting = await request('tools/call', { name: 'sentinel_current_chat', arguments: {} })
     assert.equal(waiting.result.structuredContent.signal, 'gray')
     assert.equal(waiting.result.structuredContent.observation.gap, 'observer-unavailable')
+    const diagnostic = await request('tools/call', { name: 'sentinel_installation_diagnostics', arguments: {} })
+    assert.deepEqual(diagnostic.result.structuredContent, { state: 'unavailable', reason: 'observer-unavailable' })
+    assert.notEqual(diagnostic.result.isError, true, 'startup pending is not an MCP tool failure')
     assert.equal(ownerReady, false, 'handshake and page reads finish while observer startup is still held')
     await rm(startupBarrier)
     const owner = await ownerStarting

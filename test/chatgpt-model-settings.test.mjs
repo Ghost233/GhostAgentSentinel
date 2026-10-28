@@ -585,6 +585,65 @@ test('a rejected diagnostic refresh clears the prior snapshot and never leaves o
   assert.doesNotMatch(page.element('#diagnostics-analysis').textContent, /historical|queued/)
 })
 
+test('a cold diagnostic keeps its startup state and retries only the read without resetting a model draft', async t => {
+  const page = await settingsPage(t), url = page.element('#settings-llm-url')
+  url.value = 'http://'; url.oninput()
+  const opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  const first = page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics')
+  page.reply(first.id, { isError: true, content: [{ type: 'text', text: '观察服务尚未就绪，等待数据；可自动或手动刷新' }], structuredContent: { state: 'unavailable', reason: 'observer-unavailable' } }); await opening
+  assert.match(page.element('#diagnostics-status').textContent, /启动|尚未就绪/)
+  assert.doesNotMatch(page.element('#diagnostics-status').textContent, /读取失败/)
+  assert.equal(page.timers.size, 1)
+  const [timerId, timer] = [...page.timers][0]; page.timers.delete(timerId); timer.callback(); await page.flush()
+  const second = page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics')
+  assert.notEqual(second.id, first.id)
+  page.reply(second.id, { structuredContent: diagnostics }); await page.flush()
+  assert.match(page.element('#diagnostics-status').textContent, /本安装诊断快照/)
+  assert.equal(url.value, 'http://')
+  assert.equal(page.element('#settings-pane-diagnostics').hidden, false)
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_save_model_settings').length, 0)
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_model_settings').length, 1)
+  assert.equal(page.timers.size, 0)
+})
+
+test('cold diagnostic retries stop after three attempts and leave manual refresh available', async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics')
+    page.reply(read.id, { isError: true, structuredContent: { state: 'unavailable', reason: 'observer-unavailable' } }); await page.flush()
+    if (attempt < 3) {
+      assert.equal(page.timers.size, 1)
+      const [id, timer] = [...page.timers][0]; assert.ok(timer.delay > 0, 'pending data cannot cause a busy retry loop')
+      page.timers.delete(id); timer.callback(); await page.flush()
+    }
+  }
+  await opening
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_installation_diagnostics').length, 4)
+  assert.match(page.element('#diagnostics-status').textContent, /仍未就绪.*刷新/)
+  assert.equal(page.element('#diagnostics-refresh').disabled, false)
+  assert.equal(page.timers.size, 0)
+})
+
+for (const boundary of ['leave-tab', 'hide', 'destroy']) test('a pending diagnostic retry is reclaimed on ' + boundary, async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  const read = page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics')
+  page.reply(read.id, { isError: true, structuredContent: { state: 'unavailable', reason: 'observer-unavailable' } }); await opening
+  const timer = [...page.timers.values()][0]; assert.ok(timer)
+  if (boundary === 'leave-tab') page.element('#settings-tab-settings').onclick()
+  if (boundary === 'hide') { page.document.hidden = true; page.handlers.get('visibilitychange')() }
+  if (boundary === 'destroy') await page.destroy()
+  assert.equal(page.timers.size, 0)
+  timer.callback(); await page.flush()
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_installation_diagnostics').length, 1)
+})
+
+test('diagnostics expose a real tool error without retrying it as a cold start', async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics').id, { isError: true, content: [{ type: 'text', text: 'core request deadline exceeded' }] }); await opening
+  assert.match(page.element('#diagnostics-status').textContent, /core request deadline exceeded/)
+  assert.equal(page.timers.size, 0)
+})
+
 test('directory and connection responses stay independent and reject old service results after edits or disposal', async t => {
   const page = await settingsPage(t), model = page.element('#settings-llm-model')
   model.value = 'manual-not-listed'; model.oninput()

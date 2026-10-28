@@ -1,16 +1,16 @@
 {
-  "version": "0.1.9",
+  "version": "0.2.0",
   "build": {
     "node": "v24.21.0",
     "npm": "11.19.1"
   },
-  "sha256": "7507926e973881456d6d7d6c2c61c7dd3ba6b54553f27d56f932bbda3af0dfb7",
+  "sha256": "fe9def3941b1d797e0bd5908f9a4520a93c098c0e89f7e2d22a85d3a6b477cf3",
   "files": {
     "docs/chatgpt-observation.md": "f31cf5423ec72209e945f04dfd27acde3a6d0419c85ea2e126298febac927f5d",
-    "docs/development-contract.md": "c3fd3ad16f50a18da2f890c006c840493ff6b9db8c00c192ef5e8ce1ce3486fa",
-    "docs/installation.md": "bb4c6d81fdc3094d54e236c55857e1276e7d67aaab5a8e96b872e4ea3204cc02",
-    "docs/release-notes.md": "186acb8863dcc807b1c5c4a7b84925edb4a33710bd9050a391ddbafda6b16fa5",
-    "docs/release-status.md": "68da6e1608d310d62888e7271d6c7c0df536e5f12e138ca808dedd93c17980b4",
+    "docs/development-contract.md": "7d5c89627ae94e7226537bf869555d9d6298e88852e80f7880a96138d17029de",
+    "docs/installation.md": "34a539eca103e9509ae75c04afa168f336198407bd5f4cbc8a946a01735375dd",
+    "docs/release-notes.md": "4d411f1a7a7b6999dd0b56547b959a6626e29640a079ac81ce062a5a51f54d95",
+    "docs/release-status.md": "0bfdb4f57666b24a67853492c719ddf03045701c8aa09343b1250aa2d8986c3a",
     "dsh/client.js": "bc5873fda7a16a1aec5d501b318e3ec6c5f38d13d33796a6652e3d9ba223e0c3",
     "dsh/cordis.patch.yml": "bd7d0f94c3a0d7ef682214764f5e652c82ab928306542d7a03b365e019b64696",
     "dsh/hierarchy-reader.mjs": "aa3aa9a84049271f42e71bd8b10d6b05b48f7c3694624610297ea79695728e93",
@@ -19,8 +19,8 @@
     "dsh/remote.cjs": "9d75418b5ba11979b51ae8710b80691228360c627077571bd7fdcc1d026ae134",
     "dsh/verification-evidence.mjs": "3fef17769cfcb64eadcfc7d9a067da9e253658b3d4e8317e5c4c434bc79ca107",
     "GLOSSARY.md": "f685cdec5d400bedcddd1c8627ba27087fd32feecbb6424bc01da4d4d600661b",
-    "package.json": "bdac5a60209417ad47ef9ed7e470ce212667107f0140cb942588c60b715efd72",
-    "README.md": "404523dc9d1808b1cd34f6e021a676cf84b6079ad40a3e5ccc1948174937699d",
+    "package.json": "5d4c95e7c440e1fd61bb91be7fa13591fa3211937d9ce783b6000e10175f16a5",
+    "README.md": "106ab70c647f2d7cd31f7bba68a5088eea77ca0cb2b66ed36582532d46b9b5e2",
     "src/analysis/failure-info.mjs": "67a6b3e8cd351d5cc2272351b6e46902d516b4771d7a3a2a3552970172f72d0d",
     "src/analysis/gmd-prefill-client.mjs": "52c99b16e86e2de629671a671d4d99bc7b252c0252df8a2f151858aad6f383b8",
     "src/analysis/http.mjs": "8b6c0ffe5b1a07ee7f55ce3248197f14cbec058f81191fe6f76d3f3646dffbf1",

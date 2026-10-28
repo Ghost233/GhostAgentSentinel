@@ -51,7 +51,7 @@
 </main>
 <script>
 const element=id=>document.querySelector('#'+id),text=(value,max=2000)=>typeof value==='string'?value.slice(0,max):'';
-let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0,savingGroups=null,settingsTab='settings',diagnosticsBusy=false,diagnosticsVersion=0,installationRegistrationId=null,notificationReadBusy=false,notificationReadVersion=0,permissionBusy=false,permissionVersion=0,notificationRecordsBusy=false,notificationRecordsVersion=0,notificationRecordsCursor=null;
+let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0,savingGroups=null,settingsTab='settings',diagnosticsBusy=false,diagnosticsVersion=0,diagnosticsRetryTimer=null,diagnosticsRetries=0,installationRegistrationId=null,notificationReadBusy=false,notificationReadVersion=0,permissionBusy=false,permissionVersion=0,notificationRecordsBusy=false,notificationRecordsVersion=0,notificationRecordsCursor=null;
 const pending=new Map(),directoryVersions={llm:0,jev:0},directoryRequests={llm:{list:0,check:0},jev:{list:0,check:0}},editVersions={llm:0,jev:0},completedVersions={llm:0,jev:0},dirtyRoles=new Set(),queuedGroups=new Map();
 const notificationKinds=['task-alert','monitoring-failure'],notificationEdits=Object.fromEntries(notificationKinds.map(kind=>[kind,{version:0,dirty:false,saving:false,queued:null}]));
 function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);if(entry.method==='tools/call')parent.postMessage({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id,reason}},'*');entry.reject(new Error(reason));}
@@ -190,11 +190,23 @@ function renderDiagnostics(value){
   element('diagnostics-failure').textContent=(latest?.error?'最近保留轮次错误：'+diagnosticError(latest.error)+' · '+(text(latest.error.code)||'错误未公开')+'；':'')+(analysis.latestFailure?'最近保留失败：'+diagnosticError(analysis.latestFailure)+' · '+(text(analysis.latestFailure.code)||'错误未公开'):'失败环节：未公开或无保留失败');
   element('diagnostics-status').textContent='本安装诊断快照 · '+(Number.isFinite(value.generatedAt)?new Date(value.generatedAt).toLocaleString():'时间未公开');renderConnectionChecks();
 }
-async function readDiagnostics(){
+function cancelDiagnosticRetry(){clearTimeout(diagnosticsRetryTimer);diagnosticsRetryTimer=null;diagnosticsRetries=0;}
+async function readDiagnostics(retry=false){
   if(stopped||document.hidden||!ready||settingsTab!=='diagnostics'||diagnosticsBusy)return;
+  if(!retry)cancelDiagnosticRetry();
   diagnosticsBusy=true;const version=++diagnosticsVersion;element('diagnostics-refresh').disabled=true;element('diagnostics-status').textContent='正在读取本安装诊断';
   for(const field of ['collection','model-llm','model-jev','analysis','failure'])element('diagnostics-'+field).textContent='';
-  try{const response=await request('tools/call',{name:'sentinel_installation_diagnostics',arguments:{}});if(stopped||version!==diagnosticsVersion)return;if(response.isError)throw new Error('诊断读取失败');renderDiagnostics(response.structuredContent);}
+  try{
+    const response=await request('tools/call',{name:'sentinel_installation_diagnostics',arguments:{}});if(stopped||version!==diagnosticsVersion)return;
+    if(response.structuredContent?.state==='unavailable'&&response.structuredContent.reason==='observer-unavailable'){
+      const delays=[500,1000,2000];
+      element('diagnostics-status').textContent=diagnosticsRetries<delays.length?'观察服务尚未就绪 · 正在等待启动并自动重试':'观察服务仍未就绪 · 请稍后点击刷新诊断';
+      if(!document.hidden&&settingsTab==='diagnostics'&&diagnosticsRetries<delays.length)diagnosticsRetryTimer=setTimeout(()=>{diagnosticsRetryTimer=null;void readDiagnostics(true);},delays[diagnosticsRetries++]);
+      return;
+    }
+    if(response.isError)throw new Error(response.content?.find(entry=>entry.type==='text'&&text(entry.text))?.text?.slice(0,300)||'诊断读取失败');
+    cancelDiagnosticRetry();renderDiagnostics(response.structuredContent);
+  }
   catch(error){if(!stopped&&version===diagnosticsVersion)element('diagnostics-status').textContent='连接诊断未确认 · '+text(error.message);}
   finally{if(!stopped&&version===diagnosticsVersion){diagnosticsBusy=false;element('diagnostics-refresh').disabled=false;}}
 }
@@ -232,7 +244,7 @@ async function readInstallationNotificationRecords(cursor=null){
   finally{if(current()){notificationRecordsBusy=false;element('settings-notifications-refresh').disabled=false;element('settings-notifications-older').disabled=false;}}
 }
 function selectSettingsTab(tab){
-  if(stopped)return;if(settingsTab==='notifications'&&tab!=='notifications')cancelNotificationRecords('已离开通知记录');settingsTab=tab;
+  if(stopped)return;if(settingsTab==='notifications'&&tab!=='notifications')cancelNotificationRecords('已离开通知记录');if(settingsTab==='diagnostics'&&tab!=='diagnostics')cancelDiagnosticRetry();settingsTab=tab;
   for(const name of ['settings','notifications','diagnostics']){element('settings-pane-'+name).hidden=name!==tab;element('settings-tab-'+name).setAttribute('aria-selected',String(name===tab));}
   if(tab==='diagnostics'){renderConnectionChecks();return readDiagnostics();}
   if(tab==='notifications')return readInstallationNotificationRecords();
@@ -249,7 +261,7 @@ element('settings-form').onsubmit=event=>event.preventDefault();element('setting
 element('settings-notification-reload').onclick=readNotificationPreferences;element('settings-notification-permission').onclick=requestInstallationNotificationPermission;renderNotificationPermission(null);
 for(const kind of notificationKinds){const checkbox=element('settings-notification-'+kind);checkbox.disabled=true;checkbox.onchange=()=>{if(stopped||document.hidden||checkbox.disabled)return;const edit=notificationEdits[kind];edit.version++;edit.dirty=true;edit.queued={enabled:checkbox.checked,version:edit.version};element('settings-notification-'+kind+'-status').textContent='正在保存';return saveNotificationPreference(kind);};}
 for(const tab of ['settings','notifications','diagnostics'])element('settings-tab-'+tab).onclick=()=>selectSettingsTab(tab);
-element('diagnostics-refresh').onclick=readDiagnostics;element('settings-notifications-refresh').onclick=()=>readInstallationNotificationRecords();element('settings-notifications-older').onclick=()=>notificationRecordsCursor?readInstallationNotificationRecords(notificationRecordsCursor):undefined;element('settings-notifications-older').hidden=true;element('settings-notifications-status').textContent='尚未读取本安装通知记录';element('diagnostics-status').textContent='尚未读取连接诊断';selectSettingsTab('settings');
+element('diagnostics-refresh').onclick=()=>readDiagnostics();element('settings-notifications-refresh').onclick=()=>readInstallationNotificationRecords();element('settings-notifications-older').onclick=()=>notificationRecordsCursor?readInstallationNotificationRecords(notificationRecordsCursor):undefined;element('settings-notifications-older').hidden=true;element('settings-notifications-status').textContent='尚未读取本安装通知记录';element('diagnostics-status').textContent='尚未读取连接诊断';selectSettingsTab('settings');
 for(const role of ['llm','jev']){
   for(const action of ['list','check'])element('settings-'+role+'-'+action).onclick=()=>readDirectory(role,action);
   element('settings-'+role+'-options').onchange=()=>{const selected=element('settings-'+role+'-options').value;if(!selected)return;element('settings-'+role+'-model').value=selected;markModelDraft(role,'selection');return completeModelGroup(role);};
@@ -257,8 +269,8 @@ for(const role of ['llm','jev']){
   element('settings-'+role+'-group').onkeydown=event=>{if(event.key==='Enter'&&['url','model'].some(field=>event.target===element('settings-'+role+'-'+field))){event.preventDefault();return completeModelGroup(role);}};
   for(const field of ['url','model'])element('settings-'+role+'-'+field).oninput=()=>markModelDraft(role,field);
 }
-function visibility(){if(document.hidden){cancelNotificationRecords('面板已隐藏');for(const [id,entry] of pending)if(entry.method==='tools/call')cancel(id,entry,'面板已隐藏 · 输入已保留');}else{for(const kind of notificationKinds)void saveNotificationPreference(kind);if(settingsState)void saveModelSettings();else void readModelSettings();}}
-function teardown(){if(stopped)return;stopped=true;settingsVersion++;notificationRecordsVersion++;for(const [id,entry] of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
+function visibility(){if(document.hidden){cancelDiagnosticRetry();cancelNotificationRecords('面板已隐藏');for(const [id,entry] of pending)if(entry.method==='tools/call')cancel(id,entry,'面板已隐藏 · 输入已保留');}else{for(const kind of notificationKinds)void saveNotificationPreference(kind);if(settingsState)void saveModelSettings();else void readModelSettings();if(settingsTab==='diagnostics')void readDiagnostics();}}
+function teardown(){if(stopped)return;stopped=true;cancelDiagnosticRetry();settingsVersion++;notificationRecordsVersion++;for(const [id,entry] of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('message',onMessage);addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
 (async()=>{try{const result=await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt-settings',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;applyHostTheme(result.hostContext);ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');void readNotificationPreferences();await readModelSettings();}catch(error){if(!stopped)element('settings-status').textContent='宿主初始化未完成 · '+text(error.message);}})();
 </script>

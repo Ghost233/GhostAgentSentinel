@@ -28,6 +28,7 @@ async function startPendingBridge({ configPath, input, output }) {
       analysis: { state: 'unknown', summary: '尚无可用检查结果', checks: [] },
     } }
     if (name === 'sentinel_model_settings') return { content: [{ type: 'text', text: summary }], structuredContent: { state: 'unavailable', reason: 'observer-unavailable' } }
+    if (name === 'sentinel_installation_diagnostics') return { content: [{ type: 'text', text: summary }], structuredContent: { state: 'unavailable', reason: 'observer-unavailable' } }
     return { isError: true, content: [{ type: 'text', text: summary }], structuredContent: { saveOutcome: 'unknown' } }
   }
   async function qualified() {
