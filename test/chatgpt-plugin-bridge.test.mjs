@@ -6,7 +6,8 @@ import { mkdtemp, writeFile, readFile, rm, chmod } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
-import { prepareInstallation, resolvePluginOwner } from '../chatgpt/runtime.mjs'
+import { prepareInstallation, resolvePluginOwner, startFromInstallation } from '../chatgpt/runtime.mjs'
+import { createStdioMetadataClient } from '../chatgpt/stdio-metadata.mjs'
 import { startServer } from '../src/server.mjs'
 import { startPluginBridge } from '../chatgpt/plugin-bridge.mjs'
 import { PassThrough } from 'node:stream'
@@ -99,6 +100,47 @@ test('cold observation data does not block the MCP UI and later reads recover wi
     assert.equal(bridge.runId, owner.identity.runId)
     assert.equal(launches, 1)
   } finally { await rm(startupBarrier, { force: true }); await bridge?.close(); await ownerStarting?.catch(() => {}) }
+})
+
+test('normal metadata stderr cannot close a live MCP panel or its unique observer', async t => {
+  const env = await setup(t), metadataChildren = []
+  const metadata = createStdioMetadataClient({ executable: process.execPath, args: [new URL('./fixtures/chatgpt-stdio-metadata.mjs', import.meta.url).pathname, 'stderr-chatter'], spawn(...args) { const child = spawn(...args); metadataChildren.push(child); return child } })
+  let noisy = false, runtime
+  const native = {
+    async sampleHost() { return { available: true, hostRunId: 'metadata-stderr-host', hostStartedAt: 1, profile: supportedProfile } },
+    async readEnablement(cwd) {
+      const result = await metadata.request('config/read', { key: noisy && cwd === null ? 'stderr-burst' : 'quiet' })
+      const enabled = result.config.plugins['sentinel@test'].enabled && JSON.parse(await readFile(env.statePath, 'utf8'))
+      return { user: enabled ? 'enabled' : 'disabled', effective: enabled ? 'enabled' : 'disabled' }
+    },
+    async listThreads() { return { data: [], nextCursor: null } },
+    async readThread(id) { return { thread: { id, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path: join(env.dir, id + '.jsonl'), cwd: env.dir }, anchorTurnId: 'resource-turn' } },
+    async close() { await metadata.close() },
+  }
+  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', env.configPath], stderr: 'pipe' })
+  transport.stderr.on('data', () => {})
+  const client = new Client({ name: 'metadata-stderr-panel', version: '1' })
+  try {
+    await writeFile(join(env.dir, 'resource-main.jsonl'), resourceMaterial({ at: Date.now(), cwd: env.dir, producerVersion: supportedProfile.cliVersion }))
+    runtime = await startFromInstallation({ configPath: env.configPath, native, ownership: 'plugin', pollMs: 0 })
+    await bounded(client.connect(transport), 'controlled MCP did not initialize')
+    const initial = await client.callTool({ name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'resource-main' } })
+    assert.equal(initial.structuredContent.identity.threadId, 'resource-main', 'the quiet production path is connected before diagnostic output')
+    noisy = true
+    const identities = []
+    for (let n = 0; n < 8; n++) {
+      const view = await bounded(client.callTool({ name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'resource-main' } }), 'valid panel read closed after normal metadata diagnostics')
+      assert.notEqual(view.isError, true)
+      identities.push(view.structuredContent.identity.threadId)
+    }
+    assert.deepEqual(identities, Array(8).fill('resource-main'))
+    assert.ok((await client.readResource({ uri: 'ui://ghost-sentinel/current-chat.html' })).contents.length, 'switching back can still load the page resource on the same connection')
+    assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, runtime.runId)
+    assert.equal(metadataChildren.length, 1)
+    await writeFile(env.statePath, 'false'); await runtime.refresh()
+    assert.equal((await bounded(runtime.closed, 'actual disable must still reclaim the observer')).reason, 'plugin-disabled')
+    await bounded((async () => { while (transport.pid !== null) await delay(10) })(), 'actual disable retained the MCP connection')
+  } finally { await client.close(); await runtime?.close(); await metadata.close() }
 })
 
 test('an unavailable observer retains local resources, gray reads and rejected writes without launch loops', async t => {
@@ -450,6 +492,7 @@ test('a finite native read does not require another panel request to discover di
   await writeFile(env.statePath, 'false')
   assert.deepEqual(await bounded(owner.child.ended, 'observer did not reclaim after bounded native return'), [0, null], owner.child.errors)
   assert.deepEqual(await bounded(bridge.child.ended, 'bridge required a new panel read to notice owner exit'), [0, null], bridge.child.errors)
+  assert.deepEqual(JSON.parse(bridge.child.errors.trim()), { status: 'closed', code: 'plugin_bridge_closed', reason: 'owner-ended' }, 'stdio stderr reports the exit reason without configuration or chat data')
   assert.equal(await resolvePluginOwner({ configPath: env.configPath }), null)
 })
 

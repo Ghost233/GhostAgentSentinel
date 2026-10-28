@@ -34,6 +34,7 @@ test('GitHub distribution preserves the pinned official Node license without rea
 
 test('GitHub catalog ships two isolated, self-contained plugin sources with test suffix', async () => {
   const catalog = JSON.parse(await readFile(join(root, '.agents/plugins/marketplace.json')))
+  const version = JSON.parse(await readFile(join(root, 'package.json'))).version
   assert.equal(catalog.name, 'ghostsentinel')
   assert.deepEqual(catalog.plugins.map(value => value.name), ['ghost-sentinel', 'ghost-sentinel-test'])
   const digests = [], keys = []
@@ -45,6 +46,7 @@ test('GitHub catalog ships two isolated, self-contained plugin sources with test
     else assert.equal(entry.source.source, 'local')
     const manifest = JSON.parse(await readFile(join(directory, '.codex-plugin/plugin.json')))
     assert.equal(manifest.name, entry.name)
+    assert.equal(manifest.version, version, 'plugin registration must match the repository package version')
     assert.equal(manifest.interface.displayName, entry.name.endsWith('-test') ? 'GhostSentinel test' : 'GhostSentinel')
     assert.equal(manifest.requires_local_executor, true)
     const servers = JSON.parse(await readFile(join(directory, '.mcp.json'))).mcpServers
@@ -62,6 +64,7 @@ test('GitHub catalog ships two isolated, self-contained plugin sources with test
   assert.deepEqual(keys, ['ghost_sentinel', 'ghost_sentinel_test'])
   const directory = join(root, 'plugins/ghost-sentinel')
   const packed = JSON.parse((await execute('/usr/bin/tar', ['-xOf', join(directory, 'payload.tar.gz'), './plugin-package.json'], { maxBuffer: 8 * 1024 * 1024 })).stdout)
+  assert.equal(packed.version, version, 'embedded payload must match the registered plugin version')
   assert.ok(packed.notificationPath, 'the distribution includes the existing short-lived native notifier')
   for (const [path, value] of Object.entries(packed.files)) {
     if (path.startsWith('chatgpt/node_modules/') || path.startsWith('runtime/') || path.startsWith('notification/')) continue

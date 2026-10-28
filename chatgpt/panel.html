@@ -3,7 +3,7 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sentinel 会话检查</title>
 <style>
-:root{font:13px/1.5 system-ui;color-scheme:light dark}body{margin:0;padding:14px;overflow-wrap:anywhere}h1{font-size:14px;margin:0 0 8px}p{margin:5px 0}#summary{font-weight:600;font-size:14px}#analysis,.muted{color:GrayText;font-size:12px}.issue{padding:10px 0;border-bottom:1px solid color-mix(in srgb,GrayText 22%,transparent)}h2{font-size:13px;margin:0 0 4px}.evidence{white-space:pre-line;font-size:12px;color:GrayText;line-height:1.45;margin-top:5px}details{margin-top:12px}summary{cursor:pointer;font-size:12px;color:GrayText}.check{padding:8px 0;border-bottom:1px solid color-mix(in srgb,GrayText 15%,transparent)}.check-status{font-size:12px;font-weight:400;margin-left:8px;color:GrayText}#coverage,#technical,#observation,#execution{white-space:pre-line}#error{color:GrayText;font-size:12px}.history-entry{display:block;width:100%;text-align:left;margin:5px 0;padding:6px 8px;font:inherit;border:1px solid GrayText;border-radius:5px;background:transparent;color:inherit;overflow-wrap:anywhere}.history-entry[aria-current=true]{border-width:2px;font-weight:600}
+:root{font:13px/1.5 system-ui;color-scheme:light dark}body{margin:0;padding:14px;overflow-wrap:anywhere}h1{font-size:14px;margin:0 0 8px}p{margin:5px 0}#summary{font-weight:600;font-size:14px}#analysis,.muted{color:GrayText;font-size:12px}.issue{padding:10px 0;border-bottom:1px solid color-mix(in srgb,GrayText 22%,transparent)}h2{font-size:13px;margin:0 0 4px}.evidence{white-space:pre-line;font-size:12px;color:GrayText;line-height:1.45;margin-top:5px}#checks,#history,#diagnostics,#last-summary{margin-top:16px}#diagnostics>h2,#history>h2,#last-summary>h2{color:GrayText}.check{padding:8px 0;border-bottom:1px solid color-mix(in srgb,GrayText 15%,transparent)}.check-status{font-size:12px;font-weight:400;margin-left:8px;color:GrayText}#coverage,#technical,#observation,#execution{white-space:pre-line}#error{color:GrayText;font-size:12px}.history-entry{display:block;width:100%;text-align:left;margin:5px 0;padding:6px 8px;font:inherit;border:1px solid GrayText;border-radius:5px;background:transparent;color:inherit;overflow-wrap:anywhere}.history-entry[aria-current=true]{border-width:2px;font-weight:600}
 #gs-bar{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;padding:10px 0;background:var(--color-background-primary,Canvas);border-bottom:1px solid color-mix(in srgb,GrayText 20%,transparent)}#gs-bar strong{font-size:13px;margin-right:auto}#gs-bar span{font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}#monitor-tabs{display:flex;gap:18px;margin:10px 0 14px}#monitor-tabs button{border:0;border-bottom:2px solid transparent;padding:6px 0;background:transparent;color:GrayText;font:inherit;cursor:pointer}#monitor-tabs button[aria-selected=true]{border-bottom-color:currentColor;color:inherit;font-weight:600}
 #refresh{padding:3px 7px;border:1px solid color-mix(in srgb,GrayText 35%,transparent);border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:12px;cursor:pointer}
 </style>
@@ -24,9 +24,9 @@
 <p id="health" class="muted" role="status"></p>
 <button id="pause" type="button" hidden>暂停本聊天分析</button>
 <section id="detail-issues" aria-label="所选检查的问题与依据"></section>
-<details id="checks"><summary>六项检查</summary><div id="check-list"></div></details>
-<details id="history" hidden><summary>24 小时内的检查记录</summary><button id="history-current" type="button">返回当前／最近一轮</button><div id="history-list"></div><button id="history-more" type="button" hidden>较早记录</button><p id="history-gap" class="muted"></p><details id="last-summary" hidden><summary>上次成功总结</summary><p id="last-summary-time" class="muted"></p><p id="last-summary-text"></p><div id="last-summary-evidence" class="evidence"></div></details></details>
-<details id="diagnostics"><summary id="diagnostics-title">观察与覆盖</summary><p id="identity" class="muted"></p><p id="coverage" class="muted"></p><p id="observation" class="muted"></p><div id="gaps" class="muted"></div><p id="technical" class="muted"></p></details>
+<section id="checks"><h2>六项检查</h2><div id="check-list"></div></section>
+<section id="history" hidden><h2>24 小时内的检查记录</h2><button id="history-current" type="button">返回当前／最近一轮</button><div id="history-list"></div><button id="history-more" type="button" hidden>较早记录</button><p id="history-gap" class="muted"></p><section id="last-summary" hidden><h2>上次成功总结</h2><p id="last-summary-time" class="muted"></p><p id="last-summary-text"></p><div id="last-summary-evidence" class="evidence"></div></section></section>
+<section id="diagnostics"><h2 id="diagnostics-title">观察与覆盖</h2><p id="identity" class="muted"></p><p id="coverage" class="muted"></p><p id="observation" class="muted"></p><div id="gaps" class="muted"></div><p id="technical" class="muted"></p></section>
 <p id="error" role="status"></p>
 </section>
 <script>
@@ -38,7 +38,7 @@ const element=id=>document.querySelector('#'+id);
 const text=(value,max=240)=>typeof value==='string'?value.trim().slice(0,max):'';
 const list=value=>Array.isArray(value)?value:[];
 const count=value=>Number.isSafeInteger(value)&&value>=0?String(value):'—';
-let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false,lastIdentity=null,controlState=null,scopeThreadId=null,selectedExecutionKey=null,historyCursor=null,nextHistoryCursor=null;
+let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false,controlState=null,scopeThreadId=null,selectedExecutionKey=null,historyCursor=null,nextHistoryCursor=null;
 const pending=new Map();
 function selectTab(tab){
   for(const name of ['issues','details'])element('monitor-tab-'+name).setAttribute('aria-selected',String(name===tab));
@@ -55,7 +55,7 @@ function renderGS(view,signal='gray'){
   for(const name of ['green','yellow','red','gray'])element('gs-'+name).textContent=lights[name]+' '+(active&&light===name?'1':'0');
 }
 renderGS(null);
-function reset(collapse=true){
+function reset(){
   controlState=null;element('pause').hidden=true;element('pause').disabled=false;
   for(const name of ['identity','coverage','observation','technical','error','health','execution','record-status','current-request','current-activity','inheritance','history-gap','model-status','model-summary-text','availability'])element(name).textContent='';
   element('availability').hidden=true;
@@ -65,9 +65,8 @@ function reset(collapse=true){
   for(const name of ['issues','detail-issues','check-list','gaps','history-list'])element(name).replaceChildren();
   element('history').hidden=true;element('history-more').hidden=true;
   element('analysis').textContent='当前分析不可判断';element('diagnostics-title').textContent='观察与覆盖';
-  if(collapse){element('checks').open=false;element('diagnostics').open=false;element('history').open=false;element('last-summary').open=false;}
 }
-function clearView(message){reset();renderGS(null);lastIdentity=null;scopeThreadId=null;selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;element('summary').textContent='⚪ '+message;element('summary').setAttribute('data-signal','gray');}
+function clearView(message){reset();renderGS(null);scopeThreadId=null;selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;element('summary').textContent='⚪ '+message;element('summary').setAttribute('data-signal','gray');}
 function node(tag,value,className){const child=document.createElement(tag);if(value)child.textContent=value;if(className)child.className=className;return child;}
 function renderHealth(health){
   if(health?.state==='failed'){
@@ -85,7 +84,7 @@ function readArguments(){return selectedExecutionKey||historyCursor?{...(selecte
 function selectExecution(key,cursor=historyCursor){
   if(stopped||!ready||!scopeThreadId)return;
   if(key)selectTab('details');
-  selectedExecutionKey=key;historyCursor=cursor;generation++;clearTimeout(timer);timer=null;reset(false);
+  selectedExecutionKey=key;historyCursor=cursor;generation++;clearTimeout(timer);timer=null;reset();
   element('summary').textContent='⚪ 正在读取检查记录';element('summary').setAttribute('data-signal','gray');renderGS({identity:{threadId:scopeThreadId}},'gray');
   return refresh();
 }
@@ -121,7 +120,7 @@ function render(view){
     return;
   }
   if(scopeThreadId&&scopeThreadId!==identity){selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;}
-  reset(identity!==lastIdentity);lastIdentity=identity;scopeThreadId=identity;
+  reset();scopeThreadId=identity;
   const analysis=view.analysis,byId=new Map(list(analysis.checks).filter(check=>check&&Object.hasOwn(labels,check.id)).map(check=>[check.id,check]));
   const inheritanceGap=view.inheritance&&(view.inheritance.state!=='complete'||list(view.inheritance.gaps).length>0);
   const recordRevalidating=!view.execution?.historical&&view.observation?.recordRevalidating===true;

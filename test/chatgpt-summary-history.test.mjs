@@ -82,7 +82,7 @@ test('real native material and model HTTP keep a reused summary visible and a la
   await page.refresh(); await page.deliver(failed)
   assert.equal(page.element('#model-summary').hidden, true)
   assert.equal(page.element('#last-summary').hidden, false)
-  assert.equal(page.element('#last-summary').open, false)
+  assert.equal(page.element('#last-summary').tagName, 'SECTION', 'a prior summary remains historical but is directly readable in Details')
   assert.match(page.element('#last-summary-evidence').textContent, /synthetic log/)
   assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/systemone'])
 })

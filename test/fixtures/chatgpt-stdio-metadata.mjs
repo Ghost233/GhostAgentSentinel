@@ -25,6 +25,7 @@ input.on('line',line=>{
   if(message.method==='thread/read')result.thread={id:message.params.threadId,parentThreadId:null,source:'vscode',originator:'Codex Desktop'}
   if(message.method==='thread/turns/list')result.data=[{id:'turn'}]
   if(message.method==='thread/list')result.data=[{id:'fixture-thread'}]
+  if(mode==='stderr-chatter'&&message.params?.key==='stderr-burst'){process.stderr.write('x'.repeat(256*1024)+'\n',()=>send(result));return}
   setTimeout(()=>send(result),message.params?.key==='slow'?25:0)
 })
 input.on('close',()=>{if(mode!=='stubborn'){if(mode==='bad-exit')process.stderr.write('PRIVATE-RAW-TOKEN /private/source\n');process.exit(mode==='bad-exit'?7:0)}})

@@ -218,7 +218,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     if (args.length !== 2 || args[0] !== '--config' || !isAbsolute(args[1])) throw new Error('invalid plugin bridge arguments')
     bridge = await startPluginBridge({ configPath: args[1] })
     if (stopping) await bridge.close('process-stopped')
-    await bridge.closed
+    const { reason } = await bridge.closed
+    process.stderr.write(JSON.stringify({ status: 'closed', code: 'plugin_bridge_closed', reason }) + '\n')
   } catch { process.stderr.write('{"status":"failed","code":"plugin_bridge_failed"}\n'); process.exitCode = 1 }
   finally { process.removeListener('SIGTERM', stop); process.removeListener('SIGINT', stop) }
 }

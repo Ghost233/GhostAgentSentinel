@@ -4,6 +4,29 @@ import { panelHarness as harness } from './helpers/chatgpt-panel.mjs'
 
 const ids = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait']
 const result = id => ({ signal: 'gray', summary: id ? id + ' 执行开始' : '无法确认当前观察', identity: { threadId: id }, observation: { coverage: 'caught-up', gap: null }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
+
+test('details stay directly readable across refresh, transport failure and chat changes without disclosure controls', async t => {
+  const page = await harness(t)
+  page.element('#monitor-tab-details').onclick()
+  const sections = ['checks', 'diagnostics', 'history', 'last-summary']
+  const expanded = () => {
+    for (const id of sections) assert.equal(page.element('#' + id).tagName, 'SECTION', id + ' must not require expansion')
+    assert.equal(page.element('#monitor-details').hidden, false)
+  }
+  await page.deliver(material('main-a'))
+  expanded()
+  assert.equal(page.element('#check-list').children.length, 6)
+  await page.refresh(); await page.deliver(material('main-a'))
+  expanded()
+  const request = await page.refresh()
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', id: request, error: { code: -32603, message: 'Transport closed' } } }); await page.flush()
+  expanded()
+  assert.equal(page.element('#check-list').textContent, '', 'failed reads clear old checks without collapsing the details page')
+  await page.refresh(); await page.deliver(material('main-b'))
+  expanded()
+  assert.match(page.element('#identity').textContent, /main-b/)
+  assert.equal(page.element('#check-list').children.length, 6)
+})
 const material = (id = 'main-a', signal = 'red') => ({ ...result(id), signal, summary: '当前修改可能偏离请求', analysis: { connected: true, state: 'cooldown', resultDisposition: 'current', summary: '本轮六项检查已更新', waitMs: 0, lagMs: 2500, coverage: { complete: true, gaps: [] }, checks: ids.map(checkId => ({ id: checkId, status: checkId === 'request_drift' ? 'attention' : 'clear', reason: '已核对现有材料' })), issues: [{ checkId: 'request_drift', reason: '用户只要求改文字，代理却更改了数据层', evidence: [{ text: '<img src=x onerror="alert(1)"> 只改按钮文字', reference: 'record:private-evidence-id' }] }] }, discovery: { complete: false, directoryComplete: true, counts: { main: 3, fork: 1, child: 2, remote: 0, cloud: 0, unknown: 1 }, tracked: 3, connected: 1, currentIncluded: true, gaps: ['fork-coverage-pending'] } })
 
 test('missing observation data stays visible and refreshes automatically or manually in the same page', async t => {
@@ -39,7 +62,7 @@ test('a completed model summary keeps literal evidence and disappears when the n
   assert.equal(page.element('#model-summary').hidden, true)
 })
 
-test('a failed new round keeps the prior successful summary only in collapsed history with its original time and evidence', async t => {
+test('a failed new round keeps the prior successful summary only in directly readable history with its original time and evidence', async t => {
   const page = await harness(t), view = material('main-a', 'gray'), completedAt = Date.now() - 1000
   view.analysis.state = 'failed'; view.analysis.resultDisposition = 'invalid'
   view.analysis.lastSuccessfulSummary = { generated: { text: '上次已观察到按钮更新。', evidence: [{ text: '<button> 已修改', reference: 'native:prior-result' }] }, completedAt, expiresAt: completedAt + 86400000, configScope: { registrationId: 'chatgpt:installation-a', revision: 'prior-revision' } }
@@ -47,7 +70,7 @@ test('a failed new round keeps the prior successful summary only in collapsed hi
   await page.deliver(view)
   assert.equal(page.element('#model-summary').hidden, true)
   assert.equal(page.element('#last-summary').hidden, false)
-  assert.equal(page.element('#last-summary').open, false)
+  assert.equal(page.element('#last-summary').tagName, 'SECTION')
   assert.match(page.element('#last-summary-text').textContent, /上次已观察/)
   assert.match(page.element('#last-summary-time').textContent, /历史.*当前/)
   assert.match(page.element('#last-summary-evidence').textContent, /<button> 已修改.*native:prior-result/s)
@@ -148,8 +171,8 @@ test('the real panel script accepts grounded material issues and places small li
   assert.equal(evidence.children.length, 0, 'evidence is literal text, not injected markup')
   assert.equal(page.element('#check-list').children.length, 6)
   for (const label of ['活跃但推进不足', '偏离当前请求', '同类失败反复返工', '完整验证重复成本', '本地验证证据缺口', '长等待或活动中断']) assert.ok(page.element('#check-list').textContent.includes(label), label)
-  assert.equal(page.element('#checks').open, false)
-  assert.equal(page.element('#diagnostics').open, false)
+  assert.equal(page.element('#checks').tagName, 'SECTION')
+  assert.equal(page.element('#diagnostics').tagName, 'SECTION')
   assert.match(page.element('#coverage').textContent, /主聊天.*3/)
   assert.match(page.element('#coverage').textContent, /分叉.*1/)
 })
@@ -316,12 +339,11 @@ test('unknown or unconfigured results never masquerade as green while legitimate
 test('context changes clear issues and coverage immediately, reject late output and preserve legacy metadata rendering', async t => {
   const page = await harness(t)
   await page.deliver(material())
-  page.element('#checks').open = true; page.element('#diagnostics').open = true
   const oldRequest = await page.refresh()
   page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed', params: {} } })
   for (const id of ['identity', 'coverage', 'technical', 'issues', 'check-list', 'gaps']) assert.equal(page.element('#' + id).textContent, '', id)
-  assert.equal(page.element('#checks').open, false)
-  assert.equal(page.element('#diagnostics').open, false)
+  assert.equal(page.element('#checks').tagName, 'SECTION')
+  assert.equal(page.element('#diagnostics').tagName, 'SECTION')
   page.reply(oldRequest, { structuredContent: material('main-a') }); await page.flush()
   assert.equal(page.element('#issues').children.length, 0)
   assert.doesNotMatch(page.element('#summary').textContent, /偏离请求/)
@@ -386,7 +408,7 @@ test('an unbound source failure keeps only its new diagnostic gaps after clearin
   assert.match(page.element('#gaps').textContent, /directory-page-failed/)
   assert.doesNotMatch(page.element('#gaps').textContent, /fork-coverage-pending/)
   for (const id of ['identity', 'coverage', 'technical', 'issues', 'check-list']) assert.equal(page.element('#' + id).textContent, '', id)
-  assert.equal(page.element('#diagnostics').open, false)
+  assert.equal(page.element('#diagnostics').tagName, 'SECTION')
   assert.match(page.element('#diagnostics-title').textContent, /有缺口/)
   await page.refresh(); await page.deliver(result('main-b'))
   assert.equal(page.element('#gaps').textContent, '')
@@ -397,7 +419,6 @@ test('the actual panel DOM omits excluded child-agent counts while retaining cur
   const page = await harness(t), view = material()
   view.discovery.counts.child = 987
   await page.deliver(view)
-  page.element('#diagnostics').open = true
   const visible = ['summary', 'coverage', 'technical', 'gaps'].map(id => page.element('#' + id).textContent).join('\n')
   assert.doesNotMatch(visible, /子代理|child|987/)
   assert.match(page.element('#coverage').textContent, /本聊天：已接入/)
@@ -412,10 +433,9 @@ test('the panel selects its own monitored history, keeps evidence inline and ret
   view.execution = { key: 'current', lifecycleId: 'turn-current', historical: false, status: 'running', request: 'Current request' }
   view.history = { currentKey: 'current', selectedKey: 'current', executions: [{ key: 'current', lifecycleId: 'turn-current', status: 'running', observedAt: 1000 }, { key: 'prior', lifecycleId: 'turn-prior', status: 'ended', observedAt: 500 }], hasMore: false }
   await page.deliver(view)
-  assert.equal(page.element('#history').open, false)
+  assert.equal(page.element('#history').tagName, 'SECTION')
   const prior = page.element('#history-list').children.find(node => node.getAttribute('data-execution-key') === 'prior')
   assert.ok(prior, 'actual history markup provides the prior execution selector')
-  page.element('#history').open = true
   const selection = prior.onclick(); await page.flush()
   const request = page.sent.findLast(row => row.method === 'tools/call')
   assert.deepEqual(JSON.parse(JSON.stringify(request.params.arguments)), { executionKey: 'prior', expectedThreadId: 'main-a' })
@@ -425,7 +445,7 @@ test('the panel selects its own monitored history, keeps evidence inline and ret
   assert.match(page.element('#execution').textContent, /历史执行.*已结束/)
   assert.match(page.element('#execution').textContent, /Prior request/)
   assert.match(page.element('#summary').textContent, /^⚪.*历史/)
-  assert.equal(page.element('#history').open, true)
+  assert.equal(page.element('#history').tagName, 'SECTION')
   assert.ok(page.element('#detail-issues').children[0].children.some(node => node.className === 'evidence'))
   const pause = page.element('#pause').onclick(); await page.flush()
   const control = page.sent.findLast(row => row.method === 'tools/call')

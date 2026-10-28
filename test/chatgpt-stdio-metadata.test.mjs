@@ -84,6 +84,17 @@ test('public plugin list and read remain observation-only catalog requests',asyn
   assert.equal((await f.client.request('plugin/read',{marketplacePath:'/fixture/catalog',pluginName:'fixture'})).method,'plugin/read')
   assert.deepEqual((await f.calls()).map(value=>value.method),['initialize','initialized','plugin/list','plugin/read'])
 })
+test('ordinary stderr over a long-lived metadata connection cannot invalidate valid RPC or replace the process',async t=>{
+  const f=await fixture(t,'stderr-chatter')
+  for(let n=0;n<8;n++){
+    const result=await f.client.request('config/read',{key:'stderr-burst'})
+    assert.equal(result.ready,true)
+  }
+  assert.equal((await f.client.request('thread/read',{threadId:'still-readable'})).thread.id,'still-readable')
+  assert.equal(f.children.length,1,'discarded diagnostic output must not restart metadata')
+  await f.client.close()
+  assert.deepEqual(await f.children[0].ended,{code:0,signal:null})
+})
 for(const [mode,code] of [['eof','metadata-unavailable'],['rpc','metadata-rpc-error'],['invalid','metadata-invalid-response'],['oversized','metadata-invalid-response']])test(mode+' settles pending requests with a safe metadata classification',async t=>{
   const f=await fixture(t,mode)
   await assert.rejects(f.client.request('thread/list',{}),error=>{assert.equal(error.code,code);assert.equal(error.stage,'metadata');assert.doesNotMatch(error.message,/PRIVATE|\/private\/source/);return true})

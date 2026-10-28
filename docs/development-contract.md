@@ -104,7 +104,7 @@ DSH 的每次通知认领附带不透明的 `attemptToken`。客户端建立该�
 
 关闭通知先保存偏好并取消待发记录，再等待本安装该类已签发许可完成撤销或提交结算；从另一 Host 操作和重复保存 false 也不能跳过确认。断连、取消或超时不证明旧许可已失效，返回 `notification_revocation_unconfirmed`，读取偏好时也保留对应 `revocation` 未确认状态，不能只凭 false 显示关闭完成。未结算尝试只保留有界、无正文的撤销资料，历史到期、数量裁剪或核心重开不能将其视作已安全结算；晚到回执不能复活通知历史。此接缝的自动检查与实际宿主集中验收分别记录。
 
-Codex 监控页只提供“当前问题／详情”，不再包含设置表单、系统许可按钮和旧的按执行通知记录界面。历史结果仅在详情呈现；`history.currentStatus` 与 `history.currentSignal` 取当前主聊天执行，不使用所选历史轮次的灯号。无已确认身份不补造运行节点，终止节点退出四灯计数。问题中的通知短标记只反映已有提交事实，不表示用户看见。
+Codex 监控页只提供“当前问题／详情”，不再包含设置表单、系统许可按钮和旧的按执行通知记录界面。详情中的六项检查、观察与覆盖、检查历史及上次成功总结使用直接可读的区块，不提供折叠控件；无资料的区块仍隐藏，刷新、失败和切换聊天不折叠详情，旧范围资料仍须及时清空。历史结果仅在详情呈现；`history.currentStatus` 与 `history.currentSignal` 取当前主聊天执行，不使用所选历史轮次的灯号。无已确认身份不补造运行节点，终止节点退出四灯计数。问题中的通知短标记只反映已有提交事实，不表示用户看见。
 
 安装通知记录通过 `installationNotificationRecords(registrationId, {cursor?, limit?})` 和 GET `/v1/notifications/installations/records` 读取。Codex 的 app-only `sentinel_installation_notification_records({cursor?})` 与 DSH Remote 的同名安装查询固定所属安装，不依赖当前聊天。实际运行核心须声明 `installation-notification-records/1`；缺少能力时明确报不支持，不以健康状态或客户端同名方法代验。
 

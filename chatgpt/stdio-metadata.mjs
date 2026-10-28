@@ -101,9 +101,10 @@ export function createStdioMetadataClient({ executable = NATIVE_EXECUTABLE, args
     if (opening) return opening
     opening = (async () => {
       let child
-      try { child = spawn(executable, args, { stdio: ['pipe', 'pipe', 'pipe'], detached: false, windowsHide: true }) }
+      // Diagnostic output is not RPC data and has no lifetime byte budget.
+      try { child = spawn(executable, args, { stdio: ['pipe', 'pipe', 'ignore'], detached: false, windowsHide: true }) }
       catch { throw failure('metadata-unavailable') }
-      const state = { child, buffer: Buffer.alloc(0), writingBytes: 0, stderrBytes: 0, initialized: false, retired: false, ended: false, terminal: null, stopping: null }
+      const state = { child, buffer: Buffer.alloc(0), writingBytes: 0, initialized: false, retired: false, ended: false, terminal: null, stopping: null }
       state.end = new Promise(resolve => { state.endedResolve = resolve })
       connection = state
       child.on('error', () => { void retire(state, 'metadata-unavailable') })
@@ -117,8 +118,6 @@ export function createStdioMetadataClient({ executable = NATIVE_EXECUTABLE, args
       child.stdout.on('data', bytes => receive(state, bytes))
       child.stdout.on('error', () => { void retire(state, 'metadata-unavailable') })
       child.stdout.on('end', () => { if (!state.retired) void retire(state, 'metadata-unavailable') })
-      child.stderr.on('data', bytes => { state.stderrBytes += bytes.length; if (state.stderrBytes > MAX_BYTES) void retire(state, 'metadata-invalid-response') })
-      child.stderr.on('error', () => { void retire(state, 'metadata-unavailable') })
       try {
         await wire(state, 'initialize', { clientInfo: { name: 'ghost_sentinel_chatgpt', version: '0.1.0-dev.1' }, capabilities: { experimentalApi: true } }, 3000)
         if (closed || connection !== state || state.retired) throw failure(closed ? 'cancelled' : 'metadata-unavailable')

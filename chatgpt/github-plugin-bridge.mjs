@@ -38,7 +38,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     bridge = await startGitHubBridge({ ...parseGitHubBridgeArguments(process.argv.slice(2)), signal: controller.signal })
     if (controller.signal.aborted) await bridge.close('process-stopped')
-    await bridge.closed
+    const { reason } = await bridge.closed
+    process.stderr.write(JSON.stringify({ status: 'closed', code: 'github_bridge_closed', reason }) + '\n')
   } catch { process.stderr.write('{"status":"failed","code":"github_bridge_failed"}\n'); process.exitCode = 1 }
   finally { process.removeListener('SIGTERM', stop); process.removeListener('SIGINT', stop) }
 }
