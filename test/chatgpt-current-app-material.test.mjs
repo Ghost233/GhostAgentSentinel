@@ -16,13 +16,14 @@ import { MaterialProjection, materialRecord } from '../chatgpt/material-projecti
 
 const at = 1_800_000_000_000, owner = '00000000-0000-4000-8000-000000000163', parent = '00000000-0000-4000-8000-000000000162'
 const app20770 = { appVersion: '26.1013.40934', appBuild: '20770', cliVersion: '0.163.0-alpha.10.2' }
+const app21828 = { appVersion: '26.1021.31345', appBuild: '21828', cliVersion: '0.164.0-alpha.11.1' }
 const row = (ordinal, type, payload, time = at) => JSON.stringify({ ordinal, type, payload, timestamp: new Date(time).toISOString() }) + '\n'
 const header = (id, producer = candidateHostProfile.cliVersion) => ({ id, cwd: '/synthetic-project', originator: 'Codex Desktop', source: 'vscode', cli_version: producer, history_mode: 'paginated' })
 const start = (id, trigger = 'composer') => ({ type: 'task_started', turn_id: id, turn_attribution: { turn_id: id, turn_trigger: trigger } })
 const user = (thread, turn, text = 'Inspect only the synthetic log') => ({ type: 'item_completed', thread_id: thread, turn_id: turn, item: { type: 'UserMessage', id: turn + '-user', content: [{ type: 'text', text }] } })
 const agent = (thread, turn, text = 'The synthetic log has been inspected') => ({ type: 'item_completed', thread_id: thread, turn_id: turn, item: { type: 'AgentMessage', id: turn + '-agent', content: [{ type: 'Text', text }] } })
 
-async function fixture(t, { profile = candidateHostProfile, suffix = '', records, fork = false, compressed = false, onQualificationLost } = {}) {
+async function fixture(t, { profile = candidateHostProfile, producer = candidateHostProfile.cliVersion, inheritedProducer = producer, suffix = '', records, fork = false, compressed = false, onQualificationLost } = {}) {
   let clock = at
   t.mock.method(Date, 'now', () => clock)
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-current-app-')), sessionsRoot = join(dir, 'sessions'), archived = join(dir, 'archived_sessions'), dataDir = join(dir, 'core'), path = join(sessionsRoot, 'rollout-' + owner + '.jsonl' + (compressed ? '.zst' : '')), parentPath = join(archived, 'rollout-' + parent + '.jsonl')
@@ -38,11 +39,11 @@ async function fixture(t, { profile = candidateHostProfile, suffix = '', records
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); wire.closeAllConnections(); await new Promise(resolve => wire.close(resolve)); await fs.rm(dir, { recursive: true, force: true }) })
   await new Promise(resolve => wire.listen(0, '127.0.0.1', resolve))
   const baseUrl = 'http://127.0.0.1:' + wire.address().port
-  const inherited = row(0, 'session_meta', header(parent), at - 100000) + row(1, 'event_msg', start('inherited'), at - 100000) + row(2, 'event_msg', user(parent, 'inherited', 'Keep the synthetic inherited limit'), at - 100000)
+  const inherited = row(0, 'session_meta', header(parent, inheritedProducer), at - 100000) + row(1, 'event_msg', start('inherited'), at - 100000) + row(2, 'event_msg', user(parent, 'inherited', 'Keep the synthetic inherited limit'), at - 100000)
     + row(3, 'event_msg', { type: 'item_completed', thread_id: parent, turn_id: 'inherited', item: { type: 'CommandExecution', id: 'old-validation', aggregated_output: 'Historical validation only', exit_code: 0 } }, at - 100000) + row(4, 'event_msg', { type: 'task_complete', turn_id: 'inherited' }, at - 100000)
   await fs.writeFile(parentPath, inherited)
   const base = fork ? 5 : 0
-  const bytes = row(base, 'session_meta', { ...header(owner), ...(fork ? { forked_from_id: parent, forked_from_ordinal_exclusive: 5, history_base: { thread_id: parent, end_ordinal_exclusive: 5, end_byte_offset: Buffer.byteLength(inherited) } } : {}) })
+  const bytes = row(base, 'session_meta', { ...header(owner, producer), ...(fork ? { forked_from_id: parent, forked_from_ordinal_exclusive: 5, history_base: { thread_id: parent, end_ordinal_exclusive: 5, end_byte_offset: Buffer.byteLength(inherited) } } : {}) })
     + (records ?? row(base + 1, 'event_msg', start('turn')) + row(base + 2, 'event_msg', user(owner, 'turn')) + row(base + 3, 'event_msg', agent(owner, 'turn'))) + suffix
   await fs.writeFile(path, compressed ? zstdCompressSync(Buffer.from(bytes)) : bytes)
   server = await startServer({ dataDir, now: () => clock, cooldownMs: 0 }); core = await connectCore({ dataDir })
@@ -121,6 +122,49 @@ test('the exact App build 20770 retains main and fork material ownership', async
     assert.equal(task.coverage.complete, true)
     assert.equal(task.instructionContext.userLimitRefs.length, fork ? 1 : 0)
     assert.ok(task.events.filter(event => event.data?.history).every(event => !task.activity.evidenceIds.includes(event.id)))
+  })
+})
+
+test('App build 21828 and its 0.164 producer reach the production panel with bounded main and fork materials', async t => {
+  for (const [name, options] of [['plain main', {}], ['compressed main', { compressed: true }], ['current fork', { fork: true }], ['compressed fork with retained prior producer', { fork: true, compressed: true, inheritedProducer: candidateHostProfile.cliVersion }]]) await t.test(name, async t => {
+    const f = await fixture(t, { profile: app21828, producer: app21828.cliVersion, ...options }), view = await f.caughtUp()
+    assert.equal(view.identity.threadId, owner)
+    assert.equal(view.observation.coverage, 'caught-up')
+    const tasks = (await f.core.snapshot()).tasks
+    assert.equal(tasks.length, 1)
+    const task = tasks[0]
+    assert.equal(task.currentRequest, 'Inspect only the synthetic log')
+    assert.equal(task.events.find(event => event.kind === 'input' && !event.data?.history).authorizationEligible, true)
+    assert.equal(task.coverage.complete, true)
+    assert.equal(task.instructionContext.userLimitRefs.length, options.fork ? 1 : 0)
+    assert.ok(task.events.filter(event => event.data?.history).every(event => !task.activity.evidenceIds.includes(event.id)))
+  })
+})
+
+test('current web search extensions preserve bounded tool evidence without importing queries, extra results or user authority', async t => {
+  const suffix = row(4, 'event_msg', { type: 'item_started', thread_id: owner, turn_id: 'turn', item: { type: 'Extension', kind: 'web.search', id: 'web-result' } })
+    + row(5, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item: { type: 'Extension', kind: 'web.search', id: 'web-result', query: 'private-search-query', action: { type: 'search', query: 'private-search-query' }, results: [{ type: 'search', snippet: 'Synthetic search evidence <img>', title: 'private-title', url: 'https://example.test/private' }, { snippet: 'private-second-result' }] } })
+    + row(6, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item: { type: 'Extension', kind: 'web.search', id: 'empty-web-result', action: { type: 'openPage', url: 'https://example.test/private' }, results: [] } })
+    + row(7, 'event_msg', { type: 'task_complete', turn_id: 'turn' })
+  const f = await fixture(t, { profile: app21828, producer: app21828.cliVersion, suffix }), view = await f.caughtUp()
+  assert.equal(view.observation.coverage, 'retained-history')
+  assert.equal(view.execution.historical, true)
+  const task = (await f.core.snapshot()).tasks[0], found = task.events.find(event => event.data?.callId === 'native-item:web-result')
+  assert.equal(found.kind, 'tool-result'); assert.equal(found.text, 'Synthetic search evidence <img>')
+  assert.equal(found.data.toolName, 'web.search'); assert.equal(found.data.truncated, true)
+  assert.equal(task.coverage.complete, false, 'an excerpt from only the first search result is not complete coverage')
+  assert.equal(task.events.find(event => event.data?.callId === 'native-item:empty-web-result').text, '网页工具未返回结果')
+  assert.equal(task.currentRequest, 'Inspect only the synthetic log')
+  assert.doesNotMatch(JSON.stringify(task), /private-search-query|private-second-result|private-title|example\.test/)
+})
+
+test('unknown web extension kinds and malformed result shapes retain explicit gaps without reserving a result body', async t => {
+  for (const item of [{ kind: 'unknown.extension', action: { type: 'search' }, results: [{ snippet: 'private-unapproved-result' }] }, { kind: 'web.search', action: { type: 'unknown-action' }, results: [{ snippet: 'private-unapproved-result' }] }, { kind: 'web.search', action: { type: 'search' }, results: [{ snippet: { text: 'private-unapproved-result' } }] }, { kind: 'web.search', action: { type: 'search' }, results: [{ snippet: 42 }] }]) await t.test(item.kind + '/' + item.action.type, async t => {
+    const f = await fixture(t, { profile: app21828, producer: app21828.cliVersion, suffix: row(4, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item: { type: 'Extension', id: 'unapproved-web', ...item } }) }), view = await f.read()
+    assert.match(view.observation.gap, /unsupported-(?:item-type|web-result-shape)/)
+    const snapshot = await f.core.snapshot()
+    assert.ok(snapshot.tasks.every(task => task.events.every(event => event.data?.callId !== 'native-item:unapproved-web')))
+    assert.doesNotMatch(JSON.stringify(snapshot), /private-unapproved-result|unknown\.extension|unknown-action/)
   })
 })
 
@@ -204,7 +248,7 @@ test('current-producer fork material reaches the production panel with independe
 })
 
 test('nearby or untyped Host profiles do no material IO and keep the qualified owner gray instead of declaring global loss', async t => {
-  for (const profile of [{ ...candidateHostProfile, appBuild: '20587' }, { ...candidateHostProfile, cliVersion: '0.163.0-alpha.10.3' }, { ...candidateHostProfile, appBuild: 20586 }, { ...app20770, appBuild: '20771' }, { ...app20770, cliVersion: '0.163.0-alpha.10.3' }, { ...app20770, appBuild: 20770 }]) await t.test(JSON.stringify(profile), async t => {
+  for (const profile of [{ ...candidateHostProfile, appBuild: '20587' }, { ...candidateHostProfile, cliVersion: '0.163.0-alpha.10.3' }, { ...candidateHostProfile, appBuild: 20586 }, { ...app20770, appBuild: '20771' }, { ...app20770, cliVersion: '0.163.0-alpha.10.3' }, { ...app20770, appBuild: 20770 }, { ...app21828, appBuild: '21829' }, { ...app21828, cliVersion: '0.164.0-alpha.11.2' }, { ...app21828, appBuild: 21828 }]) await t.test(JSON.stringify(profile), async t => {
     const lost = [], f = await fixture(t, { profile, onQualificationLost: reason => lost.push(reason) }), view = await f.read()
     assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'unsupported-host-version')
     assert.equal(f.state.currentRecordReads, 0); assert.equal(f.state.threadReads, 0)

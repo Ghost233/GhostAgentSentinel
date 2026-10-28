@@ -1,5 +1,5 @@
 // Metadata-only is the default; material mode shares the same bounded physical read.
-import { MaterialProjection, materialRecord } from './material-projection.mjs';
+import { MaterialProjection, materialRecord, isWebSearchItem } from './material-projection.mjs';
 import { jsonParser } from 'stream-json/core/parser.js';
 import filter from 'stream-json/core/filters/filter.js';
 import stringer from 'stream-json/core/stringer.js';
@@ -198,7 +198,8 @@ export class BoundedReader {
     if (this.materialMode && (this.state.anchored && this.state.turnId || historyProducer)) {
       const turnId = historyProducer ? row.payload.turn_id : this.state.turnId;
       const itemType = row.material.fields['payload.item.type']?.text;
-      if (row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type) && row.payload.turn_id === turnId && !materialItems.has(itemType)) { this.gap = 'unsupported-item-type:' + digest(JSON.stringify(itemType ?? null)); return; }
+      if (row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type) && row.payload.turn_id === turnId && !materialItems.has(itemType) && !isWebSearchItem(row)) { this.gap = 'unsupported-item-type:' + digest(JSON.stringify(itemType ?? null)); return; }
+      if (row.payload.turn_id === turnId && row.payload.type === 'item_completed' && isWebSearchItem(row) && (!Number.isSafeInteger(row.material.webResultsCount) || row.material.webResultsCount < 0 || row.material.webResultsCount > 0 && !row.material.webSnippetString)) { this.gap = 'unsupported-web-result-shape'; return; }
       const material = materialRecord(row, turnId, recordStart, this.offset + 1, turnId === this.state.turnId ? this.turnTrigger : null);
       // Do not reserve a native body identity for a temporary omission: later
       // fixed-field support must not conflict with an already captured body.
