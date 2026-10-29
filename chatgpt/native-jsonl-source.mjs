@@ -4,6 +4,7 @@ import { basename, resolve, sep } from 'node:path'
 import { createHash } from 'node:crypto'
 import { createZstdDecompress, constants } from 'node:zlib'
 import { NativePrefix, headerIdentity } from '../src/native-origin.mjs'
+import { createRecordSnapshot } from './native-record-snapshot.mjs'
 
 const leases = new Set()
 const CHUNK = 16384, RESERVE = CHUNK * 2, LIMIT = 262144
@@ -38,6 +39,7 @@ export class NativeJsonlSource {
     this.rawOffset = 0; this.removed = 0; this.accounted = 0; this.pendingWrite = false; this.inputEnded = false
     this.totalPhysical = 0; this.totalDecoded = 0; this.peakBuffered = 0; this.closed = false
     this.waiters = new Set()
+    this.snapshot = null; this.snapshotSignature = null
   }
   wake() { for (const resolve of this.waiters) resolve(); this.waiters.clear() }
   async wait() { if (this.closed || this.error || this.decoder?.readableLength || !this.pendingWrite && !this.inputEnded || this.decoder?.readableEnded) return; await new Promise(resolve => this.waiters.add(resolve)) }
@@ -135,10 +137,22 @@ export class NativeJsonlSource {
       if (opened.size === this.stat.size && (opened.mtimeMs !== this.stat.mtimeMs || opened.ctimeMs !== this.stat.ctimeMs)) throw fail('record-rewrite-suspected')
       if (opened.size > this.stat.size) {
         const target = [this.prefix.snapshot(), this.expected?.prefix, this.validatedPrefix, this.terminal?.prefix].filter(Boolean).sort((a, b) => b.offset - a.offset)[0]
-        this.revalidation = { target, prefix: new NativePrefix() }
+        if (!this.snapshot) {
+          // A second append cannot keep invalidating the same long check.
+          // Freeze actual source fd bytes; never replace this with a normal copy.
+          if (this.revalidation) await this.freeze()
+          this.revalidation = { target, prefix: new NativePrefix() }
+        }
       }
-      this.stat = opened; this.decodedSize = opened.size
+      this.stat = opened
+      if (!this.snapshot) this.decodedSize = opened.size
     }
+  }
+  async freeze() {
+    const next = await createRecordSnapshot(this.handle)
+    if (next.stat.size < Math.max(this.position, this.expected?.prefix.offset ?? 0, this.terminal?.prefix.offset ?? 0)) { await next.handle.close(); throw fail('native_origin_prefix_changed') }
+    await this.snapshot?.handle.close()
+    this.snapshot = next; this.snapshotSignature = signature(this.stat); this.decodedSize = next.stat.size
   }
   async pump({ physicalBudget = LIMIT, decodedBudget = LIMIT, limit = Infinity, verifyOnly = false } = {}, accept = bytes => bytes.length) {
     for (const value of [physicalBudget, decodedBudget]) if (!Number.isSafeInteger(value) || value < 0 || value > LIMIT) throw new Error('invalid source budget')
@@ -156,10 +170,15 @@ export class NativeJsonlSource {
       try {
         if (!this.handle && !await this.open()) return
         await this.guard(); this.cut = limit
+        if (this.snapshot && !this.revalidation && this.stat.size > this.snapshot.stat.size && (verifyOnly || this.position >= Math.min(limit, this.decodedSize))) {
+          const target = [this.prefix.snapshot(), this.expected?.prefix, this.validatedPrefix, this.terminal?.prefix].filter(Boolean).sort((a, b) => b.offset - a.offset)[0]
+          await this.freeze(); await this.guard()
+          this.revalidation = { target, prefix: new NativePrefix() }
+        }
         if (!this.compressed && this.revalidation) {
           const checking = this.revalidation, count = Math.min(physicalBudget, decodedBudget, checking.target.offset - checking.prefix.offset)
           if (count > 0) {
-            const bytes = Buffer.alloc(count), got = await this.handle.read(bytes, 0, count, checking.prefix.offset)
+            const bytes = Buffer.alloc(count), got = await (this.snapshot?.handle ?? this.handle).read(bytes, 0, count, checking.prefix.offset)
             physicalBytes += got.bytesRead; decodedBytes += got.bytesRead
             if (this.closed) throw fail('reader-closed')
             await this.guard()
@@ -173,7 +192,7 @@ export class NativeJsonlSource {
           }
           if (checking.prefix.offset === checking.target.offset) {
             if (JSON.stringify(checking.prefix.snapshot()) !== JSON.stringify(checking.target)) throw fail('native_origin_prefix_changed')
-            this.physical.signature = signature(this.stat); this.revalidation = null
+            this.physical.signature = this.snapshotSignature ?? signature(this.stat); this.revalidation = null
             if (verifyOnly && this.expected) { this.headerHash = this.expected.headerHash; this.baseVerified = true; this.verifiedBase = this.expected.prefix; this.validatedPrefix = checking.target }
           }
           return
@@ -183,7 +202,7 @@ export class NativeJsonlSource {
           const end = this.phase === 'validating' ? this.expected.prefix.offset : Math.min(this.decodedSize, limit)
           const count = Math.min(physicalBudget, decodedBudget, end - this.position)
           if (count > 0) {
-            const bytes = Buffer.alloc(count), got = await this.handle.read(bytes, 0, count, this.position)
+            const bytes = Buffer.alloc(count), got = await (this.snapshot?.handle ?? this.handle).read(bytes, 0, count, this.position)
             physicalBytes += got.bytesRead; decodedBytes += got.bytesRead
             if (this.closed) throw fail('reader-closed')
             await this.guard()
@@ -242,13 +261,13 @@ export class NativeJsonlSource {
         if (this.error) throw this.error
         await new Promise(resolve => setImmediate(resolve)); account()
         await this.guard()
-      } catch (error) { error.physicalBytes = physicalBytes; error.decodedBytes = decodedBytes; this.closed = true; this.decoder?.destroy(); this.wake(); await this.handle?.close(); this.handle = null; this.pending?.fill(0); this.pending = null; leases.delete(this); throw error }
+      } catch (error) { error.physicalBytes = physicalBytes; error.decodedBytes = decodedBytes; this.closed = true; this.decoder?.destroy(); this.wake(); await this.snapshot?.handle.close(); this.snapshot = null; await this.handle?.close(); this.handle = null; this.pending?.fill(0); this.pending = null; leases.delete(this); throw error }
       finally { this.totalPhysical += physicalBytes; this.totalDecoded += decodedBytes }
     })()
     try {
       await this.busy
       const phase = this.revalidation ? 'validating' : this.phase, position = this.position
-      return { physicalBytes, decodedBytes, position, decodedSize: this.decodedSize, phase, eof: phase !== 'validating' && position >= Math.min(limit, this.decodedSize), bufferedBytes: (this.decoder?.readableLength ?? 0) + (this.pending?.length ?? 0) }
+      return { physicalBytes, decodedBytes, position, decodedSize: this.decodedSize, phase, eof: phase !== 'validating' && position >= Math.min(limit, this.decodedSize), snapshotLag: Boolean(this.snapshot && this.stat.size > this.decodedSize), bufferedBytes: (this.decoder?.readableLength ?? 0) + (this.pending?.length ?? 0) }
     } finally { this.busy = null }
   }
   acknowledge(fences) { const fence = fences?.find(value => value.key === this.key); if (fence && this.headerHash === fence.headerHash && this.proof()?.next.offset <= fence.prefix.offset) { this.expected = structuredClone(fence); this.verifiedBase = structuredClone(fence.prefix); this.baseVerified = true } }
@@ -257,7 +276,7 @@ export class NativeJsonlSource {
   async close() {
     if (this.closing) return this.closing
     this.closed = true; this.decoder?.destroy(); this.wake()
-    this.closing = (async () => { try { await this.busy } catch {} await this.handle?.close(); this.handle = null; this.decoder = null; this.pending?.fill(0); this.pending = null; this.headerBytes.fill(0); this.headerBytes = Buffer.alloc(0); this.revalidation = null; leases.delete(this) })()
+    this.closing = (async () => { try { await this.busy } catch {} await this.snapshot?.handle.close(); this.snapshot = null; await this.handle?.close(); this.handle = null; this.decoder = null; this.pending?.fill(0); this.pending = null; this.headerBytes.fill(0); this.headerBytes = Buffer.alloc(0); this.revalidation = null; leases.delete(this) })()
     return this.closing
   }
 }

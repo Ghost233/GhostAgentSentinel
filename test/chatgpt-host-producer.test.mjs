@@ -352,19 +352,19 @@ test('device rebinding does not accept a different inode, missing fence, truncat
 })
 
 test('Host recovery still rejects a missing origin, wrong storage identity, changed prefix and incompatible profile', async t => {
-  for (const failure of ['missing-origin', 'wrong-storage', 'wrong-header', 'short-prefix', 'rewritten-prefix', 'foreign-chat', 'different-profile']) await t.test(failure, async t => {
+  for (const failure of ['missing-origin', 'wrong-storage', 'wrong-header', 'short-prefix', 'rewritten-prefix', 'foreign-chat', 'unknown-profile']) await t.test(failure, async t => {
     const f = await fixture(t, { records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Already captured')) + row(3, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
     const old = f.open(); await collect(old)
     const saved = structuredClone(old.checkpoint()), proof = old.io.proof()
-    if (failure !== 'different-profile') delete saved.storageScope
+    if (failure !== 'unknown-profile') delete saved.storageScope
     await old.close()
     if (failure === 'wrong-storage') saved.io.key = 'f'.repeat(64)
     if (failure === 'rewritten-prefix') await fs.writeFile(f.plain, f.bytes.toString().replace('Already captured', 'Secretly changed') + '\n')
-    const changes = { hostRunId: 'next-host', hostStartedAt: at + 1000, ...(failure === 'foreign-chat' ? { threadId: 'foreign-chat' } : {}), ...(failure === 'different-profile' ? { profile: supportedProfile } : {}) }
+    const changes = { hostRunId: 'next-host', hostStartedAt: at + 1000, ...(failure === 'foreign-chat' ? { threadId: 'foreign-chat' } : {}), ...(failure === 'unknown-profile' ? { profile: { ...currentHost, appBuild: 'unverified-build' } } : {}) }
     const restored = f.open(changes, saved, { origins: { async read(key) { return failure === 'missing-origin' ? null : { key, headerHash: failure === 'wrong-header' ? 'f'.repeat(64) : proof.headerHash, prefix: { ...proof.next, ...(failure === 'short-prefix' ? { offset: 0 } : {}) }, revision: 1 } } } })
     const result = await collect(restored)
     assert.equal(result.view.coverage, 'gap')
-    assert.equal(result.view.gap, failure === 'rewritten-prefix' ? 'native_origin_prefix_changed' : 'cursor-invalid')
+    assert.equal(result.view.gap, failure === 'rewritten-prefix' ? 'native_origin_prefix_changed' : failure === 'unknown-profile' ? 'unsupported-host-version' : 'cursor-invalid')
     assert.equal(result.view.effectivePhase, 'unknown')
     assert.deepEqual(result.materials, []); assert.deepEqual(result.lifecycle, [])
   })

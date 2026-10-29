@@ -129,6 +129,7 @@ function render(view){
   if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?(view.health.orderingGap?'监控恢复状态未确认':'监控故障，当前状态不可判断'):inheritanceGap?'当前执行已接入，继承要求待补齐':states[analysis.state]??'当前分析不可判断';}
   if(signal==='green'&&analysis.resultDisposition==='pending')summary='上轮正常 · 待分析';
   if(recordRevalidating){signal='gray';summary='当前记录重验中';element('record-status').textContent='已核实资料保留 · 新活动尚未核实';}
+  else if(!view.execution?.historical&&view.observation?.recordSnapshotLag)element('record-status').textContent='显示已核实快照 · 正在追赶新增记录';
   if(view.execution?.historical){signal='gray';summary=view.history?.currentGap?'当前执行尚未确认 · 显示最近检查记录':'历史执行 · 仅表示当时的检查记录';}
   element('summary').textContent=lights[signal]+' '+summary;element('summary').setAttribute('data-signal',signal);
   if(!view.execution?.historical&&text(view.currentFacts?.request?.text,120)){

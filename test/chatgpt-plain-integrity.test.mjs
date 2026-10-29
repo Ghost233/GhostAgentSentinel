@@ -7,7 +7,7 @@ import { zstdCompressSync } from 'node:zlib'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
-import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
+import { supportedProfile, BoundedReader } from '../chatgpt/bounded-reader.mjs'
 
 async function fixture(t, { padding = '', compressed = false, invalidFrame = false, oldAnchor = false, terminal = null } = {}) {
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-plain-integrity-')), path = join(dir, 'main.jsonl' + (compressed ? '.zst' : '')), clock = Date.now(), token = 'c'.repeat(64)
@@ -48,7 +48,7 @@ async function fixture(t, { padding = '', compressed = false, invalidFrame = fal
     if (result.structuredContent.observation.decodedBytes !== undefined) assert.ok(result.structuredContent.observation.decodedBytes <= 262144, 'one adapter pump retains its independent decoded budget')
     return result.structuredContent
   }
-  const catchUp = async (stopOnFailure = true) => { let view; for (let pump = 0; pump < 100; pump++) { view = await read(); if (stopOnFailure && view.health?.state === 'failed' || view.observation.coverage === 'caught-up' || view.observation.gap && !['main-header-unverified', 'current-turn-not-observed'].includes(view.observation.gap)) break } return view }
+  const catchUp = async (stopOnFailure = true) => { let view; for (let pump = 0; pump < 100; pump++) { view = await read(); if (stopOnFailure && view.health?.state === 'failed' || view.observation.coverage === 'caught-up' && !view.observation.recordSnapshotLag || view.observation.gap && !['main-header-unverified', 'current-turn-not-observed'].includes(view.observation.gap)) break } return view }
   const tail = row(4, 'event_msg', { type: 'item_completed', thread_id: 'main', turn_id: 'run', item: { type: 'AgentMessage', id: 'tail', content: [{ type: 'Text', text: 'New verified tail' }] } })
   const source = async () => (await core.snapshot()).sources[0].key
   return { dir, path, bytes, tail, encode, core, adapter, read, catchUp, source, ending: (phase, turnId = 'run') => row(turnId === 'run' ? 4 : 7, 'event_msg', { type: phase === 'completed' ? 'task_complete' : 'turn_aborted', turn_id: turnId }, turnId === 'run' ? undefined : clock), confirmFresh() { anchorTurnId = 'fresh-run' }, async appendFresh(old = false, confirmed = true) { const turnId = old ? 'unconfirmed-old-run' : 'fresh-run'; if (confirmed) anchorTurnId = turnId; const at = clock - (old ? 20000 : 0); await fs.appendFile(path, row(5, 'event_msg', { type: 'task_started', turn_id: turnId, turn_attribution: { turn_id: turnId, turn_trigger: 'composer' } }, at) + row(6, 'event_msg', { type: 'item_completed', thread_id: 'main', turn_id: turnId, item: { type: 'UserMessage', id: 'fresh-user', content: [{ type: 'text', text: 'Inspect the new live request' }] } }, at)) }, async restart() { await adapter.close(); adapter = await openAdapter() } }
@@ -101,21 +101,23 @@ test('a normal append spends bounded prefix-validation work before publishing it
   assert.deepEqual((await f.core.failureReceipts({ sourceKey })).receipts, [])
 })
 
-test('continuous growth keeps long current revalidation gray with verified facts until a stable window', async t => {
+test('continuous growth delivers verified frozen batches without waiting for a stable window', async t => {
   const f = await fixture(t, { padding: 'p'.repeat(600000) })
   assert.equal((await f.catchUp()).observation.coverage, 'caught-up')
   const original = (await f.core.snapshot()).tasks[0].events.map(event => [event.id, event.capturedAt, event.text])
   const sourceKey = await f.source(), generation = (await f.core.snapshot()).tasks[0].events[0].data.nativeGenerationKey
   assert.equal((await f.core.nativeOriginFence(sourceKey, generation)).prefix.offset, Buffer.byteLength(f.bytes), 'the whole long prefix was acknowledged before growth')
-  for (let index = 0; index < 4; index++) {
+  let deliveredWhileGrowing = false
+  for (let index = 0; index < 12; index++) {
     await fs.appendFile(f.path, f.tail.replace('"ordinal":4', '"ordinal":' + (4 + index)).replace('"id":"tail"', '"id":"tail-' + index + '"').replace('New verified tail', 'New verified tail ' + index))
     const view = await f.read()
-    assert.equal(view.observation.recordRevalidating, true)
-    assert.equal(view.signal, 'gray')
-    assert.equal(view.summary, '当前记录重验中')
+    if (view.observation.recordRevalidating) { assert.equal(view.signal, 'gray'); assert.equal(view.summary, '当前记录重验中') }
     assert.equal(view.currentFacts.request.text, 'Inspect this request')
-    assert.deepEqual((await f.core.snapshot()).tasks[0].events.map(event => [event.id, event.capturedAt, event.text]), original)
+    const events = (await f.core.snapshot()).tasks[0].events
+    assert.deepEqual(events.slice(0, original.length).map(event => [event.id, event.capturedAt, event.text]), original)
+    deliveredWhileGrowing ||= events.some(event => event.text.startsWith('New verified tail '))
   }
+  assert.equal(deliveredWhileGrowing, true, 'continuous appends cannot starve all new material')
   assert.deepEqual((await f.core.failureReceipts({ sourceKey })).receipts, [])
   assert.deepEqual((await f.core.nativeNotificationRecords({ sourceKey })).records, [])
   const recovered = await f.catchUp()
@@ -124,8 +126,90 @@ test('continuous growth keeps long current revalidation gray with verified facts
   assert.notEqual(recovered.summary, '当前记录重验中')
   const events = (await f.core.snapshot()).tasks[0].events
   assert.deepEqual(events.slice(0, original.length).map(event => [event.id, event.capturedAt, event.text]), original)
-  assert.equal(events.filter(event => event.text.startsWith('New verified tail ')).length, 4)
+  assert.equal(events.filter(event => event.text.startsWith('New verified tail ')).length, 12)
   assert.deepEqual((await f.core.failureReceipts({ sourceKey })).receipts, [])
+})
+
+test('a frozen read detects an old-prefix rewrite before delivering the following live version', async t => {
+  const f = await fixture(t, { padding: 'p'.repeat(600000) })
+  assert.equal((await f.catchUp()).observation.coverage, 'caught-up')
+  const original = (await f.core.snapshot()).tasks[0].events.map(event => [event.id, event.capturedAt, event.text])
+  const tail = index => f.tail.replace('"ordinal":4', '"ordinal":' + (4 + index)).replace('"id":"tail"', '"id":"tail-' + index + '"').replace('New verified tail', 'New verified tail ' + index)
+  await fs.appendFile(f.path, tail(0)); await f.read()
+  await fs.appendFile(f.path, tail(1)); await f.read()
+  await fs.writeFile(f.path, f.bytes.replace('Original owned body', 'Replaced owned body') + tail(0) + tail(1) + tail(2))
+  const view = await f.catchUp(), events = (await f.core.snapshot()).tasks[0].events
+  assert.ok(['native_origin_prefix_changed', 'native_origin_header_changed'].includes(view.observation.gap), JSON.stringify(view.observation))
+  assert.deepEqual(events.slice(0, original.length).map(event => [event.id, event.capturedAt, event.text]), original)
+  assert.equal(events.some(event => event.text === 'New verified tail 2'), false, 'the changed source cannot supply a new tail under the old proof')
+})
+
+test('a lifecycle pre-scan resumes at the verified material checkpoint instead of parsing the old prefix again', async t => {
+  const f = await fixture(t, { oldAnchor: true }), end = f.bytes.indexOf('\n') + 1
+  const padding = JSON.stringify({ ordinal: 1, type: 'token_usage_record', timestamp: new Date(Date.now()).toISOString(), payload: { padding: 'p'.repeat(600000) } }) + '\n'
+  await fs.writeFile(f.path, f.bytes.slice(0, end) + padding + f.bytes.slice(end))
+  let view
+  for (let index = 0; index < 10; index++) { view = await f.read(); if (view.observation.coldReadStage === 'scan') break }
+  assert.equal(view.observation.coldReadStage, 'scan')
+  assert.ok(view.observation.metadataOffset >= Buffer.byteLength(padding), 'the checked prefix is rehashed by IO, not parsed again as lifecycle material')
+  assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).length, 0)
+})
+
+test('a lifecycle-only pre-scan crosses opaque old material without publishing it or blocking the verified successor', async t => {
+  const f = await fixture(t, { oldAnchor: true, padding: 'p'.repeat(600000) })
+  await f.read()
+  await fs.appendFile(f.path, JSON.stringify({ ordinal: 4, timestamp: new Date(Date.now() - 20000).toISOString(), type: 'event_msg', payload: { type: 'item_completed', thread_id: 'main', turn_id: 'run', item: { type: 'SyntheticOpaqueItem', content: 'private-old-opaque-body' } } }) + '\n')
+  await f.appendFresh()
+  let view, snapshot, current
+  for (let pump = 0; pump < 100; pump++) {
+    view = await f.read(); snapshot = await f.core.snapshot(); current = snapshot.tasks.find(task => task.lifecycleId === 'fresh-run')
+    if (current?.status === 'running' || view.observation.gap?.startsWith('unsupported-')) break
+  }
+  assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation))
+  assert.equal(current?.currentRequest, 'Inspect the new live request')
+  assert.equal(current.status, 'running')
+  assert.doesNotMatch(JSON.stringify(snapshot), /private-old-opaque-body/)
+  assert.ok(snapshot.tasks.every(task => task.lifecycleId !== 'run' || task.status === 'unknown'))
+})
+
+test('unselected predecessor tool bodies do not fill the current observation store while its old request remains attributable', async t => {
+  const f = await fixture(t, { oldAnchor: true, padding: 'p'.repeat(600000) })
+  await f.read()
+  await fs.appendFile(f.path, JSON.stringify({ ordinal: 4, type: 'response_item', timestamp: new Date(Date.now() - 20000).toISOString(), payload: { type: 'function_call_output', call_id: 'unselected-old-call', output: 'Do not retain this unrelated old tool body' } }) + '\n')
+  await f.appendFresh()
+  let snapshot, current
+  for (let index = 0; index < 100; index++) { await f.read(); snapshot = await f.core.snapshot(); current = snapshot.tasks.find(task => task.lifecycleId === 'fresh-run'); if (current?.status === 'running') break }
+  assert.equal(current?.currentRequest, 'Inspect the new live request')
+  assert.equal(snapshot.tasks.find(task => task.lifecycleId === 'run')?.currentRequest, 'Inspect this request')
+  assert.doesNotMatch(JSON.stringify(snapshot), /Do not retain this unrelated old tool body|unselected-old-call/)
+})
+
+test('an unselected execution from the same Host cannot block the later verified request with opaque material', async t => {
+  const f = await fixture(t, { oldAnchor: true, padding: 'p'.repeat(600000) })
+  await f.read()
+  const clock = Date.now(), row = (ordinal, payload, time = clock) => JSON.stringify({ ordinal, type: 'event_msg', timestamp: new Date(time).toISOString(), payload }) + '\n'
+  await fs.appendFile(f.path, row(4, { type: 'task_complete', turn_id: 'run' }) + row(5, { type: 'task_started', turn_id: 'earlier-same-host', turn_attribution: { turn_id: 'earlier-same-host', turn_trigger: 'composer' } }, clock - 2000) + row(6, { type: 'item_completed', thread_id: 'main', turn_id: 'earlier-same-host', item: { type: 'SyntheticOpaqueItem', body: 'private-earlier-host-body' } }, clock - 1000) + row(7, { type: 'task_started', turn_id: 'fresh-run', turn_attribution: { turn_id: 'fresh-run', turn_trigger: 'composer' } }) + row(8, { type: 'item_completed', thread_id: 'main', turn_id: 'fresh-run', item: { type: 'UserMessage', id: 'fresh-user', content: [{ type: 'text', text: 'The later verified current request' }] } }))
+  f.confirmFresh()
+  let view, snapshot, current
+  for (let index = 0; index < 100; index++) { view = await f.read(); snapshot = await f.core.snapshot(); current = snapshot.tasks.find(task => task.lifecycleId === 'fresh-run'); if (current?.status === 'running' || view.observation.gap?.startsWith('unsupported-')) break }
+  assert.equal(current?.currentRequest, 'The later verified current request', JSON.stringify(view.observation))
+  assert.equal(snapshot.overview.runningTasks, 1)
+  assert.doesNotMatch(JSON.stringify(snapshot), /private-earlier-host-body/)
+})
+
+test('several old executions share one lifecycle pre-scan before the verified current anchor', async t => {
+  const scans = new Set(), pump = BoundedReader.prototype.pump
+  t.mock.method(BoundedReader.prototype, 'pump', async function (...args) { if (this.scanOnly) scans.add(this); return pump.apply(this, args) })
+  const f = await fixture(t, { oldAnchor: true, padding: 'p'.repeat(600000) })
+  await f.read()
+  const clock = Date.now(), row = (ordinal, payload, old = true) => JSON.stringify({ ordinal, type: 'event_msg', timestamp: new Date(clock - (old ? 20000 : 0)).toISOString(), payload }) + '\n'
+  await fs.appendFile(f.path, row(4, { type: 'task_complete', turn_id: 'run' }) + row(5, { type: 'task_started', turn_id: 'old-second', turn_attribution: { turn_id: 'old-second', turn_trigger: 'composer' } }) + row(6, { type: 'token_count', padding: 'p'.repeat(300000) }) + row(7, { type: 'task_complete', turn_id: 'old-second' }) + row(8, { type: 'task_started', turn_id: 'old-third', turn_attribution: { turn_id: 'old-third', turn_trigger: 'composer' } }) + row(9, { type: 'token_count', padding: 'p'.repeat(300000) }) + row(10, { type: 'task_started', turn_id: 'fresh-run', turn_attribution: { turn_id: 'fresh-run', turn_trigger: 'composer' } }, false) + row(11, { type: 'item_completed', thread_id: 'main', turn_id: 'fresh-run', item: { type: 'UserMessage', id: 'fresh-user', content: [{ type: 'text', text: 'One current request after old executions' }] } }, false))
+  f.confirmFresh()
+  let snapshot, current
+  for (let index = 0; index < 100; index++) { await f.read(); snapshot = await f.core.snapshot(); current = snapshot.tasks.find(task => task.lifecycleId === 'fresh-run'); if (current?.status === 'running') break }
+  assert.equal(current?.currentRequest, 'One current request after old executions')
+  assert.equal(snapshot.overview.runningTasks, 1)
+  assert.equal(scans.size, 1, 'old ends cannot trigger repeated full-file pre-scans before the already confirmed current anchor')
 })
 
 test('a confirmed bad compressed frame creates one immediate collection notice and recovers without another notice', async t => {

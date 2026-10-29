@@ -329,8 +329,15 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       const { observed, epoch, generation } = prepared
       const connection = await sourceFor(prepared.source, epoch)
       if (!connection) return await fail(entry, 'source-generation-changed', 'source')
+      const continuing = collectMaterials && entry.lifecycleVerified && entry.lifecycleId === observed.observed.turnId && entry.view.observation.phase === 'started' && observed.observed.phase === 'started' && observed.coverage === 'catching-up' && !observed.gap
+      if (collectMaterials && !entry.fork && (observed.recordRevalidating || continuing) && ![observed.recentLifecycle, observed.materials, observed.historyLifecycle, observed.historyMaterials, observed.historyBoundaries].some(events => events?.length)) {
+        // An IO check has not replaced the last verified execution material.
+        // Keep its model round alive; the UI separately marks the read backlog.
+        entry.view = { ...entry.view, identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: observed.recordRevalidating ? '当前记录重验中' : entry.view.summary, observation: { ...entry.view.observation, coverage: 'catching-up', gap: observed.gap, readBytes: observed.readBytes, decodedBytes: observed.decodedBytes, recordRevalidating: observed.recordRevalidating === true, recordSnapshotLag: observed.recordSnapshotLag === true } }
+        return entry.view
+      }
       const fork = Boolean(prepared.source.forkedFromId), offset = event => fork ? event.captureOffset : event.recordStart
-      const phase = observed.effectivePhase, lifecycleId = observed.observed.turnId ?? (fork ? prepared.source.anchorTurnId : null) ?? 'unobserved:' + prepared.source.hostRunId
+      const phase = continuing ? 'started' : observed.effectivePhase, lifecycleId = observed.observed.turnId ?? (fork ? prepared.source.anchorTurnId : null) ?? 'unobserved:' + prepared.source.hostRunId
       const status = phaseStatus(phase)
       const previousLifecycle = entry.lifecycleId, previousPhase = entry.view.observation.phase
       entry.lifecycleId = lifecycleId; entry.lifecycleVerified = observed.observed.anchored === true; entry.hostRunId = prepared.source.hostRunId; entry.sourceKey = connection.key
@@ -385,7 +392,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       if (epoch !== sourceEpoch || generation !== entry.generation || source?.key !== connection.key) return entry.view
       const task = snapshot.tasks.find(task => task.sourceKey === connection.key && task.id === entry.id && task.lifecycleId === lifecycleId)
       if (!task || !collectMaterials && task.analysis.state !== 'observation-only') { await stop(entry, 'core-capability-unconfirmed'); return entry.view }
-      entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, ...(fork ? { currentCoverage: observed.currentCoverage } : {}), gap: observed.gap, readBytes: observed.readBytes, ...(nativeOriginVersion === 2 ? { decodedBytes: observed.decodedBytes, recordRevalidating: observed.recordRevalidating === true } : {}), observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
+      entry.view = { identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: phase === 'started' ? '已观察到执行开始 · 尚无分析结论' : phase === 'completed' ? '本轮已结束 · 尚无分析结论' : phase === 'aborted' ? '本轮已中断 · 尚无分析结论' : '当前执行尚未确认', observation: { phase, status: task.status, coverage: observed.coverage, ...(fork ? { currentCoverage: observed.currentCoverage } : {}), gap: observed.gap, readBytes: observed.readBytes, ...(nativeOriginVersion === 2 ? { decodedBytes: observed.decodedBytes, recordRevalidating: observed.recordRevalidating === true, recordSnapshotLag: observed.recordSnapshotLag === true } : {}), observedAt: observed.observed.at }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } }
       if (collectMaterials) entry.view = materialView(entry.view, task, { snapshot })
       if (fork) {
         entry.view.forkProvenance = observed.forkProvenance
@@ -525,7 +532,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null,
       currentStatus: currentVerified ? current.task.status : 'unknown', currentSignal: currentVerified && current.task.analysis.state !== 'paused' && !snapshot.monitoring?.paused ? current.task.gs?.light ?? 'gray' : 'gray',
       hasMore, cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0), currentGap: retainedOnly ? entry.view.observation?.gap ?? 'current-turn-not-observed' : null, retentionMs: 86400000 }
-    if (!selected) return { ...(entry.view.observation?.coldReadStage ? entry.view : gapView(selection.executionKey ? 'history-unavailable' : entry.view.observation?.gap ?? 'current-turn-not-observed', entry.id)), health: entry.health, history }
+    if (!selected) return { ...(entry.view.observation?.coldReadStage || !selection.executionKey && entry.view.observation?.recordRevalidating ? entry.view : gapView(selection.executionKey ? 'history-unavailable' : entry.view.observation?.gap ?? 'current-turn-not-observed', entry.id)), health: entry.health, history }
     const historical = retainedOnly || selected !== current || ['ended', 'aborted'].includes(selected.item.status)
     const view = materialView({ ...entry.view, ...(historical ? { currentFacts: undefined, inheritance: undefined } : {}), identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical, snapshot })
     if (selected === current) view.health = combineHealth(view.health, entry.health)
@@ -678,9 +685,12 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   try { panel = await startPanelServer({ read, modelSettings, installationNotifications, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }
   if (onQualificationLost) await qualification()
-  const schedule = () => { if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(); schedule() }, pollMs) }
-  if (pollMs && typeof native.listThreads === 'function') void refresh()
-  schedule()
+  const schedule = () => {
+    const backlog = [...threads.values()].some(entry => entry.view.observation?.readBytes > 0 && (entry.view.observation.coverage === 'catching-up' || entry.view.observation.recordSnapshotLag))
+    if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(); schedule() }, backlog ? Math.min(25, pollMs) : pollMs)
+  }
+  if (pollMs && typeof native.listThreads === 'function') void refresh().then(schedule, schedule)
+  else schedule()
   function close(reason = 'adapter-closed') {
     return closing ??= (async () => {
       closed = true; clearTimeout(timer); timer = null

@@ -1,6 +1,6 @@
 {
   "name": "ghost-agent-sentinel",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Local read-only DSH task monitoring with an independent shared core",
   "private": true,
   "type": "module",
@@ -10,6 +10,7 @@
   "files": ["src", "dsh", "docs/installation.md", "docs/development-contract.md", "docs/chatgpt-observation.md", "docs/release-status.md", "docs/release-notes.md", "README.md", "GLOSSARY.md"],
   "engines": { "node": ">=22.13.0" },
   "scripts": {
+    "build:record-snapshot": "node chatgpt/native-record-snapshot.mjs build",
     "release:check": "node scripts/check-release.mjs",
     "check": "node scripts/check.mjs && node scripts/check-dsh-package.mjs",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",

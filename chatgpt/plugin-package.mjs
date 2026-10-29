@@ -23,6 +23,10 @@ const safe = (info, path) => { if (!own(info) || info.mode & 0o022) throw new Er
 const validPath = path => typeof path === 'string' && path.length > 0 && path.length < 1024 && !/[\x00-\x1f\x7f\\]/.test(path) && !path.startsWith('/') && path.split('/').every(part => part && part !== '.' && part !== '..')
 const ordered = entries => Object.fromEntries([...entries].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))
 const sourceEntries = files => ordered(Object.entries(files).filter(([path]) => path !== 'runtime/node' && !path.startsWith('notification/')).map(([path, value]) => [path, { sha256: value.sha256, size: value.size, mode: value.sourceMode }]))
+function verifySnapshotBuild(bytes, files) {
+  const value = JSON.parse(bytes)
+  if (Object.keys(value).sort().join(',') !== 'binarySHA256,builderSHA256,format,sourceSHA256' || value.format !== 1 || value.sourceSHA256 !== files['chatgpt/native-record-snapshot.c']?.sha256 || value.builderSHA256 !== files['chatgpt/native-record-snapshot.mjs']?.sha256 || value.binarySHA256 !== files['runtime/record-snapshot']?.sha256) throw new Error('native record snapshot build is stale; rebuild before packaging')
+}
 
 async function regular(path, limit) {
   const before = await lstat(path)
@@ -66,13 +70,14 @@ async function walk(directory, prefix = '', source = false, budget = { count: 0 
 async function sources() {
   const files = (await walk(join(root, 'src'), 'src', true)).files.filter(file => /\.(mjs|js|cjs|json)$/.test(file.key))
   for (const name of (await readdir(join(root, 'chatgpt'))).sort()) {
-    if (excluded.has(name) || !/\.(mjs|js|cjs|html)$/.test(name) && !['package.json', 'package-lock.json'].includes(name)) continue
+    if (excluded.has(name) || !/\.(mjs|js|cjs|html)$/.test(name) && !['package.json', 'package-lock.json', 'native-record-snapshot.c'].includes(name)) continue
     const path = join(root, 'chatgpt', name), info = await lstat(path)
     if (!info.isFile() || info.isSymbolicLink()) throw new Error('regular production source required: ' + name)
     files.push({ path, key: 'chatgpt/' + name })
   }
   files.push(...(await walk(join(root, 'chatgpt/node_modules'), 'chatgpt/node_modules', true)).files)
   files.push(...['package.json', 'package-lock.json', 'scripts/manage-chatgpt-plugin.mjs'].map(key => ({ path: join(root, key), key })))
+  files.push(...['runtime/record-snapshot', 'runtime/record-snapshot.json'].map(key => ({ path: join(root, key), key })))
   if (files.length > maxFiles) throw new Error('package source count over budget')
   const entries = new Map(), bytes = new Map(), identities = new Map()
   let total = 0
@@ -83,6 +88,7 @@ async function sources() {
     bytes.set(file.key, value.bytes); identities.set(file.key, value.identity)
   }
   const values = ordered(entries)
+  verifySnapshotBuild(bytes.get('runtime/record-snapshot.json'), values)
   for (const path of required) if (!values[path]) throw new Error('missing production runtime source: ' + path)
   for (const name of ['@modelcontextprotocol/sdk', '@modelcontextprotocol/ext-apps', 'stream-chain', 'stream-json', 'ws', 'zod']) if (!values['chatgpt/node_modules/' + name + '/package.json']) throw new Error('missing production dependency: ' + name)
   return { files: values, bytes, identities: ordered(identities) }
@@ -106,13 +112,15 @@ export async function inspectPluginPackage(directory, { digest } = {}) {
   if (!manifest.files || Array.isArray(manifest.files) || typeof manifest.files !== 'object' || Object.keys(manifest.files).length > maxFiles) throw new Error('invalid package file set')
   let total = 0, sourceTotal = 0
   for (const [path, value] of Object.entries(manifest.files)) {
-    const allowed = path === 'runtime/node' || ['package.json', 'package-lock.json', 'chatgpt/package.json', 'chatgpt/package-lock.json', 'scripts/manage-chatgpt-plugin.mjs'].includes(path) || path.startsWith('src/') && /\.(mjs|js|cjs|json)$/.test(path) || path.startsWith('chatgpt/node_modules/') || /^chatgpt\/[^/]+\.(mjs|js|cjs|html)$/.test(path) && !excluded.has(path.slice('chatgpt/'.length)) || path.startsWith('notification/GhostSentinelNotifications.app/')
+    const allowed = ['runtime/node', 'runtime/record-snapshot', 'runtime/record-snapshot.json', 'chatgpt/native-record-snapshot.c', 'package.json', 'package-lock.json', 'chatgpt/package.json', 'chatgpt/package-lock.json', 'scripts/manage-chatgpt-plugin.mjs'].includes(path) || path.startsWith('src/') && /\.(mjs|js|cjs|json)$/.test(path) || path.startsWith('chatgpt/node_modules/') || /^chatgpt\/[^/]+\.(mjs|js|cjs|html)$/.test(path) && !excluded.has(path.slice('chatgpt/'.length)) || path.startsWith('notification/GhostSentinelNotifications.app/')
     if (!validPath(path) || !allowed || path === manifestName || path.split('/').includes('LaunchAgents') || /\.(swift|plist)$/.test(path) && !path.startsWith('notification/')) throw new Error('invalid package file path: ' + path)
     if (!value || Object.keys(value).sort().join(',') !== 'mode,sha256,size,sourceMode' || !/^[a-f0-9]{64}$/.test(value.sha256) || !Number.isSafeInteger(value.size) || value.size < 0 || ![0o600, 0o700].includes(value.mode) || !Number.isSafeInteger(value.sourceMode) || value.sourceMode < 0 || value.sourceMode > 0o7777 || value.sourceMode & 0o022 || value.mode !== (value.sourceMode & 0o111 ? 0o700 : 0o600)) throw new Error('invalid package file metadata: ' + path)
     if ((total += value.size) > maxBytes) throw new Error('package bytes over budget')
     if (path !== 'runtime/node' && !path.startsWith('notification/') && (sourceTotal += value.size) > maxSourceBytes) throw new Error('package source bytes over budget')
   }
   for (const path of [...required, 'runtime/node']) if (!manifest.files[path]) throw new Error('missing production runtime file: ' + path)
+  const snapshotFiles = ['chatgpt/native-record-snapshot.mjs', 'chatgpt/native-record-snapshot.c', 'runtime/record-snapshot', 'runtime/record-snapshot.json']
+  if (snapshotFiles.some(path => manifest.files[path]) && snapshotFiles.some(path => !manifest.files[path]) || manifest.files['runtime/record-snapshot'] && manifest.files['runtime/record-snapshot'].mode !== 0o700) throw new Error('incomplete native record snapshot runtime')
   if (manifest.files['runtime/node'].sha256 !== manifest.node.sha256 || manifest.files['runtime/node'].mode !== 0o700) throw new Error('pinned executable Node required')
   if (manifest.notificationPath && !manifest.files[manifest.notificationPath + '/Contents/MacOS/GhostSentinelNotifications']) throw new Error('missing notification executable')
   if (Object.keys(manifest.files).some(path => path.startsWith('notification/')) !== Boolean(manifest.notificationPath)) throw new Error('unexpected notification file set')
@@ -132,6 +140,7 @@ export async function inspectPluginPackage(directory, { digest } = {}) {
   }
   const after = await walk(directory)
   if (JSON.stringify(after.files) !== JSON.stringify(tree.files) || JSON.stringify(after.directories) !== JSON.stringify(tree.directories)) throw new Error('package file set changed during inspection')
+  if (manifest.files['runtime/record-snapshot.json']) verifySnapshotBuild((await regular(join(directory, 'runtime/record-snapshot.json'), 4096)).bytes, manifest.files)
   return report(directory, manifest, actualDigest)
 }
 

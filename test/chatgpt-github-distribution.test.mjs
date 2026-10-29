@@ -68,9 +68,10 @@ test('GitHub catalog ships two isolated, self-contained plugin sources with test
   assert.ok(packed.notificationPath, 'the distribution includes the existing short-lived native notifier')
   for (const [path, value] of Object.entries(packed.files)) {
     if (path.startsWith('chatgpt/node_modules/') || path.startsWith('runtime/') || path.startsWith('notification/')) continue
-    assert.ok(/^(src\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_.-]+\.(mjs|js|json)|chatgpt\/[^/]+\.(mjs|html|json)|scripts\/manage-chatgpt-plugin.mjs|package(?:-lock)?\.json)$/.test(path), 'finite production source path: ' + path)
+    assert.ok(/^(src\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_.-]+\.(mjs|js|json)|chatgpt\/[^/]+\.(mjs|html|json)|chatgpt\/native-record-snapshot\.c|scripts\/manage-chatgpt-plugin.mjs|package(?:-lock)?\.json)$/.test(path), 'finite production source path: ' + path)
     assert.equal(hash(await readFile(join(root, path))), value.sha256, 'published runtime must match final source: ' + path)
   }
+  assert.equal(packed.files['runtime/record-snapshot'].sha256, hash(await readFile(join(root, 'runtime/record-snapshot'))))
   for (const [channel, name] of [['stable', 'ghost-sentinel'], ['test', 'ghost-sentinel-test']]) {
     const actual = await readFile(join(root, 'plugins', name, 'bin/launch-mcp'), 'utf8')
     assert.equal(actual, (await readFile(join(root, 'scripts/templates/github-launch.sh'), 'utf8')).replaceAll('@CHANNEL@', channel).replaceAll('@NODE_SHA256@', PLUGIN_NODE_SHA256))

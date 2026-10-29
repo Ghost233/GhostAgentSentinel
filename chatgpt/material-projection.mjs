@@ -3,9 +3,9 @@ import { none, isMany } from 'stream-chain/defs.js'
 import { sanitizeObservation } from '../src/privacy.mjs'
 
 const values = value => value === none ? [] : isMany(value) ? value.values : [value]
-const metadata = new Set(['type', 'timestamp', 'ordinal', 'payload.originator', 'payload.source', 'payload.cli_version', 'payload.cwd', 'payload.history_mode', 'payload.forked_from_id', 'payload.forked_from_ordinal_exclusive', 'payload.history_base.thread_id', 'payload.history_base.end_ordinal_exclusive', 'payload.history_base.end_byte_offset', 'payload.type', 'payload.id', 'payload.role', 'payload.turn_id', 'payload.root_turn_id', 'payload.thread_id', 'payload.call_id', 'payload.name', 'payload.item.type', 'payload.item.kind', 'payload.item.action.type', 'payload.item.id', 'payload.item.exit_code', 'payload.turn_attribution.turn_id', 'payload.turn_attribution.turn_trigger', 'payload.internal_chat_message_metadata_passthrough.turn_id'])
+const metadata = new Set(['type', 'timestamp', 'ordinal', 'payload.originator', 'payload.source', 'payload.cli_version', 'payload.cwd', 'payload.history_mode', 'payload.forked_from_id', 'payload.forked_from_ordinal_exclusive', 'payload.history_base.thread_id', 'payload.history_base.end_ordinal_exclusive', 'payload.history_base.end_byte_offset', 'payload.type', 'payload.id', 'payload.role', 'payload.turn_id', 'payload.root_turn_id', 'payload.thread_id', 'payload.call_id', 'payload.name', 'payload.item.type', 'payload.item.kind', 'payload.item.status', 'payload.item.action.type', 'payload.item.results.0.type', 'payload.item.id', 'payload.item.exit_code', 'payload.turn_attribution.turn_id', 'payload.turn_attribution.turn_trigger', 'payload.internal_chat_message_metadata_passthrough.turn_id'])
 const webSnippet = 'payload.item.results.0.snippet'
-const bodies = new Set(['payload.message', 'payload.arguments', 'payload.input', 'payload.output', 'payload.item.aggregated_output', webSnippet])
+const bodies = new Set(['payload.message', 'payload.arguments', 'payload.input', 'payload.output', 'payload.item.aggregated_output', 'payload.item.stdout', 'payload.item.stderr', webSnippet])
 const metadataContainers = new Set(['payload', 'payload.item', 'payload.item.action', 'payload.item.results', 'payload.item.results.0', 'payload.history_base', 'payload.turn_attribution', 'payload.internal_chat_message_metadata_passthrough'])
 // Literal dotted or empty keys never introduce structural path segments.
 const fieldPath = (parent, key) => {
@@ -37,7 +37,7 @@ export class MaterialProjection {
     this.toolBody = { text: '', truncated: false, redacted: false }
     this.toolArray = null
     this.outputValues = 0
-    this.webResultsCount = null; this.webSnippetString = false
+    this.webResultsCount = null; this.webSnippetString = false; this.webSnippetPresent = false
     this.recordType = null; this.recordTypeCount = 0
     this.payloadType = null; this.payloadTypeCount = 0
     this.structureAmbiguous = false
@@ -52,6 +52,7 @@ export class MaterialProjection {
     const child = parent.type === 'array' ? parent.index++ : parent.key
     if (parent.type === 'object') parent.key = null
     const path = fieldPath(parent.path, child)
+    if (path === webSnippet) this.webSnippetPresent = true
     if (parent.type === 'object' && child === 'type') {
       this.kindField = this.stack.length === 1 ? 'recordType' : this.stack.length === 2 && parent.path === 'payload' ? 'payloadType' : null
       if (this.kindField) { this[this.kindField] = null; this[this.kindField + 'Count']++ }
@@ -166,24 +167,27 @@ export class MaterialProjection {
       delete this.fields['payload.output']
       if (this.outputValues === 1 && this.toolArray.valid && this.toolArray.elements > 0 && this.recordTypeCount === 1 && this.payloadTypeCount === 1 && this.recordType === 'response_item' && ['function_call_output', 'custom_tool_call_output'].includes(this.payloadType) && scalar('type') === this.recordType && scalar('payload.type') === this.payloadType) this.fields['payload.output'] = { ...this.toolBody, text: this.toolBody.redacted ? '认证材料已省略，当前证据不完整' : this.toolBody.text }
     }
-    return { ordinal: scalar('ordinal') === undefined ? undefined : Number(scalar('ordinal')), type: scalar('type'), timestamp: scalar('timestamp'), payload: Object.fromEntries(['type', 'id', 'role', 'turn_id', 'root_turn_id', 'thread_id', 'call_id', 'name', 'originator', 'source', 'cli_version', 'cwd', 'history_mode', 'forked_from_id', 'forked_from_ordinal_exclusive'].map(key => [key, scalar('payload.' + key)]).concat([['history_base', scalar('payload.history_base.thread_id') ? { thread_id: scalar('payload.history_base.thread_id'), end_ordinal_exclusive: Number(scalar('payload.history_base.end_ordinal_exclusive')), end_byte_offset: Number(scalar('payload.history_base.end_byte_offset')) } : undefined]])), material: { fields: this.fields, body: this.body, agentBody: this.agentBody, webResultsCount: this.webResultsCount, webSnippetString: this.webSnippetString, turnId: scalar('payload.internal_chat_message_metadata_passthrough.turn_id'), turnTrigger: scalar('payload.turn_attribution.turn_trigger') } }
+    return { ordinal: scalar('ordinal') === undefined ? undefined : Number(scalar('ordinal')), type: scalar('type'), timestamp: scalar('timestamp'), payload: Object.fromEntries(['type', 'id', 'role', 'turn_id', 'root_turn_id', 'thread_id', 'call_id', 'name', 'originator', 'source', 'cli_version', 'cwd', 'history_mode', 'forked_from_id', 'forked_from_ordinal_exclusive'].map(key => [key, scalar('payload.' + key)]).concat([['history_base', scalar('payload.history_base.thread_id') ? { thread_id: scalar('payload.history_base.thread_id'), end_ordinal_exclusive: Number(scalar('payload.history_base.end_ordinal_exclusive')), end_byte_offset: Number(scalar('payload.history_base.end_byte_offset')) } : undefined]])), material: { fields: this.fields, body: this.body, agentBody: this.agentBody, webResultsCount: this.webResultsCount, webSnippetString: this.webSnippetString, webSnippetPresent: this.webSnippetPresent, turnId: scalar('payload.internal_chat_message_metadata_passthrough.turn_id'), turnTrigger: scalar('payload.turn_attribution.turn_trigger') } }
   }
 }
 
 export function isWebSearchItem(row) {
   const fields = row.material.fields
-  return row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type) && fields['payload.item.type']?.text === 'Extension' && fields['payload.item.kind']?.text === 'web.search' && (row.payload.type === 'item_started' || ['search', 'openPage'].includes(fields['payload.item.action.type']?.text))
+  return row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type) && fields['payload.item.type']?.text === 'Extension' && fields['payload.item.kind']?.text === 'web.search' && (row.payload.type === 'item_started' || ['search', 'openPage', 'findInPage', 'other'].includes(fields['payload.item.action.type']?.text))
 }
+
+export const isWebResultOmitted = row => row.material.webResultsCount > 0 && row.material.fields['payload.item.results.0.type']?.text === 'text_result' && !row.material.webSnippetPresent
 
 export function materialRecord(row, turnId, recordStart, recordEnd, turnTrigger) {
   const itemType = row.material.fields['payload.item.type']?.text
   const completed = row.type === 'event_msg' && row.payload.type === 'item_completed'
   const producer = completed && itemType === 'UserMessage'
   const commandResult = completed && itemType === 'CommandExecution'
+  const fileResult = completed && itemType === 'FileChange'
   const mcpResult = completed && itemType === 'McpToolCall'
   const agentOutput = completed && itemType === 'AgentMessage'
   const webResult = completed && isWebSearchItem(row)
-  if (row.type !== 'response_item' && !producer && !commandResult && !mcpResult && !agentOutput && !webResult) return null
+  if (row.type !== 'response_item' && !producer && !commandResult && !fileResult && !mcpResult && !agentOutput && !webResult) return null
   const payload = row.payload
   const data = { nativeType: 'response_item/' + payload.type, sourceKind: 'chatgpt-native', sourceForm: 'response_item/' + payload.type, runId: row.material.turnId ?? turnId }
   let kind, capture
@@ -198,9 +202,10 @@ export function materialRecord(row, turnId, recordStart, recordEnd, turnTrigger)
     }
   } else if (webResult) {
     if (payload.turn_id !== turnId) return null
-    kind = 'tool-result'
-    capture = row.material.webResultsCount === 0 ? { text: '网页工具未返回结果', truncated: false } : row.material.fields[webSnippet]
-    Object.assign(data, { nativeType: 'item_completed/Extension/web.search', sourceForm: 'event_msg/item_completed', runId: payload.turn_id, toolName: 'web.search' })
+    const omitted = isWebResultOmitted(row) || row.material.fields['payload.item.action.type']?.text === 'other'
+    kind = omitted ? 'gap' : 'tool-result'
+    capture = omitted ? { text: '网页工具动作或文字摘录未确认，当前材料不完整', truncated: true } : row.material.webResultsCount === 0 ? { text: '网页工具未返回结果', truncated: false } : row.material.fields[webSnippet]
+    Object.assign(data, { nativeType: 'item_completed/Extension/web.search' + (omitted ? '/omitted' : ''), sourceForm: 'event_msg/item_completed', runId: payload.turn_id, toolName: 'web.search' })
     const itemId = row.material.fields['payload.item.id']?.text
     if (itemId) data.callId = 'native-item:' + itemId
     if (row.material.webResultsCount > 1) data.truncated = true
@@ -209,6 +214,15 @@ export function materialRecord(row, turnId, recordStart, recordEnd, turnTrigger)
     kind = 'gap'
     capture = { text: '原生 MCP 结果正文的固定字段尚未核实，当前材料已省略', truncated: true }
     Object.assign(data, { nativeType: 'item_completed/McpToolCall', sourceForm: 'event_msg/item_completed', runId: payload.turn_id })
+  } else if (fileResult) {
+    if (payload.turn_id !== turnId) return null
+    kind = 'tool-result'
+    capture = { text: '', truncated: false, redacted: false }
+    for (const path of ['payload.item.stdout', 'payload.item.stderr']) append(capture, row.material.fields[path])
+    if (!capture.text) capture.text = '文件修改结果：completed'
+    Object.assign(data, { nativeType: 'item_completed/FileChange', sourceForm: 'event_msg/item_completed', runId: payload.turn_id, toolName: 'FileChange', verificationGaps: ['native_file_change_contents_unverified'] })
+    const itemId = row.material.fields['payload.item.id']?.text
+    if (itemId) data.callId = 'native-item:' + itemId
   } else if (commandResult) {
     if (payload.turn_id !== turnId) return null
     kind = 'tool-result'

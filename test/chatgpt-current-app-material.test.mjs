@@ -13,6 +13,7 @@ import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { candidateHostProfile, supportedProfile } from '../chatgpt/storage-compatibility.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
 import { MaterialProjection, materialRecord } from '../chatgpt/material-projection.mjs'
+import { panelHarness } from './helpers/chatgpt-panel.mjs'
 
 const at = 1_800_000_000_000, owner = '00000000-0000-4000-8000-000000000163', parent = '00000000-0000-4000-8000-000000000162'
 const app20770 = { appVersion: '26.1013.40934', appBuild: '20770', cliVersion: '0.163.0-alpha.10.2' }
@@ -23,7 +24,7 @@ const start = (id, trigger = 'composer') => ({ type: 'task_started', turn_id: id
 const user = (thread, turn, text = 'Inspect only the synthetic log') => ({ type: 'item_completed', thread_id: thread, turn_id: turn, item: { type: 'UserMessage', id: turn + '-user', content: [{ type: 'text', text }] } })
 const agent = (thread, turn, text = 'The synthetic log has been inspected') => ({ type: 'item_completed', thread_id: thread, turn_id: turn, item: { type: 'AgentMessage', id: turn + '-agent', content: [{ type: 'Text', text }] } })
 
-async function fixture(t, { profile = candidateHostProfile, producer = candidateHostProfile.cliVersion, inheritedProducer = producer, suffix = '', records, fork = false, compressed = false, onQualificationLost } = {}) {
+async function fixture(t, { profile = candidateHostProfile, producer = candidateHostProfile.cliVersion, inheritedProducer = producer, suffix = '', records, fork = false, compressed = false, pollMs = 0, onQualificationLost } = {}) {
   let clock = at
   t.mock.method(Date, 'now', () => clock)
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-current-app-')), sessionsRoot = join(dir, 'sessions'), archived = join(dir, 'archived_sessions'), dataDir = join(dir, 'core'), path = join(sessionsRoot, 'rollout-' + owner + '.jsonl' + (compressed ? '.zst' : '')), parentPath = join(archived, 'rollout-' + parent + '.jsonl')
@@ -33,8 +34,8 @@ async function fixture(t, { profile = candidateHostProfile, producer = candidate
     if (req.method === 'GET') return res.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let body = ''; for await (const chunk of req) body += chunk
     res.setHeader('content-type', 'application/json')
-    if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] }))
-    else { const request = decodeJevRequest(JSON.parse(body)); res.end(JSON.stringify({ model: 'fixed-judge', answers: Object.fromEntries(Object.keys(request.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) })) }
+    if (req.url === '/v1/chat/completions') { state.summaryCalls++; await state.modelGate; res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] })) }
+    else { state.jevCalls++; const request = decodeJevRequest(JSON.parse(body)); res.end(JSON.stringify({ model: 'fixed-judge', answers: Object.fromEntries(Object.keys(request.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) })) }
   })
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); wire.closeAllConnections(); await new Promise(resolve => wire.close(resolve)); await fs.rm(dir, { recursive: true, force: true }) })
   await new Promise(resolve => wire.listen(0, '127.0.0.1', resolve))
@@ -48,16 +49,56 @@ async function fixture(t, { profile = candidateHostProfile, producer = candidate
   await fs.writeFile(path, compressed ? zstdCompressSync(Buffer.from(bytes)) : bytes)
   server = await startServer({ dataDir, now: () => clock, cooldownMs: 0 }); core = await connectCore({ dataDir })
   await configureInstallationModels(core, 'chatgpt:current-app-material', { llm: { baseUrl, model: 'fixed-extractor' }, jev: { baseUrl, model: 'fixed-judge' } })
-  const state = { profile, hostRunId: 'current-app-fixture', hostStartedAt: at - 10000, anchorTurnId: 'turn', enabled: true, available: true, threadReads: 0, currentRecordReads: 0 }
+  const state = { profile, hostRunId: 'current-app-fixture', hostStartedAt: at - 10000, anchorTurnId: 'turn', enabled: true, available: true, threadReads: 0, currentRecordReads: 0, summaryCalls: 0, jevCalls: 0 }
   const native = { async sampleHost() { return { available: state.available, hostRunId: state.hostRunId, hostStartedAt: state.hostStartedAt, profile: state.profile } }, async readThread(id) { state.threadReads++; return { thread: { id, path: id === owner ? path : parentPath, cwd: '/synthetic-project', parentThreadId: null, forkedFromId: id === owner && fork ? parent : null, source: 'vscode', originator: 'Codex Desktop' }, anchorTurnId: id === owner ? state.anchorTurnId : null } }, async readEnablement() { return { user: state.enabled ? 'enabled' : 'disabled', effective: state.enabled ? 'enabled' : 'disabled' } }, async close() {} }
+  if (pollMs) native.listThreads = async ({ archived }) => ({ data: archived ? [] : [(await native.readThread(owner)).thread], nextCursor: null })
   const open = fs.open, watched = new Set([await fs.realpath(path), await fs.realpath(parentPath)])
   t.mock.method(fs, 'open', async (...args) => { const handle = await open(...args); if (watched.has(String(args[0]))) { const read = handle.read; handle.read = async function (...values) { const got = await read.apply(this, values); state.currentRecordReads += got.bytesRead; return got } }; return handle })
-  const reopen = async () => { await adapter?.close(); adapter = await startChatGPTAdapter({ core, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'current-app-material', token: 'c'.repeat(64), pollMs: 0, collectMaterials: true, nativeOriginVersion: 2, now: () => clock, ...(onQualificationLost ? { onQualificationLost } : {}) }) }
+  const reopen = async () => { await adapter?.close(); adapter = await startChatGPTAdapter({ core, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'current-app-material', token: 'c'.repeat(64), pollMs, collectMaterials: true, nativeOriginVersion: 2, now: () => clock, ...(onQualificationLost ? { onQualificationLost } : {}) }) }
   await reopen()
   const read = async () => { const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'c'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: owner } } }) }); assert.equal(response.status, 200); const value = await response.json(); assert.equal(value.result.isError, undefined); return value.result.structuredContent }
   const caughtUp = async () => { let view; for (let i = 0; i < 30; i++) { view = await read(); if (view.observation.coverage === 'caught-up' || view.observation.coverage === 'retained-history' && ['completed', 'aborted'].includes(view.observation.phase) || view.observation.gap?.startsWith('unsupported-') || ['cursor-invalid', 'record-malformed-or-over-limit'].includes(view.observation.gap)) break }; return view }
   return { core, state, path, dir, read, caughtUp, reopen, advance() { clock += 1000 }, get adapter() { return adapter } }
 }
+
+test('background catch-up schedules bounded work without waiting the idle polling interval between chunks', async t => {
+  const padding = Array.from({ length: 12 }, (_, index) => row(index + 1, 'token_usage_record', { padding: 'x'.repeat(65536) })).join('')
+  const f = await fixture(t, { pollMs: 10000, records: padding + row(13, 'event_msg', start('turn')) + row(14, 'event_msg', user(owner, 'turn')) + row(15, 'event_msg', agent(owner, 'turn')) })
+  const deadline = performance.now() + 3000
+  let task
+  do { task = (await f.core.snapshot()).tasks.find(task => task.id === owner && task.currentRequest); if (task) break; await new Promise(resolve => setTimeout(resolve, 5)) } while (performance.now() < deadline)
+  assert.equal(task?.currentRequest, 'Inspect only the synthetic log', 'a real backlog must progress before the 10-second idle poll is due')
+  assert.ok(f.adapter.diagnostics().refreshTimers <= 1)
+  await f.adapter.close()
+  assert.equal(f.adapter.diagnostics().refreshTimers, 0)
+})
+
+test('ongoing prefix verification cannot cancel a model round for the unchanged verified material', async t => {
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const f = await fixture(t, { suffix: row(4, 'token_usage_record', { padding: 'p'.repeat(600000) }) })
+  f.state.modelGate = gate
+  try {
+    await f.caughtUp()
+    const deadline = performance.now() + 2000
+    while (!f.state.summaryCalls && performance.now() < deadline) { await f.core.snapshot(); await new Promise(resolve => setTimeout(resolve, 5)) }
+    assert.equal(f.state.summaryCalls, 1)
+    await fs.appendFile(f.path, row(5, 'token_usage_record', { heartbeat: 1 }))
+    const waiting = await f.read()
+    assert.equal(waiting.observation.recordRevalidating, true)
+    assert.equal(waiting.signal, 'gray')
+    assert.equal((await f.core.snapshot()).tasks.find(task => task.id === owner).analysis.state, 'analyzing', 'no new execution evidence has replaced this frozen model input')
+    await f.read(); await f.read()
+    release()
+    let task
+    const completed = performance.now() + 2000
+    do { task = (await f.core.snapshot()).tasks.find(task => task.id === owner); if (task.analysis.summary?.generated) break; await new Promise(resolve => setTimeout(resolve, 5)) } while (performance.now() < completed)
+    assert.ok(task.analysis.summary?.generated)
+    assert.equal(f.state.summaryCalls, 1); assert.equal(f.state.jevCalls, 1)
+    const shown = await f.read()
+    assert.equal(shown.analysis.generated.text, task.analysis.summary.generated.text)
+  } finally { release() }
+})
 
 test('production HTTP recovery preserves legacy main and fork captures and accepts the next real execution', async t => {
   for (const fork of [false, true]) for (const recovery of ['Host', 'device-and-Host', 'device']) await t.test(`${fork ? 'fork' : 'main'}-${recovery}`, async t => {
@@ -97,6 +138,87 @@ test('production HTTP recovery preserves legacy main and fork captures and accep
     const current = (await f.core.snapshot()).tasks.find(task => task.id === owner && task.lifecycleId === 'next-turn')
     assert.equal(current.currentRequest, 'A genuinely new request')
   })
+})
+
+test('persisted cursor scopes survive an admitted App version upgrade without replaying captures', async t => {
+  for (const [fork, producer, compressed = false] of [[false, candidateHostProfile.cliVersion], [true, candidateHostProfile.cliVersion], [false, supportedProfile.cliVersion], [false, candidateHostProfile.cliVersion, true], [true, candidateHostProfile.cliVersion, true]]) await t.test((fork ? 'fork' : 'main') + '/' + producer + (compressed ? '/zstd' : ''), async t => {
+    const f = await fixture(t, { profile: app20770, producer, fork, compressed, suffix: row(fork ? 9 : 4, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
+    const before = await f.caughtUp(), prior = (await f.core.snapshot()).tasks.flatMap(task => task.events).map(event => ({ id: event.data.nativeRecordId, capturedAt: event.capturedAt })).sort((a, b) => a.id.localeCompare(b.id))
+    const cursorPath = join(f.dir, 'adapter', 'cursors', before.identity.cursorKey + '.json')
+    await f.adapter.close()
+    const saved = JSON.parse(await fs.readFile(cursorPath, 'utf8'))
+    // Persisted v0.2.2 hashes for these fixed record names, headers and ranges.
+    const frames = fork ? saved.reader.frames : [{ reader: saved.reader }]
+    const stableScopes = frames.map(frame => frame.reader.storageScope)
+    const legacyScopes = fork ? ['8b0b9a153a9d67e973f787bb1df0b893bc233e9beb7858927f2a7d071a5a277c', '0fad8c1b5dd04805fb59486cf22b45f841c143c5d79c27a5b5ff0190174b8750'] : ['fe093b3d89f6ecd47e7d2dea3f0af9b5d1bb092802f90c9525d5b930b4fa848a']
+    frames.forEach((frame, index) => { frame.reader.storageScope = legacyScopes[index] })
+    await fs.writeFile(cursorPath, JSON.stringify(saved), { mode: 0o600 })
+    f.state.profile = app21828; f.state.hostRunId = 'upgraded-app'; f.state.hostStartedAt = at + 1000
+    f.advance(); f.advance(); await f.reopen()
+    const restored = await f.caughtUp()
+    assert.notEqual(restored.observation.gap, 'cursor-invalid')
+    assert.equal(restored.observation.phase, 'completed')
+    const migrated = JSON.parse(await fs.readFile(cursorPath, 'utf8'))
+    assert.deepEqual((fork ? migrated.reader.frames : [{ reader: migrated.reader }]).map(frame => frame.reader.storageScope), stableScopes)
+    assert.deepEqual((await f.core.snapshot()).tasks.flatMap(task => task.events).map(event => ({ id: event.data.nativeRecordId, capturedAt: event.capturedAt })).sort((a, b) => a.id.localeCompare(b.id)), prior)
+    f.state.anchorTurnId = 'upgraded-turn'; f.advance(); f.advance()
+    const ordinal = fork ? 10 : 5
+    const appended = row(ordinal, 'event_msg', start('upgraded-turn'), at + 4000) + row(ordinal + 1, 'event_msg', user(owner, 'upgraded-turn', 'A new request after the App upgrade'), at + 4000)
+    await fs.appendFile(f.path, compressed ? zstdCompressSync(Buffer.from(appended)) : appended)
+    let next
+    for (let pump = 0; pump < 30; pump++) { next = await f.read(); if (next.execution?.lifecycleId === 'upgraded-turn' && next.observation.coverage === 'caught-up') break }
+    if (compressed) {
+      assert.equal(next.observation.gap, 'record-rewrite-suspected', 'completed compressed archives remain immutable')
+      assert.ok((await f.core.snapshot()).tasks.every(task => task.lifecycleId !== 'upgraded-turn'))
+      return
+    }
+    assert.equal(next.execution.lifecycleId, 'upgraded-turn', JSON.stringify({ summary: next.summary, observation: next.observation }))
+    assert.equal(next.execution.status, 'running')
+  })
+})
+
+test('App upgrades do not bypass an unrelated storage scope or unknown saved producer', async t => {
+  for (const invalid of ['scope', 'producer']) await t.test(invalid, async t => {
+    const f = await fixture(t, { profile: app20770 }), before = await f.caughtUp()
+    const path = join(f.dir, 'adapter', 'cursors', before.identity.cursorKey + '.json')
+    await f.adapter.close()
+    const saved = JSON.parse(await fs.readFile(path, 'utf8'))
+    saved.reader.storageScope = invalid === 'scope' ? '0'.repeat(64) : 'fe093b3d89f6ecd47e7d2dea3f0af9b5d1bb092802f90c9525d5b930b4fa848a'
+    if (invalid === 'producer') saved.reader.header.cliVersion = 'unknown-producer'
+    await fs.writeFile(path, JSON.stringify(saved), { mode: 0o600 })
+    f.state.profile = app21828; f.state.currentRecordReads = 0
+    await f.reopen()
+    const view = await f.read()
+    assert.equal(view.observation.gap, 'cursor-invalid')
+    assert.equal(f.state.currentRecordReads, 0)
+  })
+})
+
+test('an upgraded unanchored cursor exposes revalidation in the real panel while all input material stays sealed', async t => {
+  const records = Array.from({ length: 12 }, (_, n) => row(n + 1, 'token_usage_record', { padding: 'x'.repeat(65536) })).join('')
+    + row(13, 'event_msg', start('turn')) + row(14, 'event_msg', user(owner, 'turn'))
+  const f = await fixture(t, { profile: app20770, records })
+  await f.read(); await f.read()
+  const directory = join(f.dir, 'adapter', 'cursors'), cursors = await fs.readdir(directory)
+  assert.equal(cursors.length, 1)
+  const path = join(directory, cursors[0])
+  await f.adapter.close()
+  const saved = JSON.parse(await fs.readFile(path, 'utf8'))
+  assert.equal(saved.reader.state.anchored, false)
+  assert.ok(saved.reader.offset > 262144)
+  saved.reader.storageScope = 'fe093b3d89f6ecd47e7d2dea3f0af9b5d1bb092802f90c9525d5b930b4fa848a'
+  await fs.writeFile(path, JSON.stringify(saved), { mode: 0o600 })
+  f.state.profile = app21828; f.state.hostRunId = 'upgraded-unanchored'; f.advance()
+  await f.reopen(); const view = await f.read()
+  const source = (await f.core.snapshot()).sources.find(value => value.descriptor.registrationId === 'chatgpt:current-app-material' && value.status === 'connected')
+  const fence = await f.core.nativeOriginFence(source.key, saved.reader.io.key)
+  assert.ok(fence.prefix.offset >= saved.reader.offset, 'the retained Core proof covers the saved progress')
+  assert.equal(view.observation.recordRevalidating, true)
+  assert.equal(view.observation.coverage, 'catching-up')
+  assert.equal(view.observation.gap, 'cursor-revalidating')
+  const page = await panelHarness(t); await page.deliver(view)
+  assert.match(page.element('#summary').textContent, /当前记录重验中/)
+  assert.ok((await f.core.snapshot()).tasks.every(task => !task.currentRequest && task.events.length === 0))
 })
 
 test('the exact current App reaches the production Core HTTP and panel with a typed user request', async t => {
@@ -156,6 +278,26 @@ test('current web search extensions preserve bounded tool evidence without impor
   assert.equal(task.events.find(event => event.data?.callId === 'native-item:empty-web-result').text, '网页工具未返回结果')
   assert.equal(task.currentRequest, 'Inspect only the synthetic log')
   assert.doesNotMatch(JSON.stringify(task), /private-search-query|private-second-result|private-title|example\.test/)
+})
+
+test('observed web find and omitted text-result forms keep reading without fabricating complete evidence', async t => {
+  const cases = [
+    ['findInPage', [{ type: 'text_result', snippet: 'A bounded current page match' }], 'tool-result'],
+    ['other', [{ type: 'text_result', snippet: 'private-other-snippet' }], 'gap'],
+    ['openPage', [{ type: 'text_result', title: 'private-title', ref_id: 'private-reference' }], 'gap'],
+  ]
+  for (const [action, results, kind] of cases) await t.test(action, async t => {
+    const following = agent(owner, 'turn', 'Current execution continues'); following.item.id = 'after-web-omission'
+    const item = { type: 'Extension', kind: 'web.search', id: 'observed-web', action: { type: action, pattern: 'private-pattern', url: 'https://example.test/private' }, results }
+    const f = await fixture(t, { suffix: row(4, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item }) + row(5, 'event_msg', following) })
+    const view = await f.caughtUp(), task = (await f.core.snapshot()).tasks.find(task => task.id === owner), result = task.events.find(event => event.data?.callId === 'native-item:observed-web')
+    assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation))
+    assert.equal(result.kind, kind)
+    assert.ok(task.events.some(event => event.text === 'Current execution continues'))
+    if (kind === 'tool-result') assert.equal(result.text, 'A bounded current page match')
+    else { assert.equal(result.data.truncated, true); assert.equal(task.coverage.complete, false); assert.match(result.data.nativeType, /\/omitted$/) }
+    assert.doesNotMatch(JSON.stringify(task), /private-pattern|private-title|private-reference|private-other-snippet|example\.test/)
+  })
 })
 
 test('unknown web extension kinds and malformed result shapes retain explicit gaps without reserving a result body', async t => {
@@ -394,6 +536,54 @@ test('ambiguous payload structures stay gray through the production chain after 
   })
 })
 
+test('completed FileChange results keep a bounded main-chat result without retaining patches or paths', async t => {
+  const item = { type: 'FileChange', id: 'file-change', status: 'completed', stdout: 'Patch operation completed', stderr: '', changes: { '/private/not-retained': { diff: 'private-patch-body', kind: 'update' } } }
+  const f = await fixture(t, { suffix: row(4, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item }) })
+  const view = await f.caughtUp(), snapshot = await f.core.snapshot(), result = snapshot.tasks[0]?.events.find(event => event.data?.nativeType === 'item_completed/FileChange')
+  assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation))
+  assert.equal(result?.kind, 'tool-result')
+  assert.equal(result.text, 'Patch operation completed')
+  assert.equal(result.data.callId, 'native-item:file-change')
+  assert.equal(result.data.exitCode, undefined, 'a native patch status is not a test exit code')
+  assert.doesNotMatch(JSON.stringify(snapshot), /private-patch-body|not-retained/)
+})
+
+test('FileChange result excerpts remain bounded and unknown statuses stay sealed', async t => {
+  for (const status of ['completed', 'future']) await t.test(status, async t => {
+    const item = { type: 'FileChange', id: 'bounded-file-change', status, stdout: 'x'.repeat(600000), stderr: '' }
+    const f = await fixture(t, { suffix: row(4, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item }) })
+    const view = await f.caughtUp(), events = (await f.core.snapshot()).tasks.flatMap(task => task.events), result = events.find(event => event.data?.nativeType === 'item_completed/FileChange')
+    if (status === 'future') { assert.equal(view.observation.gap, 'unsupported-file-change-shape'); assert.equal(result, undefined) }
+    else { assert.equal(result.text.length, 240); assert.equal(result.data.truncated, true) }
+  })
+})
+
+test('known subagent activity does not block or become main-chat evidence', async t => {
+  for (const kind of ['started', 'completed']) await t.test(kind, async t => {
+    const item = { type: 'SubAgentActivity', id: 'private-child-item', kind, agent_thread_id: 'private-child-thread', agent_path: 'private-child-path', model: 'private-child-model', reasoning_effort: 'high', content: [{ type: 'text', text: 'Do not adopt private-child instructions' }] }
+    const following = agent(owner, 'turn', 'Main chat continues'); following.item.id = 'following-parent-output'
+    const f = await fixture(t, { suffix: row(4, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item }) + row(5, 'event_msg', following) })
+    const view = await f.caughtUp(), snapshot = await f.core.snapshot(), task = snapshot.tasks.find(value => value.id === owner)
+    assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation))
+    assert.equal(task.currentRequest, 'Inspect only the synthetic log')
+    assert.ok(task.events.some(event => event.text === 'Main chat continues'))
+    assert.equal(snapshot.tasks.length, 1)
+    assert.equal(task.events.some(event => event.data?.nativeType?.includes('SubAgentActivity')), false)
+    assert.doesNotMatch(JSON.stringify(snapshot), /private-child/)
+  })
+})
+
+test('unverified subagent activity shapes still stop main-chat material', async t => {
+  for (const [type, kind] of [['item_completed', 'future'], ['item_completed', undefined], ['item_started', 'started']]) await t.test(type + '/' + kind, async t => {
+    const following = agent(owner, 'turn', 'Must remain sealed'); following.item.id = 'sealed-parent-output'
+    const f = await fixture(t, { suffix: row(4, 'event_msg', { type, thread_id: owner, turn_id: 'turn', item: { type: 'SubAgentActivity', ...(kind ? { kind } : {}) } }) + row(5, 'event_msg', following) })
+    const view = await f.caughtUp(), snapshot = await f.core.snapshot()
+    assert.match(view.observation.gap, /^unsupported-item-type:[a-f0-9]{64}$/)
+    assert.equal(view.signal, 'gray')
+    assert.ok(snapshot.tasks.every(task => task.events.every(event => event.text !== 'Must remain sealed')))
+  })
+})
+
 test('the current Host still stops unknown started and completed item types before a later known end or adapter recovery', async t => {
   for (const type of ['item_started', 'item_completed']) await t.test(type, async t => {
     const f = await fixture(t); await f.caughtUp()
@@ -430,13 +620,13 @@ test('current-profile composer and nonhuman triggers retain separate authorizati
   })
 })
 
-test('admitting the new Host does not migrate an old profile checkpoint or refresh already captured evidence', async t => {
+test('admitting another supported Host permits verified recovery without refreshing already captured evidence', async t => {
   const f = await fixture(t, { profile: supportedProfile }); await f.caughtUp()
   const before = (await f.core.snapshot()).tasks[0], captures = before.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence])
   f.state.profile = candidateHostProfile; f.state.currentRecordReads = 0
   await f.reopen()
-  const view = await f.read(), after = (await f.core.snapshot()).tasks[0]
-  assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'cursor-invalid')
-  assert.equal(f.state.currentRecordReads, 0)
+  const view = await f.caughtUp(), after = (await f.core.snapshot()).tasks[0]
+  assert.equal(view.signal, 'gray'); assert.notEqual(view.observation.gap, 'cursor-invalid')
+  assert.ok(f.state.currentRecordReads > 0)
   assert.deepEqual(after.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence]), captures)
 })
