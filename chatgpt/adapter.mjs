@@ -24,6 +24,11 @@ const combineHealth = (...values) => {
   const failures = new Map(failed.flatMap(value => value.failures ?? []).map(failure => [failure.id ?? JSON.stringify([failure.domain, failure.channel, failure.roundId, failure.error]), failure]))
   return { state: failed.length ? 'failed' : values.some(value => value?.state === 'recovered') ? 'recovered' : 'unknown', failures: [...failures.values()].slice(0, 6), orderingGap: values.some(value => value?.orderingGap === true) }
 }
+const collectionHealth = value => {
+  if (!value) return null
+  const failures = (value.failures ?? []).filter(failure => failure.domain === 'collection')
+  return { ...value, failures, state: value.state === 'failed' && !failures.length ? 'unknown' : value.state }
+}
 const lifecycleGapView = (reason, threadId = null) => ({ identity: { threadId }, signal: 'gray', summary: '无法确认当前观察', observation: { phase: 'unknown', status: 'unknown', gap: reason }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
 
 function requestIdentity(meta) {
@@ -120,7 +125,8 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   const delivery = notificationIO ? createNotificationDelivery({ core, native: notificationIO, installationId, qualify: qualifyNotification, now }) : null
   const storageVersion = collectMaterials && nativeOriginVersion === 2 ? 2 : 1
   const discovery = createDiscovery({ native, sessionsRoot, nativeOriginVersion: storageVersion, now })
-  let queue = Promise.resolve(), queuedBatches = 0, rotation = 0
+  let queue = Promise.resolve(), queuedBatches = 0, rotation = 0, backlogRotation = 0, maintenanceAt = -Infinity
+  const catchingUp = entry => entry.reader && entry.view.observation?.readBytes > 0 && (entry.view.observation.coverage === 'catching-up' || entry.view.observation.recordSnapshotLag)
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
   const capability = async () => {
     const health = await core.health(), features = health.features
@@ -177,14 +183,15 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       const receipts = entry.qualifiedHostRunId === owner.hostRunId ? await core.failureReceipts({ sourceKey: key, mainId: entry.id, lifecycleId: null }) : null
       if (closed || epoch !== sourceEpoch || source !== owner) return
       const unanchored = entry.qualifiedHostRunId === owner.hostRunId ? receipts?.health ?? { state: 'unknown', failures: [], orderingGap: true } : null
-      entry.health = combineHealth(task?.monitoringHealth, unanchored, healthOutbox.health({ sourceKey: key, mainId: entry.id, lifecycleId: entry.lifecycleId ?? null }))
-      entry.view.health = combineHealth(entry.health, sourceHealth)
+      entry.health = combineHealth(collectionHealth(task?.monitoringHealth), unanchored, healthOutbox.health({ sourceKey: key, mainId: entry.id, lifecycleId: entry.lifecycleId ?? null }))
+      entry.view.health = combineHealth(task?.monitoringHealth, entry.health, sourceHealth)
     }
   }
 
   async function stop(entry, reason, revokeTask = true) {
     entry.generation++
     const reader = entry.reader
+    delete entry.publishedCheckpoint
     entry.reader = null; entry.view = { ...gapView(reason), ...(entry.health ? { health: entry.health } : {}) }
     await reader?.close()
     if (revokeTask && source && entry.lifecycleId && entry.hostRunId === source.hostRunId) {
@@ -329,8 +336,13 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       const { observed, epoch, generation } = prepared
       const connection = await sourceFor(prepared.source, epoch)
       if (!connection) return await fail(entry, 'source-generation-changed', 'source')
+      const hasEvidence = [observed.recentLifecycle, observed.materials, observed.historyLifecycle, observed.historyMaterials, observed.historyBoundaries].some(events => events?.length)
+      if (collectMaterials && !hasEvidence && observed.readBytes === 0 && (observed.decodedBytes ?? 0) === 0 && observed.coverage === 'caught-up' && entry.view.observation.coverage === 'caught-up' && entry.view.observation.gap === observed.gap && entry.view.identity.threadId === entry.id && entry.health?.state !== 'failed' && (!entry.fork || observed.forkProvenance?.complete) && entry.publishedCheckpoint === fingerprint(entry.reader.checkpoint())) {
+        entry.view.observation = { ...entry.view.observation, readBytes: 0, decodedBytes: 0 }
+        return entry.view
+      }
       const continuing = collectMaterials && entry.lifecycleVerified && entry.lifecycleId === observed.observed.turnId && entry.view.observation.phase === 'started' && observed.observed.phase === 'started' && observed.coverage === 'catching-up' && !observed.gap
-      if (collectMaterials && !entry.fork && (observed.recordRevalidating || continuing) && ![observed.recentLifecycle, observed.materials, observed.historyLifecycle, observed.historyMaterials, observed.historyBoundaries].some(events => events?.length)) {
+      if (collectMaterials && !entry.fork && (observed.recordRevalidating || continuing) && !hasEvidence) {
         // An IO check has not replaced the last verified execution material.
         // Keep its model round alive; the UI separately marks the read backlog.
         entry.view = { ...entry.view, identity: { threadId: entry.id, cursorKey: entry.cursorKey }, signal: 'gray', summary: observed.recordRevalidating ? '当前记录重验中' : entry.view.summary, observation: { ...entry.view.observation, coverage: 'catching-up', gap: observed.gap, readBytes: observed.readBytes, decodedBytes: observed.decodedBytes, recordRevalidating: observed.recordRevalidating === true, recordSnapshotLag: observed.recordSnapshotLag === true } }
@@ -339,6 +351,17 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       const fork = Boolean(prepared.source.forkedFromId), offset = event => fork ? event.captureOffset : event.recordStart
       const phase = continuing ? 'started' : observed.effectivePhase, lifecycleId = observed.observed.turnId ?? (fork ? prepared.source.anchorTurnId : null) ?? 'unobserved:' + prepared.source.hostRunId
       const status = phaseStatus(phase)
+      if (collectMaterials && !fork && !hasEvidence && entry.health?.state !== 'failed' && entry.sourceKey === connection.key && entry.lifecycleId === lifecycleId && entry.view.identity.threadId === entry.id && entry.view.observation.status === status) {
+        const checkpoint = entry.reader.checkpoint(), target = join(dataDir, 'cursors', entry.cursorKey + '.json')
+        entry.captureThroughOffset = Math.max(entry.captureThroughOffset, observed.committedOffset - 1)
+        await saveCursor(target, { ...prepared.previousCheckpoint, fileId: prepared.previousCheckpoint.fileId ?? checkpoint.fileId, attachSize: prepared.previousCheckpoint.attachSize ?? checkpoint.attachSize, knownSize: checkpoint.knownSize }, entry.captured, entry.captureThroughOffset)
+        if (observed.nativeOrigins?.length) { const accepted = await core.ingest(connection.key, { nativeOrigins: observed.nativeOrigins }); entry.reader?.acknowledgeOrigins?.(accepted.nativeOrigins) }
+        if (closed || epoch !== sourceEpoch || generation !== entry.generation) return entry.view
+        await saveCursor(target, checkpoint, entry.captured, entry.captureThroughOffset)
+        entry.publishedCheckpoint = fingerprint(checkpoint)
+        entry.view.observation = { ...entry.view.observation, phase, coverage: observed.coverage, gap: observed.gap, readBytes: observed.readBytes, decodedBytes: observed.decodedBytes, recordRevalidating: false, recordSnapshotLag: observed.recordSnapshotLag === true }
+        return entry.view
+      }
       const previousLifecycle = entry.lifecycleId, previousPhase = entry.view.observation.phase
       entry.lifecycleId = lifecycleId; entry.lifecycleVerified = observed.observed.anchored === true; entry.hostRunId = prepared.source.hostRunId; entry.sourceKey = connection.key
       if (previousLifecycle !== lifecycleId) entry.health = null
@@ -400,6 +423,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         if (entry.view.inheritance.state === 'pending' && !['red', 'yellow'].includes(entry.view.signal)) { entry.view.signal = 'gray'; entry.view.summary = task.currentRequest ? '当前执行已接入，继承要求待补齐' : entry.view.summary }
       }
       await updateHealth(entry, snapshot)
+      entry.publishedCheckpoint = fingerprint(checkpoint)
       return entry.view
     } catch (error) { if (closed || prepared.epoch !== sourceEpoch || prepared.generation !== entry.generation) return entry.view; if (error.code === 'native_origin_revision_conflict') { await stop(entry, 'native-origin-revalidating', false); return entry.view } await collectionOutcome(entry, 'failed', error, prepared.roundId); await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {}); await updateHealth(entry); return entry.view }
   }
@@ -419,7 +443,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     return { ...view, ...(availabilityFailure ? { observation: { ...view.observation, failureStage: availabilityFailure.stage } } : {}), ...(delivery ? { notifications: { permission: delivery.authorization(), errorCode: notificationError, scope: { sourceKey: view.execution?.sourceKey ?? source?.key ?? null, lifecycleId: view.execution?.lifecycleId ?? null, executionKey: view.execution?.key ?? null } } } : {}), ...(healthOutbox ? { health: { ...combineHealth(view.health, sourceHealth, outboxError, availabilityFailure?.health), historyGap: retained.rejected > 0 || retained.expired > 0 } } : {}), discovery: { ...directory, gaps: [...new Set([...directory.gaps, ...(forks.size > verified ? ['fork-coverage-pending'] : [])])], forkCoverage: { known: forks.size, verified, pending: forks.size - verified }, tracked: threads.size, connected: source ? 1 : 0, currentIncluded: Boolean(view.identity.threadId && threads.has(view.identity.threadId)) } }
   }
 
-  async function collect(requested = [], discover = false) {
+  async function collect(requested = [], discover = false, catchUpOnly = false) {
     let epoch = sourceEpoch, failureStage = 'host-verification'
     try {
       const { host, gap } = await qualification()
@@ -442,7 +466,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         const roundId = randomUUID(), result = await discovery.refresh()
         if (result.state === 'unavailable') await collectionOutcome(null, 'failed', result.error ?? { code: 'metadata-unavailable', stage: 'metadata' }, roundId)
         else if (result.state === 'ready') await collectionOutcome(null, 'succeeded', null, roundId)
-        await updateHealth()
+        if (result.state !== 'ready' || !sourceHealth || sourceHealth.state === 'failed' || outboxError || availabilityFailure) await updateHealth()
       }
       if (closed || epoch !== sourceEpoch) return
       for (const [id, entry] of threads) {
@@ -483,7 +507,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         await publish(entry, value)
       }
       failureStage = 'source-heartbeat'
-      if (source && !closed && epoch === sourceEpoch) await core.heartbeat(source.key)
+      if (source && !closed && epoch === sourceEpoch && !catchUpOnly) await core.heartbeat(source.key)
       if (discover && source && !closed && epoch === sourceEpoch) refreshNotifications({ sourceKey: source.key, hostRunId: source.hostRunId, appRunning: true, pluginEnabled: true })
       availabilityFailure = null
     } catch (error) {
@@ -570,7 +594,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       if (!(await core.health()).features?.includes('conversation-monitoring/1')) throw new Error('共享核心尚不支持本聊天暂停')
       await core.setConversationMonitoring({ registrationId: 'chatgpt:' + installationId, taskId: id, paused: change.paused, revision: change.revision })
       await collect([id])
-      return decorate(closed ? gapView('adapter-closed') : entry.view)
+      return decorate(closed ? gapView('adapter-closed') : await observedView(entry, {}))
     })
     if (!pending) throw new Error('会话检查正在收尾或队列已满')
     return pending
@@ -615,7 +639,20 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (!pending) throw new Error('会话检查正在收尾或队列已满')
     return pending
   }
-  async function refresh() { if (closed) return; if (refreshPending) return refreshPending; const pending = enqueue(() => collect([], true)); if (!pending) return; refreshPending = pending.finally(() => { refreshPending = null }); return refreshPending }
+  async function refresh(catchUpOnly = false) {
+    if (closed) return
+    if (refreshPending) return refreshPending
+    const pending = enqueue(async () => {
+      if (!catchUpOnly || performance.now() - maintenanceAt >= pollMs) { await collect([], true); maintenanceAt = performance.now(); return }
+      const entries = [...threads.values()].filter(catchingUp)
+      const ids = entries.length ? Array.from({ length: Math.min(20, entries.length) }, (_, index) => entries[(backlogRotation + index) % entries.length].id) : []
+      backlogRotation = entries.length ? (backlogRotation + ids.length) % entries.length : 0
+      if (ids.length) await collect(ids, false, true)
+    })
+    if (!pending) return
+    refreshPending = pending.finally(() => { refreshPending = null })
+    return refreshPending
+  }
   let panel
   async function qualifySettings() {
     if (closed) throw new Error('观察实例已关闭')
@@ -686,8 +723,8 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }
   if (onQualificationLost) await qualification()
   const schedule = () => {
-    const backlog = [...threads.values()].some(entry => entry.view.observation?.readBytes > 0 && (entry.view.observation.coverage === 'catching-up' || entry.view.observation.recordSnapshotLag))
-    if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(); schedule() }, backlog ? Math.min(25, pollMs) : pollMs)
+    const backlog = [...threads.values()].some(catchingUp)
+    if (!closed && pollMs) timer = setTimeout(async () => { timer = null; await refresh(true); schedule() }, backlog ? 0 : pollMs)
   }
   if (pollMs && typeof native.listThreads === 'function') void refresh().then(schedule, schedule)
   else schedule()

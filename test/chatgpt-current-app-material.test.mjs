@@ -24,7 +24,7 @@ const start = (id, trigger = 'composer') => ({ type: 'task_started', turn_id: id
 const user = (thread, turn, text = 'Inspect only the synthetic log') => ({ type: 'item_completed', thread_id: thread, turn_id: turn, item: { type: 'UserMessage', id: turn + '-user', content: [{ type: 'text', text }] } })
 const agent = (thread, turn, text = 'The synthetic log has been inspected') => ({ type: 'item_completed', thread_id: thread, turn_id: turn, item: { type: 'AgentMessage', id: turn + '-agent', content: [{ type: 'Text', text }] } })
 
-async function fixture(t, { profile = candidateHostProfile, producer = candidateHostProfile.cliVersion, inheritedProducer = producer, suffix = '', records, fork = false, compressed = false, pollMs = 0, onQualificationLost } = {}) {
+async function fixture(t, { profile = candidateHostProfile, producer = candidateHostProfile.cliVersion, inheritedProducer = producer, suffix = '', records, fork = false, compressed = false, pollMs = 0, backgroundChats = 0, cooldownMs = 0, onQualificationLost } = {}) {
   let clock = at
   t.mock.method(Date, 'now', () => clock)
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-current-app-')), sessionsRoot = join(dir, 'sessions'), archived = join(dir, 'archived_sessions'), dataDir = join(dir, 'core'), path = join(sessionsRoot, 'rollout-' + owner + '.jsonl' + (compressed ? '.zst' : '')), parentPath = join(archived, 'rollout-' + parent + '.jsonl')
@@ -34,7 +34,7 @@ async function fixture(t, { profile = candidateHostProfile, producer = candidate
     if (req.method === 'GET') return res.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let body = ''; for await (const chunk of req) body += chunk
     res.setHeader('content-type', 'application/json')
-    if (req.url === '/v1/chat/completions') { state.summaryCalls++; await state.modelGate; res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] })) }
+    if (req.url === '/v1/chat/completions') { state.summaryCalls++; await state.modelGate; if (state.modelFailure) return res.writeHead(503).end('{"error":"controlled model unavailable"}'); res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] })) }
     else { state.jevCalls++; const request = decodeJevRequest(JSON.parse(body)); res.end(JSON.stringify({ model: 'fixed-judge', answers: Object.fromEntries(Object.keys(request.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) })) }
   })
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); wire.closeAllConnections(); await new Promise(resolve => wire.close(resolve)); await fs.rm(dir, { recursive: true, force: true }) })
@@ -47,19 +47,85 @@ async function fixture(t, { profile = candidateHostProfile, producer = candidate
   const bytes = row(base, 'session_meta', { ...header(owner, producer), ...(fork ? { forked_from_id: parent, forked_from_ordinal_exclusive: 5, history_base: { thread_id: parent, end_ordinal_exclusive: 5, end_byte_offset: Buffer.byteLength(inherited) } } : {}) })
     + (records ?? row(base + 1, 'event_msg', start('turn')) + row(base + 2, 'event_msg', user(owner, 'turn')) + row(base + 3, 'event_msg', agent(owner, 'turn'))) + suffix
   await fs.writeFile(path, compressed ? zstdCompressSync(Buffer.from(bytes)) : bytes)
-  server = await startServer({ dataDir, now: () => clock, cooldownMs: 0 }); core = await connectCore({ dataDir })
+  const extraPaths = new Map()
+  for (let index = 0; index < backgroundChats; index++) {
+    const id = 'background-' + index, extraPath = join(sessionsRoot, 'rollout-' + id + '.jsonl')
+    await fs.writeFile(extraPath, row(0, 'session_meta', header(id, producer)) + row(1, 'event_msg', start('turn-' + id)) + row(2, 'event_msg', user(id, 'turn-' + id)) + row(3, 'event_msg', agent(id, 'turn-' + id)))
+    extraPaths.set(id, extraPath)
+  }
+  server = await startServer({ dataDir, now: () => clock, cooldownMs }); core = await connectCore({ dataDir })
   await configureInstallationModels(core, 'chatgpt:current-app-material', { llm: { baseUrl, model: 'fixed-extractor' }, jev: { baseUrl, model: 'fixed-judge' } })
-  const state = { profile, hostRunId: 'current-app-fixture', hostStartedAt: at - 10000, anchorTurnId: 'turn', enabled: true, available: true, threadReads: 0, currentRecordReads: 0, summaryCalls: 0, jevCalls: 0 }
-  const native = { async sampleHost() { return { available: state.available, hostRunId: state.hostRunId, hostStartedAt: state.hostStartedAt, profile: state.profile } }, async readThread(id) { state.threadReads++; return { thread: { id, path: id === owner ? path : parentPath, cwd: '/synthetic-project', parentThreadId: null, forkedFromId: id === owner && fork ? parent : null, source: 'vscode', originator: 'Codex Desktop' }, anchorTurnId: id === owner ? state.anchorTurnId : null } }, async readEnablement() { return { user: state.enabled ? 'enabled' : 'disabled', effective: state.enabled ? 'enabled' : 'disabled' } }, async close() {} }
-  if (pollMs) native.listThreads = async ({ archived }) => ({ data: archived ? [] : [(await native.readThread(owner)).thread], nextCursor: null })
+  const state = { profile, hostRunId: 'current-app-fixture', hostStartedAt: at - 10000, anchorTurnId: 'turn', enabled: true, available: true, threadReads: 0, threadReadIds: [], currentRecordReads: 0, summaryCalls: 0, jevCalls: 0, coreCalls: {}, snapshotSites: {} }
+  const native = { async sampleHost() { return { available: state.available, hostRunId: state.hostRunId, hostStartedAt: state.hostStartedAt, profile: state.profile } }, async readThread(id) { state.threadReads++; state.threadReadIds.push(id); return { thread: { id, path: id === owner ? path : extraPaths.get(id) ?? parentPath, cwd: '/synthetic-project', parentThreadId: null, forkedFromId: id === owner && fork ? parent : null, source: 'vscode', originator: 'Codex Desktop' }, anchorTurnId: id === owner ? state.anchorTurnId : extraPaths.has(id) ? 'turn-' + id : null } }, async readEnablement() { return { user: state.enabled ? 'enabled' : 'disabled', effective: state.enabled ? 'enabled' : 'disabled' } }, async close() {} }
+  if (pollMs || backgroundChats) native.listThreads = async ({ archived }) => ({ data: archived ? [] : await Promise.all([owner, ...extraPaths.keys()].map(async id => (await native.readThread(id)).thread)), nextCursor: null })
+  const adapterCore = new Proxy(core, { get(target, name) { const value = target[name]; return typeof value !== 'function' ? value : (...args) => { state.coreCalls[name] = (state.coreCalls[name] ?? 0) + 1; if (name === 'snapshot') { const site = new Error().stack.split('\n').find(line => line.includes('/chatgpt/adapter.mjs'))?.trim() ?? 'other'; state.snapshotSites[site] = (state.snapshotSites[site] ?? 0) + 1 }; return value(...args) } } })
   const open = fs.open, watched = new Set([await fs.realpath(path), await fs.realpath(parentPath)])
   t.mock.method(fs, 'open', async (...args) => { const handle = await open(...args); if (watched.has(String(args[0]))) { const read = handle.read; handle.read = async function (...values) { const got = await read.apply(this, values); state.currentRecordReads += got.bytesRead; return got } }; return handle })
-  const reopen = async () => { await adapter?.close(); adapter = await startChatGPTAdapter({ core, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'current-app-material', token: 'c'.repeat(64), pollMs, collectMaterials: true, nativeOriginVersion: 2, now: () => clock, ...(onQualificationLost ? { onQualificationLost } : {}) }) }
+  const reopen = async () => { await adapter?.close(); adapter = await startChatGPTAdapter({ core: adapterCore, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'current-app-material', token: 'c'.repeat(64), pollMs, collectMaterials: true, nativeOriginVersion: 2, now: () => clock, ...(onQualificationLost ? { onQualificationLost } : {}) }) }
   await reopen()
   const read = async () => { const response = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'c'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: owner } } }) }); assert.equal(response.status, 200); const value = await response.json(); assert.equal(value.result.isError, undefined); return value.result.structuredContent }
   const caughtUp = async () => { let view; for (let i = 0; i < 30; i++) { view = await read(); if (view.observation.coverage === 'caught-up' || view.observation.coverage === 'retained-history' && ['completed', 'aborted'].includes(view.observation.phase) || view.observation.gap?.startsWith('unsupported-') || ['cursor-invalid', 'record-malformed-or-over-limit'].includes(view.observation.gap)) break }; return view }
   return { core, state, path, dir, read, caughtUp, reopen, advance() { clock += 1000 }, get adapter() { return adapter } }
 }
+
+test('unchanged background chats do not multiply whole-Core snapshots or repeat ingestion', async t => {
+  const f = await fixture(t, { backgroundChats: 27 })
+  await f.adapter.refresh(); await f.adapter.refresh()
+  const before = (await f.core.snapshot()).tasks.map(task => [task.id, task.lifecycleId, task.currentRequest, task.events.map(event => [event.id, event.capturedAt])]).sort()
+  f.state.coreCalls = {}; f.state.snapshotSites = {}
+  await f.adapter.refresh()
+  t.diagnostic(JSON.stringify({ calls: f.state.coreCalls, snapshotSites: f.state.snapshotSites }))
+  assert.ok((f.state.coreCalls.snapshot ?? 0) <= 2, 'one unchanged background batch must not read complete snapshots for every chat')
+  assert.equal(f.state.coreCalls.ingest ?? 0, 0, 'unchanged native records must not rebuild source hierarchy')
+  assert.equal(f.state.coreCalls.heartbeat, 1)
+  const after = (await f.core.snapshot()).tasks.map(task => [task.id, task.lifecycleId, task.currentRequest, task.events.map(event => [event.id, event.capturedAt])]).sort()
+  assert.deepEqual(after, before)
+})
+
+test('fast catch-up does not repeat discovery or idle-chat qualification between maintenance rounds', async t => {
+  const padding = Array.from({ length: 20 }, (_, index) => row(index + 1, 'token_usage_record', { padding: 'x'.repeat(65536) })).join('')
+  const f = await fixture(t, { pollMs: 10000, backgroundChats: 27, records: padding + row(21, 'event_msg', start('turn')) + row(22, 'event_msg', user(owner, 'turn')) + row(23, 'event_msg', agent(owner, 'turn')) })
+  await f.adapter.refresh()
+  f.state.threadReadIds = []; f.state.coreCalls = {}; f.state.snapshotSites = {}
+  const deadline = performance.now() + 3000
+  let current
+  do { current = (await f.core.snapshot()).tasks.find(task => task.id === owner && task.currentRequest); if (current) break; await new Promise(resolve => setTimeout(resolve, 5)) } while (performance.now() < deadline)
+  assert.equal(current?.currentRequest, 'Inspect only the synthetic log')
+  const idleReads = f.state.threadReadIds.filter(id => id !== owner).length
+  t.diagnostic(JSON.stringify({ idleMetadataReads: idleReads, calls: f.state.coreCalls, snapshotSites: f.state.snapshotSites }))
+  assert.equal(idleReads, 0, 'a backlogged reader must not requalify every idle chat on each physical chunk')
+  assert.ok((f.state.coreCalls.snapshot ?? 0) <= 2, 'only material publication needs its before/after snapshots during this catch-up window')
+  await f.adapter.close(); assert.equal(f.adapter.diagnostics().refreshTimers, 0)
+})
+
+test('unchanged observation cannot hide an explicit pause or resume response', async t => {
+  const f = await fixture(t); let view = await f.caughtUp()
+  for (const paused of [true, false]) {
+    const response = await fetch(f.adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'c'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_set_chat_analysis', arguments: { expectedThreadId: owner, paused, revision: view.monitoring.revision }, _meta: { thread_id: owner } } }) })
+    const packet = await response.json()
+    assert.equal(packet.result.isError, undefined)
+    view = packet.result.structuredContent
+    assert.equal(view.monitoring.paused, paused, 'the committed control response must reflect the new state immediately')
+  }
+})
+
+test('cached collection health cannot retain an old model failure after a successful unchanged-material retry', async t => {
+  const f = await fixture(t, { cooldownMs: 60000 })
+  const waitTask = async predicate => { const deadline = performance.now() + 2000; let task; do { task = (await f.core.snapshot()).tasks.find(t => t.id === owner); if (task && predicate(task)) return task; await new Promise(resolve => setTimeout(resolve, 5)) } while (performance.now() < deadline); assert.fail('controlled analysis did not reach expected state: ' + task?.analysis.state) }
+  f.state.modelFailure = true; await f.caughtUp(); await waitTask(task => task.analysis.state === 'failed')
+  const changed = agent(owner, 'turn', 'A new owned activity after the failure'); changed.item.id = 'after-model-failure'
+  await fs.appendFile(f.path, row(4, 'event_msg', changed)); await f.caughtUp()
+  f.state.modelFailure = false
+  const source = (await f.core.snapshot()).sources.find(source => source.status === 'connected')
+  for (let second = 0; second < 60; second++) { f.advance(); await f.core.heartbeat(source.key) }
+  const setting = await f.core.installationAnalysisConfig('chatgpt:current-app-material')
+  await f.core.configureInstallationAnalysis(setting.registrationId, setting.config, setting.revision)
+  await waitTask(task => Boolean(task.analysis.summary?.generated))
+  f.state.coreCalls = {}
+  const recovered = await f.read()
+  assert.notEqual(recovered.health?.state, 'failed', 'analysis health comes from the fresh Core result, not an old collection cache')
+  assert.ok((f.state.coreCalls.snapshot ?? 0) <= 1, 'a recovered model cannot force unchanged material through full publication again')
+})
 
 test('background catch-up schedules bounded work without waiting the idle polling interval between chunks', async t => {
   const padding = Array.from({ length: 12 }, (_, index) => row(index + 1, 'token_usage_record', { padding: 'x'.repeat(65536) })).join('')

@@ -1,6 +1,6 @@
 {
   "name": "ghost-agent-sentinel",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Local read-only DSH task monitoring with an independent shared core",
   "private": true,
   "type": "module",
