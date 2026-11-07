@@ -11,7 +11,7 @@ import { readModelDirectory } from './model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
-import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE } from '../src/protocol.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -129,7 +129,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
   const capability = async () => {
     const health = await core.health(), features = health.features
-    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
+    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
     required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
     if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
     if (delivery) required.push('monitoring-notifications/1', RECOVERY_ROLLUP_FEATURE)
@@ -427,7 +427,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       if (closed || epoch !== sourceEpoch || generation !== entry.generation) return entry.view
       entry.reader?.acknowledgeOrigins?.(accepted.nativeOrigins)
       await saveCursor(target, checkpoint, entry.captured, entry.captureThroughOffset, { fork, deliveryThrough: entry.deliveryThrough })
-      await collectionOutcome(entry, observed.forkProvenance?.error ? 'failed' : 'succeeded', observed.forkProvenance?.error ?? null, prepared.roundId)
+      // A partial replay has not yet reached the previously failed material.
+      // Only reaching EOF with every material ACK proves collection recovery.
+      if (observed.forkProvenance?.error || observed.coverage === 'caught-up') await collectionOutcome(entry, observed.forkProvenance?.error ? 'failed' : 'succeeded', observed.forkProvenance?.error ?? null, prepared.roundId)
       const snapshot = await core.snapshot()
       if (closed) return gapView('adapter-closed')
       if (epoch !== sourceEpoch || generation !== entry.generation || source?.key !== connection.key) return entry.view
@@ -470,7 +472,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       failureStage = 'core-connection'
       const supported = await capability()
       if (closed || epoch !== sourceEpoch) return
-      if (!supported.available) { await stopSource(supported.missingFeatures.length === 1 && supported.missingFeatures[0] === RECOVERY_ROLLUP_FEATURE ? 'core-update-required' : 'core-capability-unavailable'); return }
+      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
       if (coreInstanceId && supported.instanceId && coreInstanceId !== supported.instanceId) {
         try { await stopSource('core-generation-changed') } catch (error) { if (error.status !== 400) throw error }
         if (closed) return
@@ -630,6 +632,18 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (!pending) throw new Error('会话检查正在收尾或队列已满')
     return pending
   }
+  async function dismissNotifications(meta, change) {
+    const id = requestIdentity(meta), through = now()
+    if (!delivery || !id || id !== change.expectedThreadId) throw new Error('当前聊天身份或通知组件尚未确认')
+    const pending = enqueue(async () => {
+      const entry = threads.get(id), owner = source, epoch = sourceEpoch
+      const proof = entry && owner ? await historyProof(entry) : null
+      if (closed || source !== owner || epoch !== sourceEpoch || !proof?.source || proof.gap || proof.source.hostRunId !== owner.hostRunId) throw new Error('当前聊天的通知资格尚未确认')
+      return delivery.dismissChat({ sourceKey: owner.key, hostRunId: owner.hostRunId, mainId: id, through })
+    })
+    if (!pending) throw new Error('会话检查正在收尾或队列已满')
+    return pending
+  }
   async function notificationRecords(meta, selection) {
     const id = requestIdentity(meta)
     if (!delivery || !id || id !== selection.expectedThreadId) throw new Error('当前聊天身份或通知组件尚未确认')
@@ -737,7 +751,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       return { registrationId: 'chatgpt:' + installationId, permission: result }
     } } : {}),
   } : undefined
-  try { panel = await startPanelServer({ read, modelSettings, installationNotifications, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
+  try { panel = await startPanelServer({ read, modelSettings, installationNotifications, ...(collectMaterials ? { control } : {}), ...(delivery ? { requestNotifications, dismissNotifications, notificationRecords } : {}), runtimeStatus, displayName, token, port }) }
   catch (error) { await delivery?.stop(); await healthOutbox?.close(); throw error }
   if (onQualificationLost) await qualification()
   const schedule = () => {

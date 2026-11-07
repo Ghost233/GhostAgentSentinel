@@ -12,7 +12,7 @@ export function createNativeOriginFences({ db }) {
   if (entries.size > LIMIT) throw fail('native_origin_capacity')
   const versions = new Map(db.prepare('SELECT key,value FROM records WHERE collection=?').all(VERSIONS).map(row => [row.key, JSON.parse(row.value)]))
   if ([...versions.values()].some(value => ![1, 2].includes(value))) throw fail('native_origin_state_invalid')
-  const legacy = new Set(db.prepare('SELECT value FROM records WHERE collection=?').all('native-capture-progress').map(row => JSON.parse(row.value).registrationId))
+  const legacy = new Set(db.prepare("SELECT DISTINCT json_extract(value,'$.registrationId') AS registrationId FROM records WHERE collection=?").all('native-capture-progress').map(row => row.registrationId))
   const write = db.prepare('INSERT INTO records(collection,key,value) VALUES(?,?,?) ON CONFLICT(collection,key) DO UPDATE SET value=excluded.value')
   const remove = db.prepare('DELETE FROM records WHERE collection=? AND key=?')
   function version(registrationId, requested) {
@@ -56,7 +56,7 @@ export function createNativeOriginFences({ db }) {
         return () => { if (hasCapturedProgress) legacy.add(registrationId); if (determinesVersion) versions.set(registrationId, requested); for (const [key, value] of changes) entries.set(key, structuredClone(value)) }
       } }
     },
-    diagnostics() { const backed = new Set([...legacy, ...[...entries.keys()].map(key => JSON.parse(key)[0])]); return { generations: entries.size, limit: LIMIT, registrations: versions.size, newRegistrationLimit: LIMIT * 2, legacyModeOnly: [...versions.keys()].filter(key => !backed.has(key)).length } },
+    diagnostics() { const backed = new Set([...legacy, ...[...entries.keys()].map(key => JSON.parse(key)[0])]); return { generations: entries.size, limit: LIMIT, registrations: versions.size, legacyModeOnly: [...versions.keys()].filter(key => !backed.has(key)).length } },
     clearRegistration(registrationId) { prepareClearRegistration(registrationId).stage()() },
   }
 }

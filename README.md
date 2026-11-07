@@ -1,18 +1,20 @@
 # GhostAgentSentinel
 
-面向 AI agent 的本机只读执行监控工具。共享核心连接 DSH 与 Codex：DSH 观察主代理及多级子代理，Codex 观察本机主聊天及分叉主会话。当前源码及两端安装版本为 0.2.6；本地验收范围与保留缺口见发布验证范围。
+面向 AI agent 的本机只读执行监控工具。两端共用代码、分别运行独立 Core：DSH 观察主代理及多级子代理，Codex 观察本机主聊天及分叉主会话。当前源码及两端安装版本为 0.2.7；本地验收范围与保留缺口见发布验证范围。
 
 同一份 Codex 插件提供会话检查与全局安装设置两个独立面板，无需另一份设置插件。监控页分为“当前问题”和“详情”，顶部 GS 在滚动时固定，依据放在对应问题下。设置页分为“设置”“通知记录”和“连接诊断”，模型分组自动保存，两个模型各有“读取列表”和“检查连接”。
 
-0.2.6 的 Codex 通知采用聊天优先：先显示聊天名称，再显示问题状态、原因和下一步。点击通知打开对应聊天；技术 ID 留在诊断记录，已恢复故障另行标明。缺少明确聊天身份的来源级提醒不猜测目标。
+Codex 通知采用聊天优先：先显示聊天名称，再显示问题状态、原因和下一步。点击通知打开对应聊天；技术 ID 留在诊断记录，已恢复故障另行标明。缺少明确聊天身份的来源级提醒不猜测目标。
 
 兼容性按公开接口响应和记录结构判断，App、构建号和 CLI 版本仅作诊断信息。未知事件形成明确材料缺口，后续已知记录继续采集；结构损坏、身份或可信前缀不符仍停止对应读取。分叉继承中的未知材料也保留缺口，不显示为正常结论。模型配置、暂停和原有读取预算继续保留。
 
+0.2.7 修复过期身份占满采集额度及补读过程反复提醒。正文和结果继续保留 24 小时，过期身份仍精确防重放。进入对应聊天且会话检查面板可见时，撤下该聊天已显示的通知；故障记录和后续新提醒保留。Codex 更新时按安装身份复制旧 Core 中的自身资料，启动独立 Core；DSH 保持运行，不需要一起停用。
+
 ## 安装
 
-DSH 0.2.6 安装包为 `ghost-agent-sentinel-0.2.6.tgz`，从 [GitHub 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases) 下载并解压到长期保留的目录。在 DSH 的“插件 → 安装第三方插件”中选择解压后的 `package` 目录，安装并启用 `ghost-agent-sentinel`。既有正式 tag 保留。
+DSH 0.2.7 安装包为 `ghost-agent-sentinel-0.2.7.tgz`，从 [GitHub 发布页](https://github.com/Ghost233/GhostAgentSentinel/releases) 下载并解压到长期保留的目录。在 DSH 的“插件 → 安装第三方插件”中选择解压后的 `package` 目录，安装并启用 `ghost-agent-sentinel`。既有正式 tag 保留。
 
-Codex 通过 [GitHub 仓库市场安装](docs/chatgpt-github-installation.md)。添加仓库后，按“插件 → 个人 → GhostSentinel（或 GhostSentinel test）→ 添加”安装。正式版与 test 均为 0.2.6，可独立安装和并存，配置、通知和暂停状态各自保存。
+Codex 通过 [GitHub 仓库市场安装](docs/chatgpt-github-installation.md)。添加仓库后，按“插件 → 个人 → GhostSentinel（或 GhostSentinel test）→ 添加”安装。正式版与 test 均为 0.2.7，可独立安装和并存，配置、通知和暂停状态各自保存。
 
 DSH Host 需要支持 Node.js 22.13 或更新版本及 `node:sqlite`。DSH 插件使用宿主提供的 SDK 和 React，没有 npm 运行依赖或安装脚本。当前原版宿主缺少部分历史补采和父代理等待依据时，明确显示覆盖缺口，见 [安装说明与兼容性](docs/installation.md)。
 

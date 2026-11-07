@@ -27,6 +27,8 @@ test('the production adapter keeps denied notices pending and its app-only permi
     async cancel() { return { pendingIds: [], observedAt: clock } },
     cancelPendingOperations() { if (authorizationStarted) cancelAuthorization(Object.assign(new Error('Cancelled owned test IO'), { code: 'native_unavailable' })) }, close() {},
   }
+  const dismissed = []
+  notificationIO.dismiss = async ids => { dismissed.push(...ids); return { deliveredIds: [], observedAt: clock } }
   const native = {
     async sampleHost() { return { available: true, hostRunId: 'notification-host', hostStartedAt: hostBirth, profile: supportedProfile } },
     async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async readThread() { return { thread, anchorTurnId: 'run' } },
@@ -65,4 +67,18 @@ test('the production adapter keeps denied notices pending and its app-only permi
   assert.equal(visible.records[0].delivery, 'system-accepted')
   assert.equal(visible.records[0].humanSeen, 'unknown')
   assert.match(visible.records[0].body, /EACCES/)
+  const chatNotice = await core.recordCollectionOutcome({ sourceKey, mainId: 'main', lifecycleId: 'run', channel: 'default', roundId: 'owned-chat-failure', outcome: 'failed', settledAt: clock, error: { code: 'EIO', stage: 'collection' } })
+  await adapter.refresh()
+  for (let wait = 0; wait < 100 && !submits.some(value => value.metadata.mainId === 'main'); wait++) await delay(2)
+  const shown = submits.find(value => value.metadata.mainId === 'main')
+  assert.ok(shown)
+  let delivered = [{ requestId: shown.requestId, metadata: shown.metadata, deliveryDate: clock }]
+  notificationIO.snapshot = async () => ({ pending: [], delivered, actions: [], observedAt: clock })
+  notificationIO.dismiss = async ids => { dismissed.push(...ids); delivered = delivered.filter(value => !ids.includes(value.requestId)); return { deliveredIds: [], observedAt: clock } }
+  const invalid = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sentinel_dismiss_chat_notifications', arguments: { expectedThreadId: 'another-chat' }, _meta: { thread_id: 'main' } } }) })
+  assert.equal((await invalid.json()).result.isError, true)
+  assert.equal(dismissed.length, 0)
+  assert.equal((await call('sentinel_dismiss_chat_notifications', { expectedThreadId: 'main' })).dismissed, 1)
+  assert.deepEqual(dismissed, [shown.requestId])
+  assert.ok((await core.failureReceipts({ sourceKey })).receipts.some(value => value.id === chatNotice.receipt.id))
 })

@@ -10,7 +10,7 @@ import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.m
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { setTimeout as delay } from 'node:timers/promises'
 
-test('an older Core without recovery rollup support is reported before collection or notification starts', async t => {
+for (const missing of ['monitoring-recovery-rollup/1', 'native-capture-live-budget/1']) test('an older Core without ' + missing + ' is reported before collection or notification starts', async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-old-recovery-core-')), clock = Date.now()
   let server, core, adapter, compatible = false, lists = 0
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); await fs.rm(dir, { recursive: true, force: true }) })
@@ -18,10 +18,10 @@ test('an older Core without recovery rollup support is reported before collectio
   await fs.writeFile(thread.path, JSON.stringify({ type: 'session_meta', timestamp: new Date(clock).toISOString(), payload: { id: thread.id } }) + '\n')
   server = await startServer({ dataDir: join(dir, 'core'), now: () => clock }); core = await connectCore({ dataDir: join(dir, 'core') })
   const health = core.health
-  core.health = async (...args) => { const value = await health(...args); return { ...value, features: compatible ? value.features : value.features.filter(feature => feature !== 'monitoring-recovery-rollup/1') } }
+  core.health = async (...args) => { const value = await health(...args); return { ...value, features: compatible ? value.features : value.features.filter(feature => feature !== missing) } }
   const native = { async sampleHost() { return { available: true, hostRunId: 'owned-host', hostStartedAt: clock - 10000, profile: supportedProfile } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async listThreads() { lists++; return { data: [thread], nextCursor: null } }, async readThread() { return { thread, anchorTurnId: null } }, async close() {} }
   const notificationIO = { async settings() { return { authorization: 'authorized', observedAt: clock } }, async snapshot() { return { pending: [], delivered: [], actions: [], observedAt: clock } }, async submit() { assert.fail('no system notification is expected') }, async cancel() { return { pendingIds: [], observedAt: clock } }, close() {} }
-  adapter = await startChatGPTAdapter({ core, native, notificationIO, sessionsRoot: dir, dataDir: join(dir, 'adapter'), installationId: 'old-core-notice', token: 'a'.repeat(64), collectMaterials: true, pollMs: 0, now: () => clock })
+  adapter = await startChatGPTAdapter({ core, native, notificationIO, sessionsRoot: dir, dataDir: join(dir, 'adapter'), installationId: 'old-core-notice', token: 'a'.repeat(64), collectMaterials: true, nativeOriginVersion: 2, pollMs: 0, now: () => clock })
   await adapter.refresh()
   assert.equal(lists, 0, 'an older shared Core cannot silently use the new observer with old notification behavior')
   const view = await adapter.read({ thread_id: thread.id })

@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile, rm, mkdir, realpath, chmod } from 'node:f
 import fs from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { createServer } from 'node:http'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
@@ -284,4 +284,33 @@ test('owner resolution authenticates release identity in the owner, publication 
   await writeFile(publicationPath, JSON.stringify(publication))
   await writeFile(ownerPath, JSON.stringify({ ...identity, releaseId: nextRelease }))
   await assert.rejects(runtime.resolvePluginOwner(prepared), /untrusted helper owner/)
+})
+
+for (const failedWrite of [false, true]) test(`a managed legacy Core path migrates once to an independent Codex profile (${failedWrite ? 'retry after config write' : 'normal upgrade'})`, async t => {
+  const f = await githubFixture(t), first = await f.packet('stable', '1'.repeat(64)), calls = []
+  first.coreDataDir = join(homedir(), '.ghost-agent-sentinel')
+  const { prepareGitHubInstallation, inspectGitHubInstallation } = await import('../chatgpt/github-installation.mjs')
+  const initial = await prepareGitHubInstallation(first, f.io), previous = await runtime.loadInstallationConfig(initial.configPath)
+  const next = await f.packet('stable', '2'.repeat(64), 'independent')
+  const io = { ...f.io, async migrateCoreProfile(value) { calls.push(value); return { migrated: true } } }
+  if (failedWrite) {
+    const write = fs.writeFile; let rejected = false
+    t.mock.method(fs, 'writeFile', async (...args) => { if (!rejected && String(args[0]).includes('github-installation.json.') && String(args[1]).includes(next.archiveSHA256)) { rejected = true; throw Object.assign(new Error('owned receipt write failure'), { code: 'EIO' }) }; return write(...args) }); syncBuiltinESMExports()
+    try { await assert.rejects(prepareGitHubInstallation(next, io), { code: 'EIO' }) } finally { t.mock.restoreAll(); syncBuiltinESMExports() }
+  }
+  await prepareGitHubInstallation(next, io)
+  const current = await runtime.loadInstallationConfig(initial.configPath)
+  assert.equal(current.coreDataDir, join(homedir(), '.ghost-agent-sentinel-codex', previous.installationId))
+  for (const key of ['installationId', 'token', 'initialEnrollmentBaseline', 'dataDir']) assert.deepEqual(current[key], previous[key])
+  assert.ok(calls.every(value => value.from === previous.coreDataDir && value.to === current.coreDataDir && value.registrationId === 'chatgpt:' + previous.installationId))
+  assert.equal((await inspectGitHubInstallation(next)).config.coreDataDir, current.coreDataDir)
+})
+
+test('a new Codex installation defaults to its own Core rather than the DSH directory', async t => {
+  const f = await githubFixture(t), options = await f.packet('stable', '3'.repeat(64))
+  delete options.coreDataDir
+  const { prepareGitHubInstallation } = await import('../chatgpt/github-installation.mjs')
+  const result = await prepareGitHubInstallation(options, f.io), config = await runtime.loadInstallationConfig(result.configPath)
+  assert.equal(config.coreDataDir, join(homedir(), '.ghost-agent-sentinel-codex', config.installationId))
+  assert.notEqual(config.coreDataDir, join(homedir(), '.ghost-agent-sentinel'))
 })

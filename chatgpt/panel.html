@@ -212,7 +212,9 @@ function completeOperation(){
 }
 function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');return;}if(message.method==='ui/notifications/host-context-changed'){generation++;clearView('会话已变化，重新核对中');clearTimeout(timer);timer=null;if(ready&&!busy)void refresh();}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
 addEventListener('message',onMessage);
-async function refresh(){if(stopped||document.hidden||busy||!ready)return;busy=true;const g=generation;try{const response=await request('tools/call',{name:'sentinel_current_chat',arguments:readArguments()});if(stopped||g!==generation)return;if(response.isError)throw new Error('当前检查读取失败');render(response.structuredContent);}catch(error){if(!stopped&&g===generation){clearView('本次读取失败，当前状态不可判断');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}}finally{completeOperation();}}
+let dismissedGeneration=-1;
+async function dismissDisplayed(view,g){const threadId=view?.identity?.threadId;if(!threadId||!view.notifications?.scope?.sourceKey||document.hidden||stopped||g!==generation||dismissedGeneration===g)return;dismissedGeneration=g;try{await request('tools/call',{name:'sentinel_dismiss_chat_notifications',arguments:{expectedThreadId:threadId}});}catch{}}
+async function refresh(){if(stopped||document.hidden||busy||!ready)return;busy=true;const g=generation;try{const response=await request('tools/call',{name:'sentinel_current_chat',arguments:readArguments()});if(stopped||g!==generation)return;if(response.isError)throw new Error('当前检查读取失败');render(response.structuredContent);void dismissDisplayed(response.structuredContent,g);}catch(error){if(!stopped&&g===generation){clearView('本次读取失败，当前状态不可判断');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}}finally{completeOperation();}}
 element('refresh').onclick=()=>refresh();
 async function setPaused(){
   if(stopped||busy||!ready||!controlState)return;
@@ -234,7 +236,7 @@ async function setPaused(){
 element('pause').onclick=setPaused;
 element('history-current').onclick=()=>selectExecution(null,null);
 element('history-more').onclick=()=>nextHistoryCursor?selectExecution(selectedExecutionKey,nextHistoryCursor):undefined;
-function visibility(){clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void refresh();}
+function visibility(){dismissedGeneration=-1;clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void refresh();}
 function teardown(){stopped=true;generation++;clearTimeout(timer);timer=null;for(const [id,entry]of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
 (async()=>{try{await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');await refresh();}catch(error){clearView('宿主初始化未完成');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}})();

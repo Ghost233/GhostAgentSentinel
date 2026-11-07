@@ -55,6 +55,8 @@ export function createNativeNotificationIO({ bundlePath, installationId, testMod
       if (result.requestId !== fields.requestId || typeof result.accepted !== 'boolean' || !auth.has(result.authorization)) throw protocol()
     } else if (operation === 'cancel') {
       if (!Array.isArray(result.pendingIds) || result.pendingIds.length > 100 || result.pendingIds.some(value => !owned(value))) throw protocol()
+    } else if (operation === 'dismiss') {
+      if (!Array.isArray(result.deliveredIds) || result.deliveredIds.length > 100 || result.deliveredIds.some(value => !owned(value) || !fields.requestIds.includes(value))) throw protocol()
     } else if (operation === 'purge-installation') {
       if (!Number.isSafeInteger(result.requestedCancellations) || result.requestedCancellations < 0 || result.requestedCancellations > 100 || !Number.isSafeInteger(result.remainingPending) || result.remainingPending < 0 || !Number.isSafeInteger(result.clearedActions) || result.clearedActions < 0 || result.clearedActions > 256 || result.deliveredPreserved !== true || result.complete !== (result.remainingPending === 0)) throw protocol()
     } else {
@@ -79,7 +81,15 @@ export function createNativeNotificationIO({ bundlePath, installationId, testMod
       if (!Array.isArray(requestIds) || requestIds.length > 100 || requestIds.some(value => !owned(value))) return Promise.reject(new Error('notification cancellation belongs to another installation or exceeds its budget'))
       return invoke('cancel', { requestIds: [...new Set(requestIds)] })
     },
-    snapshot: () => invoke('snapshot'),
+    dismiss(requestIds) {
+      if (!Array.isArray(requestIds) || requestIds.length > 100 || requestIds.some(value => !owned(value))) return Promise.reject(new Error('notification dismissal belongs to another installation or exceeds its budget'))
+      return invoke('dismiss', { requestIds: [...new Set(requestIds)] })
+    },
+    snapshot({ mainId, through } = {}) {
+      if (mainId === undefined && through === undefined) return invoke('snapshot')
+      if (!id(mainId) || !time(through)) return Promise.reject(protocol())
+      return invoke('snapshot', { mainId, through })
+    },
     purgeInstallation: () => invoke('purge-installation'),
     cancelPendingOperations: () => active?.abort(),
     close: () => { closed = true; active?.abort() },

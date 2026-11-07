@@ -22,6 +22,7 @@ async function fixture(t, { authorization = 'authorized', qualify } = {}) {
       result = { ...result, authorization: permission, alertSetting: 'enabled', notificationCenterSetting: 'enabled' }
     } else if (request.operation === 'submit') { pending.set(request.requestId, request.metadata); result = { ...result, requestId: request.requestId, accepted: true, authorization: permission } }
     else if (request.operation === 'cancel') { for (const id of request.requestIds) pending.delete(id); result.pendingIds = request.requestIds.filter(id => pending.has(id)) }
+    else if (request.operation === 'dismiss') { for (const id of request.requestIds) delivered.delete(id); result.deliveredIds = request.requestIds.filter(id => delivered.has(id)) }
     else result = { ...result, pending: [...pending.keys()].slice(0, 100).map(requestId => ({ requestId })), delivered: [...delivered].map(([requestId, metadata]) => ({ requestId, metadata, deliveryDate: clock })), actions: [], historyGap: false, pendingHasMore: pending.size > 100, deliveredHasMore: false }
     return { stdout: JSON.stringify({ schemaVersion: 1, bundleId: 'com.ghostsentinel.notifications', operation: request.operation, ok: true, result }) }
   } })
@@ -30,6 +31,24 @@ async function fixture(t, { authorization = 'authorized', qualify } = {}) {
   const fail = async (mainId = null) => core.recordCollectionOutcome({ sourceKey, mainId, lifecycleId: mainId === null ? null : 'one', channel: 'directory', roundId: 'collection-' + (mainId ?? 'source'), outcome: 'failed', settledAt: clock, error: { code: 'EIO', stage: 'collection' } })
   return { core, delivery, facts, calls, pending, delivered, fail, prefix: notificationPrefix(installationId), now: () => clock, advance: ms => { clock += ms } }
 }
+
+test('viewing a qualified chat dismisses only its displayed notices and preserves receipts, other chats and later notices', async t => {
+  const f = await fixture(t)
+  await f.core.ingest(f.facts.sourceKey, { tasks: ['A', 'B'].map(id => ({ id, lifecycleId: 'one', title: id, status: 'running' })) })
+  await f.fail('A'); await f.fail('B'); await f.delivery.refresh(f.facts)
+  for (const [id, metadata] of f.pending) f.delivered.set(id, metadata)
+  const notices = (await f.core.nativeNotificationRecords({ sourceKey: f.facts.sourceKey })).records
+  const viewed = await f.delivery.dismissChat({ ...f.facts, mainId: 'A', through: f.now() })
+  assert.equal(viewed.dismissed, 1)
+  assert.deepEqual([...f.delivered.values()].map(value => value.mainId), ['B'])
+  assert.equal((await f.core.failureReceipts({ sourceKey: f.facts.sourceKey })).receipts.length, 2)
+  assert.ok((await f.core.nativeNotificationRecords({ sourceKey: f.facts.sourceKey })).records.every(value => value.humanSeen === 'unknown'))
+  f.advance(1)
+  const a = notices.find(value => value.mainId === 'A')
+  f.delivered.set(a.native.nativeRequestId, { notificationId: a.id, attemptId: a.native.attemptId, sourceKey: a.sourceKey, hostRunId: a.hostRunId, mainId: a.mainId, lifecycleId: a.lifecycleId })
+  await f.delivery.dismissChat({ ...f.facts, mainId: 'A', through: f.now() - 1 })
+  assert.equal(f.delivered.size, 2, 'delivery after the view boundary is preserved')
+})
 
 test('chat-first notices show the qualified chat name, plain failure and current recovery state without exposing transport identities', async t => {
   let facts

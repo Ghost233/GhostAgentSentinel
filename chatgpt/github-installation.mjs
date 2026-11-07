@@ -5,6 +5,7 @@ import { homedir } from 'node:os'
 import { randomBytes, randomUUID, createHash } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import { inspectPluginPackage } from './plugin-package.mjs'
+import { migrateCoreProfile } from '../src/core-profile-migration.mjs'
 import { prepareInstallation, loadInstallationConfig, resolvePluginOwner, HELPER_VERSION, HELPER_PROTOCOL } from './runtime.mjs'
 
 export const GITHUB_CHANNELS = Object.freeze({
@@ -134,13 +135,15 @@ async function upgrade(paths, config, receipt, packet, pending, io) {
       const authenticated = await (io.resolveOwner ?? resolvePluginOwner)({ configPath: paths.configPath })
       if (!authenticated || ownerFields.some(key => authenticated[key] !== current.owner[key])) fail('github_owner_unconfirmed')
     }
-    operation = { format: 1, kind: 'ghost-sentinel-github-operation/1', phase: 'upgrade', operationId: randomUUID(), channel: paths.channel, stateRoot: paths.stateRoot, archiveSHA256: packet.archiveSHA256, releaseId: packet.releaseId, previousReceipt: receipt, owner: current.owner ?? null }
+    operation = { format: 1, kind: 'ghost-sentinel-github-operation/1', phase: 'upgrade', operationId: randomUUID(), channel: paths.channel, stateRoot: paths.stateRoot, archiveSHA256: packet.archiveSHA256, releaseId: packet.releaseId, previousReceipt: receipt, owner: current.owner ?? null, previousCoreDataDir: config.coreDataDir }
     await save(paths.operationPath, operation, true)
   }
-  if (Object.keys(operation).length !== 10 || operation.format !== 1 || operation.kind !== 'ghost-sentinel-github-operation/1' || operation.phase !== 'upgrade' || !uuid(operation.operationId) || operation.channel !== paths.channel || operation.stateRoot !== paths.stateRoot || operation.archiveSHA256 !== packet.archiveSHA256 || operation.releaseId !== packet.releaseId) fail('github_operation_requires_review')
+  if (Object.keys(operation).length !== (operation.previousCoreDataDir === undefined ? 10 : 11) || operation.previousCoreDataDir !== undefined && (typeof operation.previousCoreDataDir !== 'string' || !isAbsolute(operation.previousCoreDataDir)) || operation.format !== 1 || operation.kind !== 'ghost-sentinel-github-operation/1' || operation.phase !== 'upgrade' || !uuid(operation.operationId) || operation.channel !== paths.channel || operation.stateRoot !== paths.stateRoot || operation.archiveSHA256 !== packet.archiveSHA256 || operation.releaseId !== packet.releaseId) fail('github_operation_requires_review')
   const previous = operation.previousReceipt
   const oldEntry = previous?.releases?.find(value => value.archiveSHA256 === previous.activeArchiveSHA256)
-  const oldConfig = { ...config, releaseId: previous?.activeReleaseId }
+  const previousCoreDataDir = operation.previousCoreDataDir ?? config.coreDataDir
+  const coreDataDir = previousCoreDataDir === join(homedir(), '.ghost-agent-sentinel') ? join(homedir(), '.ghost-agent-sentinel-codex', config.installationId) : previousCoreDataDir
+  const oldConfig = { ...config, coreDataDir: previousCoreDataDir, releaseId: previous?.activeReleaseId }
   if (oldEntry?.notificationBundlePath) oldConfig.notificationBundlePath = oldEntry.notificationBundlePath
   else delete oldConfig.notificationBundlePath
   checkedReceipt(previous, oldConfig, paths)
@@ -166,8 +169,9 @@ async function upgrade(paths, config, receipt, packet, pending, io) {
     await delay(25)
   }
   config = await checkedConfig(paths)
-  if (configIdentity(config) !== previous.configIdentity || ![previous.activeReleaseId, packet.releaseId].includes(config.releaseId)) fail('github_upgrade_configuration_changed')
-  const updated = { ...config, releaseId: packet.releaseId }
+  if (configIdentity({ ...config, coreDataDir: previousCoreDataDir }) !== previous.configIdentity || ![previousCoreDataDir, coreDataDir].includes(config.coreDataDir) || ![previous.activeReleaseId, packet.releaseId].includes(config.releaseId)) fail('github_upgrade_configuration_changed')
+  if (coreDataDir !== previousCoreDataDir) await (io.migrateCoreProfile ?? migrateCoreProfile)({ from: previousCoreDataDir, to: coreDataDir, registrationId: 'chatgpt:' + config.installationId })
+  const updated = { ...config, coreDataDir, releaseId: packet.releaseId }
   if (packet.notificationBundlePath) updated.notificationBundlePath = packet.notificationBundlePath
   else delete updated.notificationBundlePath
   await save(paths.configPath, updated)
@@ -228,7 +232,8 @@ export async function prepareGitHubInstallation(options, io = {}) {
       if (config && !pending) fail('github_foreign_configuration')
       let operation = pending
       if (!operation) {
-        const planned = { format: 1, installationId: randomUUID(), initialEnrollmentBaseline: { id: randomUUID(), claimable: true }, dataDir: paths.dataDir, coreDataDir: resolve(options.coreDataDir ?? join(homedir(), '.ghost-agent-sentinel')), sessionsRoot: resolve(options.sessionsRoot ?? join(homedir(), '.codex/sessions')), metadataSocket: join(paths.stateRoot, 'unused.sock'), pluginId: paths.pluginId, token: randomBytes(32).toString('hex'), releaseId: packet.releaseId, ...(packet.notificationBundlePath ? { notificationBundlePath: packet.notificationBundlePath } : {}) }
+        const installationId = randomUUID()
+        const planned = { format: 1, installationId, initialEnrollmentBaseline: { id: randomUUID(), claimable: true }, dataDir: paths.dataDir, coreDataDir: resolve(options.coreDataDir ?? join(homedir(), '.ghost-agent-sentinel-codex', installationId)), sessionsRoot: resolve(options.sessionsRoot ?? join(homedir(), '.codex/sessions')), metadataSocket: join(paths.stateRoot, 'unused.sock'), pluginId: paths.pluginId, token: randomBytes(32).toString('hex'), releaseId: packet.releaseId, ...(packet.notificationBundlePath ? { notificationBundlePath: packet.notificationBundlePath } : {}) }
         operation = { format: 1, kind: 'ghost-sentinel-github-operation/1', phase: 'initial', operationId: randomUUID(), channel: paths.channel, stateRoot: paths.stateRoot, archiveSHA256: packet.archiveSHA256, releaseId: packet.releaseId, planned }
         await save(paths.operationPath, operation, true)
       }

@@ -7,6 +7,9 @@ import { createHash } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
+import { controlledModelService } from './helpers/controlled-model-service.mjs'
+import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const DAY = 86400000
 const nativeId = name => createHash('sha256').update(name).digest('hex')
@@ -102,6 +105,33 @@ test('the global native progress quota fails explicitly without forgetting old i
   const legacy = await f.register('dsh:quota-independent', 'host-three', null)
   await f.emit(legacy, 'legacy-after-quota', 'new-dsh-native-tag')
   assert.ok((await f.core.snapshot()).tasks.find(task => task.id === 'legacy-after-quota').events.length)
+  await f.core.unregisterSource(first); await f.core.unregisterSource(second)
+  f.advance(DAY + 1); await f.core.snapshot(); await f.restart()
+  const resumed = await f.register('chatgpt:install-one', 'after-expiry')
+  await f.emit(resumed, 'resumed-task', 'fresh-after-full-capacity', f.now, 'Fresh append after retention')
+  await f.emit(resumed, 'replayed-task', 'bulk-0', f.now, 'Bulk body 0')
+  assert.deepEqual((await f.core.snapshot()).tasks.flatMap(task => task.events).filter(event => event.data?.sourceKind === 'chatgpt-native').map(event => event.text), ['Fresh append after retention'])
+  const retained = (await f.core.diagnostics()).retained.nativeCaptureProgress
+  assert.equal(retained.expired, 10000, 'expiry keeps every exact replay fence')
+  assert.equal(retained.residentRecords, 1, 'expired fences do not consume the live material budget or resident index')
+  const models = await controlledModelService(t)
+  await configureInstallationModels(f.core, 'chatgpt:install-one', models.config)
+  const taskId = 'resumed-task', lifecycleId = 'own-run'
+  const event = (id, kind, text, data) => { const value = f.batch(taskId, id, f.now, text).events[0]; return { ...value, kind, data: { ...value.data, ...data } } }
+  const ref = eventId => ({ taskId, lifecycleId, eventId })
+  await f.core.ingest(resumed, { tasks: [{ id: taskId, sessionId: taskId, lifecycleId, title: 'Recovered model task', status: 'running' }], events: [
+    event('new-start', 'status', 'Started', { nativeType: 'task_started', sourceForm: 'event_msg', turnTrigger: 'composer', status: 'running' }),
+    event('new-request', 'input', 'Read the current log only', { nativeType: 'item_completed/UserMessage', messageId: 'new-user', inputOrigin: 'user-entry', inputPhase: 'consumed' }),
+    event('new-output', 'output', 'Read the current log', {}),
+  ], hierarchyContext: { schemaVersion: 1, revision: 1, sessions: [{ sessionId: taskId }], relations: [], activations: [{ taskId, lifecycleId, sessionId: taskId, runId: lifecycleId, state: 'running', stateRefs: [ref('new-start')] }], instructionBindings: [{ taskId, lifecycleId, inputRef: ref('new-request'), origin: 'user-entry', phase: 'consumed', originRefs: [ref('new-start'), ref('new-request')], ancestorLimitRefs: [] }], coverage: { complete: true, branchGaps: [] } } })
+  let analyzed
+  for (let attempt = 0; attempt < 100; attempt++) { analyzed = (await f.core.snapshot()).tasks.find(task => task.id === taskId); if (analyzed.analysis.completedAt) break; await delay(5) }
+  assert.ok(analyzed.analysis.completedAt, 'new retained material reaches actual summary and judgment HTTP after old capacity expires')
+  assert.equal(analyzed.analysis.error, null)
+  await f.restart()
+  const reopened = await f.register('chatgpt:install-one', 'after-reopening')
+  await f.emit(reopened, 'replayed-after-restart', 'bulk-9999', f.now, 'Bulk body 9999')
+  assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).some(event => event.text === 'Bulk body 9999'), false)
 })
 
 test('unexpired native progress preserves first body, evidence and clock across source and core replacement without sharing authorization', async t => {

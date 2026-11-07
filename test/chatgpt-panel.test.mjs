@@ -5,6 +5,23 @@ import { panelHarness as harness } from './helpers/chatgpt-panel.mjs'
 const ids = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait']
 const result = id => ({ signal: 'gray', summary: id ? id + ' 执行开始' : '无法确认当前观察', identity: { threadId: id }, observation: { coverage: 'caught-up', gap: null }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
 
+test('visible chat entry dismisses its displayed notices once per activation without affecting monitor refresh', async t => {
+  const page = await harness(t), view = { ...result('main-a'), notifications: { scope: { sourceKey: 'owned-source' } } }
+  await page.deliver(view)
+  const dismiss = page.sent.findLast(row => row.params?.name === 'sentinel_dismiss_chat_notifications')
+  assert.equal(dismiss.params.arguments.expectedThreadId, 'main-a')
+  page.reply(dismiss.id, { structuredContent: { dismissed: 1 } }); await page.flush()
+  await page.refresh(); await page.deliver(view)
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_dismiss_chat_notifications').length, 1)
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed' } }); await page.flush()
+  await page.deliver({ ...view, identity: { threadId: 'main-b' } })
+  assert.equal(page.sent.findLast(row => row.params?.name === 'sentinel_dismiss_chat_notifications').params.arguments.expectedThreadId, 'main-b')
+  const count = page.sent.filter(row => row.params?.name === 'sentinel_dismiss_chat_notifications').length
+  page.document.hidden = true
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed' } }); await page.flush()
+  assert.equal(page.sent.filter(row => row.params?.name === 'sentinel_dismiss_chat_notifications').length, count)
+})
+
 test('details stay directly readable across refresh, transport failure and chat changes without disclosure controls', async t => {
   const page = await harness(t)
   page.element('#monitor-tab-details').onclick()

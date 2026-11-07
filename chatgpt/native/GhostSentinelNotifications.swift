@@ -75,25 +75,26 @@ private func reply(_ operation: String, result: [String: Any]? = nil, error: Str
     FileHandle.standardOutput.write(bytes); FileHandle.standardOutput.write(Data([10]))
     DispatchQueue.main.async { NSApp.terminate(nil) }
 }
-private func snapshot(_ prefix: String, completion: @escaping ([String: Any]) -> Void) {
+private func snapshot(_ prefix: String, mainId: String? = nil, through: Int64? = nil, completion: @escaping ([String: Any]) -> Void) {
     center.getPendingNotificationRequests { requests in
         center.getDeliveredNotifications { notifications in
             let pending = requests.filter { owned($0.identifier, prefix) }
-            let delivered = notifications.filter { owned($0.request.identifier, prefix) }
+            let delivered = notifications.filter { owned($0.request.identifier, prefix) && (mainId == nil || metadata($0.request.content.userInfo)?["mainId"] as? String == mainId) && (through == nil || Int64($0.date.timeIntervalSince1970 * 1000) <= through!) }
+            let limit = mainId == nil ? 32 : 100
             let journal = try? actionJournal.read()
             let actions = journal?.events.filter { owned($0["requestId"] as? String ?? "", prefix) } ?? []
-            let deliveredFacts: [[String: Any]] = delivered.prefix(32).compactMap { item in
+            let deliveredFacts: [[String: Any]] = delivered.prefix(limit).compactMap { item in
                 guard let facts = metadata(item.request.content.userInfo) else { return nil }
                 return ["requestId": item.request.identifier, "deliveryDate": Int64(item.date.timeIntervalSince1970 * 1000), "metadata": facts]
             }
-            completion(["pending": pending.prefix(100).map { ["requestId": $0.identifier] }, "pendingHasMore": pending.count > 100, "delivered": deliveredFacts, "deliveredHasMore": delivered.count > 32, "actions": Array(actions.suffix(32)), "historyGap": (journal?.gap ?? false) || journal == nil || actions.count > 32 || delivered.count > 32, "observedAt": clock()])
+            completion(["pending": pending.prefix(100).map { ["requestId": $0.identifier] }, "pendingHasMore": pending.count > 100, "delivered": deliveredFacts, "deliveredHasMore": delivered.count > limit, "actions": Array(actions.suffix(32)), "historyGap": (journal?.gap ?? false) || journal == nil || actions.count > 32 || delivered.count > limit, "observedAt": clock()])
         }
     }
 }
 private func execute(_ request: [String: Any]) {
     let operation = request["operation"] as? String ?? "invalid"
     guard request["schemaVersion"] as? Int == 1, let prefix = request["ownerPrefix"] as? String, prefixValid(prefix), Bundle.main.bundleIdentifier == identity else { reply(operation, error: "native_protocol"); return }
-    let fields: [String: Set<String>] = ["status": [], "authorize": [], "snapshot": [], "purge-installation": [], "submit": ["requestId", "title", "subtitle", "body", "metadata"], "cancel": ["requestIds"]]
+    let fields: [String: Set<String>] = ["status": [], "authorize": [], "snapshot": ["mainId", "through"], "purge-installation": [], "submit": ["requestId", "title", "subtitle", "body", "metadata"], "cancel": ["requestIds"], "dismiss": ["requestIds"]]
     guard let allowed = fields[operation], Set(request.keys).isSubset(of: allowed.union(["schemaVersion", "operation", "ownerPrefix"])) else { reply(operation, error: "native_protocol"); return }
     switch operation {
     case "status":
@@ -104,11 +105,19 @@ private func execute(_ request: [String: Any]) {
             if current["authorization"] as? String == "denied" { reply(operation, result: current); return }
             center.requestAuthorization(options: [.alert, .sound]) { _, error in if error != nil { reply(operation, error: "native_unavailable") } else { settings { reply(operation, result: $0) } } }
         }
-    case "snapshot": snapshot(prefix) { reply(operation, result: $0) }
+    case "snapshot":
+        if request["mainId"] != nil || request["through"] != nil {
+            guard let mainId = identifier(request["mainId"]), let through = request["through"] as? Int64, through >= 0, through <= clock() else { reply(operation, error: "native_protocol"); return }
+            snapshot(prefix, mainId: mainId, through: through) { reply(operation, result: $0) }
+        } else { snapshot(prefix) { reply(operation, result: $0) } }
     case "cancel":
         guard let ids = request["requestIds"] as? [String], ids.count <= 100, ids.allSatisfy({ owned($0, prefix) }) else { reply(operation, error: "native_protocol"); return }
         center.removePendingNotificationRequests(withIdentifiers: ids)
         center.getPendingNotificationRequests { requests in reply(operation, result: ["pendingIds": requests.filter { ids.contains($0.identifier) }.map { $0.identifier }, "observedAt": clock()]) }
+    case "dismiss":
+        guard let ids = request["requestIds"] as? [String], ids.count <= 100, ids.allSatisfy({ owned($0, prefix) }) else { reply(operation, error: "native_protocol"); return }
+        center.removeDeliveredNotifications(withIdentifiers: ids)
+        center.getDeliveredNotifications { values in reply(operation, result: ["deliveredIds": values.filter { ids.contains($0.request.identifier) }.map { $0.request.identifier }, "observedAt": clock()]) }
     case "purge-installation":
         center.getPendingNotificationRequests { requests in
             let ids = Array(requests.filter { owned($0.identifier, prefix) }.prefix(100).map { $0.identifier })

@@ -48,7 +48,7 @@ export async function createCore({
   const remove = db.prepare('DELETE FROM records WHERE collection=? AND key=?');
   const beforeNativeWrite = db.prepare('SELECT value FROM records WHERE collection=? AND key=?');
   const failureStore = createFailureReceipts({ db, now });
-  const rows = db.prepare('SELECT collection,key,value FROM records').all();
+  const rows = db.prepare("SELECT collection,key,value FROM records WHERE collection<>'native-capture-progress'").all();
   const savedCursorKey = rows.find(row => row.collection === 'settings' && row.key === 'notification-record-cursor-key');
   const notificationCursorKey = savedCursorKey ? JSON.parse(savedCursorKey.value).key : randomUUID();
   if (!savedCursorKey) write.run('settings', 'notification-record-cursor-key', JSON.stringify({ key: notificationCursorKey }));

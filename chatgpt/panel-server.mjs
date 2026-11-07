@@ -6,7 +6,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
 import { z } from 'zod'
 
-export async function createPanelMCPServer({ read, control, modelSettings, installationNotifications, requestNotifications, notificationRecords, forwardTool, resources, displayName = 'Sentinel' }) {
+export async function createPanelMCPServer({ read, control, modelSettings, installationNotifications, requestNotifications, dismissNotifications, notificationRecords, forwardTool, resources, displayName = 'Sentinel' }) {
   if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid panel display name')
   const title = displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查'
   const html = (resources?.html ?? await readFile(new URL('./panel.html', import.meta.url), 'utf8')).replace('<title>Sentinel 会话检查</title>', '<title>' + title + '</title>').replace('<h1>Sentinel · 当前会话</h1>', '<h1>' + displayName + ' · 当前会话</h1>')
@@ -101,6 +101,11 @@ export async function createPanelMCPServer({ read, control, modelSettings, insta
     const view = await requestNotifications(extra._meta, change)
     return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
   })
+  if (forwardTool || typeof dismissNotifications === 'function') registerTool(mcp, 'sentinel_dismiss_chat_notifications', {
+    title: '关闭当前聊天已显示的提醒', description: '核实当前聊天后撤下进入时已经显示的系统通知，保留故障记录和后续新提醒。',
+    inputSchema: { expectedThreadId: z.string().min(1).max(128) },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+  }, async (change, extra) => ({ content: [{ type: 'text', text: '当前聊天提醒已处理' }], structuredContent: await dismissNotifications(extra._meta, change) }))
   if (forwardTool || typeof notificationRecords === 'function') registerTool(mcp, 'sentinel_notification_records', {
     title: '本聊天通知记录', description: '只读核对当前聊天及所选执行的系统通知事实。',
     inputSchema: { expectedThreadId: z.string().min(1).max(128), executionKey: z.string().min(1).max(256).optional(), beforeSequence: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional() },
@@ -112,7 +117,7 @@ export async function createPanelMCPServer({ read, control, modelSettings, insta
   return mcp
 }
 
-export async function startPanelServer({ read, control, modelSettings, installationNotifications, requestNotifications, notificationRecords, runtimeStatus, displayName = 'Sentinel', token, port = 0 }) {
+export async function startPanelServer({ read, control, modelSettings, installationNotifications, requestNotifications, dismissNotifications, notificationRecords, runtimeStatus, displayName = 'Sentinel', token, port = 0 }) {
   if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) throw new Error('installation authentication is required')
   if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid panel display name')
   const resources = { html: await readFile(new URL('./panel.html', import.meta.url), 'utf8'), settingsHtml: modelSettings ? await readFile(new URL('./settings.html', import.meta.url), 'utf8') : null }
@@ -136,7 +141,7 @@ export async function startPanelServer({ read, control, modelSettings, installat
     if (req.url !== '/mcp') return res.writeHead(404, { 'content-type': 'application/json' }).end('{"error":"Not found"}')
     if (closed) return res.writeHead(503).end()
     activeRequests++
-    const mcp = await createPanelMCPServer({ read, control, modelSettings, installationNotifications, requestNotifications, notificationRecords, displayName, resources })
+    const mcp = await createPanelMCPServer({ read, control, modelSettings, installationNotifications, requestNotifications, dismissNotifications, notificationRecords, displayName, resources })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
     transports++
     let done = false

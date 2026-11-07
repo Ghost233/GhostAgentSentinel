@@ -156,6 +156,21 @@ export function createNotificationDelivery({ core, native, installationId, quali
       refreshing.set(facts.sourceKey, job)
       return pending
     },
+    dismissChat({ mainId, through }) {
+      return serial(async () => {
+        if (stopped || !mainId || !Number.isSafeInteger(through) || through > now()) throw new Error('Chat notification view is unverified')
+        const summary = { dismissed: 0, historyGap: false }
+        for (let page = 0; page < 11; page++) {
+          const snapshot = await native.snapshot({ mainId, through })
+          const ids = snapshot.delivered.filter(value => owned(value.requestId) && value.deliveryDate <= through && value.metadata?.mainId === mainId).map(value => value.requestId)
+          if (!ids.length) { summary.historyGap ||= snapshot.deliveredHasMore === true; break }
+          const result = await native.dismiss(ids), remaining = new Set(result.deliveredIds)
+          summary.dismissed += ids.filter(id => !remaining.has(id)).length
+          if (remaining.size) { summary.historyGap = true; break }
+        }
+        return summary
+      })
+    },
     stop() {
       if (stopping) return stopping
       stopped = true; native.cancelPendingOperations?.()

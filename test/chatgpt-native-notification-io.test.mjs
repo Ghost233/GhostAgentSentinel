@@ -9,6 +9,18 @@ import { createNativeNotificationIO, notificationPrefix } from '../chatgpt/nativ
 
 const identity = 'com.ghostsentinel.notifications'
 const packet = (operation, result) => ({ stdout: JSON.stringify({ schemaVersion: 1, bundleId: identity, operation, ok: true, result }) })
+test('displayed-notification dismissal is bounded to the owning installation and verifies returned identifiers', async () => {
+  const prefix = notificationPrefix('view-owner'), calls = []
+  const io = createNativeNotificationIO({ bundlePath: '/private/tmp/Notifications.app', installationId: 'view-owner', async run(_file, _args, input) { const request = JSON.parse(input); calls.push(request); return packet('dismiss', { deliveredIds: [], observedAt: 1000 }) } })
+  await assert.rejects(io.dismiss([notificationPrefix('other') + 'attempt']), /installation/)
+  await assert.rejects(io.dismiss(Array(101).fill(prefix + 'attempt')), /budget/)
+  assert.equal(calls.length, 0)
+  await io.dismiss([prefix + 'attempt', prefix + 'attempt'])
+  assert.deepEqual(calls[0].requestIds, [prefix + 'attempt'])
+  const invalid = createNativeNotificationIO({ bundlePath: '/private/tmp/Notifications.app', installationId: 'view-owner', run: async () => packet('dismiss', { deliveredIds: [prefix + 'unrequested'], observedAt: 1000 }) })
+  await assert.rejects(invalid.dismiss([prefix + 'attempt']), { code: 'native_protocol' })
+  io.close(); invalid.close()
+})
 test('the native bridge sends bounded JSON on stdin under GhostSentinel identity and never requests permission during settings or submission', async () => {
   const calls = [], owner = 'isolated-installation', prefix = notificationPrefix(owner)
   const io = createNativeNotificationIO({ bundlePath: '/private/tmp/Isolated GhostSentinel.app', installationId: owner, run: async (file, args, input, options) => {
@@ -143,4 +155,43 @@ test('authorization remains one bounded invocation while a pending precheck is c
     assert.equal(invocation.options.timeoutMs, 60000); assert.equal(invocation.options.maxBuffer, 262144)
   } finally { io.close(); await assert.rejects(pending, { code: 'native_unavailable' }) }
   assert.equal(invocation.options.signal.aborted, true)
+})
+
+test('compiled native dispatch admits dismissal, removes displayed IDs and rejects foreign or extra fields', { skip: process.platform !== 'darwin' && 'requires macOS Swift' }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'sentinel-native-dismiss-')), cache = join(dir, 'cache'), binary = join(dir, 'dismiss'), fixture = join(dir, 'dismiss.swift')
+  t.after(() => rm(dir, { recursive: true, force: true })); await mkdir(cache)
+  const source = await readFile(new URL('../chatgpt/native/GhostSentinelNotifications.swift', import.meta.url), 'utf8')
+  const fields = source.slice(source.indexOf('    let fields: [String: Set<String>]'), source.indexOf('    switch operation {'))
+  const body = source.slice(source.indexOf('    case "dismiss":') + '    case "dismiss":'.length, source.indexOf('    case "purge-installation":'))
+  await writeFile(fixture, `import Foundation
+private struct Request { let identifier: String }
+private struct Notification { let request: Request }
+private final class Center {
+ var removed: [String] = []
+ func removeDeliveredNotifications(withIdentifiers ids: [String]) { removed += ids }
+ func getDeliveredNotifications(_ reply: ([Notification]) -> Void) { reply([]) }
+}
+private let center = Center(), clock: () -> Int64 = { 1000 }
+private var errorCode: String? = nil, replied = false
+private func reply(_ operation: String, result: [String: Any]? = nil, error: String? = nil) { replied = result != nil; errorCode = error }
+private func owned(_ id: String, _ prefix: String) -> Bool { id.hasPrefix(prefix) }
+private func dispatch(_ request: [String: Any]) {
+ let operation = request["operation"] as! String, prefix = request["ownerPrefix"] as! String
+ ${fields}
+ switch operation { case "dismiss": ${body} default: return }
+}
+@main struct Checks {
+ static func main() {
+  let prefix = "ghostsentinel:0123456789abcdef01234567:", own = "ghostsentinel:0123456789abcdef01234567:attempt"
+  let valid: [String: Any] = ["schemaVersion": 1, "operation": "dismiss", "ownerPrefix": prefix, "requestIds": [own]]
+  dispatch(valid); precondition(replied && errorCode == nil && center.removed == [own])
+  var foreign = valid; foreign["requestIds"] = ["another-installation:attempt"]; dispatch(foreign); precondition(errorCode == "native_protocol" && center.removed == [own])
+  var extra = valid; extra["body"] = "must not be accepted"; dispatch(extra); precondition(errorCode == "native_protocol" && center.removed == [own])
+  var large = valid; large["requestIds"] = Array(repeating: own, count: 101); dispatch(large); precondition(errorCode == "native_protocol" && center.removed == [own])
+  print("PASS native dismissal dispatch")
+ }
+}`)
+  const run = promisify(execFile)
+  await run('/usr/bin/xcrun', ['swiftc', '-swift-version', '5', '-parse-as-library', '-module-cache-path', cache, fixture, '-o', binary], { timeout: 60000, maxBuffer: 1048576 })
+  assert.match((await run(binary, [], { timeout: 10000 })).stdout, /PASS native dismissal dispatch/)
 })
