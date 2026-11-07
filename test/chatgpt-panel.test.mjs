@@ -100,6 +100,25 @@ test('a failed new round keeps the prior successful summary only in directly rea
   assert.equal(page.element('#last-summary-evidence').textContent, '')
 })
 
+test('a partial summary lists observation gaps, stays gray and keeps the prior complete summary as history', async t => {
+  const page = await harness(t), view = material('main-a', 'green'), completedAt = Date.now() - 1000
+  view.analysis.coverage = { complete: false, gaps: ['analysis_evidence_budget'], verificationGaps: ['tool-result-image-omitted'] }
+  view.analysis.partial = { text: '已观察到文案调整，后续结果尚未完整核实。', evidence: [{ text: '按钮文案已调整', reference: 'native:partial' }] }
+  view.analysis.lastSuccessfulSummary = { completedAt, expiresAt: completedAt + 86400000, generated: { text: '上次完整观察总结。', evidence: [{ text: '先前结果', reference: 'native:prior' }] } }
+  await page.deliver(view)
+  assert.equal(page.element('#model-summary').hidden, false)
+  assert.equal(page.element('#model-summary-title').textContent, '部分观察总结')
+  assert.match(page.element('#model-summary-gaps').textContent, /预算内.*图片未纳入/)
+  assert.match(page.element('#summary').textContent, /^⚪/)
+  assert.doesNotMatch(page.element('#model-status').textContent, /本轮完成/)
+  assert.equal(page.element('#last-summary').hidden, false)
+  for (const state of ['failed', 'stale']) {
+    await page.refresh(); await page.deliver({ ...view, analysis: { ...view.analysis, state } })
+    assert.equal(page.element('#model-summary').hidden, true)
+    assert.equal(page.element('#model-summary-gaps').textContent, '')
+  }
+})
+
 test('an unconfirmed chat explains the actual collection boundary without inline configuration', async t => {
   const page = await harness(t)
   await page.deliver({ ...result(null), observation: { gap: 'observation-unavailable', failureStage: 'core-connection' }, health: { state: 'failed', failures: [{ domain: 'collection', error: { code: 'ECONNREFUSED', stage: 'core' } }] }, notifications: { permission: { authorization: 'denied' } } })

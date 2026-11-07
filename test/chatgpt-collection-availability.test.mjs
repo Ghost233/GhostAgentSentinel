@@ -10,6 +10,37 @@ import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { candidateHostProfile } from '../chatgpt/storage-compatibility.mjs'
 
+test('a capability-blocked private Core retires naturally and the observer reconnects while the separate DSH Core stays running', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'sentinel-core-capability-upgrade-')), dataDir = join(dir, 'codex')
+  let old, oldClient, replacement, dsh, dshClient, adapter, retired = false, reads = 0, connections = 0
+  const core = createLazyCore({ dataDir, connect: async () => {
+    connections++
+    if (retired && !replacement) replacement = await startServer({ dataDir })
+    const client = await connectCore({ dataDir }), health = client.health
+    if (!retired) client.health = async (...args) => { const value = await health(...args); return { ...value, features: value.features.filter(feature => feature !== 'partial-observation-summary/1') } }
+    return client
+  } })
+  t.after(async () => { await adapter?.close(); await core.close(); await oldClient?.close(); await dshClient?.close(); await old?.close(); await replacement?.close(); await dsh?.close(); await rm(dir, { recursive: true, force: true }) })
+  old = await startServer({ dataDir, idleGraceMs: 200, onIdle: () => { void old.close().then(() => { retired = true }) } })
+  oldClient = await connectCore({ dataDir })
+  const oldSource = await oldClient.registerSource({ registrationId: 'chatgpt:capability-upgrade', hostRunId: 'previous-observer', name: 'Previous observer' })
+  dsh = await startServer({ dataDir: join(dir, 'dsh') }); dshClient = await connectCore({ dataDir: join(dir, 'dsh') })
+  const dshSource = await dshClient.registerSource({ registrationId: 'dsh:independent', hostRunId: 'dsh-host', name: 'Independent DSH' }), dshInstance = (await dshClient.health()).instanceId
+  const native = { async sampleHost() { return { available: true, hostRunId: 'qualified-app', hostStartedAt: Date.now() - 1000, profile: candidateHostProfile } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async readThread() { reads++; return null }, async close() {} }
+  adapter = await startChatGPTAdapter({ core, native, sessionsRoot: dir, dataDir: join(dir, 'adapter'), installationId: 'capability-upgrade', token: 'c'.repeat(64), collectMaterials: true, nativeOriginVersion: 2, pollMs: 0 })
+  assert.equal((await adapter.read({ thread_id: 'main' })).observation.gap, 'core-update-required')
+  assert.equal(reads, 0)
+  await oldClient.unregisterSource(oldSource, 'observer-update')
+  const deadline = performance.now() + 3000
+  while (!retired) { assert.ok(performance.now() < deadline, 'the unregistered private Core exits by its idle grace'); await new Promise(resolve => setTimeout(resolve, 5)) }
+  await adapter.read({ thread_id: 'main' })
+  assert.ok(reads > 0, 'the new capable Core allows collection without restarting the observer')
+  assert.equal(connections, 2)
+  assert.equal((await dshClient.health()).instanceId, dshInstance)
+  await dshClient.heartbeat(dshSource)
+  assert.equal((await dshClient.snapshot()).sources[0].status, 'connected')
+})
+
 test('an unavailable Core before source registration exposes its transport cause in the authenticated current-chat view', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-core-availability-')), token = 'c'.repeat(64)
   const server = await startServer({ dataDir: join(dir, 'core') })

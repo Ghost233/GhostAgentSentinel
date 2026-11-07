@@ -976,9 +976,10 @@ export async function createCore({
     const referenceIds = new Set([...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])].map(event => referenceKey(eventRef(event))));
     const checks = new Map();
     if (!['currentTask', 'currentState', 'recentProgress', 'attention'].every(field => typeof result.summary[field] === 'string')) throw new Error('Analyzer summary fields must be strings');
-    if (result.summary.generated !== undefined) {
-      const generated = result.summary.generated;
+    for (const field of ['generated', 'partial']) if (result.summary[field] !== undefined) {
+      const generated = result.summary[field];
       const invalid = () => { throw Object.assign(new Error('Analyzer returned invalid or unverified generated summary evidence'), { code: 'invalid_summary', stage: 'llm' }); };
+      if (field === 'partial' && (result.summary.generated !== undefined || result.coverage?.complete !== false)) invalid();
       if (!generated || typeof generated !== 'object' || Array.isArray(generated) || Object.keys(generated).length !== 3 || typeof generated.text !== 'string' || !generated.text.trim() || generated.text.length > 600 || !Array.isArray(generated.evidenceIds) || !generated.evidenceIds.length || new Set(generated.evidenceIds).size !== generated.evidenceIds.length || generated.evidenceIds.some(id => typeof id !== 'string' || !id) || !Array.isArray(generated.evidenceRefs) || !generated.evidenceRefs.length) invalid();
       const retained = new Set([...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])].filter(event => event.capturedAt > now() - DAY).map(event => referenceKey(eventRef(event))));
       const seen = new Set(), citedIds = new Set();
@@ -1075,7 +1076,7 @@ export async function createCore({
       task.analysis.state = 'failed';
       task.analysis.error = { ...failureErrorInfo(settledError), message: 'One or more analysis checks failed' };
     }
-    if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' && (error || !result.coverage?.dependencies?.length)) {
+    if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' && (settledError || !result.summary.partial && !result.coverage?.dependencies?.length)) {
       const settled = failureStore.settle({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId, roundId: round.id,
         domain: 'analysis', outcome: settledError ? 'failed' : 'succeeded', attempted: true, settled: true, settledAt: completedAt, error: settledError });
       nativeNotifications.observeFailure(settled.receipt);

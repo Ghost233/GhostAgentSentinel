@@ -20,7 +20,7 @@
 <p id="inheritance" class="muted" role="status"></p>
 <p id="analysis">当前分析不可判断</p>
 <p id="model-status" class="muted"></p>
-<section id="model-summary" hidden><h2>模型总结</h2><p id="model-summary-text"></p><div id="model-summary-evidence" class="evidence"></div></section>
+<section id="model-summary" hidden><h2 id="model-summary-title">模型总结</h2><p id="model-summary-text"></p><p id="model-summary-gaps" class="muted"></p><div id="model-summary-evidence" class="evidence"></div></section>
 <p id="health" class="muted" role="status"></p>
 <button id="pause" type="button" hidden>暂停本聊天分析</button>
 <section id="detail-issues" aria-label="所选检查的问题与依据"></section>
@@ -59,7 +59,7 @@ function reset(){
   controlState=null;element('pause').hidden=true;element('pause').disabled=false;
   for(const name of ['identity','coverage','observation','technical','error','health','execution','record-status','current-request','current-activity','inheritance','history-gap','model-status','model-summary-text','availability'])element(name).textContent='';
   element('availability').hidden=true;
-  element('model-summary').hidden=true;element('model-summary-evidence').replaceChildren();
+  element('model-summary').hidden=true;element('model-summary-evidence').replaceChildren();element('model-summary-title').textContent='模型总结';element('model-summary-gaps').textContent='';
   element('last-summary').hidden=true;element('last-summary-time').textContent='';element('last-summary-text').textContent='';element('last-summary-evidence').replaceChildren();
   element('current-facts').hidden=true;
   for(const name of ['issues','detail-issues','check-list','gaps','history-list'])element(name).replaceChildren();
@@ -139,18 +139,25 @@ function render(view){
   }
   if(inheritanceGap)element('inheritance').textContent=view.inheritance.state==='pending'?'继承要求待补齐 · 相关检查不可判断':'继承要求存在缺口 · 相关检查不可判断';
   element('analysis').textContent=(view.execution?.historical?'历史检查 · ':'')+stateLine(analysis);
-  const generated=analysis.generated,publishable=generated&&text(generated.text,600)&&Array.isArray(generated.evidence)&&generated.evidence.length&&!['failed','unavailable','interrupted','stale','unknown'].includes(analysis.state)&&(view.execution?.historical||['current','reused'].includes(analysis.resultDisposition));
+  const partial=!analysis.generated&&analysis.coverage?.complete===false?analysis.partial:null;
+  const generated=analysis.generated||partial,publishable=generated&&text(generated.text,600)&&Array.isArray(generated.evidence)&&generated.evidence.length&&!['failed','unavailable','interrupted','stale','unknown'].includes(analysis.state)&&(view.execution?.historical||['current','reused'].includes(analysis.resultDisposition));
   if(publishable){
     element('model-summary').hidden=false;element('model-summary-text').textContent=text(generated.text,600);
     for(const evidence of generated.evidence.slice(0,2))element('model-summary-evidence').append(node('p',[text(evidence.text,240),text(evidence.reference,2000)?'出处：'+text(evidence.reference,2000):''].filter(Boolean).join('\n'),'evidence'));
-    element('model-status').textContent=analysis.resultDisposition==='reused'?'总结模型／JEV：复用仍有效的结果':'总结模型：本轮成功 · JEV：本轮完成';
+    if(partial){
+      element('model-summary-title').textContent='部分观察总结';
+      const descriptions={'tool-result-image-omitted':'图片未纳入文本观察',analysis_evidence_budget:'本轮仅使用预算内的部分记录',event_excerpt_or_capture_gap:'部分记录截断或存在采集缺口','Some observed excerpts are truncated':'部分记录截断','Some observed content was omitted for privacy':'敏感内容已省略',native_file_change_contents_unverified:'文件变更正文未完整核实',capture_coverage_unconfirmed:'采集覆盖未完整确认',analysis_input_budget:'判断材料超过预算',judgment_evidence_insufficient:'判断执行活动的证据不足',extraction_evidence_gap:'模型提取的证据存在缺口'};
+      const gaps=[...list(analysis.coverage?.gaps),...list(analysis.coverage?.verificationGaps),...list(analysis.coverage?.contextGaps),...list(analysis.coverage?.extractionGaps)].filter(value=>text(value));
+      element('model-summary-gaps').textContent='观察缺口：'+[...new Set(gaps.map(gap=>descriptions[gap]||(gap.includes('unsupported-item-type:')?'存在未识别的原生事件':text(gap,160))))].join('；');
+      element('model-status').textContent='总结模型：部分观察 · JEV：未形成完整判断';
+    }else element('model-status').textContent=analysis.resultDisposition==='reused'?'总结模型／JEV：复用仍有效的结果':'总结模型：本轮成功 · JEV：本轮完成';
   }else if(analysis.error?.stage==='llm')element('model-status').textContent='总结模型：本轮失败 · JEV：未完成';
   else if(analysis.error?.stage==='jev')element('model-status').textContent='总结模型：证据已整理 · JEV：本轮失败';
   else if(analysis.state==='unavailable')element('model-status').textContent='总结模型／JEV：缺少配置或不可用，可在设置中核对';
   renderHealth(view.health);
   renderHistory(view);
   const prior=analysis.lastSuccessfulSummary,old=prior?.generated,readAt=Date.now();
-  if(!publishable&&Number.isFinite(prior?.completedAt)&&prior.completedAt<=readAt&&Number.isFinite(prior.expiresAt)&&prior.expiresAt>readAt&&text(old?.text,600)&&Array.isArray(old.evidence)&&old.evidence.length){
+  if((!publishable||partial)&&Number.isFinite(prior?.completedAt)&&prior.completedAt<=readAt&&Number.isFinite(prior.expiresAt)&&prior.expiresAt>readAt&&text(old?.text,600)&&Array.isArray(old.evidence)&&old.evidence.length){
     element('history').hidden=false;element('last-summary').hidden=false;
     element('last-summary-time').textContent='历史记录 · 不代表当前结果 · '+new Date(prior.completedAt).toLocaleString();
     element('last-summary-text').textContent=text(old.text,600);

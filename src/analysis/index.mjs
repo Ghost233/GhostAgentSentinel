@@ -117,13 +117,36 @@ export function createAnalyzer(config = {}) {
         result.summary.attention = '本轮没有仍在保留期限内的任务证据';
         return prewarming ? { state: 'skipped' } : result;
       }
-      const catalog = evidenceCatalog(events, latestInput);
-      const messages = [
+      let catalog = evidenceCatalog(events, latestInput);
+      const requestFor = catalog => ({ model: config.llm.model, stream: false, max_tokens: 4096, temperature: 0, messages: [
         { role: 'system', content: EXTRACTION_INSTRUCTIONS },
         { role: 'user', content: JSON.stringify({ task: { status: input.task.status }, evidence: catalog.groups, coverage }) },
-      ];
-      const llmRequest = { model: config.llm.model, stream: false, max_tokens: 1024, temperature: 0, messages };
-      if (JSON.stringify(llmRequest).length > (config.inputBudgetChars ?? 24_000)) {
+      ] });
+      const budget = config.inputBudgetChars ?? 24_000;
+      let llmRequest = requestFor(catalog);
+      if (JSON.stringify(llmRequest).length > budget) {
+        coverage.complete = false;
+        coverage.gaps.push('analysis_evidence_budget');
+        // Keep the consumed request and every authorized inherited limit. Fit a
+        // recent suffix of other observations without changing retained records.
+        const required = new Set([...inherited, ...(latestInput ? [latestInput] : [])].map(event => referenceKey(eventRef(event))));
+        const optional = events.filter(event => !required.has(referenceKey(eventRef(event))));
+        const selection = count => {
+          const included = new Set(optional.slice(optional.length - count));
+          const selected = events.filter(event => included.has(event) || required.has(referenceKey(eventRef(event))));
+          coverage.analysisOmittedEvents = events.length - selected.length;
+          const selectedCatalog = evidenceCatalog(selected, latestInput);
+          return { catalog: selectedCatalog, request: requestFor(selectedCatalog) };
+        };
+        let low = 0, high = optional.length;
+        while (low < high) {
+          const mid = Math.ceil((low + high) / 2);
+          if (JSON.stringify(selection(mid).request).length <= budget) low = mid; else high = mid - 1;
+        }
+        const bounded = selection(low);
+        catalog = bounded.catalog; llmRequest = bounded.request;
+      }
+      if (JSON.stringify(llmRequest).length > budget) {
         coverage.complete = false;
         coverage.gaps.push('analysis_input_budget');
         result.summary.attention = '本轮证据超过摘取预算，语义分析不可判断';
@@ -150,7 +173,10 @@ export function createAnalyzer(config = {}) {
       if (llmReceipt) result.usage.gmd = { llm: llmReceipt };
       const candidates = buildCandidates(events, facts, latestInput, coverage, checks);
       if (!Object.keys(candidates).length) {
-        result.summary.attention = '当前材料或采集覆盖不足，本轮完整总结未发布，语义项目不可判断';
+        coverage.complete = false;
+        if (!coverage.gaps.length) coverage.gaps.push('judgment_evidence_insufficient');
+        result.summary.partial = generatedSummary;
+        result.summary.attention = '当前材料或采集覆盖不足，仅发布部分观察总结，语义项目不可判断';
         return result;
       }
       const questions = Object.fromEntries(Object.keys(candidates).map(id => [id, {
@@ -188,6 +214,7 @@ export function createAnalyzer(config = {}) {
       const renderedJevRequest = renderJevRequest(jevRequest);
       if (JSON.stringify(renderedJevRequest).length > (config.inputBudgetChars ?? 24_000)) {
         coverage.complete = false; coverage.gaps.push('analysis_input_budget');
+        result.summary.partial = generatedSummary;
         result.summary.attention = '本轮证据及恢复材料超过判断预算，语义分析不可判断';
         return result;
       }

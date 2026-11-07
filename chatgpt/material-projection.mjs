@@ -16,6 +16,8 @@ const contentType = /^payload\.(?:item\.)?content\.\d+\.type$/
 const contentText = /^payload\.(?:item\.)?content\.\d+\.text$/
 const toolType = /^payload\.output\.\d+\.type$/
 const toolText = /^payload\.output\.\d+\.text$/
+const toolDetail = /^payload\.output\.\d+\.detail$/
+const toolFields = ['type', 'text', 'image_url', 'detail']
 
 function append(target, capture) {
   if (target.text && capture.text) target.text += '\n'
@@ -62,20 +64,21 @@ export class MaterialProjection {
     return path
   }
 
-  selected(path) { return metadata.has(path) || bodies.has(path) || contentType.test(path) || contentText.test(path) || toolType.test(path) || toolText.test(path) }
+  selected(path) { return metadata.has(path) || bodies.has(path) || contentType.test(path) || contentText.test(path) || toolType.test(path) || toolText.test(path) || toolDetail.test(path) }
 
   accept(path, capture, toolField = null) {
-    if (toolType.test(path) || toolText.test(path)) {
+    if (toolType.test(path) || toolText.test(path) || toolDetail.test(path)) {
       const item = this.stack.at(-1)
       if (!item?.toolElement || !toolField) return
       if (toolField === 'type') item.toolType = capture.text
-      else item.toolText = capture
+      else if (toolField === 'text') item.toolText = capture
+      else if (toolField === 'detail') item.toolDetail = capture
     } else if (contentType.test(path) || contentText.test(path)) {
       const item = this.stack.at(-1)
       if (contentType.test(path)) item.contentType = capture.text
       else item.contentText = capture
     } else this.fields[path] = capture
-    const bytes = Buffer.byteLength(JSON.stringify(this.fields)) + Buffer.byteLength(this.body.text) + Buffer.byteLength(this.agentBody.text) + Buffer.byteLength(this.toolBody.text) + Buffer.byteLength(this.stack.at(-1)?.contentText?.text ?? '') + Buffer.byteLength(this.stack.at(-1)?.toolText?.text ?? '')
+    const bytes = Buffer.byteLength(JSON.stringify(this.fields)) + Buffer.byteLength(this.body.text) + Buffer.byteLength(this.agentBody.text) + Buffer.byteLength(this.toolBody.text) + Buffer.byteLength(this.stack.at(-1)?.contentText?.text ?? '') + Buffer.byteLength(this.stack.at(-1)?.toolText?.text ?? '') + Buffer.byteLength(this.stack.at(-1)?.toolDetail?.text ?? '')
     this.peakProjectionBytes = Math.max(this.peakProjectionBytes, bytes)
     if (bytes > 16384) throw new Error('material projection limit exceeded')
   }
@@ -92,14 +95,15 @@ export class MaterialProjection {
           item.projectedKeys.add(this.key)
         }
         if (this.toolArray && item.toolElement) {
-          if (!['type', 'text'].includes(this.key)) this.toolArray.valid = false
-          else { const seen = this.key === 'type' ? 'toolTypeSeen' : 'toolTextSeen'; if (item[seen]) this.toolArray.valid = false; item[seen] = true }
+          item.toolKeys ??= new Set()
+          if (!toolFields.includes(this.key) || item.toolKeys.has(this.key)) this.toolArray.valid = false
+          else item.toolKeys.add(this.key)
         }
         item.key = this.key; this.key = null; continue
       }
       if (token.name === 'stringChunk' && this.key != null) { this.key = (this.key + token.value).slice(0, 129); continue }
       if (token.name === 'startObject' || token.name === 'startArray') {
-        const parent = this.stack.at(-1), element = parent?.toolRoot === true, field = parent?.toolElement && ['type', 'text'].includes(parent.key)
+        const parent = this.stack.at(-1), element = parent?.toolRoot === true, field = parent?.toolElement && toolFields.includes(parent.key)
         const path = this.path()
         if (this.rootOutputValue && token.name === 'startArray') this.toolArray = { valid: true, elements: 0 }
         if (this.toolArray && element) { this.toolArray.elements++; if (token.name !== 'startObject') this.toolArray.valid = false }
@@ -110,8 +114,9 @@ export class MaterialProjection {
         const item = this.stack.pop()
         if (item.path === 'payload.item.results' && item.type === 'array') this.webResultsCount = item.index
         if (this.toolArray && item.toolElement) {
-          if (item.type !== 'object' || item.toolType !== 'input_text' || !item.toolText) this.toolArray.valid = false
-          else append(this.toolBody, item.toolText)
+          if (item.type === 'object' && item.toolType === 'input_text' && item.toolText && item.toolKeys.size === 2) append(this.toolBody, item.toolText)
+          else if (item.type === 'object' && item.toolType === 'input_image' && item.toolImageURL && !item.toolKeys.has('text') && (!item.toolKeys.has('detail') || ['auto', 'low', 'high', 'original'].includes(item.toolDetail?.text))) { this.toolBody.truncated = true; this.toolBody.imageOmitted = true }
+          else this.toolArray.valid = false
         }
         if (/^payload\.(?:item\.)?content\.\d+$/.test(item.path)) {
           if (['input_text', 'output_text', 'text'].includes(item.contentType) && item.contentText) append(this.body, item.contentText)
@@ -120,13 +125,14 @@ export class MaterialProjection {
           else { this.agentBody.truncated = true; this.agentBody.omitted = true }
         }
       } else if (token.name === 'startString' || token.name === 'startNumber') {
-        const parent = this.stack.at(-1), field = parent?.toolElement && ['type', 'text'].includes(parent.key) ? parent.key : null
+        const parent = this.stack.at(-1), field = parent?.toolElement && toolFields.includes(parent.key) ? parent.key : null
         const path = this.path()
         if (path === webSnippet) this.webSnippetString = token.name === 'startString'
         if (this.toolArray && (parent?.toolRoot || token.name !== 'startString' && field)) this.toolArray.valid = false
-        this.scalar = { path, toolField: field, kindField: this.kindField, selected: this.selected(path) && (!(toolType.test(path) || toolText.test(path)) || field !== null), text: '', scan: '', length: 0, truncated: false, redacted: false }
+        this.scalar = { path, toolField: field, kindField: this.kindField, selected: this.selected(path) && (!(toolType.test(path) || toolText.test(path) || toolDetail.test(path)) || field !== null), text: '', scan: '', length: 0, truncated: false, redacted: false }
       } else if (token.name === 'stringChunk' || token.name === 'numberChunk') {
         const scalar = this.scalar
+        if (scalar?.toolField === 'image_url' && token.name === 'stringChunk' && token.value.length) this.stack.at(-1).toolImageURL = true
         if (!scalar?.selected) continue
         const limit = scalar.path === 'payload.cwd' ? 1024 : scalar.path === 'payload.arguments' ? 4096 : metadata.has(scalar.path) || contentType.test(scalar.path) || toolType.test(scalar.path) ? 256 : 240
         scalar.length += token.value.length
@@ -144,7 +150,7 @@ export class MaterialProjection {
         }
         this.scalar = null
       } else if (['nullValue', 'trueValue', 'falseValue'].includes(token.name)) {
-        const parent = this.stack.at(-1), field = parent?.toolElement && ['type', 'text'].includes(parent.key)
+        const parent = this.stack.at(-1), field = parent?.toolElement && toolFields.includes(parent.key)
         this.path()
         if (this.toolArray && (parent?.toolRoot || field)) this.toolArray.valid = false
       }
@@ -273,6 +279,7 @@ export function materialRecord(row, turnId, recordStart, recordEnd, turnTrigger,
     kind = 'tool-result'
     capture = row.material.fields['payload.output'] ?? { text: '', truncated: true }
     if (payload.call_id) data.callId = payload.call_id
+    if (capture.imageOmitted) data.verificationGaps = ['tool-result-image-omitted']
   } else if (['reasoning', 'agent_message'].includes(payload.type) || payload.type === 'message' && ['system', 'developer'].includes(payload.role)) return null
   else {
     kind = 'gap'

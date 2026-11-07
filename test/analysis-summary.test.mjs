@@ -53,6 +53,38 @@ test('two successful model calls publish the generated short summary with verifi
   assert.ok(['currentTask', 'currentState', 'recentProgress', 'attention'].every(key => typeof result.summary[key] === 'string'));
 });
 
+test('an incomplete observation publishes only a cited partial summary and preserves its gaps without a normal judgment', async t => {
+  const { analyzer, requests } = await models(t);
+  const result = await analyzer.analyze({ ...observation, coverage: { complete: false, gaps: ['missing interval'] } });
+  assert.equal(result.summary.generated, undefined);
+  assert.equal(result.summary.partial.text, summaryText);
+  assert.deepEqual(result.summary.partial.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
+  assert.equal(result.coverage.complete, false);
+  assert.ok(result.coverage.gaps.includes('missing interval'));
+  assert.ok(result.checks.every(check => check.status === 'unknown'));
+  assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions']);
+});
+
+test('long observations select recent evidence within the unchanged budget while retaining the request and all inherited limits', async t => {
+  const { analyzer, requests } = await models(t);
+  const events = [observation.events[0], ...Array.from({ length: 180 }, (_, index) => ({ ...observation.events[1], id: 'action-' + index, text: ('Observed action ' + index + ': ').padEnd(230, 'x'), capturedAt: now - 180 + index }))];
+  const inherited = { id: 'limit', taskId: 'parent', taskLifecycleId: 'parent-run', kind: 'input', text: 'Keep the inherited user restriction.', capturedAt: now - 2000, contextRole: 'ancestor-limit', authorizationEligible: true, sourceRef: { taskId: 'parent', lifecycleId: 'parent-run', eventId: 'limit' } };
+  const result = await analyzer.analyze({ ...observation, events, instructionContext: { inheritedEvents: [inherited], binding: { origin: 'delegated' }, gaps: [] } });
+  assert.equal(requests.length, 1, 'a bounded partial summary reaches the summary model');
+  assert.ok(JSON.stringify(requests[0].body).length <= 24000);
+  const payload = JSON.parse(requests[0].body.messages[1].content);
+  assert.ok(payload.evidence.some(group => group.isCurrentInput && group.text === observation.events[0].text));
+  assert.ok(payload.evidence.some(group => group.contextRole === 'ancestor-limit' && group.text === inherited.text));
+  assert.ok(payload.evidence.some(group => group.text === events.at(-1).text));
+  assert.ok(payload.evidence.length < events.length);
+  assert.ok(result.coverage.gaps.includes('analysis_evidence_budget'));
+  assert.ok(result.coverage.analysisOmittedEvents > 0);
+  assert.equal(result.coverage.complete, false);
+  assert.ok(result.summary.partial);
+  assert.equal(result.summary.generated, undefined);
+  assert.equal(events.length, 181, 'input observations are not pruned or rewritten');
+});
+
 test('invalid short-summary structure or sentence count fails the model round before judgment', async t => {
   const summaries = [null, [], {}, { text: '', evidenceOptionIds: ['placeholder'] }, { text: '   ', evidenceOptionIds: ['placeholder'] },
     { text: '第一句。第二句。第三句。', evidenceOptionIds: ['placeholder'] }, { text: '材'.repeat(601), evidenceOptionIds: ['placeholder'] },
@@ -112,7 +144,7 @@ test('missing either model or an ineligible evidence round preserves observation
   for (const input of [{ ...observation, events: [observation.events[0]] }, { ...observation, coverage: { complete: false, gaps: ['missing interval'] } }]) {
     const result = await analyzer.analyze(input);
     assert.equal(result.summary.generated, undefined);
-    assert.match(result.summary.attention, /不足.*完整总结未发布/);
+    assert.match(result.summary.attention, /不足.*部分观察总结/);
   }
   assert.equal(old.summary.generated.text, summaryText);
 });

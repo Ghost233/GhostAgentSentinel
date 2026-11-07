@@ -590,11 +590,36 @@ test('a genuine global plugin disable still closes the adapter and preserves an 
   assert.equal(snapshot.sources.find(source => source.key === dsh).status, 'connected')
 })
 
+test('mixed text and image tool results preserve text, flag missing images and continue to the current execution and model requests', async t => {
+  const image = 'data:image/png;base64,' + 'PRIVATE-IMAGE-DATA'.repeat(40000), f = await fixture(t)
+  await f.caughtUp(); f.advance()
+  const callsBefore = { summary: f.state.summaryCalls, jev: f.state.jevCalls }
+  await fs.appendFile(f.path, row(4, 'response_item', { type: 'custom_tool_call_output', call_id: 'mixed-image', output: [{ type: 'input_text', text: 'Observed bounded text' }, { type: 'input_image', image_url: image, detail: 'original' }, { type: 'input_text', text: 'Text after the image' }] })
+    + row(5, 'event_msg', { type: 'task_complete', turn_id: 'turn' })
+    + row(6, 'event_msg', start('current'))
+    + row(7, 'event_msg', user(owner, 'current', 'Inspect the new request'))
+    + row(8, 'event_msg', agent(owner, 'current', 'Current execution is advancing')))
+  f.state.anchorTurnId = 'current'
+  const view = await f.caughtUp(), snapshot = await f.core.snapshot(), old = snapshot.tasks.find(task => task.lifecycleId === 'turn'), current = snapshot.tasks.find(task => task.lifecycleId === 'current')
+  assert.equal(view.observation.gap, null, 'a known mixed image result must not stop the production reader')
+  assert.equal(view.observation.coverage, 'caught-up')
+  const result = old.events.find(event => event.data?.callId === 'mixed-image')
+  assert.equal(result.text, 'Observed bounded text\nText after the image')
+  assert.equal(result.data.truncated, true)
+  assert.ok(result.data.verificationGaps.includes('tool-result-image-omitted'))
+  assert.equal(old.coverage.complete, false)
+  assert.equal(current.status, 'running'); assert.equal(current.currentRequest, 'Inspect the new request')
+  assert.doesNotMatch(JSON.stringify(snapshot), /PRIVATE-IMAGE|data:image|image_url/)
+  const deadline = performance.now() + 3000
+  while (!(await f.core.snapshot()).tasks.find(task => task.lifecycleId === 'current')?.analysis.completedAt) { assert.ok(performance.now() < deadline, 'current execution reaches summary and judgment HTTP'); await new Promise(resolve => setTimeout(resolve, 5)) }
+  assert.ok(f.state.summaryCalls > callsBefore.summary); assert.ok(f.state.jevCalls > callsBefore.jev)
+})
+
 test('unverified and malformed tool arrays stay gray across later completion and adapter recovery without reserving body identities', async t => {
   const cases = [
     ['empty', []], ['scalar-element', ['Not a typed element']], ['missing-type', [{ text: 'unverified-body' }]], ['missing-text', [{ type: 'input_text' }]],
     ['null-text', [{ type: 'input_text', text: null }]], ['number-text', [{ type: 'input_text', text: 7 }]], ['object-text', [{ type: 'input_text', text: { nested: 'unverified-body' } }]],
-    ['unverified-image', [{ type: 'input_image', image_url: 'unverified-body' }]], ['mixed', [{ type: 'input_text', text: 'unverified-body' }, { type: 'input_audio', audio_url: 'unverified-body' }]],
+    ['missing-image-url', [{ type: 'input_image', detail: 'original' }]], ['invalid-image-url', [{ type: 'input_image', image_url: { url: 'unverified-body' } }]], ['invalid-image-detail', [{ type: 'input_image', image_url: 'unverified-body', detail: 'unknown' }]], ['mixed', [{ type: 'input_text', text: 'unverified-body' }, { type: 'input_audio', audio_url: 'unverified-body' }]],
     ['extra-field', [{ type: 'input_text', text: 'unverified-body', extra: { authorization: 'Bearer PRIVATE-UNVERIFIED' } }]],
   ]
   for (const type of ['function_call_output', 'custom_tool_call_output']) for (const [name, output] of cases) await t.test(type + '/' + name, async t => {
@@ -611,6 +636,22 @@ test('unverified and malformed tool arrays stay gray across later completion and
     assert.deepEqual(after.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence]), old)
     assert.doesNotMatch(JSON.stringify(after.events), /unverified-body|PRIVATE-UNVERIFIED|task_complete/)
   })
+})
+
+for (const type of ['function_call_output', 'custom_tool_call_output']) for (const text of ['', 'Known text before the image']) test(type + ' image omission preserves an explicit gap after model completion (' + (text ? 'mixed' : 'image-only') + ')', async t => {
+  const output = [...(text ? [{ type: 'input_text', text }] : []), { type: 'input_image', image_url: 'data:image/png;base64,PRIVATE-OMITTED-IMAGE', detail: 'high' }]
+  const f = await fixture(t, { suffix: row(4, 'response_item', { type, call_id: 'image-result', output }) })
+  assert.equal((await f.caughtUp()).observation.coverage, 'caught-up')
+  let task
+  const deadline = performance.now() + 3000
+  do { task = (await f.core.snapshot()).tasks[0]; if (task.analysis.summary?.partial) break; assert.ok(performance.now() < deadline, 'partial image observations still reach model analysis: ' + JSON.stringify({ status: task.status, hasRequest: Boolean(task.currentRequest), state: task.analysis.state, error: task.analysis.error?.code, summaryCalls: f.state.summaryCalls, jevCalls: f.state.jevCalls, summaryKeys: Object.keys(task.analysis.summary ?? {}), checks: task.analysis.checks.map(check => ({ status: check.status, reason: check.reason })) })); await new Promise(resolve => setTimeout(resolve, 5)) } while (true)
+  const result = task.events.find(event => event.data?.callId === 'image-result')
+  assert.equal(result.text, text); assert.equal(result.data.truncated, true)
+  assert.ok(result.data.verificationGaps.includes('tool-result-image-omitted'))
+  assert.equal(task.coverage.complete, false); assert.notEqual(task.gs.light, 'green')
+  assert.equal(task.analysis.summary.generated, undefined); assert.ok(task.analysis.summary.partial.evidenceRefs.length)
+  const partialView = await f.caughtUp(); assert.ok(partialView.analysis.partial?.text); assert.equal(partialView.analysis.generated, null)
+  assert.doesNotMatch(JSON.stringify(task), /PRIVATE-OMITTED-IMAGE|image_url|data:image/)
 })
 
 test('observed function arrays coexist with scalar function and custom results without replacing earlier material', async t => {

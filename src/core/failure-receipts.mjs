@@ -25,6 +25,7 @@ export function failureErrorInfo(error = {}) {
   if (typeof error.code === 'string' && /^(unsupported-record-type|unsupported-event-type):/.test(error.code)) error = { ...error, code: error.code.split(':', 1)[0] };
   const known = CATEGORIES.has(error.code), code = known ? error.code : error.code == null ? 'analysis_failed' : 'unrecognized_error';
   const value = { code, stage: STAGES.has(error.stage) ? error.stage : null, category: CATEGORIES.get(code) ?? 'other' };
+  if (code === 'gmd_operation_failed' && error.details?.remoteCode === 'invalid_response') value.category = 'protocol';
   if (!known && typeof error.code === 'string') value.codeHash = createHash('sha256').update(error.code).digest('hex');
   else if (code === 'unrecognized_error' && /^[a-f0-9]{64}$/.test(error.codeHash ?? '')) value.codeHash = error.codeHash;
   const status = error.status ?? error.details?.status;

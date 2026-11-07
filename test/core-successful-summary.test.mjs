@@ -74,6 +74,31 @@ test('a successful generated summary remains reachable only as history after the
   assert.deepEqual((await f.task(source)).analysis.lastSuccessfulSummary, expected, 'the single historical success is durable');
 });
 
+test('a cited partial observation survives Core restart without replacing complete history or clearing an earlier judgment failure', async t => {
+  const f = await fixture(t), { source } = await observed(f), first = (await f.task(source)).analysis.lastSuccessfulSummary;
+  f.mode('fail-jev'); f.advance(10);
+  await f.client.ingest(source, { events: [{ ...nativeBatch(f.now()).events[2], id: 'failed-output', text: 'Inspecting another log entry' }] });
+  await until(async () => (await f.task(source)).analysis.state === 'failed', 'the real judgment fails');
+  const failed = (await f.task(source)).monitoringHealth;
+  assert.equal(failed.state, 'failed');
+  f.mode('success'); f.text('仅观察到部分日志。'); f.advance(1000);
+  await f.client.ingest(source, { events: [{ ...nativeBatch(f.now()).events[2], id: 'partial-output', text: 'A truncated visible entry', data: { ...nativeBatch(f.now()).events[2].data, truncated: true, verificationGaps: ['tool-result-image-omitted'] } }] });
+  await until(async () => (await f.task(source)).analysis.summary?.partial, 'the bounded partial summary completes');
+  const task = await f.task(source);
+  assert.equal(task.analysis.summary.generated, undefined);
+  assert.ok(task.analysis.summary.partial.evidenceRefs.length);
+  assert.equal(task.analysis.coverage.complete, false);
+  assert.notEqual(task.gs.light, 'green');
+  assert.deepEqual(task.analysis.lastSuccessfulSummary, first);
+  assert.equal(task.monitoringHealth.state, 'failed', 'summary-only success does not prove JEV recovery');
+  assert.equal(f.calls.filter(call => call.path === '/v1/systemone').length, 2);
+  await f.restart();
+  const restored = await f.task(source);
+  assert.deepEqual(restored.analysis.summary.partial, task.analysis.summary.partial);
+  assert.deepEqual(restored.analysis.lastSuccessfulSummary, first);
+  assert.equal(restored.monitoringHealth.state, 'failed');
+});
+
 test('the historical summary expires with the earliest round material even when that material was not cited', async t => {
   const f = await fixture(t), at = f.now(), { source } = await observed(f);
   const first = (await f.task(source)).analysis.lastSuccessfulSummary;

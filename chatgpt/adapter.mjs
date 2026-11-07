@@ -11,7 +11,7 @@ import { readModelDirectory } from './model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
-import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE } from '../src/protocol.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -82,7 +82,9 @@ function materialView(view, task, { historical = false, snapshot } = {}) {
   const forkBinding = task.instructionContext?.binding?.forkContext
   const inheritance = forkBinding ? { state: forkBinding.receiptId ? 'complete' : 'pending', gaps: [...new Set([...(task.instructionContext.gaps ?? []), ...(!historical ? view.inheritance?.gaps ?? [] : [])])] } : null
   const revalidating = !historical && view.observation?.recordRevalidating === true
-  const generated = task.analysis.summary?.generated && (historical || ['current', 'reused'].includes(task.analysis.resultDisposition)) && !['failed', 'unavailable', 'interrupted', 'stale'].includes(task.analysis.state) ? task.analysis.summary.generated : null
+  const summaryVisible = (historical || ['current', 'reused'].includes(task.analysis.resultDisposition)) && !['failed', 'unavailable', 'interrupted', 'stale'].includes(task.analysis.state)
+  const generated = summaryVisible ? task.analysis.summary?.generated : null
+  const partial = summaryVisible && task.analysis.coverage?.complete === false ? task.analysis.summary?.partial : null
   const generatedView = value => value ? { text: value.text, evidence: value.evidenceRefs.slice(0, 2).map(reference => {
     const owner = (snapshot?.tasks ?? [task]).find(candidate => candidate.sourceKey === task.sourceKey && candidate.id === reference.taskId && candidate.lifecycleId === reference.lifecycleId)
     const event = owner?.events.find(event => event.id === reference.eventId && event.taskId === reference.taskId && event.taskLifecycleId === reference.lifecycleId)
@@ -96,7 +98,7 @@ function materialView(view, task, { historical = false, snapshot } = {}) {
     health: task.monitoringHealth,
     observation: { ...view.observation, gap: view.observation.gap ?? own.find(event => event.kind === 'gap' && event.data?.verificationGaps?.length)?.data.verificationGaps[0] ?? (!task.currentRequest ? 'current-user-request-unverified' : null) },
     analysis: { connected: true, state: task.analysis.state, summary: states[task.analysis.state] ?? '本轮尚无有效检查结论', checks: task.analysis.checks, issues,
-      generated: generatedView(generated), lastSuccessfulSummary, configScope: task.analysis.configScope, currentConfigScope: task.analysis.currentConfigScope,
+      generated: generatedView(generated), partial: generatedView(partial), lastSuccessfulSummary, configScope: task.analysis.configScope, currentConfigScope: task.analysis.currentConfigScope,
       resultDisposition: task.analysis.resultDisposition, completedAt: task.analysis.completedAt, through: task.analysis.through, waitMs: task.analysis.waitMs, lagMs: task.analysis.lagMs, error: task.analysis.error, coverage: task.analysis.coverage ?? task.coverage } }
 }
 
@@ -112,7 +114,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   if (onQualificationLost !== undefined && typeof onQualificationLost !== 'function') throw new Error('invalid qualification loss handler')
   if (initialEnrollmentBaseline !== undefined && (!initialEnrollmentBaseline || typeof initialEnrollmentBaseline.initialize !== 'boolean' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(initialEnrollmentBaseline.id ?? ''))) throw new Error('invalid initial enrollment baseline')
   let baselineInitializationAvailable = initialEnrollmentBaseline?.initialize === true, baselineCoreInstanceId = null
-  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (reason === 'core-update-required') view.summary = '共享核心需要更新，监控未启动；请待旧核心自然退出后启用新版'; if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
+  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (reason === 'core-update-required') view.summary = '观察核心需要更新，等待旧实例自然退出后自动重连'; if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
   await mkdir(join(dataDir, 'cursors'), { recursive: true, mode: 0o700 })
   const healthOutbox = collectMaterials ? await openHealthOutbox({ dataDir, now }) : null
   let closed = false, closing = null, timer = null, refreshPending = null, source = null, sourceEpoch = 0, registration = null
@@ -129,7 +131,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
   const capability = async () => {
     const health = await core.health(), features = health.features
-    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
+    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, PARTIAL_SUMMARY_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
     required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
     if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
     if (delivery) required.push('monitoring-notifications/1', RECOVERY_ROLLUP_FEATURE)
@@ -472,7 +474,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       failureStage = 'core-connection'
       const supported = await capability()
       if (closed || epoch !== sourceEpoch) return
-      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
+      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
       if (coreInstanceId && supported.instanceId && coreInstanceId !== supported.instanceId) {
         try { await stopSource('core-generation-changed') } catch (error) { if (error.status !== 400) throw error }
         if (closed) return

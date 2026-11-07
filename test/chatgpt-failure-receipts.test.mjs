@@ -83,6 +83,16 @@ test('settled errors retain their original safe classification without response 
   for (const secret of ['private-token', 'private text', 'private.invalid', 'authorization', 'headers', 'message', 'remoteCode']) assert.equal(output.includes(secret), false);
 });
 
+test('a managed invalid response keeps its original code but reports the actionable protocol cause without private provider details', t => {
+  const f = fixture(t);
+  const result = f.store.settle({ ...failure, error: { code: 'gmd_operation_failed', stage: 'llm', details: { remoteCode: 'invalid_response', remoteStage: 'response', body: 'PRIVATE-PROVIDER-OUTPUT' } } });
+  assert.equal(result.receipt.error.code, 'gmd_operation_failed');
+  assert.equal(result.receipt.error.category, 'protocol');
+  const restored = createFailureReceipts({ db: f.db, now: f.now }).list();
+  assert.equal(restored.receipts[0].error.category, 'protocol');
+  assert.doesNotMatch(JSON.stringify(restored), /PRIVATE-PROVIDER-OUTPUT|remoteCode|body/);
+});
+
 test('24 hour retention does not renew on replay, while a continuing cause stays deduplicated', t => {
   const f = fixture(t), first = f.store.settle(failure).receipt;
   f.advance(86_400_000 - 1);

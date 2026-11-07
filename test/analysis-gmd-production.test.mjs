@@ -21,7 +21,7 @@ const observation = {
   ], coverage: { complete: true, gaps: [] },
 };
 
-async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgment = false, holdSummary = false, invalidConsumeReceipt = false, holdJudgment = false, rejectFirstSummary = false } = {}) {
+async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgment = false, holdSummary = false, invalidConsumeReceipt = false, holdJudgment = false, rejectFirstSummary = false, minimumOutputTokens = 0 } = {}) {
   const requests = [];
   const operations = new Map();
   let released = !holdSummary, nativeSequence = 0;
@@ -59,6 +59,12 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
       runtime_generation: generation(body.model), cache_salt_sha256: hash(body.cache_salt), state: 'completed', terminal: true, lease_released: true,
       children: [{ native_request_id: ++nativeSequence, runtime_generation: 1, question_id: null, state: prefill ? 'length' : 'stop', prompt_tokens: 24,
         completion_tokens: prefill || body.model === 'judge' ? 0 : 8, matched_prompt_tokens: 8, deduplicated_tokens: 0, lease_released: true }] } : null;
+    if (metadata && body.model === 'summary' && !prefill && body.max_tokens < minimumOutputTokens) {
+      const failed = { ...metadata, state: 'failed', error: { code: 'invalid_response', stage: 'response' }, children: [{ ...metadata.children[0], state: 'length', completion_tokens: body.max_tokens }] };
+      operations.set(metadata.request_id, { metadata: failed });
+      res.statusCode = 202;
+      return send(failed);
+    }
     const result = prefill ? { model: body.model, choices: [], prefill: { ...metadata, generated_tokens: 0 } }
       : req.url === '/v1/chat/completions' ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }], ...(metadata ? { cache: invalidConsumeReceipt ? { ...metadata, request_id: 'foreign-operation' } : metadata } : {}), ...(spoofReceipt ? { gmdOperation: { lease_released: true, secret: 'unverified-provider-field' } } : {}) }
         : { model: body.model, answers: invalidJudgment ? {} : Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown' }])), ...(metadata ? { cache: metadata } : {}) };
@@ -75,6 +81,18 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
     releaseJudge, stopLifetime() { lifetime.abort(new Error('Observer lifetime closed')); } };
 }
 
+test('a bounded output allowance above the observed truncation ceiling can publish a cited partial summary in one managed generation', async t => {
+  const f = await fixture(t, { minimumOutputTokens: 4096 });
+  const result = await f.analyzer.analyze({ ...observation, coverage: { complete: false, gaps: ['image omitted'] } }, f.options);
+  assert.ok(result.summary.partial.evidenceRefs.length);
+  assert.equal(result.summary.generated, undefined);
+  assert.equal(result.coverage.complete, false);
+  assert.equal(f.requests.length, 1, 'no untracked replacement after a released generation');
+  assert.equal(f.requests[0].body.max_tokens, 4096);
+  assert.ok(result.summary.partial.text.length <= 600);
+  assert.ok(result.usage.gmd.llm.terminal && result.usage.gmd.llm.lease_released);
+});
+
 test('a warmed observation consumes the newer frozen input and publishes only after JEV succeeds', async t => {
   const f = await fixture(t);
   const warmed = await f.analyzer.prefill(observation, f.options);
@@ -84,7 +102,7 @@ test('a warmed observation consumes the newer frozen input and publishes only af
   assert.ok(result.summary.generated);
   assert.equal(result.checks.length, 6);
   assert.deepEqual(f.requests.map(request => [request.path, request.body.max_tokens ?? null]), [
-    ['/v1/chat/completions', 0], ['/v1/chat/completions', 1024], ['/v1/systemone', null],
+    ['/v1/chat/completions', 0], ['/v1/chat/completions', 4096], ['/v1/systemone', null],
   ], 'consume handles the new suffix without an extra zero-budget request');
   assert.ok(JSON.stringify(f.requests[1].body).includes('Found the newer requested log entry.'));
   assert.equal(f.requests[0].body.cache_salt, f.requests[1].body.cache_salt);
@@ -129,7 +147,7 @@ test('a managed-operation fault never starts an untracked replacement generation
   await assert.rejects(f.analyzer.analyze(observation, f.options), error => error.code === 'gmd_binding_mismatch');
   assert.equal(f.requests.length, 1);
   assert.ok(f.requests[0].id);
-  assert.equal(f.requests[0].body.max_tokens, 1024);
+  assert.equal(f.requests[0].body.max_tokens, 4096);
 });
 
 test('an explicitly unconfirmed request cannot borrow a historical input to prefill inherited context', async t => {

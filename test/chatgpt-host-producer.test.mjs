@@ -500,25 +500,28 @@ test('strict material gaps reach the real Core HTTP chain and cannot let a known
     const retained = (await f.core.diagnostics()).retained.nativeCaptureProgress.records
     f.advance()
     const unsupported = kind === 'array-output'
-      ? row(4, 'response_item', { type: 'custom_tool_call_output', call_id: 'unverified', output: [{ type: 'input_text', text: 'Do not retain this body' }, { type: 'input_image', image_url: 'unverified-image-body' }] })
+      ? row(4, 'response_item', { type: 'custom_tool_call_output', call_id: 'unverified', output: [{ type: 'input_text', text: 'Known text beside an omitted image' }, { type: 'input_image', image_url: 'unverified-image-body' }] })
       : row(4, 'event_msg', { type: kind === 'unknown-item' ? 'item_completed' : 'item_started', thread_id: owner, turn_id: 'turn', item: { ...(kind === 'missing-started-type' ? {} : { type: 'SyntheticOpaqueItem' }), query: 'Do not retain this body' } })
     await fs.appendFile(f.path, unsupported + row(5, 'event_msg', { type: 'task_complete', turn_id: 'turn' }))
     let view
     for (let attempt = 0; attempt < 20; attempt++) { view = await f.read(); if (view.observation.gap?.startsWith('unsupported-')) break }
     const unknownType = ['unknown-item', 'unknown-started-item'].includes(kind)
     assert.equal(view.signal, 'gray'); assert.notEqual(view.observation.coverage, 'caught-up')
-    assert.match(view.observation.gap, kind === 'array-output' ? /^unsupported-tool-result-shape$/ : /^unsupported-item-type:[a-f0-9]{64}$/)
+    const knownImage = kind === 'array-output', continues = knownImage || unknownType
+    if (knownImage) assert.equal(view.observation.gap, null)
+    else assert.match(view.observation.gap, /^unsupported-item-type:[a-f0-9]{64}$/)
     let after = (await f.core.snapshot()).tasks[0]
-    assert.equal(after.status, unknownType ? 'idle' : 'unknown'); assert.equal(after.coverage.complete, false); assert.notEqual(after.gs.light, 'green')
-    if (!unknownType) assert.equal(after.lastActivity, original.lastActivity)
+    assert.equal(after.status, continues ? 'idle' : 'unknown'); assert.equal(after.coverage.complete, false); assert.notEqual(after.gs.light, 'green')
+    if (!continues) assert.equal(after.lastActivity, original.lastActivity)
     assert.deepEqual(after.events.slice(0, captures.length).map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence]), captures)
-    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, retained + (unknownType ? 2 : 0))
-    assert.doesNotMatch(JSON.stringify(after.events), /Do not retain|SyntheticOpaqueItem/)
+    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, retained + (continues ? 2 : 0))
+    assert.doesNotMatch(JSON.stringify(after.events), /Do not retain|SyntheticOpaqueItem|unverified-image-body|image_url/)
+    if (knownImage) { const result = after.events.find(event => event.data.callId === 'unverified'); assert.equal(result.text, 'Known text beside an omitted image'); assert.ok(result.data.verificationGaps.includes('tool-result-image-omitted')) }
     const allCaptures = after.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence])
     await f.reopen(); view = await f.read(); after = (await f.core.snapshot()).tasks[0]
     assert.equal(view.signal, 'gray'); assert.equal(after.coverage.complete, false)
     assert.deepEqual(after.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence]), allCaptures)
-    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, retained + (unknownType ? 2 : 0))
-    assert.equal(after.events.some(event => event.data.nativeType === 'task_complete'), unknownType)
+    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, retained + (continues ? 2 : 0))
+    assert.equal(after.events.some(event => event.data.nativeType === 'task_complete'), continues)
   })
 })

@@ -11,6 +11,7 @@ export const NOTIFICATION_REVOCATION_FEATURE = 'notification-submission-revocati
 export const INSTALLATION_NOTIFICATION_RECORDS_FEATURE = 'installation-notification-records/1'
 export const INITIAL_ENROLLMENT_ROLLUP_FEATURE = 'monitoring-initial-enrollment-rollup/1'
 export const RECOVERY_ROLLUP_FEATURE = 'monitoring-recovery-rollup/1'
+export const PARTIAL_SUMMARY_FEATURE = 'partial-observation-summary/1'
 export const NATIVE_CAPTURE_LIVE_BUDGET_FEATURE = 'native-capture-live-budget/1'
 export const CHATGPT_INSTALLATION_PURGE_FEATURE = 'chatgpt-installation-purge/1'
 export const CHATGPT_RETENTION_MAINTENANCE_FEATURE = 'chatgpt-retention-maintenance/1'

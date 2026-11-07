@@ -1,18 +1,18 @@
 {
-  "version": "0.2.7",
+  "version": "0.2.8",
   "build": {
     "node": "v24.21.0",
     "npm": "11.19.1"
   },
-  "sha256": "61f97a1cb562db79d462ebb14124b6f10b842bdd014b489c07764a3e5a39114e",
+  "sha256": "730b301f01dc4bf9f2a0ec22c16296fa8c506ab149edda40b313b8dfb231b77b",
   "files": {
     "GLOSSARY.md": "f685cdec5d400bedcddd1c8627ba27087fd32feecbb6424bc01da4d4d600661b",
-    "README.md": "46b9b12e9779d3695bbe2dc01dadfb11cf359723f3479bac76256018b94626e0",
-    "docs/chatgpt-observation.md": "8f953e3646a600a6dad38978218b05bcb657a8ef58943fdae024bb81c291e78d",
-    "docs/development-contract.md": "56b72c208f65998cd987a6de391fa63938bb8c2b434e9b5a37df42313d6a4b8c",
+    "README.md": "7854bccd72bc75a61de38f0860feaf0d70d56106e5c7d734a4e01647df15168f",
+    "docs/chatgpt-observation.md": "111508a595d17ecd2d020e939b09dac5901e929d52e13c8ad1ca7f68dc96608e",
+    "docs/development-contract.md": "810cb8c63ceb09e48e64b0b060fb299aabf05598326a175ebef5eb88c8d533fb",
     "docs/installation.md": "6b06d237b7e3c9cfe39f1086660a438310d333365670dc61d38f627274a5c704",
-    "docs/release-notes.md": "1e8300189d6bcb0a75bb68582f6fbf1c9796ebc81947da35531d60ac3eac6f34",
-    "docs/release-status.md": "344f5071443dcee8d0bf31866af9dc6334e5234607bdc2081014ef3ab724b455",
+    "docs/release-notes.md": "f2479033d0212bd902d411c68298b078830f2c0430c703c04ae99038750fddf0",
+    "docs/release-status.md": "bf9ef49ef1f3c8826de837c25d04cb35fd35595551199e6538116c213c9b5a7a",
     "dsh/client.js": "bc5873fda7a16a1aec5d501b318e3ec6c5f38d13d33796a6652e3d9ba223e0c3",
     "dsh/cordis.patch.yml": "bd7d0f94c3a0d7ef682214764f5e652c82ab928306542d7a03b365e019b64696",
     "dsh/hierarchy-reader.mjs": "aa3aa9a84049271f42e71bd8b10d6b05b48f7c3694624610297ea79695728e93",
@@ -20,16 +20,16 @@
     "dsh/observation.mjs": "c075d1bbc1d920196504e50cc729164fac7fc881bdfdbc7970a7dc8ae0ceda70",
     "dsh/remote.cjs": "9d75418b5ba11979b51ae8710b80691228360c627077571bd7fdcc1d026ae134",
     "dsh/verification-evidence.mjs": "3fef17769cfcb64eadcfc7d9a067da9e253658b3d4e8317e5c4c434bc79ca107",
-    "package.json": "b2884d39a5693e3c296e050d0cdca9268fb279c486ca2ac9a5e3dbaf8091f02a",
+    "package.json": "199ffcd602caa1702703868f063e25b65bb37e20cca2170f9f0f32318fc11ae7",
     "src/analysis/failure-info.mjs": "67a6b3e8cd351d5cc2272351b6e46902d516b4771d7a3a2a3552970172f72d0d",
     "src/analysis/gmd-prefill-client.mjs": "52c99b16e86e2de629671a671d4d99bc7b252c0252df8a2f151858aad6f383b8",
     "src/analysis/http.mjs": "8b6c0ffe5b1a07ee7f55ce3248197f14cbec058f81191fe6f76d3f3646dffbf1",
-    "src/analysis/index.mjs": "2fe8f5965b851019e36ea5e21adb9f9789e8e7a6c3d6a9c663c098701a251d7f",
+    "src/analysis/index.mjs": "b1e3319d3230671d417665164d7fa255c87b879d8a8323c2885b0e07201bbb58",
     "src/analysis/jev-rendering.mjs": "7f1285fe531cea41627c2ad1aaa9ec197888aa68efb1c3829de71a892fe39991",
     "src/core-client.mjs": "e84bc6610f4ef9653dbe20376e1ac23dcb1f48a52a13023a7423857515b8018d",
     "src/core-profile-migration.mjs": "f8e9f324a4a4d592e0d6de550fd354427495f5514118011c6783c4513bb3df6f",
-    "src/core/failure-receipts.mjs": "1c888d8d1a567ae19f80b7300b3da487da78a817b57e7fc3cbc0375f8d5bf797",
-    "src/core/index.mjs": "c2dddccd29fc716c32bf50ac23b8f05c4204a4aa168a1b1facd64bd862bfab9e",
+    "src/core/failure-receipts.mjs": "1b6cfd54b19de0fb5df4754762818e8a7a689c2520e681ef43dc22f6a6c8c65c",
+    "src/core/index.mjs": "b34aa0e4623b7bd29183882e6979ab7089d441db510606d324f875d11eaff6de",
     "src/core/native-capture-progress.mjs": "5d610f9b10ce7bd2e47f80c5f6e892a83fb1cb2ded70c78aba6dcb1fcbb8f662",
     "src/core/native-notifications.mjs": "10faf0ebfb5554abbf48e85e9f45d0d3b69087833b7387f34df620b505af5b7d",
     "src/core/native-origin-fences.mjs": "fddf9bd96ac7c065ee655cdf0983ab280b3136aeb1f2a8a57139e3b35fea400f",
@@ -44,7 +44,7 @@
     "src/model-directory.mjs": "7031c764f2c38c37f40d1339c52ee70c3126f89e3849a48d8955680b26365973",
     "src/native-origin.mjs": "0afc126bfa484df8a5fa4d8559d2ad3b2cbda9b4b7c3928d316c05a1a990310c",
     "src/privacy.mjs": "82bb8e6c661414e02d68f608d4c78915c365c02ad87add4d5dec2ba137b69972",
-    "src/protocol.mjs": "36b2a076c18faf867d3aa35191d0d0f8f7fcbb95d6e45f740be799c32cef4592",
-    "src/server.mjs": "03ec99f292a9a43f4a5b0379d1c1583b8663ba8687386c66fa8618442360b227"
+    "src/protocol.mjs": "ce20050d3f4e03db989eb50de203baad912e4dd8a9ecdb53d753fc0a4c78d4d6",
+    "src/server.mjs": "703793d0db3cb4b490eb1357bd889526172ed9ebd4d4586e0a7e13742f54922e"
   }
 }
