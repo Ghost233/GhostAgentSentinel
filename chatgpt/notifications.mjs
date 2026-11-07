@@ -1,7 +1,14 @@
 import { NOTIFICATION_BUNDLE_ID, notificationPrefix } from './native-notifications.mjs'
+import { sanitizeObservation } from '../src/privacy.mjs'
 
 const permitted = value => ['authorized', 'provisional'].includes(value)
 const safeError = error => ['native_unavailable', 'native_protocol', 'native_submission', 'native_timeout'].includes(error?.code) ? error.code : 'native_unavailable'
+const displayText = (value, fallback, limit) => {
+  const safe = sanitizeObservation(typeof value === 'string' ? value : '')
+  if (safe.redacted || !safe.text.trim()) return fallback
+  const text = safe.text.replace(/[\x00-\x1f\x7f]/g, ' ').trim()
+  return text.length > limit ? text.slice(0, limit - 1) + '…' : text
+}
 
 // One installation, one native child at a time. Refresh never requests permission.
 export function createNotificationDelivery({ core, native, installationId, qualify, now = Date.now }) {
@@ -95,7 +102,13 @@ export function createNotificationDelivery({ core, native, installationId, quali
       }
       try {
         activeNoticeKind = notice.kind
-        const result = await native.submit({ requestId: packet(notice, {}).nativeRequestId, title: notice.title, body: notice.body, metadata: { notificationId: notice.id, attemptId: notice.native.attemptId, sourceKey: notice.sourceKey, hostRunId: notice.hostRunId, mainId: notice.mainId, lifecycleId: notice.lifecycleId } })
+        const fallback = notice.kind === 'task-alert' ? { subtitle: '需要关注', body: '发现需要关注的异常，点击进入聊天查看依据。' } : { subtitle: '检查状态待确认', body: '曾记录监控故障，点击进入聊天查看当前状态。' }
+        const presentation = notice.presentation ?? fallback
+        const result = await native.submit({ requestId: packet(notice, {}).nativeRequestId,
+          title: notice.mainId === null ? 'GhostSentinel' : displayText(qualification.chatTitle, '未命名聊天', 40),
+          subtitle: displayText(presentation.subtitle, fallback.subtitle, 80),
+          body: notice.mainId === null ? '获取聊天信息时遇到问题，尚未确认具体聊天。可在插件安装设置查看故障记录。' : displayText(presentation.body, fallback.body, 240),
+          metadata: { notificationId: notice.id, attemptId: notice.native.attemptId, sourceKey: notice.sourceKey, hostRunId: notice.hostRunId, mainId: notice.mainId, lifecycleId: notice.lifecycleId } })
         if (!noticeCurrent()) await record(notice, { event: 'suppressed', reason: stopped ? 'driver-stopped' : 'qualification-unconfirmed' }, summary)
         cache({ ...authorization, ...result })
         await record(notice, { event: 'authorization', authorization: result.authorization, observedAt: result.observedAt }, summary)

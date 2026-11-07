@@ -35,6 +35,21 @@ test('the native bridge rejects foreign installation cancellation, wrong bundle 
   await assert.rejects(big.settings(), error => error.code === 'native_protocol')
 })
 
+test('native notification subtitles are bounded display text alongside immutable chat identity', async () => {
+  const prefix = notificationPrefix('chat-first'), calls = []
+  const io = createNativeNotificationIO({ bundlePath: '/private/tmp/Notification Preview.app', installationId: 'chat-first', run: async (_file, _args, input) => {
+    const request = JSON.parse(input); calls.push(request)
+    return packet('submit', { requestId: request.requestId, accepted: true, authorization: 'authorized', observedAt: 1001 })
+  } })
+  const value = { requestId: prefix + 'attempt', title: '支付回调验收', subtitle: '本轮检查暂不可用', body: '会话记录读取失败。点击查看详情。', metadata: { notificationId: 'notice', attemptId: 'attempt', sourceKey: 'source', hostRunId: 'host', mainId: 'main', lifecycleId: 'run' } }
+  await io.submit(value)
+  assert.equal(calls[0].subtitle, value.subtitle)
+  assert.deepEqual(calls[0].metadata, value.metadata)
+  for (const subtitle of [7, null, 'x'.repeat(201)]) await assert.rejects(io.submit({ ...value, subtitle }), { code: 'native_protocol' })
+  assert.equal(calls.length, 1)
+  io.close()
+})
+
 test('uninstall clears only its installation and preserves delivered OS history without requesting permission', async () => {
   const calls = [], prefix = notificationPrefix('own-uninstall')
   const io = createNativeNotificationIO({ bundlePath: '/private/tmp/Owned Notifications.app', installationId: 'own-uninstall', run: async (file, args, input) => {

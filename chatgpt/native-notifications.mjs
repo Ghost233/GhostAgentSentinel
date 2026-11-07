@@ -70,10 +70,10 @@ export function createNativeNotificationIO({ bundlePath, installationId, testMod
     requestAuthorization: () => invoke('authorize'),
     submit(value) {
       if (!owned(value?.requestId)) return Promise.reject(new Error('notification request belongs to another installation'))
-      if (typeof value.title !== 'string' || !value.title.trim() || value.title.length > 200 || typeof value.body !== 'string' || value.body.length > 1200) return Promise.reject(protocol())
+      if (typeof value.title !== 'string' || !value.title.trim() || value.title.length > 200 || typeof value.body !== 'string' || value.body.length > 1200 || value.subtitle !== undefined && (typeof value.subtitle !== 'string' || value.subtitle.length > 200)) return Promise.reject(protocol())
       const title = !testMode || /^GhostSentinel test(?:[ ·]|$)/.test(value.title) ? value.title : /^GhostSentinel(?:[ ·]|$)/.test(value.title) ? value.title.replace(/^GhostSentinel/, 'GhostSentinel test') : 'GhostSentinel test · ' + value.title
       if (title.length > 200) return Promise.reject(protocol())
-      return invoke('submit', { requestId: value.requestId, title, body: value.body, metadata: metadata(value.metadata) })
+      return invoke('submit', { requestId: value.requestId, title, ...(value.subtitle === undefined ? {} : { subtitle: value.subtitle }), body: value.body, metadata: metadata(value.metadata) })
     },
     cancel(requestIds) {
       if (!Array.isArray(requestIds) || requestIds.length > 100 || requestIds.some(value => !owned(value))) return Promise.reject(new Error('notification cancellation belongs to another installation or exceeds its budget'))

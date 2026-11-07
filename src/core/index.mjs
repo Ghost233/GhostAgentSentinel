@@ -2067,7 +2067,7 @@ export async function createCore({
         notification.status = 'claimed';
         notification.claimedAt = now();
         if (!notification.kind) { notification.submissionAttempt = { token: randomUUID(), issued: legacy, settled: false, ...(legacy ? { legacy: true } : {}) }; if (legacy) issuedCount++; }
-        nativeNotifications.claim(notification);
+        const presentation = nativeNotifications.claim(notification);
         for (const member of notification.members) {
           const task = tasks.get(member.taskKey);
           for (const alert of task?.alerts ?? []) if (member.alertIds.includes(alert.id)) { alert.lastAttemptAt = now(); alert.notification = { id: notification.id, status: 'claimed', delivery: 'unknown', seen: 'unknown', at: now() }; }
@@ -2075,7 +2075,7 @@ export async function createCore({
         }
         save('notifications', notification);
         const { requestId, alertIds, createdAt, status, delivery, seen, claimedAt, groupKey, readyAt, submissionAttempt, ...publicValue } = notification;
-        claimed.push(copy({ ...publicValue, ...(submissionAttempt && !legacy ? { attemptToken: submissionAttempt.token } : {}), members: notification.members.map(({ requestId, ...member }) => member) }));
+        claimed.push(copy({ ...publicValue, ...(presentation ? { presentation } : {}), ...(submissionAttempt && !legacy ? { attemptToken: submissionAttempt.token } : {}), members: notification.members.map(({ requestId, ...member }) => member) }));
       }
       return claimed;
     },

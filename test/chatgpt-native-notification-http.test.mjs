@@ -184,6 +184,20 @@ for (const transition of ['running', 'idle', 'next-execution']) test(`an actual 
   assert.equal(claimed[0].lifecycleId, 'turn'); assert.deepEqual(claimed[0].receiptIds, [receipt.id])
 })
 
+test('a pending failure notice describes the active cause when an earlier merged analysis failure has recovered', async t => {
+  const model = await provider(t, { failFirst: true }), f = await fixture(t, { cooldownMs: 0, leaseMs: 1e9 })
+  await configureInstallationModels(f.core, 'chatgpt:native-notification', model.config)
+  await f.core.ingest(f.sourceKey, nativeBatch(f.now()))
+  await until(async () => { const actor = (await f.core.snapshot()).tasks[0]; return actor.analysis.summary && !actor.analysis.error && model.calls() >= 3 }, 'analysis recovers before its first notification')
+  await f.core.recordCollectionOutcome({ sourceKey: f.sourceKey, mainId: 'main', lifecycleId: 'turn', roundId: 'record-failure', outcome: 'failed', settledAt: f.now(), error: { code: 'EIO', stage: 'collection' } })
+  await f.core.setNativeNotificationEligibility({ sourceKey: f.sourceKey, hostRunId: 'native-host', appRunning: true, pluginEnabled: true })
+  const [notice] = await f.core.claimNotifications(f.sourceKey)
+  assert.equal(notice.receiptIds.length, 2)
+  assert.equal(notice.presentation.subtitle, '本轮检查暂不可用')
+  assert.match(notice.presentation.body, /会话记录读取失败/)
+  assert.doesNotMatch(notice.presentation.body, /已恢复|检查服务请求/)
+})
+
 test('ChatGPT task alerts retain the three-second window and ten-minute successful repeat while a late old attempt cannot overwrite the new one', async t => {
   const model = await provider(t, { attention: true }), f = await fixture(t, { leaseMs: 1e9 })
   await configureInstallationModels(f.core, 'chatgpt:native-notification', model.config)
@@ -197,6 +211,10 @@ test('ChatGPT task alerts retain the three-second window and ten-minute successf
   const first = (await f.core.claimNotifications(f.sourceKey))[0]
   assert.equal(first.kind, 'task-alert')
   assert.deepEqual(first.checkIds, ['request_drift'])
+  assert.equal(first.presentation.subtitle, '需要关注')
+  assert.ok(first.presentation.body.includes(first.members[0].reasons[0]))
+  assert.equal(first.presentation.body.includes(f.sourceKey), false)
+  assert.match(first.presentation.body, /点击.*聊天/)
   const emit = (notice, fields) => f.core.recordNativeNotificationResult({ notificationId: notice.id, attemptId: notice.native.attemptId, nativeRequestId: 'ghostsentinel:0123456789abcdef01234567:' + notice.native.attemptId, bundleId: 'com.ghostsentinel.notifications', observedAt: f.now(), ...fields })
   await emit(first, { event: 'authorization', authorization: 'authorized' }); assert.equal((await emit(first, { event: 'submitting' })).maySubmit, true); await emit(first, { event: 'accepted' })
   f.advance(599999); await qualify(); assert.deepEqual(await f.core.claimNotifications(f.sourceKey), [])

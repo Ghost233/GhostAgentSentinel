@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { sanitizeObservation } from '../privacy.mjs';
 
 const DAY = 86_400_000, LIMIT = 1024;
 const META = 'native-notification-metadata', LINKS = 'native-notification-links';
@@ -182,7 +183,24 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
   function claim(value) {
     if (!native(value)) return;
     if (value.native?.suppression?.deferred && value.native.submission.state === 'not-attempted') return;
+    let presentation;
+    if (value.kind === 'task-alert') {
+      const reasons = [...new Set(value.members.flatMap(member => member.reasons ?? []))];
+      presentation = { subtitle: '需要关注', body: (sanitizeObservation(reasons.join('；')).text.slice(0, 180) || '发现需要关注的异常。') + ' 点击进入聊天查看依据。' };
+    } else {
+      const receipts = value.receiptIds.map(id => readReceipt(id)).filter(Boolean), first = receipts.find(receipt => receipt.state === 'active') ?? receipts[0];
+      const recovered = receipts.length === value.receiptIds.length && receipts.length > 0 && receipts.every(receipt => receipt.state === 'recovered');
+      const active = receipts.some(receipt => receipt.state === 'active');
+      const reason = first?.domain === 'collection' ? '会话记录读取失败，本次检查未完成。' : ({
+        timeout: '模型检查超时，本次没有生成有效结论。', transport: '检查服务请求未成功，本次没有生成有效结论。',
+        protocol: '检查服务的返回内容无法用于判断，本次检查未完成。', configuration: '检查所需配置不可用，本次检查未完成。',
+        evidence: '检查依据无法核实，本次没有有效结论。', expired: '检查依据已过期，本次没有有效结论。',
+      })[first?.error.category] ?? '曾记录监控故障，具体原因请在会话检查中核对。';
+      presentation = { subtitle: recovered ? '检查已恢复 · 曾发生故障' : active ? '本轮检查暂不可用' : '检查状态待确认',
+        body: reason + (recovered ? '这次故障已恢复。' : !active ? '当前恢复状态待确认。' : '') + (value.rollupId ? '同类提醒已合并，其他聊天保留独立回执。' : '') + '点击进入聊天查看详情。' };
+    }
     value.native = { attemptId: randomUUID(), nativeRequestId: null, bundleId: 'com.ghostsentinel.notifications', authorization: { state: 'unknown', observedAt: null }, submission: { state: 'not-attempted', observedAt: null } };
+    return presentation;
   }
   function recordResult(result) {
     if (result.observedAt > now() || result.deliveryDate > result.observedAt) throw new Error('Native notification observation is in the future');

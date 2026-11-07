@@ -31,6 +31,46 @@ async function fixture(t, { authorization = 'authorized', qualify } = {}) {
   return { core, delivery, facts, calls, pending, delivered, fail, prefix: notificationPrefix(installationId), now: () => clock, advance: ms => { clock += ms } }
 }
 
+test('chat-first notices show the qualified chat name, plain failure and current recovery state without exposing transport identities', async t => {
+  let facts
+  const f = await fixture(t, { qualify: async notice => ({ ...facts, projectEnabled: true, chatTitle: notice.mainId === 'A' ? '支付回调验收' : '账单导出修复' }) }); facts = f.facts
+  await f.core.ingest(facts.sourceKey, { tasks: ['A', 'B'].map(id => ({ id, lifecycleId: 'one', title: id, status: 'running' })) })
+  await f.fail('A'); await f.fail('B')
+  f.advance(1)
+  await f.core.recordCollectionOutcome({ sourceKey: facts.sourceKey, mainId: 'A', lifecycleId: 'one', channel: 'directory', roundId: 'recovered-A', outcome: 'succeeded', settledAt: f.now() })
+  await f.delivery.refresh(facts)
+  const submitted = f.calls.filter(value => value.operation === 'submit')
+  assert.equal(submitted.length, 2)
+  const recovered = submitted.find(value => value.metadata.mainId === 'A'), active = submitted.find(value => value.metadata.mainId === 'B')
+  assert.equal(recovered.title, '支付回调验收'); assert.match(recovered.subtitle, /已恢复/)
+  assert.equal(active.title, '账单导出修复'); assert.match(active.subtitle, /检查.*不可用/)
+  for (const request of submitted) {
+    assert.match(request.body, /会话记录.*读取.*失败/)
+    assert.match(request.body, /点击/)
+    assert.doesNotMatch(request.body, /来源：|主聊天：|执行：|EIO/)
+    assert.equal(request.body.includes(facts.sourceKey), false)
+    assert.equal(request.metadata.sourceKey, facts.sourceKey)
+  }
+  assert.match((await f.core.nativeNotificationRecords({ sourceKey: facts.sourceKey })).records[0].body, /EIO/, 'diagnostic detail retains the original safe error and identity')
+})
+
+test('an older Core and private chat labels retain a useful fallback without exposing old raw notification bodies', async t => {
+  let facts
+  const f = await fixture(t, { qualify: async () => ({ ...facts, projectEnabled: true, chatTitle: '支付回调验收'.repeat(100) + ' authorization: Bearer must-not-appear' }) }); facts = f.facts
+  await f.core.ingest(facts.sourceKey, { tasks: [{ id: 'A', lifecycleId: 'one', title: 'A', status: 'running' }] })
+  const claim = f.core.claimNotifications
+  f.core.claimNotifications = async (...args) => (await claim(...args)).map(({ presentation, ...notice }) => notice)
+  await f.fail('A'); await f.fail()
+  await f.delivery.refresh(facts)
+  const submitted = f.calls.filter(value => value.operation === 'submit')
+  assert.equal(submitted.find(value => value.metadata.mainId === 'A').title, '未命名聊天')
+  assert.equal(submitted.find(value => value.metadata.mainId === null).title, 'GhostSentinel')
+  for (const request of submitted) {
+    assert.doesNotMatch(JSON.stringify({ title: request.title, subtitle: request.subtitle, body: request.body }), /must-not-appear|来源：|主聊天：|EIO/)
+    assert.match(request.body, /故障|问题/)
+  }
+})
+
 test('background refresh does not request authorization or consume a denied first-failure notice; explicit authorization enables the original attempt', async t => {
   const f = await fixture(t, { authorization: 'denied' })
   await f.fail()

@@ -24,6 +24,10 @@ private func metadata(_ value: Any?) -> [String: Any]? {
     if value["mainId"] is NSNull && !(value["lifecycleId"] is NSNull) { return nil }
     return value
 }
+private func chatURL(_ value: Any?) -> URL? {
+    guard let text = value as? String, text.utf8.count == 36, let id = UUID(uuidString: text) else { return nil }
+    return URL(string: "codex://threads/" + id.uuidString.lowercased())
+}
 private func authorization(_ status: UNAuthorizationStatus) -> String {
     switch status {
     case .notDetermined: return "not-determined"
@@ -58,6 +62,9 @@ private final class Delegate: NSObject, NSApplicationDelegate, UNUserNotificatio
         else if response.actionIdentifier == UNNotificationDismissActionIdentifier { action = "dismiss" }
         else { return }
         try? actionJournal.append(["observationId": UUID().uuidString, "requestId": request.identifier, "action": action, "observedAt": clock(), "metadata": facts])
+        if action == "default", let url = chatURL(facts["mainId"]) {
+            DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+        }
     }
 }
 
@@ -86,7 +93,7 @@ private func snapshot(_ prefix: String, completion: @escaping ([String: Any]) ->
 private func execute(_ request: [String: Any]) {
     let operation = request["operation"] as? String ?? "invalid"
     guard request["schemaVersion"] as? Int == 1, let prefix = request["ownerPrefix"] as? String, prefixValid(prefix), Bundle.main.bundleIdentifier == identity else { reply(operation, error: "native_protocol"); return }
-    let fields: [String: Set<String>] = ["status": [], "authorize": [], "snapshot": [], "purge-installation": [], "submit": ["requestId", "title", "body", "metadata"], "cancel": ["requestIds"]]
+    let fields: [String: Set<String>] = ["status": [], "authorize": [], "snapshot": [], "purge-installation": [], "submit": ["requestId", "title", "subtitle", "body", "metadata"], "cancel": ["requestIds"]]
     guard let allowed = fields[operation], Set(request.keys).isSubset(of: allowed.union(["schemaVersion", "operation", "ownerPrefix"])) else { reply(operation, error: "native_protocol"); return }
     switch operation {
     case "status":
@@ -115,6 +122,8 @@ private func execute(_ request: [String: Any]) {
             }
         }
     case "submit":
+        let subtitle = request["subtitle"] as? String ?? ""
+        guard (request["subtitle"] == nil || request["subtitle"] is String), subtitle.count <= 200 else { reply(operation, error: "native_protocol"); return }
         guard let id = identifier(request["requestId"], maximum: 200), owned(id, prefix), let title = request["title"] as? String, !title.isEmpty, title.count <= 200, let body = request["body"] as? String, body.count <= 1200, let facts = metadata(request["metadata"]) else { reply(operation, error: "native_protocol"); return }
         settings { permission in
             guard ["authorized", "provisional"].contains(permission["authorization"] as? String ?? "") else { reply(operation, result: ["requestId": id, "accepted": false, "authorization": permission["authorization"] ?? "unknown", "observedAt": clock()]); return }
@@ -125,7 +134,7 @@ private func execute(_ request: [String: Any]) {
                 } catch { reply(operation, error: "native_protocol"); return }
                 let category = UNNotificationCategory(identifier: "GhostSentinelObservation", actions: [], intentIdentifiers: [], options: [.customDismissAction])
                 center.setNotificationCategories([category])
-                let content = UNMutableNotificationContent(); content.title = title; content.body = body; content.userInfo = facts; content.categoryIdentifier = category.identifier
+                let content = UNMutableNotificationContent(); content.title = title; content.subtitle = subtitle; content.body = body; content.userInfo = facts; content.categoryIdentifier = category.identifier
                 center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { error in
                     if error != nil { reply(operation, error: "native_submission") }
                     else { reply(operation, result: ["requestId": id, "accepted": true, "authorization": permission["authorization"] ?? "unknown", "observedAt": clock()]) }

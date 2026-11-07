@@ -144,7 +144,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const facts = { hostRunId: host?.hostRunId ?? null, appRunning: !closed && epoch === sourceEpoch && !hostGap(host), pluginEnabled: !closed && epoch === sourceEpoch && !gap, projectEnabled: null }
     if (!facts.appRunning || !facts.pluginEnabled || host.hostRunId !== notice.hostRunId || notice.mainId === null) return facts
     const proof = await qualify(notice.mainId, null, { host, projects: new Map() })
-    return { ...facts, projectEnabled: proof.source ? true : proof.gap === 'plugin-disabled' ? false : null }
+    return { ...facts, projectEnabled: proof.source ? true : proof.gap === 'plugin-disabled' ? false : null, chatTitle: proof.chatTitle }
   }
   function refreshNotifications(facts) {
     if (!delivery || closed) return
@@ -287,7 +287,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (enabled?.user !== 'enabled' || enabled?.effective !== 'enabled') return { gap: enabled?.user === 'disabled' || enabled?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed', scope: enabled?.user !== 'enabled' ? 'source' : 'task' }
     const source = { ...(collectMaterials && nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), path: thread.path, allowedRoot: nativeStorageRoot(thread.path, sessionsRoot, storageVersion), threadId: id, parentId: null, sourceKind: thread.source, originator: thread.originator, cwd: thread.cwd, forkedFromId: thread.forkedFromId ?? null, anchorTurnId: metadata.anchorTurnId ?? null, hostRunId: host.hostRunId, hostStartedAt: host.hostStartedAt, profile: host.profile }
     if (expected && fingerprint([source.path, source.cwd, source.sourceKind, source.originator, source.forkedFromId, source.hostRunId, source.hostStartedAt]) !== fingerprint([expected.path, expected.cwd, expected.sourceKind, expected.originator, expected.forkedFromId, expected.hostRunId, expected.hostStartedAt])) return { gap: 'source-generation-changed', scope: source.hostRunId !== expected.hostRunId ? 'source' : 'task' }
-    return { source }
+    return { source, chatTitle: [thread.name, thread.title, thread.preview].find(value => typeof value === 'string' && value.trim()) }
   }
 
   async function prepare(entry, context, epoch) {
