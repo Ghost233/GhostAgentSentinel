@@ -83,14 +83,17 @@ test('an independently consumed user request remains the only input when a later
   assert.deepEqual(view.recentLifecycle.map(event => event.type), ['task_started'])
 })
 
-test('unrecognized event types still stop an anchored reader with the same goal-shaped payload', async t => {
+test('unrecognized goal-shaped events emit gaps without consuming their payload as authority', async t => {
   for (const type of ['thread_goal_updated_extra', 'thread_goal_update', 'unknown_native_event']) await t.test(type, async t => {
-    const f = await fixture(t, [row(1, 'event_msg', { type: 'task_started', turn_id: 'current-run' }), row(2, 'event_msg', goal(type)), row(3, 'event_msg', { type: 'task_complete', turn_id: 'current-run' })])
+    const f = await fixture(t, [row(1, 'event_msg', { type: 'task_started', turn_id: 'current-run' }), row(2, 'event_msg', goal(type)), row(3, 'event_msg', { type: 'task_complete', turn_id: 'current-run' })], { mode: 'history' })
     const view = await f.reader.pump()
-    assert.equal(view.coverage, 'gap')
-    assert.equal(view.gap, 'unsupported-event-type:' + type)
-    assert.ok(view.offset < f.source.historyRange.endByteOffset)
-    assert.deepEqual(view.recentLifecycle.map(event => event.type), ['task_started'])
+    assert.equal(view.coverage, 'caught-up')
+    assert.equal(view.gap, null)
+    assert.equal(view.materials.length, 1); assert.equal(view.materials[0].kind, 'gap')
+    assert.match(view.materials[0].text, /unsupported-event-type:/)
+    assert.equal(view.offset, f.source.historyRange.endByteOffset)
+    assert.deepEqual(view.recentLifecycle.map(event => event.type), ['task_started', 'task_complete'])
+    assert.doesNotMatch(JSON.stringify(view.materials), /GOAL_IS_NOT_USER_AUTHORIZATION/)
   })
 })
 

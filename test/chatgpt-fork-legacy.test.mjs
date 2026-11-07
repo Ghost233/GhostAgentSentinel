@@ -59,10 +59,11 @@ async function fixture(t, { producer = ALPHA2, trigger = null, form = 'typed', h
   return { get core() { return core }, read, get calls() { return calls }, get maximumBytes() { return maximumBytes }, async caughtUp() { let view; for (let i = 0; i < 20; i++) { view = await read(); if (view.observation.coverage === 'caught-up' || view.observation.gap === 'core-capability-unavailable' || view.observation.gap === 'unsupported-host-version') break } return view }, async restart() { await adapter.close(); await core.close(); await server.close(); server = await startServer({ dataDir: join(dir, 'core'), now: () => clock }); core = await connectCore({ dataDir: join(dir, 'core') }); await openAdapter() }, advance(ms) { clock += ms }, async next() { clock += 10; const previous = turn; turn += '-next'; await fs.appendFile(path, row(ordinal++, 'event_msg', { type: 'task_complete', turn_id: previous }) + row(ordinal++, 'event_msg', start(turn, 'composer')) + row(ordinal++, 'event_msg', typed('fork', turn, 'Inspect another independent request'))); return read() } }
 }
 
-test('an exact historical alpha.2 producer remains user-unverified while the unchanged alpha.17.2 baseline retains typed context', async t => {
+test('historical user scope depends on typed attribution rather than producer version', async t => {
   for (const [name, options, users, unconfirmed] of [
     ['current-baseline', { producer: supportedProfile.cliVersion, trigger: 'composer' }, 1, 0],
     ['observed-alpha2-no-attribution', {}, 1, 1],
+    ['unlisted-trigger', { producer: 'future', trigger: 'future-trigger' }, 1, 0],
     ['alpha2-even-with-composer', { trigger: 'composer' }, 1, 0],
     ['alpha2-role-user-only', { form: 'role-user' }, 0, 0],
     ['alpha2-user-message-only', { form: 'user-message' }, 0, 0],
@@ -72,18 +73,18 @@ test('an exact historical alpha.2 producer remains user-unverified while the unc
     const task = (await f.core.snapshot()).tasks.find(task => task.lifecycleId === 'current'), receipt = task.events.find(event => event.data?.forkReceipt).data.forkReceipt
     assert.equal(task.currentRequest, 'Inspect independent current request'); assert.equal(task.events.find(event => event.kind === 'input' && !event.data.history).authorizationEligible, true)
     assert.equal(receipt.users, users); assert.equal(receipt.unconfirmed, unconfirmed)
-    if (name === 'current-baseline') { assert.equal(receipt.version, 1); assert.equal(Object.hasOwn(receipt, 'userProofMode'), false); assert.deepEqual(task.instructionContext.gaps, []); assert.equal(task.instructionContext.userLimitRefs.length, 1) }
+    if (options.trigger === 'composer') { assert.equal(receipt.version, 1); assert.equal(Object.hasOwn(receipt, 'userProofMode'), false); assert.deepEqual(task.instructionContext.gaps, []); assert.equal(task.instructionContext.userLimitRefs.length, 1) }
     else { assert.equal(receipt.version, 2); assert.equal(receipt.userProofMode, 'legacy-unverified'); assert.deepEqual(task.instructionContext.userLimitRefs, []); assert.ok(task.instructionContext.gaps.includes('fork_user_context_unverified')); assert.notEqual(view.signal, 'green'); assert.ok(task.events.filter(event => event.data?.history).every(event => event.authorizationEligible !== true)) }
   })
 })
 
-test('other historical versions, a changed current Host and an older core never silently consume the legacy semantics', async t => {
+test('unlisted versions retain unverified attribution while a core missing required capabilities cannot read', async t => {
   for (const [name, options] of [['unknown-alpha3', { producer: '0.162.0-alpha.3' }], ['current-host-alpha2', { host: { ...supportedProfile, cliVersion: ALPHA2 } }], ['missing-legacy-capability', { missingCapability: true }], ['missing-legacy-capability-modern', { producer: supportedProfile.cliVersion, trigger: 'composer', missingCapability: true }]]) await t.test(name, async t => {
     const f = await fixture(t, options), view = await f.caughtUp()
+    if (!name.startsWith('missing-legacy-capability')) { assert.equal(view.forkProvenance.complete, true); const task = (await f.core.snapshot()).tasks.find(task => task.lifecycleId === 'current'); assert.ok(task.instructionContext.gaps.includes('fork_user_context_unverified')); assert.notEqual(view.signal, 'green'); return }
     assert.notEqual(view.forkProvenance?.complete, true)
     assert.equal((await f.core.snapshot()).tasks.flatMap(task => task.events).some(event => event.data?.history), false)
     if (name.startsWith('missing-legacy-capability')) { assert.equal(view.observation.gap, 'core-capability-unavailable'); assert.equal(f.calls, 0); assert.equal(f.maximumBytes, 0) }
-    if (name === 'current-host-alpha2') { assert.equal(view.observation.gap, 'unsupported-host-version'); assert.equal(f.maximumBytes, 0) }
   })
 })
 
@@ -119,21 +120,13 @@ test('legacy ACK replay and core-adapter recovery preserve the semantic gap and 
 })
 
 
-test('v2 compressed legacy admission is exact and retains unverified user provenance for both observed legacy producers', async t => {
+test('compressed inherited user proof follows observed attribution across arbitrary producer versions', async t => {
   for (const [producer, form, trigger] of [[supportedProfile.cliVersion, 'typed', 'composer'], [ALPHA2, 'typed', null], ['0.160.1', 'typed', null], ['0.160.1', 'typed', 'composer'], ['0.160.1', 'role-user', null], ['0.160.1', 'user-message', null], ['0.160.2', 'typed', null]]) await t.test([producer, form, trigger].join(' / '), async t => {
     const f = await fixture(t, { producer, form, trigger, nativeOriginVersion: 2, compressed: true }), view = await f.caughtUp()
-    if (producer === '0.160.2') {
-      assert.notEqual(view.forkProvenance?.complete, true)
-      const task = (await f.core.snapshot()).tasks.find(task => task.lifecycleId === 'current')
-      assert.equal(task.currentRequest, 'Inspect independent current request')
-      assert.equal(task.events.filter(event => event.data.history).length, 0)
-      assert.deepEqual(task.instructionContext.userLimitRefs, []); assert.ok(task.instructionContext.gaps.length)
-      return
-    }
     assert.equal(view.observation.coverage, 'caught-up', JSON.stringify(view.observation)); assert.equal(view.forkProvenance.complete, true)
     const task = (await f.core.snapshot()).tasks.find(task => task.lifecycleId === 'current'), receipt = task.events.find(event => event.data?.forkReceipt).data.forkReceipt
     assert.equal(task.currentRequest, 'Inspect independent current request')
-    if (producer === supportedProfile.cliVersion) { assert.equal(receipt.version, 1); assert.equal(task.instructionContext.userLimitRefs.length, 1) }
+    if (form === 'typed' && trigger === 'composer') { assert.equal(receipt.version, 1); assert.equal(task.instructionContext.userLimitRefs.length, 1) }
     else { assert.equal(receipt.version, 2); assert.equal(receipt.userProofMode, 'legacy-unverified'); assert.equal(receipt.users, form === 'typed' ? 1 : 0); assert.equal(receipt.unconfirmed, form === 'typed' && !trigger ? 1 : 0); assert.ok(task.instructionContext.gaps.includes('fork_user_context_unverified')); assert.equal(task.instructionContext.userLimitRefs.length, 0); assert.notEqual(view.signal, 'green') }
     assert.ok(task.events.every(event => event.data.nativeGenerationKey))
     assert.ok(task.events.filter(event => event.data.history).every(event => event.authorizationEligible !== true))

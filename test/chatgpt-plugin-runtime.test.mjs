@@ -425,8 +425,8 @@ for (const loss of ['disabled', 'unknown', 'enablement-failed', 'host-lost', 'ge
       return { available: true, hostRunId: changed && loss === 'identity-unconfirmed' ? null : changed && loss === 'generation-changed' ? 'different-host' : 'host', hostStartedAt: changed && loss === 'start-time-unconfirmed' ? null : 1, profile: { appVersion: '26.1013.31256', appBuild: '20587', cliVersion: '0.163.0-alpha.10.2' } }
     },
     async readEnablement(cwd) { enablementReads++; assert.equal(cwd, null); if (changed && loss === 'enablement-failed') throw new Error('owned global configuration unavailable'); return { user: changed && ['disabled', 'unknown'].includes(loss) ? loss : 'enabled', effective: changed && ['disabled', 'unknown'].includes(loss) ? loss : 'enabled' } },
-    async listThreads() { materialReads++; assert.fail('an unsupported material profile cannot read the chat directory') },
-    async readThread() { materialReads++; assert.fail('an unsupported material profile cannot read a chat record') }, async close() {},
+    async listThreads() { materialReads++; return { data: [], nextCursor: null } },
+    async readThread() { materialReads++; return { thread: null } }, async close() {},
   }
   runtime = await startFromInstallation({ configPath: prepared.configPath, native, pollMs: 20, ownership: 'plugin' })
   await runtime.refresh()
@@ -436,20 +436,20 @@ for (const loss of ['disabled', 'unknown', 'enablement-failed', 'host-lost', 'ge
   assert.equal(health.runId, runtime.runId); assert.equal(health.ownership, 'plugin')
   const response = await fetch(runtime.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + config.token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'unverified-chat' } } }) })
   const view = (await response.json()).result.structuredContent
-  assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'unsupported-host-version')
-  assert.match(view.summary, /版本尚未适配.*材料采集已停止/)
+  assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'main-identity-unverified')
+  assert.match(view.summary, /无法确认当前观察/)
   assert.equal(view.identity.threadId, null, 'unsupported material does not claim a verified current chat')
   const reads = enablementReads
   for (let n = 0; enablementReads <= reads && n < 100; n++) await delay(5)
   assert.ok(enablementReads > reads, 'safe global eligibility checks continue with the same observer')
-  assert.equal(materialReads, 0)
-  await assert.rejects(stat(join(dir, 'core')), { code: 'ENOENT' })
+  assert.ok(materialReads > 0)
+  assert.equal((await stat(join(dir, 'core'))).isDirectory(), true)
   changed = true; await runtime.refresh()
   assert.deepEqual(await completed(runtime.closed), { reason: loss === 'disabled' ? 'plugin-disabled' : ['unknown', 'enablement-failed'].includes(loss) ? 'plugin-enablement-unconfirmed' : loss === 'generation-changed' ? 'source-generation-changed' : ['identity-unconfirmed', 'start-time-unconfirmed'].includes(loss) ? 'source-generation-unverified' : 'execution-source-unavailable' })
   await assert.rejects(stat(join(dir, 'adapter/runtime.lock')), { code: 'ENOENT' })
 })
 
-for (const notificationFailure of [false, true]) test(`an unsupported profile revokes an existing source and in-flight analysis while preserving its gray owner${notificationFailure ? ' and notification cleanup error' : ''}`, async t => {
+for (const notificationFailure of [false, true]) test(`version metadata changes retain the source and in-flight analysis${notificationFailure ? ' and notification cleanup error' : ''}`, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-plugin-profile-change-')), dataDir = join(dir, 'adapter')
   let runtime, profile = supportedProfile, enabled = true, modelReached, modelConnectionClosed = false, heldResponse, modelRequests = 0, materialReads = 0, notifierCancellations = 0, failNotifications = false
   const reached = new Promise(resolve => { modelReached = resolve })
@@ -483,9 +483,8 @@ for (const notificationFailure of [false, true]) test(`an unsupported profile re
   failNotifications = notificationFailure
   profile = { appVersion: '26.1013.31256', appBuild: '20587', cliVersion: '0.163.0-alpha.10.2' }
   await runtime.refresh()
-  assert.equal(runtime.diagnostics().closed, false); assert.equal(runtime.diagnostics().openReaders, 0)
-  for (let n = 0; !modelConnectionClosed && n < 100; n++) await delay(2)
-  assert.equal(modelConnectionClosed, true)
+  assert.equal(runtime.diagnostics().closed, false); assert.equal(runtime.diagnostics().openReaders, 1)
+  assert.equal(modelConnectionClosed, false, 'version diagnostics do not cancel an active model request')
   heldResponse.end(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '{"selectedOptionIds":[],"gaps":[]}' } }] }))
   const read = async () => {
     const response = await fetch(runtime.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + config.token, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'main' } } }) })
@@ -493,15 +492,14 @@ for (const notificationFailure of [false, true]) test(`an unsupported profile re
   }
   let view = await read()
   if (notificationFailure) for (let n = 0; view.notifications.errorCode !== 'native_unavailable' && n < 100; n++) { await delay(2); view = await read() }
-  assert.equal(view.signal, 'gray'); assert.equal(view.observation.gap, 'unsupported-host-version')
-  assert.match(view.summary, /版本尚未适配.*材料采集已停止/)
+  assert.equal(view.observation.gap, null); assert.equal(view.identity.threadId, 'main')
   assert.equal(view.notifications.errorCode, notificationFailure ? 'native_unavailable' : null)
-  assert.ok(notifierCancellations > 0)
-  assert.equal(materialReads, readCount, 'unsupported material never reaches directory or record metadata IO')
+  assert.equal(notifierCancellations, 0)
+  assert.ok(materialReads >= readCount, 'version diagnostics retain compatible metadata collection')
   assert.equal((await fetch(runtime.url + '/health', { headers: { authorization: 'Bearer ' + config.token } }).then(response => response.json())).runId, runtime.runId)
   const after = await client.snapshot(), retained = after.tasks.find(value => value.key === task.key)
-  assert.equal(after.sources.find(value => value.key === task.sourceKey).status, 'disconnected')
-  assert.deepEqual(retained.events, task.events); assert.equal(retained.analysis.completedAt, null); assert.equal(modelRequests, 1)
+  assert.equal(after.sources.find(value => value.key === task.sourceKey).status, 'connected')
+  assert.deepEqual(retained.events, task.events); assert.equal(retained.analysis.completedAt, null); assert.equal(modelRequests, 2)
   failNotifications = false; enabled = false; await runtime.refresh()
   assert.deepEqual(await completed(runtime.closed), { reason: 'plugin-disabled' })
 })

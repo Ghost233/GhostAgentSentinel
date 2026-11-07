@@ -20,7 +20,7 @@ test('one production helper serves 20 panel clients and reclaims 100 plugin cycl
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'controlled.sock'), pluginId: 'ghost-sentinel@resources' })
   const started = Date.now() - 10000, path = join(dir, 'main.jsonl')
   const line = (type, payload, index) => JSON.stringify({ type, timestamp: new Date(started + 2000 + index).toISOString(), payload }) + '\n'
-  await writeFile(path, line('session_meta', { id: 'resource-main', cli_version: supportedProfile.cliVersion }, 0)
+  await writeFile(path, line('session_meta', { id: 'resource-main', cli_version: supportedProfile.cliVersion, originator: 'Codex Desktop', source: 'vscode', cwd: dir }, 0)
     + line('event_msg', { type: 'task_started', turn_id: 'resource-turn', turn_attribution: { turn_id: 'resource-turn', turn_trigger: 'composer' } }, 1)
     + line('event_msg', { type: 'item_completed', thread_id: 'resource-main', turn_id: 'resource-turn', item: { type: 'UserMessage', id: 'resource-input', content: [{ type: 'text', text: 'Observe this resource fixture only' }] } }, 2))
   const thread = { id: 'resource-main', parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', cwd: dir, path }

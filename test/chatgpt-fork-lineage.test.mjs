@@ -1015,8 +1015,9 @@ test('inheritance coverage restrictions do not become failure receipts while def
     let view
     for (let attempt = 0; attempt < 16; attempt++) { view = await f.read(F); if (view.inheritance?.gaps.some(gap => gap !== 'fork_context_pending')) break }
     assert.equal(view.currentFacts.request.text, 'Check this independent fork request')
-    assert.equal(view.inheritance.state, 'pending')
     const task = (await f.core.snapshot()).tasks.find(task => task.id === F), scope = { sourceKey: task.sourceKey, mainId: F, lifecycleId: 'F' }
+    if (kind === 'unsupported-producer') { assert.equal(view.forkProvenance.complete, true); assert.equal((await f.core.failureReceipts(scope)).receipts.length, 0); return }
+    assert.equal(view.inheritance.state, 'pending')
     const first = await f.core.failureReceipts(scope)
     const definite = ['transport', 'corrupt-frame'].includes(kind)
     assert.equal(first.receipts.length, Number(definite), JSON.stringify({ gaps: view.inheritance.gaps, failures: first.receipts }))

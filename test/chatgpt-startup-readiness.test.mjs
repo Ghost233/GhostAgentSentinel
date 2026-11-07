@@ -50,13 +50,13 @@ test('enabled initial qualification retains a real authenticated plugin runtime'
   assert.equal(runtime.diagnostics().closed, false); assert.equal(owner.present, true)
 })
 
-test('enabled unsupported profile retains a legal authenticated gray runtime', { timeout: 5000 }, async t => {
-  const own = await fixture(t, { async sampleHost() { return { ...host, profile: { ...supportedProfile, appBuild: 'unsupported-local-fixture' } } } }), runtime = await own.start()
+test('enabled unlisted version retains a legal runtime and uses actual metadata interfaces', { timeout: 5000 }, async t => {
+  const own = await fixture(t, { async sampleHost() { return { ...host, profile: { ...supportedProfile, appBuild: 'unlisted-local-fixture' } } }, async readThread() { return { thread: null } } }, { realCore: true }), runtime = await own.start()
   await runtime.refresh()
   const owner = await own.authenticatedOwner(), view = await own.grayView()
   t.diagnostic('[startup-readiness] ' + JSON.stringify({ scenario: 'unsupported-profile', startResolved: true, adapterClosed: runtime.diagnostics().closed, authenticatedOwner: owner.present, view, ...own.counts() }))
   assert.equal(runtime.diagnostics().closed, false); assert.equal(owner.present, true)
-  assert.deepEqual(view, { signal: 'gray', gap: 'unsupported-host-version' }); assert.equal(own.counts().materialReads, 0)
+  assert.deepEqual(view, { signal: 'gray', gap: 'main-identity-unverified' }); assert.ok(own.counts().materialReads > 0)
 })
 
 for (const state of ['disabled', 'unknown', 'host-unavailable']) test(`initial ${state} must not publish ready after qualification has already closed the adapter`, { timeout: 5000 }, async t => {

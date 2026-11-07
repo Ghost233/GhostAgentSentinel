@@ -3,7 +3,7 @@ import { none, isMany } from 'stream-chain/defs.js'
 import { sanitizeObservation } from '../src/privacy.mjs'
 
 const values = value => value === none ? [] : isMany(value) ? value.values : [value]
-const metadata = new Set(['type', 'timestamp', 'ordinal', 'payload.originator', 'payload.source', 'payload.cli_version', 'payload.cwd', 'payload.history_mode', 'payload.forked_from_id', 'payload.forked_from_ordinal_exclusive', 'payload.history_base.thread_id', 'payload.history_base.end_ordinal_exclusive', 'payload.history_base.end_byte_offset', 'payload.type', 'payload.id', 'payload.role', 'payload.turn_id', 'payload.root_turn_id', 'payload.thread_id', 'payload.call_id', 'payload.name', 'payload.item.type', 'payload.item.kind', 'payload.item.status', 'payload.item.action.type', 'payload.item.results.0.type', 'payload.item.id', 'payload.item.exit_code', 'payload.turn_attribution.turn_id', 'payload.turn_attribution.turn_trigger', 'payload.internal_chat_message_metadata_passthrough.turn_id'])
+const metadata = new Set(['type', 'timestamp', 'ordinal', 'payload.originator', 'payload.source', 'payload.cli_version', 'payload.cwd', 'payload.history_mode', 'payload.forked_from_id', 'payload.forked_from_ordinal_exclusive', 'payload.history_base.thread_id', 'payload.history_base.end_ordinal_exclusive', 'payload.history_base.end_byte_offset', 'payload.type', 'payload.id', 'payload.role', 'payload.turn_id', 'payload.root_turn_id', 'payload.thread_id', 'payload.call_id', 'payload.name', 'payload.item.type', 'payload.item.kind', 'payload.item.status', 'payload.item.action.type', 'payload.item.results.0.type', 'payload.item.id', 'payload.item.exit_code', 'payload.item.durationMs', 'payload.turn_attribution.turn_id', 'payload.turn_attribution.turn_trigger', 'payload.internal_chat_message_metadata_passthrough.turn_id'])
 const webSnippet = 'payload.item.results.0.snippet'
 const bodies = new Set(['payload.message', 'payload.arguments', 'payload.input', 'payload.output', 'payload.item.aggregated_output', 'payload.item.stdout', 'payload.item.stderr', webSnippet])
 const metadataContainers = new Set(['payload', 'payload.item', 'payload.item.action', 'payload.item.results', 'payload.item.results.0', 'payload.history_base', 'payload.turn_attribution', 'payload.internal_chat_message_metadata_passthrough'])
@@ -178,7 +178,13 @@ export function isWebSearchItem(row) {
 
 export const isWebResultOmitted = row => row.material.webResultsCount > 0 && row.material.fields['payload.item.results.0.type']?.text === 'text_result' && !row.material.webSnippetPresent
 
-export function materialRecord(row, turnId, recordStart, recordEnd, turnTrigger) {
+export function isClockSleepItem(row) {
+  const fields = row.material.fields, duration = Number(fields['payload.item.durationMs']?.text)
+  return row.type === 'event_msg' && row.payload.type === 'item_completed' && fields['payload.item.type']?.text === 'Extension' && fields['payload.item.kind']?.text === 'clock.sleep' && Number.isSafeInteger(duration) && duration >= 0 && duration <= 43200000
+}
+
+export function materialRecord(row, turnId, recordStart, recordEnd, turnTrigger, gapReason = null) {
+  if (gapReason) return { recordStart, recordEnd, turnId, at: Number.isFinite(Date.parse(row.timestamp)) ? Date.parse(row.timestamp) : null, kind: 'gap', text: '存在未识别的原生事件，材料覆盖有缺口：' + gapReason, data: { nativeType: 'unsupported/' + gapReason.split(':')[0], sourceKind: 'chatgpt-native', sourceForm: 'native-record', runId: turnId, truncated: true, verificationGaps: [gapReason] } }
   const itemType = row.material.fields['payload.item.type']?.text
   const completed = row.type === 'event_msg' && row.payload.type === 'item_completed'
   const producer = completed && itemType === 'UserMessage'
@@ -187,7 +193,8 @@ export function materialRecord(row, turnId, recordStart, recordEnd, turnTrigger)
   const mcpResult = completed && itemType === 'McpToolCall'
   const agentOutput = completed && itemType === 'AgentMessage'
   const webResult = completed && isWebSearchItem(row)
-  if (row.type !== 'response_item' && !producer && !commandResult && !fileResult && !mcpResult && !agentOutput && !webResult) return null
+  const sleepResult = completed && isClockSleepItem(row)
+  if (row.type !== 'response_item' && !producer && !commandResult && !fileResult && !mcpResult && !agentOutput && !webResult && !sleepResult) return null
   const payload = row.payload
   const data = { nativeType: 'response_item/' + payload.type, sourceKind: 'chatgpt-native', sourceForm: 'response_item/' + payload.type, runId: row.material.turnId ?? turnId }
   let kind, capture
@@ -209,6 +216,13 @@ export function materialRecord(row, turnId, recordStart, recordEnd, turnTrigger)
     const itemId = row.material.fields['payload.item.id']?.text
     if (itemId) data.callId = 'native-item:' + itemId
     if (row.material.webResultsCount > 1) data.truncated = true
+  } else if (sleepResult) {
+    if (payload.turn_id !== turnId) return null
+    kind = 'tool-result'
+    capture = { text: '等待工具已返回，设定时长 ' + row.material.fields['payload.item.durationMs'].text + ' 毫秒', truncated: false }
+    Object.assign(data, { nativeType: 'item_completed/Extension/clock.sleep', sourceForm: 'event_msg/item_completed', runId: payload.turn_id, toolName: 'clock.sleep' })
+    const itemId = row.material.fields['payload.item.id']?.text
+    if (itemId) data.callId = 'native-item:' + itemId
   } else if (mcpResult) {
     if (payload.turn_id !== turnId) return null
     kind = 'gap'

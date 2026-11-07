@@ -75,3 +75,17 @@ test('production native IO qualifies actual app-server facts and readonly metada
   await adapter.close()
   assert.deepEqual(native.diagnostics(), { closed: true, pendingRequests: 0, deadlineTimers: 0, connected: false })
 })
+
+test('version diagnostics can fail while actual App ownership remains verified', async t => {
+  const native = createNativeIO({ pluginId: 'sentinel@test', profileSample: async () => { throw new Error('version metadata unavailable') }, processSample: async () => [{ pid: 11, ppid: 1, command: app, started: 'Sat Nov  7 05:50:27 2026' }, { pid: 12, ppid: 11, command: nativePath + ' app-server', started: 'Sat Nov  7 05:50:27 2026' }], metadataClient: { async close() {} } })
+  t.after(() => native.close())
+  const host = await native.sampleHost()
+  assert.equal(host.available, true); assert.equal(host.profile, null)
+  assert.match(host.hostRunId, /^12:/)
+})
+
+test('turn metadata capability is checked by response structure', async t => {
+  const native = createNativeIO({ pluginId: 'sentinel@test', metadataClient: { async request(method) { return method === 'thread/read' ? { thread: { id: 'main', parentThreadId: null, source: 'vscode', originator: 'Codex Desktop' } } : { data: { id: 'not-a-page' } } }, async close() {} } })
+  t.after(() => native.close())
+  await assert.rejects(native.readThread('main'), { code: 'metadata-invalid-response' })
+})

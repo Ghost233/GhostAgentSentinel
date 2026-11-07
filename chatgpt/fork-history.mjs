@@ -2,8 +2,8 @@ import fs from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { NativeJsonlSource, nativeStorageKey } from './native-jsonl-source.mjs'
 import { BoundedReader } from './bounded-reader.mjs'
-import { supportsStorageProducer } from './storage-compatibility.mjs'
-import { emptyForkProof, foldForkProof, forkGeneration, receiptIdentity, validForkProof, nativeRecordIdentity, FORK_LINEAGE_FRAMES, FORK_LEGACY_PRODUCER, FORK_LEGACY_MODE, isLegacyForkProducer } from '../src/fork-proof.mjs'
+import { supportsRecordHeader } from './storage-compatibility.mjs'
+import { emptyForkProof, foldForkProof, forkGeneration, receiptIdentity, validForkProof, nativeRecordIdentity, FORK_LINEAGE_FRAMES, FORK_LEGACY_MODE } from '../src/fork-proof.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 
 const MAX_DEPTH = FORK_LINEAGE_FRAMES
@@ -248,7 +248,7 @@ export class ForkHistoryReader {
       }
       if (resolution.phase === 'header' && view.header) {
         const header = view.header
-        const matches = header.threadId === resolution.metadata.record.id && header.originator === 'Codex Desktop' && header.sourceKind === resolution.metadata.record.source && supportsStorageProducer(header.cliVersion) && header.ordinal < base.endOrdinalExclusive
+        const matches = supportsRecordHeader(probe.source, header) && header.threadId === resolution.metadata.record.id && header.originator === 'Codex Desktop' && header.sourceKind === resolution.metadata.record.source && header.ordinal < base.endOrdinalExclusive
         if (matches) {
           await this.producerProject(header.cwd); budget.projects.add(header.cwd)
           const source = { ...probe.source, cwd: header.cwd }
@@ -300,7 +300,7 @@ export class ForkHistoryReader {
   receipt(node) {
     const base = node.reader.forkProvenance?.historyBase
     if (!base || !node.parent) return null
-    const legacy = isLegacyForkProducer(node.parent.reader.header.cliVersion)
+    const legacy = node.parent.proof.unconfirmed > 0 || !['composer', 'edit_user_message'].includes(node.parent.proof.start?.trigger)
     const receipt = { version: legacy ? 2 : 1, ownerGeneration: this.generation(node), generation: this.generation(node.parent), beginOrdinal: node.parent.reader.header.ordinal, endOrdinalExclusive: base.endOrdinalExclusive, endByteOffset: base.endByteOffset, users: node.parent.proof.users, digest: node.parent.proof.digest, unconfirmed: node.parent.proof.unconfirmed, parentId: this.receipt(node.parent)?.id ?? null, overBudget: node.parent.proof.overBudget, ...(legacy ? { userProofMode: FORK_LEGACY_MODE } : {}) }
     receipt.id = receiptIdentity(receipt, node.source.threadId, base.sourceThreadId, node.parent.source.threadId)
     return receipt
@@ -456,7 +456,6 @@ export class ForkHistoryReader {
     if (this.closed || this.gap) return this.view()
     if (options.available === false) { this.temporarilyUnavailable = true; return this.view({}, 'source-unavailable') }
     if (options.hostRunId !== undefined && options.hostRunId !== this.source.hostRunId) { this.gap = 'source-generation-changed'; return this.view() }
-    if (options.profile && ['appVersion', 'appBuild', 'cliVersion'].some(key => options.profile[key] !== this.source.profile[key])) { this.gap = 'unsupported-host-version'; return this.view() }
     if (this.busy) return { ...this.view(), coverage: 'catching-up', effectivePhase: 'unknown', gap: 'reader-busy' }
     this.busy = (async () => {
       const previous = this.checkpoint()

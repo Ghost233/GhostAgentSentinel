@@ -129,7 +129,7 @@ test('a truncated record closes observation instead of retaining running state',
   assert.equal((await f.core.snapshot()).tasks[0].status, 'unknown')
 })
 
-test('an execution-source change and unsupported host version never reuse old live state', async t => {
+test('an execution-source change remains fenced after diagnostic version metadata changes', async t => {
   const f = await fixture(t)
   assert.equal((await f.call({ thread_id: 'main-a' })).data.result.structuredContent.observation.status, 'running')
   f.facts.host.hostRunId = 'test-native:new-generation'
@@ -138,7 +138,7 @@ test('an execution-source change and unsupported host version never reuse old li
   assert.equal(changed.observation.status, 'unknown')
   f.facts.host.profile.appBuild = 'unverified-build'
   const unknown = (await f.call({ thread_id: 'main-a' })).data.result.structuredContent
-  assert.equal(unknown.observation.gap, 'unsupported-host-version')
+  assert.equal(unknown.observation.gap, 'cursor-invalid')
   assert.equal(unknown.observation.status, 'unknown')
   assert.equal(f.adapter.diagnostics().openReaders, 0)
 })

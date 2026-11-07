@@ -8,7 +8,6 @@ import { zstdCompressSync } from 'node:zlib'
 import { createHash } from 'node:crypto'
 import { BoundedReader, supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { ForkHistoryReader } from '../chatgpt/fork-history.mjs'
-import { supportsHostProfile } from '../chatgpt/storage-compatibility.mjs'
 import { createServer } from 'node:http'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
@@ -64,13 +63,13 @@ test('the exact candidate Host reads fixed current-producer main shapes without 
   assert.equal(command.data.callId, 'native-item:command')
 })
 
-test('an admitted Host does not admit an unknown or missing storage producer', async t => {
-  for (const producer of ['0.163.0-alpha.10.3', '0.162.0-alpha.3', null]) await t.test(String(producer), async t => {
-    const f = await fixture(t, { producer, records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Must remain unread')) })
+test('record structure admits unlisted or absent producer version metadata', async t => {
+  for (const producer of ['future-producer', '0.163.0-alpha.10.3', null]) await t.test(String(producer), async t => {
+    const f = await fixture(t, { producer, records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Verified by structure')) })
     const result = await collect(f.open())
-    assert.equal(result.view.gap, 'record-producer-unverified')
-    assert.equal(result.view.effectivePhase, 'unknown')
-    assert.deepEqual(result.materials, []); assert.deepEqual(result.lifecycle, [])
+    assert.equal(result.view.gap, null)
+    assert.equal(result.view.effectivePhase, 'started')
+    assert.equal(result.materials[0].text, 'Verified by structure')
   })
 })
 
@@ -165,43 +164,35 @@ test('the candidate Host reads a mixed old-producer ancestor and current-produce
   assert.equal(Object.hasOwn(result.boundaries[0].data.forkReceipt, 'userProofMode'), false)
 })
 
-test('an unknown stored item stops at a hashed coverage gap without claiming user, activity, or native body identity', async t => {
-  const f = await fixture(t, { records: row(1, 'event_msg', start('turn'))
-    + row(2, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item: { type: 'SyntheticOpaqueItem', kind: 'opaque', query: 'private-unapproved-query', action: { text: 'private-unapproved-action' }, results: ['private-unapproved-result'] } })
-    + row(3, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item: { type: 'Reasoning', summary: ['private-reasoning'] } }) })
-  const result = await collect(f.open())
-  const typeHash = createHash('sha256').update(JSON.stringify('SyntheticOpaqueItem')).digest('hex')
-  assert.equal(result.view.gap, 'unsupported-item-type:' + typeHash)
-  assert.equal(result.view.effectivePhase, 'unknown'); assert.deepEqual(result.materials, [])
-  assert.doesNotMatch(JSON.stringify(result), /SyntheticOpaqueItem|private-unapproved|private-reasoning/)
-})
-
-test('an unknown typed item start cannot be skipped by a later known execution end', async t => {
-  const f = await fixture(t, { records: row(1, 'event_msg', start('turn'))
-    + row(2, 'event_msg', user(owner, 'turn', 'Inspect only the synthetic request'))
-    + row(3, 'event_msg', { type: 'item_started', thread_id: owner, turn_id: 'turn', item: { type: 'SyntheticOpaqueItem', query: 'unverified-start-body' } })
-    + row(4, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
-  const reader = f.open(), result = await collect(reader)
-  const typeHash = createHash('sha256').update(JSON.stringify('SyntheticOpaqueItem')).digest('hex')
-  assert.equal(result.view.gap, 'unsupported-item-type:' + typeHash)
-  assert.equal(result.view.coverage, 'gap'); assert.equal(result.view.effectivePhase, 'unknown')
-  assert.deepEqual(result.lifecycle.map(event => event.type), ['task_started'])
-  assert.deepEqual(result.materials.map(event => event.kind), ['input'])
-  assert.doesNotMatch(JSON.stringify(result), /SyntheticOpaqueItem|unverified-start-body/)
-  const checkpoint = JSON.parse(JSON.stringify(reader.checkpoint())); await reader.close()
-  const restored = await collect(f.open({}, checkpoint))
-  assert.equal(restored.view.effectivePhase, 'unknown'); assert.equal(restored.view.gap, 'cursor-retains-gap')
-  assert.deepEqual(restored.materials, []); assert.deepEqual(restored.lifecycle, [])
+test('unknown item records emit bounded gaps and retain later known lifecycle without leaking bodies', async t => {
+  for (const type of ['item_started', 'item_completed']) await t.test(type, async t => {
+    const f = await fixture(t, { records: row(1, 'event_msg', start('turn'))
+      + row(2, 'event_msg', user(owner, 'turn', 'Inspect only the synthetic request'))
+      + row(3, 'event_msg', { type, thread_id: owner, turn_id: 'turn', item: { type: 'SyntheticOpaqueItem', query: 'unverified-start-body' } })
+      + row(4, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
+    const reader = f.open(), result = await collect(reader)
+    const typeHash = createHash('sha256').update(JSON.stringify('SyntheticOpaqueItem')).digest('hex')
+    assert.equal(result.view.coverage, 'caught-up'); assert.equal(result.view.effectivePhase, 'completed')
+    assert.deepEqual(result.lifecycle.map(event => event.type), ['task_started', 'task_complete'])
+    assert.deepEqual(result.materials.map(event => event.kind), ['input', 'gap'])
+    assert.deepEqual(result.materials[1].data.verificationGaps, ['unsupported-item-type:' + typeHash])
+    assert.doesNotMatch(JSON.stringify(result), /SyntheticOpaqueItem|unverified-start-body/)
+    const checkpoint = JSON.parse(JSON.stringify(reader.checkpoint())); await reader.close()
+    const restored = await collect(f.open({}, checkpoint))
+    assert.equal(restored.view.effectivePhase, 'completed'); assert.equal(restored.view.gap, null)
+    assert.deepEqual(restored.materials, []); assert.deepEqual(restored.lifecycle, [])
+  })
 })
 
 test('typed item starts retain missing-type gaps and do not invent activity for known reasoning or command items', async t => {
-  for (const [name, item, rejected] of [['missing-item', undefined, true], ['missing-type', {}, true], ['unknown-type', { type: 'SyntheticOpaqueItem' }, true], ['known-reasoning', { type: 'Reasoning', summary: ['private-started-reasoning'] }, false], ['known-command', { type: 'CommandExecution', aggregated_output: 'uncompleted-command-is-not-a-result', exit_code: 0 }, false]]) await t.test(name, async t => {
+  for (const [name, item, rejected] of [['missing-item', undefined, true], ['missing-type', {}, true], ['unknown-type', { type: 'SyntheticOpaqueItem' }, false], ['known-reasoning', { type: 'Reasoning', summary: ['private-started-reasoning'] }, false], ['known-command', { type: 'CommandExecution', aggregated_output: 'uncompleted-command-is-not-a-result', exit_code: 0 }, false]]) await t.test(name, async t => {
     const f = await fixture(t, { records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Inspect only the synthetic request'))
       + row(3, 'event_msg', { type: 'item_started', thread_id: owner, turn_id: 'turn', ...(item ? { item } : {}) })
       + row(4, 'event_msg', { type: 'item_started', thread_id: owner, turn_id: 'turn', item: { type: 'CommandExecution', aggregated_output: 'later-start-is-not-a-result', exit_code: 0 } })
       + row(5, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
     const result = await collect(f.open())
-    assert.deepEqual(result.materials.map(event => [event.kind, event.text]), [['input', 'Inspect only the synthetic request']])
+    assert.deepEqual(result.materials.filter(event => event.kind !== 'gap').map(event => [event.kind, event.text]), [['input', 'Inspect only the synthetic request']])
+    assert.equal(result.materials.filter(event => event.kind === 'gap').length, name === 'unknown-type' ? 1 : 0)
     assert.doesNotMatch(JSON.stringify(result), /private-started-reasoning|uncompleted-command-is-not-a-result|later-start-is-not-a-result|SyntheticOpaqueItem/)
     if (rejected) {
       const typeHash = createHash('sha256').update(JSON.stringify(item?.type ?? null)).digest('hex')
@@ -239,15 +230,12 @@ test('object-array tool output stops at an explicit shape gap without reserving 
   assert.doesNotMatch(JSON.stringify(result), /Unverified array text|PRIVATE-ARRAY-TOKEN|opaque|authorization/)
 })
 
-test('Host admission requires exact string fields instead of coercing similar or unknown profiles', async t => {
-  assert.equal(supportsHostProfile(supportedProfile), true)
-  assert.equal(supportsHostProfile(currentHost), true)
-  for (const profile of [null, {}, { ...currentHost, appBuild: 20586 }, { ...currentHost, appVersion: [currentHost.appVersion] }, { ...currentHost, appBuild: '20587' }, { ...currentHost, cliVersion: '0.163.0-alpha.10.3' }]) {
+test('host version metadata does not control structural admission', async t => {
+  for (const profile of [null, {}, { ...currentHost, appBuild: 20586 }, { ...currentHost, appVersion: [currentHost.appVersion] }, { ...currentHost, appBuild: '20587' }, { ...currentHost, cliVersion: 'future-cli' }]) {
     const f = await fixture(t, { profile, records: row(1, 'event_msg', start('turn')) })
-    assert.equal(supportsHostProfile(profile), false)
     const result = await collect(f.open())
-    assert.equal(result.view.gap, 'unsupported-host-version'); assert.equal(result.view.readBytes, 0)
-    assert.deepEqual(result.materials, []); assert.deepEqual(result.lifecycle, [])
+    assert.equal(result.view.gap, null); assert.equal(result.view.effectivePhase, 'started')
+    assert.deepEqual(result.lifecycle.map(event => event.type), ['task_started'])
   }
 })
 
@@ -269,16 +257,16 @@ test('candidate plain and zstd reads keep both byte budgets, native identities, 
   assert.doesNotMatch(JSON.stringify(restored) + JSON.stringify(checkpoint), /hidden-reasoning/)
 })
 
-test('old producer progress is retained within one Host profile and explicitly refuses cross-profile migration', async t => {
+test('old producer progress is retained when only diagnostic version metadata changes', async t => {
   const f = await fixture(t, { producer: supportedProfile.cliVersion, profile: supportedProfile, records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Old producer request')) })
   const old = f.open(), first = await collect(old), checkpoint = JSON.parse(JSON.stringify(old.checkpoint())), retained = structuredClone(checkpoint)
   assert.equal(first.view.coverage, 'caught-up'); assert.ok(checkpoint.offset > 0); await old.close()
   const restored = await collect(f.open({}, checkpoint))
   assert.equal(restored.view.coverage, 'caught-up'); assert.deepEqual(restored.materials, []); assert.deepEqual(restored.lifecycle, [])
   const changed = await collect(f.open({ profile: currentHost }, checkpoint))
-  assert.equal(changed.view.gap, 'cursor-invalid'); assert.equal(changed.view.readBytes, 0)
+  assert.equal(changed.view.gap, null); assert.ok(changed.view.readBytes <= 1024)
   assert.deepEqual(changed.materials, []); assert.deepEqual(changed.lifecycle, [])
-  assert.deepEqual(checkpoint, retained, 'the rejected checkpoint is not rewritten or migrated')
+  assert.deepEqual(checkpoint, retained, 'the retained checkpoint is not rewritten')
   const independentlyVerified = await collect(f.open({ profile: currentHost }))
   assert.equal(independentlyVerified.view.coverage, 'caught-up')
   assert.deepEqual(independentlyVerified.materials.map(event => event.data.nativeRecordId), first.materials.map(event => event.data.nativeRecordId))
@@ -363,8 +351,9 @@ test('Host recovery still rejects a missing origin, wrong storage identity, chan
     const changes = { hostRunId: 'next-host', hostStartedAt: at + 1000, ...(failure === 'foreign-chat' ? { threadId: 'foreign-chat' } : {}), ...(failure === 'unknown-profile' ? { profile: { ...currentHost, appBuild: 'unverified-build' } } : {}) }
     const restored = f.open(changes, saved, { origins: { async read(key) { return failure === 'missing-origin' ? null : { key, headerHash: failure === 'wrong-header' ? 'f'.repeat(64) : proof.headerHash, prefix: { ...proof.next, ...(failure === 'short-prefix' ? { offset: 0 } : {}) }, revision: 1 } } } })
     const result = await collect(restored)
+    if (failure === 'unknown-profile') { assert.equal(result.view.coverage, 'caught-up'); assert.equal(result.view.gap, null); assert.deepEqual(result.materials, []); return }
     assert.equal(result.view.coverage, 'gap')
-    assert.equal(result.view.gap, failure === 'rewritten-prefix' ? 'native_origin_prefix_changed' : failure === 'unknown-profile' ? 'unsupported-host-version' : 'cursor-invalid')
+    assert.equal(result.view.gap, failure === 'rewritten-prefix' ? 'native_origin_prefix_changed' : 'cursor-invalid')
     assert.equal(result.view.effectivePhase, 'unknown')
     assert.deepEqual(result.materials, []); assert.deepEqual(result.lifecycle, [])
   })
@@ -392,15 +381,15 @@ test('a recovered old running cursor stays unknown until a new Host execution is
   assert.deepEqual(inputs, ['New Host input'])
 })
 
-test('a live reader does not accept a different admitted Host or a changed profile reference', async t => {
+test('a live reader keeps verified progress when only version metadata changes', async t => {
   const f = await fixture(t, { profile: { ...currentHost }, records: row(1, 'event_msg', start('turn')) }), explicit = f.open()
   await collect(explicit)
   const other = await explicit.pump({ profile: supportedProfile })
-  assert.equal(other.gap, 'unsupported-host-version'); assert.equal(other.readBytes, 0)
+  assert.equal(other.gap, null); assert.equal(other.readBytes, 0)
   const mutable = f.open(); await collect(mutable)
   Object.assign(f.source.profile, supportedProfile)
   const mutated = await mutable.pump()
-  assert.equal(mutated.gap, 'unsupported-host-version'); assert.equal(mutated.readBytes, 0)
+  assert.equal(mutated.gap, null); assert.equal(mutated.readBytes, 0)
 })
 
 test('a metadata-only native checkpoint revalidates its real producer without requiring a material header in the cursor', async t => {
@@ -412,23 +401,23 @@ test('a metadata-only native checkpoint revalidates its real producer without re
   assert.deepEqual(resumed.lifecycle, [])
 })
 
-test('new and old producers retain modern receipts while both exact legacy ancestor producers retain their legacy proof mode', async t => {
+test('receipt proof mode follows typed structure instead of producer version', async t => {
   for (const [producer, childProducer, compressed] of [[currentHost.cliVersion, supportedProfile.cliVersion, true], ['0.162.0-alpha.2', currentHost.cliVersion, false], ['0.160.1', currentHost.cliVersion, true]]) await t.test(producer, async t => {
     const f = await forkFixture(t, producer, { childProducer, compressed }), result = await f.collect()
     assert.equal(result.view.coverage, 'caught-up', JSON.stringify({ gap: result.view.gap, historyGap: result.view.historyGap }))
     assert.equal(result.view.forkProvenance.complete, true)
     const receipt = result.boundaries[0].data.forkReceipt
-    if (producer === currentHost.cliVersion) { assert.equal(receipt.version, 1); assert.equal(Object.hasOwn(receipt, 'userProofMode'), false) }
-    else { assert.equal(receipt.version, 2); assert.equal(receipt.userProofMode, 'legacy-unverified') }
+    assert.equal(receipt.version, 1); assert.equal(Object.hasOwn(receipt, 'userProofMode'), false)
     assert.equal(receipt.users, 1); assert.equal(receipt.unconfirmed, 0)
     assert.ok(result.history.every(event => event.data.history === true && event.data.inherited === true))
   })
 })
 
-test('an unknown ancestor producer never releases inherited bodies or marks the fork complete', async t => {
+test('an unlisted ancestor producer releases only structurally verified inherited material', async t => {
   const f = await forkFixture(t, '0.163.0-alpha.999'), result = await f.collect()
-  assert.notEqual(result.view.forkProvenance.complete, true)
-  assert.deepEqual(result.history, []); assert.deepEqual(result.boundaries, [])
+  assert.equal(result.view.forkProvenance.complete, true)
+  assert.ok(result.history.some(event => event.text === 'Keep the synthetic inherited limit'))
+  assert.equal(result.boundaries.length, 1)
   assert.deepEqual(result.materials.map(event => event.text), ['Inspect the independent synthetic fork'])
 })
 
@@ -516,18 +505,20 @@ test('strict material gaps reach the real Core HTTP chain and cannot let a known
     await fs.appendFile(f.path, unsupported + row(5, 'event_msg', { type: 'task_complete', turn_id: 'turn' }))
     let view
     for (let attempt = 0; attempt < 20; attempt++) { view = await f.read(); if (view.observation.gap?.startsWith('unsupported-')) break }
+    const unknownType = ['unknown-item', 'unknown-started-item'].includes(kind)
     assert.equal(view.signal, 'gray'); assert.notEqual(view.observation.coverage, 'caught-up')
     assert.match(view.observation.gap, kind === 'array-output' ? /^unsupported-tool-result-shape$/ : /^unsupported-item-type:[a-f0-9]{64}$/)
     let after = (await f.core.snapshot()).tasks[0]
-    assert.equal(after.status, 'unknown'); assert.equal(after.coverage.complete, false); assert.notEqual(after.gs.light, 'green')
-    assert.equal(after.lastActivity, original.lastActivity)
-    assert.deepEqual(after.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence]), captures)
-    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, retained)
-    assert.doesNotMatch(JSON.stringify(after.events), /Do not retain|SyntheticOpaqueItem|task_complete/)
+    assert.equal(after.status, unknownType ? 'idle' : 'unknown'); assert.equal(after.coverage.complete, false); assert.notEqual(after.gs.light, 'green')
+    if (!unknownType) assert.equal(after.lastActivity, original.lastActivity)
+    assert.deepEqual(after.events.slice(0, captures.length).map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence]), captures)
+    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, retained + (unknownType ? 2 : 0))
+    assert.doesNotMatch(JSON.stringify(after.events), /Do not retain|SyntheticOpaqueItem/)
+    const allCaptures = after.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence])
     await f.reopen(); view = await f.read(); after = (await f.core.snapshot()).tasks[0]
     assert.equal(view.signal, 'gray'); assert.equal(after.coverage.complete, false)
-    assert.deepEqual(after.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence]), captures)
-    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, retained)
-    assert.equal(after.events.some(event => event.data.nativeType === 'task_complete'), false)
+    assert.deepEqual(after.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence]), allCaptures)
+    assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, retained + (unknownType ? 2 : 0))
+    assert.equal(after.events.some(event => event.data.nativeType === 'task_complete'), unknownType)
   })
 })

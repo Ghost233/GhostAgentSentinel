@@ -1,5 +1,5 @@
 // Metadata-only is the default; material mode shares the same bounded physical read.
-import { MaterialProjection, materialRecord, isWebSearchItem, isWebResultOmitted } from './material-projection.mjs';
+import { MaterialProjection, materialRecord, isWebSearchItem, isWebResultOmitted, isClockSleepItem } from './material-projection.mjs';
 import { jsonParser } from 'stream-json/core/parser.js';
 import filter from 'stream-json/core/filters/filter.js';
 import stringer from 'stream-json/core/stringer.js';
@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { NativeJsonlSource, nativeStorageKey } from './native-jsonl-source.mjs';
 import { nativeRecordIdentity } from '../src/fork-proof.mjs';
 import { headerIdentity, normalizeNativePrefix } from '../src/native-origin.mjs';
-import { supportedProfile, hostProfiles, supportsHostProfile, supportsStorageProducer, hostProfileKey as profileKey } from './storage-compatibility.mjs';
+import { legacyHostProfiles, supportsRecordHeader, hostProfileKey as profileKey } from './storage-compatibility.mjs';
 
 const values = value => value === none ? [] : isMany(value) ? value.values : [value];
 const fields = /^(?:type|timestamp|ordinal|payload\.(?:type|turn_id|root_turn_id|thread_id|id|originator|source|cli_version|cwd|history_mode|forked_from_id|forked_from_ordinal_exclusive)|payload\.history_base\.(?:thread_id|end_ordinal_exclusive|end_byte_offset))$/;
@@ -86,7 +86,6 @@ const materialItems = new Set(['UserMessage', 'AgentMessage', 'CommandExecution'
 const sourceIoCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'EIO', 'ENOTDIR', 'ELOOP', 'EMFILE', 'ENFILE', 'EBADF']);
 
 const nativeHeader = row => ({ threadId: row.payload.id, ordinal: row.ordinal, originator: row.payload.originator, sourceKind: row.payload.source, cliVersion: row.payload.cli_version, historyMode: row.payload.history_mode, cwd: row.payload.cwd, creationSourceThreadId: row.payload.forked_from_id ?? null, historyBase: row.payload.history_base ? { sourceThreadId: row.payload.history_base.thread_id, endOrdinalExclusive: row.payload.history_base.end_ordinal_exclusive, endByteOffset: row.payload.history_base.end_byte_offset } : null });
-const producerAllowed = (source, version) => supportsStorageProducer(version) || version === undefined && (source.nativeOriginVersion ?? 1) === 1 && profileKey(source.profile) === profileKey(supportedProfile);
 
 export class BoundedReader {
   constructor(source, cursor = null, { mode = 'metadata', forkSuffix = false, origins = null, scanOnly = false, terminalProof = cursor?.terminalProof ?? null, successorProof = cursor?.successorProof ?? null } = {}) {
@@ -95,13 +94,12 @@ export class BoundedReader {
     this.historyRange = this.historyMode ? source.historyRange : null; this.nextOrdinal = null; this.forkProvenance = null;
     this.source = source; this.nativeOriginVersion = source.nativeOriginVersion ?? 1;
     this.currentAnchorTurnId = source.anchorTurnId;
-    this.hostProfileKey = profileKey(source.profile);
     this.scanOnly = scanOnly; this.scanStart = null; this.coldScan = null; this.coldCheckpoint = null; this.terminalProof = terminalProof; this.successorProof = successorProof;
     this.originIdentity = this.nativeOriginVersion === 2 ? 'native-storage/2:' + nativeStorageKey(source.path) : null;
-    const binding = [this.nativeOriginVersion === 2 ? this.originIdentity : typeof source.path === 'string' ? resolve(source.path) : '', source.threadId, source.hostRunId, profileKey(source.profile), ...(this.ordinalMode ? [mode, source.forkedFromId ?? null, this.historyRange, this.nativeOriginVersion === 2 ? null : source.expectedFileId ?? null, source.expectedHeader ?? null] : [])];
+    const binding = [this.nativeOriginVersion === 2 ? this.originIdentity : typeof source.path === 'string' ? resolve(source.path) : '', source.threadId, source.hostRunId, 'record-schema/1', ...(this.ordinalMode ? [mode, source.forkedFromId ?? null, this.historyRange, this.nativeOriginVersion === 2 ? null : source.expectedFileId ?? null, source.expectedHeader ?? null] : [])];
     this.scope = digest(JSON.stringify(binding));
     this.storageScope = digest(JSON.stringify(binding.filter((_, index) => index !== 2 && (this.nativeOriginVersion !== 2 || index !== 3))));
-    const legacyStorageScope = this.nativeOriginVersion === 2 && cursor?.storageScope !== undefined && hostProfiles.some(profile => digest(JSON.stringify(binding.map((value, index) => index === 3 ? profileKey(profile) : value).filter((_, index) => index !== 2))) === cursor.storageScope);
+    const legacyStorageScope = this.nativeOriginVersion === 2 && cursor?.storageScope !== undefined && legacyHostProfiles.some(profile => digest(JSON.stringify(binding.map((value, index) => index === 3 ? profileKey(profile) : value).filter((_, index) => index !== 2))) === cursor.storageScope);
     // Legacy v2 cursors only stored a Host-bound hash. Rebinding requires the
     // retained Core origin and a fresh physical/header/prefix verification.
     // Older storage hashes included the viewing App; admit only known profiles.
@@ -120,12 +118,12 @@ export class BoundedReader {
     this.turnTrigger = this.materialMode && typeof cursor?.turnTrigger === 'string' && cursor.turnTrigger.length <= 256 ? cursor.turnTrigger : null;
     if (typeof source.threadId !== 'string' || !source.threadId || source.threadId.length > 128 || source.parentId !== null || !source.hostRunId || !Number.isFinite(source.hostStartedAt) || !['vscode', 'cli', 'appServer'].includes(source.sourceKind) || source.originator !== 'Codex Desktop') this.gap = 'main-identity-unverified';
     else if (source.forkedFromId && !forkSuffix && !this.historyMode) this.gap = 'fork-provenance-unverified';
-    else if (!supportsHostProfile(source.profile)) this.gap = 'unsupported-host-version';
     else if (this.historyMode && (!Number.isSafeInteger(this.historyRange?.endOrdinalExclusive) || this.historyRange.endOrdinalExclusive < 1 || !Number.isSafeInteger(this.historyRange?.endByteOffset) || this.historyRange.endByteOffset < 1)) this.gap = 'history-boundary-unverified';
     else if (cursor && this.materialMode && cursor.projectionMode !== this.mode) this.gap = 'material-cursor-baseline-missing';
     else if (cursor && this.materialMode && cursor.nativeOriginVersion !== this.nativeOriginVersion) this.gap = 'cursor-invalid';
     else if (cursor && this.materialMode && cursor.state?.header && cursor.header?.threadId !== source.threadId) this.gap = 'cursor-invalid';
-    else if (cursor?.state?.header && cursor.header && !producerAllowed(source, cursor.header.cliVersion)) this.gap = 'cursor-invalid';
+    else if (cursor?.state?.header && cursor.header && !supportsRecordHeader(source, cursor.header)) this.gap = 'cursor-invalid';
+    else if (this.nativeOriginVersion === 2 && cursor?.storageScope !== undefined && cursor.storageScope !== this.storageScope && !legacyStorageScope) this.gap = 'cursor-invalid';
     const pristineV2 = cursor && this.nativeOriginVersion === 2 && cursor.format === 3 && (cursor.scope === this.scope || recovering) && cursor.offset === 0 && cursor.fileId === null && cursor.knownSize === null && cursor.attachSize === null && cursor.state?.header === false && cursor.state?.anchored === false && cursor.state?.phase === 'unknown' && cursor.state?.turnId === null && cursor.gap === null;
     if (cursor && !this.gap && !pristineV2) {
       const s = cursor.state;
@@ -183,7 +181,7 @@ export class BoundedReader {
         return;
       }
       this.header = nativeHeader(row);
-      if (!producerAllowed(this.source, this.header.cliVersion)) { this.gap = 'record-producer-unverified'; return; }
+      if (!supportsRecordHeader(this.source, this.header)) { this.gap = 'unsupported-record-schema'; return; }
       if (this.nativeOriginVersion === 2) this.io?.header(this.header);
       if (this.source.expectedHeader && JSON.stringify(this.header) !== JSON.stringify(this.source.expectedHeader)) { this.gap = 'history-source-generation-changed'; return; }
       if (this.historyMode && row.ordinal >= this.historyRange.endOrdinalExclusive) { this.gap = 'history-generation-range-unverified'; return; }
@@ -205,15 +203,23 @@ export class BoundedReader {
     if (this.materialMode && materialEligible) {
       const turnId = historyProducer ? row.payload.turn_id : this.state.turnId;
       const itemType = row.material.fields['payload.item.type']?.text;
+      let materialGap = null;
       // Only a known old request is needed to attribute an unselected prior run.
       // Its tool/output bodies are neither current evidence nor inherited context.
       if (priorUnselected && (row.type === 'response_item' || row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type)) && !(row.type === 'event_msg' && row.payload.type === 'item_completed' && itemType === 'UserMessage')) { this.excluded++; return; }
       // Child activity is a known parent-log sideband, outside main-chat scope.
       if (row.type === 'event_msg' && row.payload.type === 'item_completed' && row.payload.turn_id === turnId && itemType === 'SubAgentActivity' && ['started', 'completed'].includes(row.material.fields['payload.item.kind']?.text)) { this.excluded++; return; }
-      if (row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type) && row.payload.turn_id === turnId && !materialItems.has(itemType) && !isWebSearchItem(row)) { this.gap = 'unsupported-item-type:' + digest(JSON.stringify(itemType ?? null)); return; }
+      if (row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type) && row.payload.turn_id === turnId && !materialItems.has(itemType) && !isWebSearchItem(row) && !isClockSleepItem(row)) {
+        const code = 'unsupported-item-type:' + digest(JSON.stringify(itemType ?? null));
+        if (!itemType) { this.gap = code; return; }
+        if (itemType === 'Extension' && row.material.fields['payload.item.kind']?.text === 'clock.sleep') { this.gap = 'unsupported-clock-result-shape'; return; }
+        materialGap = code;
+      }
       if (row.type === 'event_msg' && row.payload.type === 'item_completed' && row.payload.turn_id === turnId && itemType === 'FileChange' && (row.material.fields['payload.item.status']?.text !== 'completed' || !row.material.fields['payload.item.stdout'] || !row.material.fields['payload.item.stderr'])) { this.gap = 'unsupported-file-change-shape'; return; }
       if (row.payload.turn_id === turnId && row.payload.type === 'item_completed' && isWebSearchItem(row) && (!Number.isSafeInteger(row.material.webResultsCount) || row.material.webResultsCount < 0 || row.material.webResultsCount > 0 && !row.material.webSnippetString && !isWebResultOmitted(row))) { this.gap = 'unsupported-web-result-shape'; return; }
-      const material = materialRecord(row, turnId, recordStart, this.offset + 1, turnId === this.state.turnId ? this.turnTrigger : null);
+      if ((!row.payload.turn_id || row.payload.turn_id === turnId) && row.type !== 'event_msg' && !otherRecords.has(row.type)) materialGap = 'unsupported-record-type:' + digest(JSON.stringify(row.type));
+      if ((!row.payload.turn_id || row.payload.turn_id === turnId) && row.type === 'event_msg' && !lifecycle.has(row.payload.type) && !otherEvents.has(row.payload.type)) materialGap = 'unsupported-event-type:' + digest(JSON.stringify(row.payload.type));
+      const material = materialRecord(row, turnId, recordStart, this.offset + 1, turnId === this.state.turnId ? this.turnTrigger : null, materialGap);
       // Do not reserve a native body identity for a temporary omission: later
       // fixed-field support must not conflict with an already captured body.
       if (material?.turnId === turnId && material.kind === 'tool-result' && row.type === 'response_item' && ['function_call_output', 'custom_tool_call_output'].includes(row.payload.type) && !row.material.fields['payload.output']) { this.gap = 'unsupported-tool-result-shape'; return; }
@@ -227,12 +233,12 @@ export class BoundedReader {
       else if (material) this.excluded++;
     }
     if (row.type !== 'event_msg') {
-      if (this.state.anchored && !otherRecords.has(row.type)) this.gap = 'unsupported-record-type:' + String(row.type).slice(0, 80);
+      if (!this.materialMode && this.mode !== 'history-metadata' && this.state.anchored && !otherRecords.has(row.type)) this.gap = 'unsupported-record-type:' + String(row.type).slice(0, 80);
       return;
     }
     const type = row.payload?.type;
     if (!lifecycle.has(type)) {
-      if (this.state.anchored && !otherEvents.has(type)) this.gap = 'unsupported-event-type:' + String(type).slice(0, 80);
+      if (!this.materialMode && this.mode !== 'history-metadata' && this.state.anchored && !otherEvents.has(type)) this.gap = 'unsupported-event-type:' + String(type).slice(0, 80);
       return;
     }
     const id = row.payload.turn_id;
@@ -278,14 +284,13 @@ export class BoundedReader {
     }
   }
 
-  async pump({ budgetBytes = 262144, maxEvents = 16, verifyOnly = false, available = this.available ?? true, profile = this.source.profile, hostRunId = this.source.hostRunId, anchorTurnId = this.source.anchorTurnId } = {}) {
+  async pump({ budgetBytes = 262144, maxEvents = 16, verifyOnly = false, available = this.available ?? true, hostRunId = this.source.hostRunId, anchorTurnId = this.source.anchorTurnId } = {}) {
     if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 16) throw new Error('invalid event budget');
     this.maxEvents = maxEvents;
     if (!Number.isSafeInteger(budgetBytes) || budgetBytes < 1 || budgetBytes > 262144) throw new Error('invalid read budget');
     if (this.materialMode && !this.busy) { this.recentLifecycle = []; this.materials = []; }
     if (this.closed) return { ...this.view('reader-closed'), readBytes: 0 };
     if (this.gap) return { ...this.view(), readBytes: 0 };
-    if (!supportsHostProfile(profile) || profileKey(profile) !== this.hostProfileKey || profileKey(this.source.profile) !== this.hostProfileKey) { this.gap = 'unsupported-host-version'; return { ...this.view(), readBytes: 0 }; }
     if (hostRunId !== this.source.hostRunId) { this.gap = 'source-generation-changed'; return { ...this.view(), readBytes: 0 }; }
     this.available = available;
     if (!available) { this.needsGuard = true; return { ...this.view('source-unavailable'), readBytes: 0 }; }
@@ -384,7 +389,7 @@ export class BoundedReader {
         return { ...this.view(), readBytes, decodedBytes, nativeOrigins: [] };
       }
       const recoveryFence = this.recoveryFence, origins = recoveryFence ? { read: async key => key === recoveryFence.key ? recoveryFence : this.origins.read(key) } : this.origins;
-      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); const header = nativeHeader(row); if (!producerAllowed(this.source, header.cliVersion)) throw Object.assign(new Error('unverified native producer'), { code: 'record-producer-unverified' }); return header; } });
+      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); const header = nativeHeader(row); if (this.header && headerIdentity(this.header) !== headerIdentity(header)) throw Object.assign(new Error('saved header differs from native record'), { code: 'cursor-invalid' }); if (!supportsRecordHeader(this.source, header)) throw Object.assign(new Error('unsupported native record schema'), { code: 'unsupported-record-schema' }); return header; } });
       const value = await this.io.pump({ physicalBudget: budgetBytes, decodedBudget: decodedBudgetBytes, limit: this.historyRange?.endByteOffset ?? Infinity, verifyOnly: verifyOnly && !this.recoveryCheckpoint && !(this.io.deviceRemapped && !this.io.proof()) }, bytes => {
         this.attachSize ??= this.io.decodedSize;
         const before = this.offset; this.consume(bytes); return this.offset - before;
@@ -412,7 +417,7 @@ export class BoundedReader {
         this.coldCheckpoint = previous;
         this.coldScan = scan;
       }
-    } catch (error) { this.handle = this.io?.handle ?? null; readBytes = error.physicalBytes ?? readBytes; decodedBytes = error.decodedBytes ?? decodedBytes; this.gap = ['native_origin_prefix_changed', 'native_origin_header_changed', 'record-path-unverified', 'record-producer-unverified', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'compressed-frame-unverified', 'compressed-window-unverified', 'compressed-data-invalid', 'decoded-budget-exceeded', 'decoded-buffer-exceeded'].includes(error.code) ? error.code : 'record-source-unavailable'; if (sourceIoCodes.has(error?.code)) this.error = { code: error.code }; }
+    } catch (error) { this.handle = this.io?.handle ?? null; readBytes = error.physicalBytes ?? readBytes; decodedBytes = error.decodedBytes ?? decodedBytes; this.gap = ['native_origin_prefix_changed', 'native_origin_header_changed', 'record-path-unverified', 'unsupported-record-schema', 'cursor-invalid', 'record-file-replaced', 'record-file-truncated', 'record-rewrite-suspected', 'compressed-frame-unverified', 'compressed-window-unverified', 'compressed-data-invalid', 'decoded-budget-exceeded', 'decoded-buffer-exceeded'].includes(error.code) ? error.code : 'record-source-unavailable'; if (sourceIoCodes.has(error?.code)) this.error = { code: error.code }; }
     finally { this.busy = false; this.metrics.physicalBytes += readBytes; this.metrics.decodedBytes = (this.metrics.decodedBytes ?? 0) + decodedBytes; this.metrics.maximumReadBytes = Math.max(this.metrics.maximumReadBytes, readBytes); finishPump(); this.pumpComplete = null; }
     return { ...this.view(), readBytes, decodedBytes, nativeOrigins: this.io?.proof() ? [this.io.proof()] : [], nativeRangeProof: this.io?.rangeProof() ?? null };
   }

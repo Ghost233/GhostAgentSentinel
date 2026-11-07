@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BoundedReader } from './bounded-reader.mjs'
-import { supportsHostProfile } from './storage-compatibility.mjs'
 import { ForkHistoryReader } from './fork-history.mjs'
 import { startPanelServer } from './panel-server.mjs'
 import { loadCursor, saveCursor } from './cursor-store.mjs'
@@ -95,7 +94,7 @@ function materialView(view, task, { historical = false, snapshot } = {}) {
   return { ...view, ...(currentFacts ? { currentFacts } : {}), ...(!historical && inheritance ? { inheritance } : {}), signal: task.conversationMonitoring?.paused || revalidating ? 'gray' : task.gs?.light ?? 'gray', summary: (task.conversationMonitoring?.paused ? '本聊天分析已暂停，继续只读采集' : revalidating ? '当前记录重验中' : task.currentRequest ? task.gs?.reason ?? view.summary : '当前用户请求尚未核实，检查结论不可判断').slice(0, 240),
     ...(task.conversationMonitoring ? { monitoring: task.conversationMonitoring } : {}),
     health: task.monitoringHealth,
-    observation: { ...view.observation, gap: view.observation.gap ?? (!task.currentRequest ? 'current-user-request-unverified' : null) },
+    observation: { ...view.observation, gap: view.observation.gap ?? own.find(event => event.kind === 'gap' && event.data?.verificationGaps?.length)?.data.verificationGaps[0] ?? (!task.currentRequest ? 'current-user-request-unverified' : null) },
     analysis: { connected: true, state: task.analysis.state, summary: states[task.analysis.state] ?? '本轮尚无有效检查结论', checks: task.analysis.checks, issues,
       generated: generatedView(generated), lastSuccessfulSummary, configScope: task.analysis.configScope, currentConfigScope: task.analysis.currentConfigScope,
       resultDisposition: task.analysis.resultDisposition, completedAt: task.analysis.completedAt, through: task.analysis.through, waitMs: task.analysis.waitMs, lagMs: task.analysis.lagMs, error: task.analysis.error, coverage: task.analysis.coverage ?? task.coverage } }
@@ -113,7 +112,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   if (onQualificationLost !== undefined && typeof onQualificationLost !== 'function') throw new Error('invalid qualification loss handler')
   if (initialEnrollmentBaseline !== undefined && (!initialEnrollmentBaseline || typeof initialEnrollmentBaseline.initialize !== 'boolean' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(initialEnrollmentBaseline.id ?? ''))) throw new Error('invalid initial enrollment baseline')
   let baselineInitializationAvailable = initialEnrollmentBaseline?.initialize === true, baselineCoreInstanceId = null
-  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (reason === 'core-update-required') view.summary = '共享核心需要更新，监控未启动；请待旧核心自然退出后启用新版'; if (reason === 'unsupported-host-version') view.summary = '当前 App 版本尚未适配，材料采集已停止'; if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
+  const gapView = (reason, threadId = null) => { const view = lifecycleGapView(reason, threadId); if (reason === 'core-update-required') view.summary = '共享核心需要更新，监控未启动；请待旧核心自然退出后启用新版'; if (collectMaterials) view.analysis = { connected: true, state: 'unknown', summary: '当前观察不可用，检查结论不可判断', checks: [] }; return view }
   await mkdir(join(dataDir, 'cursors'), { recursive: true, mode: 0o700 })
   const healthOutbox = collectMaterials ? await openHealthOutbox({ dataDir, now }) : null
   let closed = false, closing = null, timer = null, refreshPending = null, source = null, sourceEpoch = 0, registration = null
@@ -253,6 +252,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
   async function qualification(expected = null) {
     let host, user
+    if (typeof native.sampleHost !== 'function' || typeof native.readEnablement !== 'function') return { host: null, gap: 'metadata-capability-unavailable' }
     try { host = await native.sampleHost() }
     catch (error) { if (!onQualificationLost) throw error; const gap = 'host-verification-unavailable'; await qualificationLost(gap); return { host: null, gap } }
     const previous = expected ?? qualifiedHost
@@ -263,7 +263,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const enabledGap = user?.user !== 'enabled' || user?.effective !== 'enabled' ? user?.user === 'disabled' || user?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed' : null
     if (enabledGap) { await qualificationLost(enabledGap); return { host, gap: enabledGap } }
     if (onQualificationLost && !qualifiedHost) qualifiedHost = { hostRunId: host.hostRunId, hostStartedAt: host.hostStartedAt }
-    return { host, gap: supportsHostProfile(host.profile) ? null : 'unsupported-host-version' }
+    return { host, gap: null }
   }
   async function projectSetting(context, cwd) {
     if (!context.projects.has(cwd)) context.projects.set(cwd, Promise.resolve().then(() => native.readEnablement(cwd)).then(setting => ({ setting }), () => ({ unavailable: true })))
@@ -275,6 +275,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     return entry
   }
   async function qualify(id, expected = null, context) {
+    if (typeof native.readThread !== 'function') return { gap: 'metadata-capability-unavailable' }
     const metadata = await native.readThread(id)
     const thread = metadata?.thread
     const kind = classifyThread(thread, sessionsRoot, storageVersion)
@@ -285,7 +286,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const enabled = project.setting
     if (enabled?.user !== 'enabled' || enabled?.effective !== 'enabled') return { gap: enabled?.user === 'disabled' || enabled?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed', scope: enabled?.user !== 'enabled' ? 'source' : 'task' }
     const source = { ...(collectMaterials && nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), path: thread.path, allowedRoot: nativeStorageRoot(thread.path, sessionsRoot, storageVersion), threadId: id, parentId: null, sourceKind: thread.source, originator: thread.originator, cwd: thread.cwd, forkedFromId: thread.forkedFromId ?? null, anchorTurnId: metadata.anchorTurnId ?? null, hostRunId: host.hostRunId, hostStartedAt: host.hostStartedAt, profile: host.profile }
-    if (expected && fingerprint([source.path, source.cwd, source.sourceKind, source.originator, source.forkedFromId, source.hostRunId, source.hostStartedAt, source.profile]) !== fingerprint([expected.path, expected.cwd, expected.sourceKind, expected.originator, expected.forkedFromId, expected.hostRunId, expected.hostStartedAt, expected.profile])) return { gap: 'source-generation-changed', scope: source.hostRunId !== expected.hostRunId ? 'source' : 'task' }
+    if (expected && fingerprint([source.path, source.cwd, source.sourceKind, source.originator, source.forkedFromId, source.hostRunId, source.hostStartedAt]) !== fingerprint([expected.path, expected.cwd, expected.sourceKind, expected.originator, expected.forkedFromId, expected.hostRunId, expected.hostStartedAt])) return { gap: 'source-generation-changed', scope: source.hostRunId !== expected.hostRunId ? 'source' : 'task' }
     return { source }
   }
 
@@ -403,6 +404,23 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         for (const turnId of observed.unconfirmedStarts ?? []) descriptions.set(turnId, { ...descriptions.get(turnId), id: entry.id, sessionId: entry.id, lifecycleId: turnId, title: 'ChatGPT 主会话', status: 'unknown', gaps: [...new Set([...(descriptions.get(turnId)?.gaps ?? []), 'historical-execution-unconfirmed'])] })
         for (const event of [...known.flatMap(task => task.events), ...batch.events]) if (event.taskLifecycleId !== lifecycleId && !event.data?.history && !event.data?.inherited && event.data?.sourceKind === 'chatgpt-native' && ['task_complete', 'turn_aborted'].includes(event.data?.nativeType)) descriptions.set(event.taskLifecycleId, { id: entry.id, sessionId: entry.id, lifecycleId: event.taskLifecycleId, title: 'ChatGPT 主会话', status: 'idle' })
         batch.tasks = [...descriptions.values()]
+        if (fork) {
+          const inherited = [...known.flatMap(task => task.events), ...batch.events].filter(event => event.data?.history && event.data?.forkThreadId === entry.id)
+          const receipts = new Map(inherited.filter(event => event.data.forkReceipt).map(event => [event.data.forkReceipt.id, event.data.forkReceipt]))
+          const generations = new Set(), seen = new Set()
+          let id = observed.forkProvenance.receiptId
+          while (id && seen.size < 16 && !seen.has(id)) {
+            seen.add(id)
+            const receipt = receipts.get(id)
+            if (!receipt) break
+            generations.add(receipt.generation); id = receipt.parentId
+          }
+          const gaps = inherited.filter(event => event.kind === 'gap' && generations.has(event.data.historyGeneration)).map(event => event.text)
+          if (gaps.length) {
+            const current = batch.tasks.find(task => task.lifecycleId === lifecycleId)
+            current.gaps = [...new Set([...(current.gaps ?? []), ...gaps])]
+          }
+        }
         batch.hierarchyContext = materialContext(before, connection.key, batch, fork ? { taskId: entry.id, complete: observed.forkProvenance.complete, receiptId: observed.forkProvenance.receiptId, generation: observed.forkProvenance.generation } : null)
       }
       const accepted = await core.ingest(connection.key, batch)
@@ -562,7 +580,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (selected === current) view.health = combineHealth(view.health, entry.health)
     if (historical) {
       view.signal = 'gray'; view.summary = retainedOnly ? '当前执行尚未确认 · 显示最近检查记录' : '历史执行 · 仅表示当时的检查记录'
-      view.observation = { phase: selected.item.status === 'ended' ? 'completed' : selected.item.status === 'aborted' ? 'aborted' : 'unknown', status: selected.task.status, coverage: 'retained-history', gap: history.currentGap ?? (selected.task.currentRequest ? null : 'historical-user-request-unverified'), observedAt: selected.item.observedAt }
+      view.observation = { phase: selected.item.status === 'ended' ? 'completed' : selected.item.status === 'aborted' ? 'aborted' : 'unknown', status: selected.task.status, coverage: 'retained-history', gap: history.currentGap ?? selected.task.events.find(event => event.kind === 'gap' && !event.data?.history && event.data?.verificationGaps?.length)?.data.verificationGaps[0] ?? (selected.task.currentRequest ? null : 'historical-user-request-unverified'), observedAt: selected.item.observedAt }
     }
     return { ...view, history, execution: { ...selected.item, request: selected.task.currentRequest.slice(0, 240), historical } }
   }
@@ -657,7 +675,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   async function qualifySettings() {
     if (closed) throw new Error('观察实例已关闭')
     const qualified = await qualification(), { gap } = qualified
-    if (closed || gap && gap !== 'unsupported-host-version') throw new Error('本安装设置资格未确认：' + (gap ?? 'adapter-closed'))
+    if (closed || gap) throw new Error('本安装设置资格未确认：' + (gap ?? 'adapter-closed'))
     return qualified
   }
   function settingsRead(requested, action) {

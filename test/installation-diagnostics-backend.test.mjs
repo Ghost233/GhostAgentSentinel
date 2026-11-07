@@ -69,9 +69,9 @@ test('global installation diagnostics expose only own configuration and actual c
   assert.equal((await control.snapshot()).sources.length, 2, 'diagnostics do not register a collection source')
   profile = null
   const unsupported = (await mcp(adapter, token, 'tools/call', { name: tool.name, arguments: {} })).structuredContent
-  assert.equal(unsupported.collection.state, 'unconfirmed', 'old connected sources cannot hide an unsupported current host')
+  assert.equal(unsupported.collection.state, 'failed', 'missing version metadata cannot hide the actual metadata failure')
   assert.equal(unsupported.collection.connectedSources, 1)
-  assert.deepEqual(unsupported.collection.error, { stage: 'host-verification', code: 'unsupported-host-version' })
+  assert.deepEqual(unsupported.collection.error, { stage: 'metadata', code: 'metadata-unavailable' })
   enabled = false
   assert.equal((await mcp(adapter, token, 'tools/call', { name: tool.name, arguments: {} })).isError, true)
   profile = supportedProfile; enabled = true

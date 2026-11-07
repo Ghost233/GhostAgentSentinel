@@ -180,7 +180,7 @@ export function createNativeIO({ pluginId, socketPath, processSample, profileSam
     async sampleHost() {
       if (closed) return { available: false, reason: 'source-closed' }
       try {
-        const [processes, profile] = await Promise.all([sampleProcesses(), sampleProfile()])
+        const [processes, profile] = await Promise.all([sampleProcesses(), sampleProfile().catch(() => null)])
         const apps = new Set(processes.filter(row => row.command === appExecutable || row.command.startsWith(appExecutable + ' ')).map(row => row.pid))
         const candidates = processes.filter(row => apps.has(row.ppid) && executionSubcommand(row.command) === 'app-server')
         if (candidates.length !== 1) return { available: false, reason: candidates.length ? 'execution-domain-ambiguous' : 'execution-source-unavailable' }
@@ -198,6 +198,7 @@ export function createNativeIO({ pluginId, socketPath, processSample, profileSam
       const thread = result?.thread
       if (!thread || thread.id !== id || thread.parentThreadId !== null || typeof thread.source !== 'string' || thread.originator !== 'Codex Desktop') return { thread }
       const turns = await rpc.request('thread/turns/list', { threadId: id, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' })
+      if (!Array.isArray(turns?.data) || turns.data.length > 1 || turns.data.some(turn => typeof turn?.id !== 'string' || !turn.id || turn.id.length > 128)) throw metadataError('metadata-invalid-response')
       return { thread, anchorTurnId: turns?.data?.[0]?.id ?? null }
     },
     async readEnablement(cwd) {

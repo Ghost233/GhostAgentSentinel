@@ -6,8 +6,6 @@ export const FORK_LINEAGE_FEATURE = 'chatgpt-fork-lineage/1'
 export const FORK_LINEAGE_FRAMES = 16
 export const FORK_COMPRESSION_FEATURE = 'chatgpt-fork-compression/1'
 export const FORK_LEGACY_FEATURE = 'chatgpt-fork-legacy/1'
-export const FORK_LEGACY_PRODUCER = '0.162.0-alpha.2'
-export const isLegacyForkProducer = version => [FORK_LEGACY_PRODUCER, '0.160.1'].includes(version)
 export const FORK_LEGACY_MODE = 'legacy-unverified'
 export const FORK_USER_LIMIT = 1024
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')

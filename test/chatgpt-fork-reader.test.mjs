@@ -41,9 +41,9 @@ async function oldAnchorFixture(t, completed) {
   return { ...f, reader }
 }
 
-test('a fork error return accounts for the actual decoded bytes spent before a protocol gap', async t => {
+test('a fork error return accounts for the actual decoded bytes spent before a malformed record', async t => {
   const f = await oldAnchorFixture(t, false), pump = NativeJsonlSource.prototype.pump
-  await writeFile(f.source.path, (await readFile(f.source.path, 'utf8')).replaceAll(new Date(at - 10000).toISOString(), new Date(at).toISOString()).replace('"type":"response_item"', '"type":"unsupported_owned_record"'))
+  await writeFile(f.source.path, (await readFile(f.source.path, 'utf8')).replaceAll(new Date(at - 10000).toISOString(), new Date(at).toISOString()).replace('"type":"response_item"', '"type":'))
   let physical = 0, decoded = 0
   t.mock.method(NativeJsonlSource.prototype, 'pump', async function (...args) {
     try { const value = await pump.apply(this, args); physical += value.physicalBytes; decoded += value.decodedBytes; return value }
@@ -55,7 +55,7 @@ test('a fork error return accounts for the actual decoded bytes spent before a p
     assert.equal(view.readBytes, physical); assert.equal(view.decodedBytes, decoded)
     if (view.coverage === 'gap') break
   }
-  assert.equal(view.gap, 'unsupported-record-type')
+  assert.equal(view.gap, 'record-malformed-or-over-limit')
   assert.ok(decoded > 0); assert.ok(decoded <= 262144)
   assert.equal(view.readBytes, physical)
   assert.equal(view.decodedBytes, decoded)
@@ -287,7 +287,8 @@ test('buffered suffix data cannot cross the host generation or profile fence whi
     const first = await reader.pump({ budgetBytes: (await stat(f.source.path)).size + 64 })
     assert.equal(first.coverage, 'catching-up')
     const changed = await reader.pump(kind === 'generation' ? { hostRunId: 'different-host' } : { profile: { ...supportedProfile, appBuild: 'different' } })
-    assert.equal(changed.gap, kind === 'generation' ? 'source-generation-changed' : 'unsupported-host-version')
+    if (kind !== 'generation') { assert.equal(changed.gap, null); assert.ok(changed.readBytes <= 262144); return }
+    assert.equal(changed.gap, 'source-generation-changed')
     assert.equal(changed.readBytes, 0)
     assert.deepEqual(changed.materials, [])
     assert.equal(changed.forkProvenance.complete, false)
