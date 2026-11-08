@@ -69,6 +69,49 @@ async function fixture(t, { profile = candidateHostProfile, producer = candidate
   return { core, state, native, path, dir, read, caughtUp, reopen, advance() { clock += 1000 }, get adapter() { return adapter } }
 }
 
+test('installation diagnostics report bounded backfill positions without pumping records or inferring an active execution', async t => {
+  const f = await fixture(t, { suffix: row(4, 'response_item', { type: 'custom_tool_call_output', call_id: 'large', output: 'x'.repeat(800000) }) })
+  assert.equal((await f.read()).observation.coverage, 'catching-up')
+  const bytes = f.state.currentRecordReads, threadReads = f.state.threadReads
+  const response = await fetch(f.adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'c'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_installation_diagnostics', arguments: {} } }) })
+  const result = (await response.json()).result.structuredContent
+  assert.equal(result.collection.backfill.pendingChats, 1)
+  assert.equal(result.collection.backfill.knownChats, 1)
+  assert.equal(result.collection.backfill.totalBytes, (await fs.stat(f.path)).size)
+  assert.ok(result.collection.backfill.readBytes >= 0 && result.collection.backfill.readBytes < result.collection.backfill.totalBytes)
+  assert.equal(result.analysis.counts.total, 0)
+  assert.equal(f.state.currentRecordReads, bytes, 'a diagnostic read does not advance collection')
+  assert.equal(f.state.threadReads, threadReads)
+  assert.ok(!JSON.stringify(result).includes(f.path))
+  await f.caughtUp()
+  const later = await fetch(f.adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'c'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sentinel_installation_diagnostics', arguments: {} } }) })
+  assert.equal((await later.json()).result.structuredContent.collection.backfill, undefined)
+})
+
+test('a fresh read failure remains current even after its execution becomes unknown, and verified EOF clears only that current failure', async t => {
+  const f = await fixture(t), recordPath = await fs.realpath(f.path), open = fs.open
+  let broken = false
+  t.mock.method(fs, 'open', async (...args) => { const handle = await open(...args); if (String(args[0]) === recordPath) { const read = handle.read; handle.read = async function (...params) { if (broken) throw Object.assign(new Error('Controlled record read failure'), { code: 'EIO' }); return read.apply(this, params) } }; return handle })
+  await f.caughtUp()
+  const diagnostics = async () => {
+    const response = await fetch(f.adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'c'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_installation_diagnostics', arguments: {} } }) })
+    return (await response.json()).result.structuredContent
+  }
+  await fs.appendFile(f.path, row(4, 'event_msg', { type: 'item_completed', thread_id: owner, turn_id: 'turn', item: { type: 'AgentMessage', id: 'later-output', content: [{ type: 'Text', text: 'New activity after the verified prefix' }] } }))
+  broken = true
+  await f.read()
+  assert.equal((await f.core.snapshot()).tasks[0].status, 'unknown')
+  const failed = await diagnostics()
+  assert.equal(failed.collection.state, 'failed')
+  assert.equal(failed.collection.error.code, 'EIO')
+  assert.equal(failed.collection.pendingHistory, undefined, 'a fresh failure is not labeled as old execution history')
+  broken = false
+  const recoveredView = await f.caughtUp()
+  const recovered = await diagnostics()
+  assert.equal(recovered.collection.state, 'connected', JSON.stringify({ collection: recovered.collection, observation: recoveredView.observation }))
+  assert.equal(recovered.collection.error, null)
+})
+
 test('unchanged background chats do not multiply whole-Core snapshots or repeat ingestion', async t => {
   const f = await fixture(t, { backgroundChats: 27 })
   await f.adapter.refresh(); await f.adapter.refresh()

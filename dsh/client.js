@@ -480,6 +480,7 @@
             h('p', null, ({ connected: '来源已连接，不代表采集完整', disconnected: '来源已断开', unconfirmed: '来源或采集范围未确认', failed: '采集失败' })[collection?.state] || '采集状态未确认'),
             h('p', null, `${collection?.connectedSources ?? 0}/${collection?.sourceCount ?? 0} 个来源已连接；最近联系：${timeText(collection?.lastSeenAt)}`),
             collection?.error && h('p', null, `采集失败环节：${failure(collection.error)}`),
+            collection?.pendingHistory?.count > 0 && h('p', null, `旧执行采集故障：${collection.pendingHistory.count} 项恢复未确认；最近一项首次发生：${timeText(collection.pendingHistory.latest?.firstFailedAt)}；最近发生：${timeText(collection.pendingHistory.latest?.updatedAt)}；${failure(collection.pendingHistory.latest)}`),
             h('h3', null, '已保存模型准备状态'),
             ['llm', 'jev'].map(role => h('div', { key: role }, h('p', null, `${role === 'llm' ? '总结模型' : 'JEV'}：${value.models?.[role]?.configured ? '配置完整；在线与实际推理未确认' : '尚未配置完整'}`),
               h('p', null, `当前编辑内容的连接检查：${checks[role] ? checks[role].scope === connectionScope && connectionScope?.active ? checks[role].message : '检查已过期，请重新检查' : '尚未检查当前编辑内容'}`))),

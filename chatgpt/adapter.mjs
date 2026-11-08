@@ -160,6 +160,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (!healthOutbox || !source || closed) return
     const scope = entry?.lifecycleVerified && entry.hostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: entry.lifecycleId } : entry?.qualifiedHostRunId === source.hostRunId ? { mainId: entry.id, lifecycleId: null } : { mainId: null, lifecycleId: null }
     const value = { sourceKey: source.key, ...scope, channel, roundId, outcome, settledAt: now(), ...(scope.mainId !== null ? { enrollmentPhase: scope.lifecycleId !== null ? 'established' : entry?.enrollmentPhase ?? 'unknown' } : {}), ...(error ? { error: failureErrorInfo({ code: error.code ?? 'collection_failed', codeHash: error.codeHash, stage: error.stage ?? 'collection', status: error.status, details: error.details }) } : {}) }
+    if (entry) entry.collectionFailure = outcome === 'failed' ? { epoch: sourceEpoch, sourceKey: source.key, roundId, error: value.error, settledAt: value.settledAt } : null
     try {
       healthOutbox.push(value)
       if (entry && outcome === 'succeeded') entry.enrollmentPhase = 'established'
@@ -718,9 +719,14 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         const [setting, snapshot] = await Promise.all([core.installationAnalysisConfig('chatgpt:' + installationId, signal), core.snapshot(signal)])
         return { setting, snapshot }
       })
-      const failures = combineHealth(sourceHealth, availabilityFailure?.health, outboxError, ...[...threads.values()].map(entry => entry.health)).failures.filter(failure => failure.domain === 'collection')
-      const collectionError = qualified.gap ? { stage: 'host-verification', code: qualified.gap } : failures[0]?.error ?? null
-      return projectInstallationDiagnostics(result.setting, result.snapshot, { collectionError, collectionState: qualified.gap ? 'unconfirmed' : null })
+      const entries = [...threads.values()]
+      const failures = combineHealth(sourceHealth, availabilityFailure?.health, outboxError).failures.filter(failure => failure.domain === 'collection')
+      const currentCollectionFailures = entries.filter(entry => source && entry.qualifiedHostRunId === source.hostRunId && entry.collectionFailure?.epoch === sourceEpoch).map(entry => entry.collectionFailure).sort((a, b) => b.settledAt - a.settledAt)
+      const collectionError = qualified.gap ? { stage: 'host-verification', code: qualified.gap } : failures[0]?.error ?? currentCollectionFailures[0]?.error ?? null
+      const pending = entries.filter(entry => entry.reader && (['catching-up', 'partial-record'].includes(entry.view.observation?.coverage) || entry.view.observation?.recordSnapshotLag || entry.view.observation?.recordRevalidating))
+      const positions = pending.filter(entry => !entry.fork).map(entry => entry.reader.checkpoint()).filter(value => Number.isSafeInteger(value.offset) && value.offset >= 0 && Number.isSafeInteger(value.knownSize) && value.knownSize >= value.offset)
+      const backfill = pending.length ? { pendingChats: pending.length, knownChats: positions.length, readBytes: positions.reduce((sum, value) => sum + value.offset, 0), totalBytes: positions.reduce((sum, value) => sum + value.knownSize, 0), revalidatingChats: pending.filter(entry => entry.view.observation?.recordRevalidating || entry.view.observation?.coldReadStage).length } : null
+      return projectInstallationDiagnostics(result.setting, result.snapshot, { collectionError, collectionState: qualified.gap ? 'unconfirmed' : null, currentCollectionFailures, backfill })
     },
   } : undefined
   const installationNotifications = collectMaterials ? {

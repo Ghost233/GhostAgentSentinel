@@ -544,6 +544,28 @@ test('choosing a listed model or pressing Enter in a manual field completes the 
   page.reply(second.id, { structuredContent: { ...state, revision: 'manual-enter-saved', config: second.params.arguments.config } }); await entering
 })
 
+test('diagnostics distinguish unresolved history and backfill from a current collection failure and clear old progress on refresh', async t => {
+  const page = await settingsPage(t), opening = page.element('#settings-tab-diagnostics').onclick(); await page.flush()
+  const history = { count: 2, latest: { stage: 'collection', code: 'native_capture_capacity', firstFailedAt: Date.now() - 86400000, updatedAt: Date.now() - 3600000 } }
+  const value = { ...diagnostics, collection: { state: 'connected', sourceCount: 1, connectedSources: 1, lastSeenAt: Date.now(), error: null, pendingHistory: history, backfill: { pendingChats: 3, knownChats: 2, readBytes: 1048576, totalBytes: 4194304, revalidatingChats: 1 } }, analysis: { counts: { scope: 'active-tasks', total: 0, states: {} }, latest: null, latestFailure: null } }
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics').id, { structuredContent: value }); await opening
+  assert.match(page.element('#diagnostics-collection').textContent, /已连接/)
+  assert.doesNotMatch(page.element('#diagnostics-collection').textContent, /采集失败|native_capture_capacity/)
+  assert.match(page.element('#diagnostics-collection-history').textContent, /旧执行.*2.*恢复未确认.*首次发生：.*最近发生：.*native_capture_capacity/)
+  assert.match(page.element('#diagnostics-backfill').textContent, /补读.*3.*1.0.*4.0.*1.*总量未确认.*重验.*不代表分析完成/)
+  assert.match(page.element('#diagnostics-analysis').textContent, /活动任务：0.*正在补读.*当前执行尚未确认/)
+  assert.doesNotMatch(page.element('#diagnostics-analysis').textContent, /无活动任务|分析成功/)
+  const refresh = page.element('#diagnostics-refresh').onclick(); await page.flush()
+  assert.equal(page.element('#diagnostics-backfill').textContent, '')
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics').id, { structuredContent: { ...value, collection: { state: 'failed', sourceCount: 1, connectedSources: 1, error: { stage: 'collection', code: 'EIO' }, pendingHistory: history } } }); await refresh
+  assert.match(page.element('#diagnostics-collection').textContent, /采集失败.*EIO/)
+  assert.match(page.element('#diagnostics-collection-history').textContent, /恢复未确认/)
+  assert.equal(page.element('#diagnostics-backfill').textContent, '')
+  const failed = page.element('#diagnostics-refresh').onclick(); await page.flush()
+  page.reply(page.sent.findLast(row => row.params?.name === 'sentinel_installation_diagnostics').id, { isError: true }); await failed
+  assert.equal(page.element('#diagnostics-collection-history').textContent, '')
+})
+
 test('settings tabs preserve the draft and position while diagnostics read only on demand and never select a tab on response', async t => {
   const page = await settingsPage(t)
   assert.equal(page.element('#settings-pane-settings').hidden, false)

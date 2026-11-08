@@ -12,6 +12,7 @@ import { createServer } from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { req } from './dsh-native-runtime.mjs'
 import { createAdapter } from '../dsh/host.mjs'
+import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 
 async function until(predicate, label) {
   const end = Date.now() + 5000
@@ -76,6 +77,44 @@ test('global installation diagnostics expose only own configuration and actual c
   assert.equal((await mcp(adapter, token, 'tools/call', { name: tool.name, arguments: {} })).isError, true)
   profile = supportedProfile; enabled = true
   assert.equal((await mcp(adapter, token, 'tools/call', { name: tool.name, arguments: { registrationId: 'PRIVATE OTHER INSTALLATION' } })).isError, true)
+})
+
+test('retained ended and unconfirmed execution failures stay separate from current collection without settling their receipts', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-retained-diagnostics-')), token = 'd'.repeat(64), clock = Date.now()
+  const server = await startServer({ dataDir, now: () => clock }), core = await connectCore({ dataDir })
+  let adapter
+  t.after(async () => { await adapter?.close(); await core.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }) })
+  const registrationId = 'chatgpt:retained-diagnostics', own = await core.registerSource({ registrationId, hostRunId: 'own-host', name: 'PRIVATE SOURCE', policy: 'chatgpt-main/1' })
+  const other = await core.registerSource({ registrationId: 'PRIVATE OTHER', hostRunId: 'other', name: 'PRIVATE OTHER', policy: 'chatgpt-main/1' })
+  for (const source of [own, other]) for (const [id, status] of [['PRIVATE ENDED', 'idle'], ['PRIVATE UNCONFIRMED', 'unknown']]) {
+    await core.ingest(source, { tasks: [{ id, lifecycleId: 'old-run', title: 'PRIVATE TITLE', status }] })
+    await core.recordCollectionOutcome({ sourceKey: source, mainId: id, lifecycleId: 'old-run', channel: 'main:' + 'a'.repeat(64), roundId: id, outcome: 'failed', settledAt: clock - 60000, error: { code: 'native_capture_capacity', stage: 'collection' } })
+  }
+  const before = await core.failureReceipts({ sourceKey: own })
+  adapter = await startChatGPTAdapter({ core, native: { async sampleHost() { return { available: true, hostRunId: 'qualified-host', hostStartedAt: clock - 1000, profile: supportedProfile } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } } }, installationId: 'retained-diagnostics', sessionsRoot: dataDir, dataDir: join(dataDir, 'adapter'), collectMaterials: true, token, pollMs: 0 })
+  const result = (await mcp(adapter, token, 'tools/call', { name: 'sentinel_installation_diagnostics', arguments: {} })).structuredContent
+  assert.equal(result.collection.state, 'connected')
+  assert.equal(result.collection.error, null)
+  assert.equal(result.collection.pendingHistory.count, 2)
+  assert.deepEqual(result.collection.pendingHistory.latest, { stage: 'collection', code: 'native_capture_capacity', firstFailedAt: clock - 60000, updatedAt: clock - 60000 })
+  assert.equal(result.analysis.counts.total, 0)
+  assert.deepEqual(await core.failureReceipts({ sourceKey: own }), before, 'diagnostics never recover or discard an old receipt')
+  assert.ok((await core.snapshot()).tasks.filter(task => task.sourceKey === own).every(task => task.monitoringHealth.state === 'failed'))
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE|old-run/)
+})
+
+test('current task and source faults still fail collection while historical duplicates are counted once', () => {
+  const failure = { id: 'old-receipt', domain: 'collection', error: { code: 'native_capture_capacity', stage: 'collection' }, firstFailedAt: 1, updatedAt: 2 }
+  const source = { key: 'own', descriptor: { registrationId: 'own' }, status: 'connected', lastSeenAt: 3 }
+  const task = { sourceKey: 'own', status: 'idle', updatedAt: 3, analysis: { state: 'stale' }, monitoringHealth: { state: 'failed', failures: [failure] } }
+  const setting = { registrationId: 'own', config: {}, revision: 'r' }, snapshot = { generatedAt: 4, sources: [source], tasks: [task, { ...task, status: 'unknown' }] }
+  const history = projectInstallationDiagnostics(setting, snapshot)
+  assert.equal(history.collection.state, 'connected')
+  assert.equal(history.collection.pendingHistory.count, 1)
+  const active = projectInstallationDiagnostics(setting, { ...snapshot, tasks: [{ ...task, status: 'running' }] })
+  assert.equal(active.collection.state, 'failed'); assert.equal(active.collection.error.code, 'native_capture_capacity')
+  const unavailable = projectInstallationDiagnostics(setting, snapshot, { collectionError: { code: 'EIO', stage: 'collection' } })
+  assert.equal(unavailable.collection.state, 'failed'); assert.equal(unavailable.collection.error.code, 'EIO')
 })
 
 test('an unconfigured installation with no source reports unknown collection and no retained analysis', async t => {

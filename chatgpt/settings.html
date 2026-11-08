@@ -44,7 +44,7 @@
 </section>
 <section id="settings-pane-diagnostics" class="tab-card" role="tabpanel" aria-labelledby="settings-tab-diagnostics" hidden>
 <button id="diagnostics-refresh" type="button">刷新诊断</button><p id="diagnostics-status" class="muted"></p>
-<div class="diagnostic-section"><h2>采集</h2><p id="diagnostics-collection"></p></div>
+<div class="diagnostic-section"><h2>采集</h2><p id="diagnostics-collection"></p><p id="diagnostics-backfill" class="muted"></p><p id="diagnostics-collection-history" class="muted"></p></div>
 <div class="diagnostic-section"><h2>模型准备</h2><p id="diagnostics-model-llm"></p><p id="diagnostics-llm-check" class="muted"></p><p id="diagnostics-model-jev"></p><p id="diagnostics-jev-check" class="muted"></p></div>
 <div class="diagnostic-section"><h2>实际分析</h2><p id="diagnostics-analysis"></p><p id="diagnostics-failure" class="muted"></p></div>
 </section>
@@ -185,8 +185,11 @@ function renderDiagnostics(value){
   if(!value||value.protocol!==1||!text(value.registrationId)||settingsState&&value.registrationId!==settingsState.registrationId||!value.collection||!['connected','disconnected','unconfirmed','failed'].includes(value.collection.state)||!value.models||!['llm','jev'].every(role=>typeof value.models[role]?.configured==='boolean')||!value.analysis||value.analysis.counts?.scope!=='active-tasks'||!value.analysis.counts.states||typeof value.analysis.counts.states!=='object')throw new Error('本安装诊断结果未确认');
   const collection=value.collection,analysis=value.analysis,latest=analysis.latest;
   element('diagnostics-collection').textContent=({connected:'已连接',disconnected:'已断连',unconfirmed:'采集未确认',failed:'采集失败'})[collection.state]+' · '+collection.connectedSources+'/'+collection.sourceCount+' 个来源已连接'+(collection.error?' · '+diagnosticError(collection.error)+' · '+(text(collection.error.code)||'错误未公开'):'');
+  const history=collection.pendingHistory,backfill=collection.backfill,date=value=>Number.isFinite(value)?new Date(value).toLocaleString():'时间未确认';
+  element('diagnostics-collection-history').textContent=history?.count>0?'旧执行采集故障：'+history.count+' 项恢复未确认；最近一项首次发生：'+date(history.latest?.firstFailedAt)+'；最近发生：'+date(history.latest?.updatedAt)+' · '+diagnosticError(history.latest)+' · '+(text(history.latest?.code)||'错误未公开'):'';
+  element('diagnostics-backfill').textContent=backfill?.pendingChats>0?'正在补读 '+backfill.pendingChats+' 个聊天；'+(backfill.knownChats>0?'已知记录读取位置 '+(backfill.readBytes/1048576).toFixed(1)+' / '+(backfill.totalBytes/1048576).toFixed(1)+' MiB':'记录字节总量未确认')+(backfill.pendingChats>backfill.knownChats?'；另有 '+(backfill.pendingChats-backfill.knownChats)+' 个聊天总量未确认':'')+(backfill.revalidatingChats>0?'；'+backfill.revalidatingChats+' 个聊天正在重验':'')+'；文件可能继续增长，读取进度不代表分析完成':'';
   for(const role of ['llm','jev'])element('diagnostics-model-'+role).textContent=(role==='llm'?'总结模型':'JEV')+'已保存配置：'+(value.models[role].configured?'已配置':'未配置')+' · 服务在线与实际分析另行核对';
-  element('diagnostics-analysis').textContent='活动任务：'+analysis.counts.total+' · '+(Object.entries(analysis.counts.states).map(([state,count])=>text(state)+': '+count).join('，')||'无活动任务')+'；'+(latest?'最近保留轮次：'+(text(latest.state)||'未公开')+' · '+(text(latest.resultDisposition)||'结果归属未公开')+(latest.configRevision&&latest.configRevision!==value.configRevision?' · 配置已改变':''):'实际分析：尚无可用轮次');
+  element('diagnostics-analysis').textContent='活动任务：'+analysis.counts.total+' · '+(Object.entries(analysis.counts.states).map(([state,count])=>text(state)+': '+count).join('，')||(backfill?.pendingChats>0?'正在补读，当前执行尚未确认':'无活动任务'))+'；'+(latest?'最近保留轮次：'+(text(latest.state)||'未公开')+' · '+(text(latest.resultDisposition)||'结果归属未公开')+(latest.configRevision&&latest.configRevision!==value.configRevision?' · 配置已改变':''):'实际分析：尚无可用轮次');
   element('diagnostics-failure').textContent=(latest?.error?'最近保留轮次错误：'+diagnosticError(latest.error)+' · '+(text(latest.error.code)||'错误未公开')+'；':'')+(analysis.latestFailure?'最近保留失败：'+diagnosticError(analysis.latestFailure)+' · '+(text(analysis.latestFailure.code)||'错误未公开'):'失败环节：未公开或无保留失败');
   element('diagnostics-status').textContent='本安装诊断快照 · '+(Number.isFinite(value.generatedAt)?new Date(value.generatedAt).toLocaleString():'时间未公开');renderConnectionChecks();
 }
@@ -195,7 +198,7 @@ async function readDiagnostics(retry=false){
   if(stopped||document.hidden||!ready||settingsTab!=='diagnostics'||diagnosticsBusy)return;
   if(!retry)cancelDiagnosticRetry();
   diagnosticsBusy=true;const version=++diagnosticsVersion;element('diagnostics-refresh').disabled=true;element('diagnostics-status').textContent='正在读取本安装诊断';
-  for(const field of ['collection','model-llm','model-jev','analysis','failure'])element('diagnostics-'+field).textContent='';
+  for(const field of ['collection','backfill','collection-history','model-llm','model-jev','analysis','failure'])element('diagnostics-'+field).textContent='';
   try{
     const response=await request('tools/call',{name:'sentinel_installation_diagnostics',arguments:{}});if(stopped||version!==diagnosticsVersion)return;
     if(response.structuredContent?.state==='unavailable'&&response.structuredContent.reason==='observer-unavailable'){

@@ -10,7 +10,7 @@ const safeError = error => {
     code: error.code == null ? null : ['unsupported-host-version', 'analyzer_unconfigured'].includes(error.code) ? error.code : safe.code }
 }
 
-export function projectInstallationDiagnostics(setting, snapshot, { collectionError = null, collectionState = null } = {}) {
+export function projectInstallationDiagnostics(setting, snapshot, { collectionError = null, collectionState = null, currentCollectionFailures = [], backfill = null } = {}) {
   const { registrationId, config, revision } = setting
   const sources = snapshot.sources.filter(source => source.descriptor.registrationId === registrationId)
   const sourceKeys = new Set(sources.map(source => source.key)), tasks = snapshot.tasks.filter(task => sourceKeys.has(task.sourceKey))
@@ -19,14 +19,24 @@ export function projectInstallationDiagnostics(setting, snapshot, { collectionEr
   const order = task => Math.max(time(task.analysis.startedAt) ?? 0, time(task.analysis.completedAt) ?? 0)
   const latest = [...tasks].sort((a, b) => order(b) - order(a) || b.updatedAt - a.updatedAt)[0]?.analysis
   const failure = tasks.filter(task => task.analysis.state === 'failed' && task.analysis.error).sort((a, b) => order(b) - order(a))[0]?.analysis
-  const collectionFailure = [...sources, ...tasks].flatMap(value => value.monitoringHealth?.failures ?? []).filter(value => value.domain === 'collection').sort((a, b) => b.updatedAt - a.updatedAt)[0]
+  const connected = new Set(sources.filter(source => source.status === 'connected').map(source => source.key))
+  const current = task => task.status === 'running' && connected.has(task.sourceKey)
+  const failures = values => values.flatMap(value => value.monitoringHealth?.failures ?? []).filter(value => value.domain === 'collection')
+  const retainedFailures = failures([...sources.filter(source => !connected.has(source.key)), ...tasks.filter(task => !current(task))])
+  const recent = new Set(currentCollectionFailures.map(value => JSON.stringify([value.sourceKey, value.roundId])))
+  const currentFailures = [...failures([...sources.filter(source => connected.has(source.key)), ...tasks.filter(current)]), ...retainedFailures.filter(value => recent.has(JSON.stringify([value.sourceKey, value.roundId])))]
+  const currentIds = new Set(currentFailures.map(value => value.id ?? value))
+  const pending = [...new Map(retainedFailures.filter(value => !currentIds.has(value.id ?? value)).map(value => [value.id ?? value, value])).values()].sort((a, b) => (time(b.updatedAt) ?? 0) - (time(a.updatedAt) ?? 0))
+  const collectionFailure = currentFailures.sort((a, b) => (time(b.updatedAt) ?? 0) - (time(a.updatedAt) ?? 0))[0]
   const error = safeError(collectionError ?? collectionFailure?.error)
   const connectedSources = sources.filter(source => source.status === 'connected').length
   const lastSeen = sources.map(source => time(source.lastSeenAt)).filter(value => value !== null)
   return {
     protocol: 1, registrationId, generatedAt: snapshot.generatedAt, configRevision: revision,
     models: Object.fromEntries(['llm', 'jev'].map(role => [role, { configured: Boolean(config[role]?.baseUrl && config[role]?.model) }])),
-    collection: { state: collectionState ?? (error ? 'failed' : connectedSources ? 'connected' : sources.length ? 'disconnected' : 'unconfirmed'), sourceCount: sources.length, connectedSources, lastSeenAt: lastSeen.length ? Math.max(...lastSeen) : null, error },
+    collection: { state: collectionState ?? (error ? 'failed' : connectedSources ? 'connected' : sources.length ? 'disconnected' : 'unconfirmed'), sourceCount: sources.length, connectedSources, lastSeenAt: lastSeen.length ? Math.max(...lastSeen) : null, error,
+      ...(pending.length ? { pendingHistory: { count: pending.length, latest: { ...safeError(pending[0].error), firstFailedAt: time(pending[0].firstFailedAt), updatedAt: time(pending[0].updatedAt) } } } : {}),
+      ...(backfill ? { backfill: { pendingChats: backfill.pendingChats, knownChats: backfill.knownChats, readBytes: backfill.readBytes, totalBytes: backfill.totalBytes, revalidatingChats: backfill.revalidatingChats } } : {}) },
     analysis: {
       counts: { scope: 'active-tasks', total: active.length, states: counts },
       latest: latest ? { state: state(latest.state), resultDisposition: ['none', 'current', 'pending', 'invalid'].includes(latest.resultDisposition) ? latest.resultDisposition : null,
