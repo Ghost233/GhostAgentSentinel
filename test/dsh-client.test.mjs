@@ -1381,8 +1381,10 @@ test('an older core with hierarchy support explicitly reports missing GS status 
 test('a later browser notification error updates a successful submission to failed without claiming that the user saw it', async t => {
   const f = await client(t, { protocol: 1, generatedAt: Date.now(), monitoring: { state: 'active' }, overview: {}, sources: [], tasks: [] })
   assert.equal(f.acknowledged[0].result.status, 'submitted')
-  f.delivered[0].instance.onerror()
-  await new Promise(resolve => setTimeout(resolve, 0))
+  await f.interact(async () => {
+    f.delivered[0].instance.onerror()
+    await f.waitUntil(() => f.acknowledged.at(-1).result.status === 'failed', 'The notification error acknowledgement did not finish')
+  })
   assert.equal(f.acknowledged.at(-1).result.status, 'failed')
   assert.equal(f.acknowledged.at(-1).result.error, '浏览器报告通知投递失败')
   assert.ok(f.acknowledged.every(ack => ack.result.seen === undefined))

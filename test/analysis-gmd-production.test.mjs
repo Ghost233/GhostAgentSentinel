@@ -21,7 +21,7 @@ const observation = {
   ], coverage: { complete: true, gaps: [] },
 };
 
-async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgment = false, holdSummary = false, invalidConsumeReceipt = false, holdJudgment = false, rejectFirstSummary = false, minimumOutputTokens = 0 } = {}) {
+async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgment = false, holdSummary = false, invalidConsumeReceipt = false, holdJudgment = false, rejectFirstSummary = false, minimumOutputTokens = 0, requiresThinkingControl = false } = {}) {
   const requests = [];
   const operations = new Map();
   let released = !holdSummary, nativeSequence = 0;
@@ -59,7 +59,7 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
       runtime_generation: generation(body.model), cache_salt_sha256: hash(body.cache_salt), state: 'completed', terminal: true, lease_released: true,
       children: [{ native_request_id: ++nativeSequence, runtime_generation: 1, question_id: null, state: prefill ? 'length' : 'stop', prompt_tokens: 24,
         completion_tokens: prefill || body.model === 'judge' ? 0 : 8, matched_prompt_tokens: 8, deduplicated_tokens: 0, lease_released: true }] } : null;
-    if (metadata && body.model === 'summary' && !prefill && body.max_tokens < minimumOutputTokens) {
+    if (metadata && body.model === 'summary' && !prefill && (body.max_tokens < minimumOutputTokens || requiresThinkingControl && body.thinking_token_budget !== 0)) {
       const failed = { ...metadata, state: 'failed', error: { code: 'invalid_response', stage: 'response' }, children: [{ ...metadata.children[0], state: 'length', completion_tokens: body.max_tokens }] };
       operations.set(metadata.request_id, { metadata: failed });
       res.statusCode = 202;
@@ -93,8 +93,8 @@ test('a bounded output allowance above the observed truncation ceiling can publi
   assert.ok(result.usage.gmd.llm.terminal && result.usage.gmd.llm.lease_released);
 });
 
-test('a warmed observation consumes the newer frozen input and publishes only after JEV succeeds', async t => {
-  const f = await fixture(t);
+test('managed summary prefill and generation bound thinking before publishing a JEV-validated result', async t => {
+  const f = await fixture(t, { requiresThinkingControl: true });
   const warmed = await f.analyzer.prefill(observation, f.options);
   assert.equal(warmed.state, 'completed');
   const newer = { ...observation, events: [...observation.events, { ...observation.events[1], id: 'latest', text: 'Found the newer requested log entry.' }] };
@@ -106,6 +106,10 @@ test('a warmed observation consumes the newer frozen input and publishes only af
   ], 'consume handles the new suffix without an extra zero-budget request');
   assert.ok(JSON.stringify(f.requests[1].body).includes('Found the newer requested log entry.'));
   assert.equal(f.requests[0].body.cache_salt, f.requests[1].body.cache_salt);
+  assert.deepEqual(f.requests.map(request => request.body.thinking_token_budget), [0, 0, undefined]);
+  const legacySalt = 'sentinel:' + hash(JSON.stringify(['analysis-cache/1', observation.source.registrationId, observation.task.key, observation.task.lifecycleId, observation.task.currentRequestId,
+    'llm', f.config.llm.baseUrl + '/', 'summary', hash(f.requests[0].body.messages[0].content)]));
+  assert.notEqual(f.requests[0].body.cache_salt, legacySalt, 'new generation policy cannot reuse the unconstrained-thinking prefix');
   assert.notEqual(f.requests[1].body.cache_salt, f.requests[2].body.cache_salt);
   assert.notEqual(f.requests[0].id, f.requests[1].id);
   assert.ok(result.usage.gmd.llm.lease_released);
@@ -118,7 +122,19 @@ test('an undeclared prefill provider retains the existing two-model analysis wit
   const result = await f.analyzer.analyze(observation, f.options);
   assert.ok(result.summary.generated);
   assert.deepEqual(f.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
-  assert.ok(f.requests.every(request => request.id === undefined && request.body.cache_salt === undefined));
+  assert.ok(f.requests.every(request => request.id === undefined && request.body.cache_salt === undefined && request.body.thinking_token_budget === undefined));
+});
+
+test('the complete managed summary envelope fits its input budget without dropping the current request', async t => {
+  const f = await fixture(t, { requiresThinkingControl: true });
+  const events = [...observation.events, ...Array.from({ length: 180 }, (_, index) => ({ ...observation.events[1], id: 'recent-' + index, text: 'Recent observation ' + index + ': ' + 'x'.repeat(220) }))];
+  const result = await f.analyzer.analyze({ ...observation, events }, f.options);
+  assert.ok(result.summary.partial.evidenceRefs.length);
+  assert.ok(result.coverage.gaps.includes('analysis_evidence_budget'));
+  assert.equal(f.requests.length, 1);
+  assert.ok(JSON.stringify(f.requests[0].body).length <= 24_000, 'budget includes the thinking policy and cache namespace actually sent');
+  const evidence = JSON.parse(f.requests[0].body.messages[1].content).evidence;
+  assert.ok(evidence.some(group => group.isCurrentInput));
 });
 
 test('an ordinary provider cannot inject a certified GMD receipt into analysis history', async t => {

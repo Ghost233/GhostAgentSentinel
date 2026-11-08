@@ -17,7 +17,7 @@ test('a capability-blocked private Core retires naturally and the observer recon
     connections++
     if (retired && !replacement) replacement = await startServer({ dataDir })
     const client = await connectCore({ dataDir }), health = client.health
-    if (!retired) client.health = async (...args) => { const value = await health(...args); return { ...value, features: value.features.filter(feature => feature !== 'partial-observation-summary/1') } }
+    if (!retired) client.health = async (...args) => { const value = await health(...args); return { ...value, features: value.features.filter(feature => feature !== 'bounded-summary-generation/1') } }
     return client
   } })
   t.after(async () => { await adapter?.close(); await core.close(); await oldClient?.close(); await dshClient?.close(); await old?.close(); await replacement?.close(); await dsh?.close(); await rm(dir, { recursive: true, force: true }) })

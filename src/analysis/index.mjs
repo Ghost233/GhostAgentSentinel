@@ -25,26 +25,34 @@ export function createAnalyzer(config = {}) {
   for (const name of ['llm', 'jev']) if (config[name]?.baseUrl) inferenceEndpoint(config[name], '/');
   const capabilities = new Map();
   const digest = value => createHash('sha256').update(value).digest('hex');
-  async function modelRequest(role, input, body, options, prefill = false) {
+  async function modelCapability(role, options) {
     const mode = role === 'llm' ? 'chat_max_tokens_zero' : 'systemone_state';
-    const path = role === 'llm' ? '/v1/chat/completions' : '/v1/systemone';
-    const timeoutMs = role === 'llm' ? config.llmTimeoutMs ?? 120_000 : config.jevTimeoutMs ?? 30_000;
     let cached = capabilities.get(role);
     if (!cached || performance.now() - cached.at >= 30_000) {
       const signals = [options.signal, options.transportSignal, options.lifetimeSignal].filter(Boolean);
       cached = { value: await discoverGMDPrefill(config[role], { mode, signal: signals.length ? AbortSignal.any(signals) : undefined }), at: performance.now() };
       capabilities.set(role, cached);
     }
-    if (!cached.value.supported) {
-      if (prefill) return { state: 'unsupported', reason: cached.value.reason };
-      return { payload: await requestInference(config[role], path, body, { ...options, timeoutMs, stage: role }), receipt: null };
-    }
+    return cached.value;
+  }
+  function modelCacheSalt(role, input, body) {
     const owner = input.source?.descriptor ?? input.source;
     const requestId = Object.hasOwn(input.task, 'currentRequestId') ? input.task.currentRequestId : input.events.findLast(event => event.kind === 'input')?.id;
     if (!owner?.registrationId || !input.task.key || !requestId) throw new AnalysisError('configuration', role, 'GMD 缓存操作缺少已确认的安装、任务或请求身份');
-    const cacheSalt = 'sentinel:' + digest(JSON.stringify(['analysis-cache/1', owner.registrationId, input.task.key, input.task.lifecycleId, requestId,
-      role, inferenceEndpoint(config[role], '/'), config[role].model, role === 'llm' ? digest(EXTRACTION_INSTRUCTIONS) : 'jev-rendered-time/1']));
-    const operation = createGMDOperation(config[role], { mode, capability: cached.value,
+    return 'sentinel:' + digest(JSON.stringify(['analysis-cache/1', owner.registrationId, input.task.key, input.task.lifecycleId, requestId,
+      role, inferenceEndpoint(config[role], '/'), config[role].model, role === 'llm' ? digest(JSON.stringify([EXTRACTION_INSTRUCTIONS, body.thinking_token_budget])) : 'jev-rendered-time/1']));
+  }
+  async function modelRequest(role, input, body, options, prefill = false, capability) {
+    const mode = role === 'llm' ? 'chat_max_tokens_zero' : 'systemone_state';
+    const path = role === 'llm' ? '/v1/chat/completions' : '/v1/systemone';
+    const timeoutMs = role === 'llm' ? config.llmTimeoutMs ?? 120_000 : config.jevTimeoutMs ?? 30_000;
+    capability ??= await modelCapability(role, options);
+    if (!capability.supported) {
+      if (prefill) return { state: 'unsupported', reason: capability.reason };
+      return { payload: await requestInference(config[role], path, body, { ...options, timeoutMs, stage: role }), receipt: null };
+    }
+    const cacheSalt = modelCacheSalt(role, input, body);
+    const operation = createGMDOperation(config[role], { mode, capability,
       body: { ...body, stream: false, cache_salt: cacheSalt, ...(prefill ? { max_tokens: 0 } : {}) } });
     const response = await operation.execute({ ...options, timeoutMs });
     if (prefill) return { state: 'completed', receipt: operation.snapshot() };
@@ -117,8 +125,12 @@ export function createAnalyzer(config = {}) {
         result.summary.attention = '本轮没有仍在保留期限内的任务证据';
         return prewarming ? { state: 'skipped' } : result;
       }
+      const options = { signal, transportSignal, lifetimeSignal, onState };
+      const llmCapability = await modelCapability('llm', options);
+      const generation = llmCapability.supported ? { thinking_token_budget: 0 } : {};
+      const managed = llmCapability.supported ? { ...generation, cache_salt: modelCacheSalt('llm', input, generation) } : {};
       let catalog = evidenceCatalog(events, latestInput);
-      const requestFor = catalog => ({ model: config.llm.model, stream: false, max_tokens: 4096, temperature: 0, messages: [
+      const requestFor = catalog => ({ model: config.llm.model, stream: false, max_tokens: 4096, temperature: 0, ...managed, messages: [
         { role: 'system', content: EXTRACTION_INSTRUCTIONS },
         { role: 'user', content: JSON.stringify({ task: { status: input.task.status }, evidence: catalog.groups, coverage }) },
       ] });
@@ -152,9 +164,8 @@ export function createAnalyzer(config = {}) {
         result.summary.attention = '本轮证据超过摘取预算，语义分析不可判断';
         return prewarming ? { state: 'skipped' } : result;
       }
-      const options = { signal, transportSignal, lifetimeSignal, onState };
-      if (prewarming) return modelRequest('llm', input, llmRequest, options, true);
-      const { payload: llm, receipt: llmReceipt } = await modelRequest('llm', input, llmRequest, options);
+      if (prewarming) return modelRequest('llm', input, llmRequest, options, true, llmCapability);
+      const { payload: llm, receipt: llmReceipt } = await modelRequest('llm', input, llmRequest, options, false, llmCapability);
       const message = llm.choices?.[0];
       if (message?.finish_reason !== 'stop' || typeof message?.message?.content !== 'string' || !message.message.content.trim()) throw new AnalysisError('incomplete_response', 'llm', '摘取响应未完整结束或达到输出上限');
       let extracted;
