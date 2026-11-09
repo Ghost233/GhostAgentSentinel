@@ -10,7 +10,7 @@
         "source": "git-subdir",
         "url": "https://github.com/Ghost233/GhostAgentSentinel",
         "path": "./plugins/ghost-sentinel",
-        "sha": "801fa2c8ced4c4bd3d97780d963bef3e0bafc938"
+        "sha": "b977e34a18c61e6e43c8c2909096b55124a45fa9"
       },
       "policy": {
         "installation": "AVAILABLE",
