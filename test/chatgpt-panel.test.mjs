@@ -100,6 +100,21 @@ test('a failed new round keeps the prior successful summary only in directly rea
   assert.equal(page.element('#last-summary-evidence').textContent, '')
 })
 
+test('verified summary cache contention shows automatic recovery beside the last valid summary', async t => {
+  const page = await harness(t), view = material('main-a', 'gray'), completedAt = Date.now() - 10000
+  const error = { code: 'gmd_not_admitted', stage: 'llm', category: 'cache-busy', remoteCode: 'prefill_context_busy' }
+  view.analysis = { ...view.analysis, state: 'failed', resultDisposition: 'invalid', nextEligibleAt: Date.now() + 60000, error }
+  view.health = { state: 'failed', failures: [{ domain: 'analysis', error }] }
+  view.recentModelActivity = { summary: { text: '上次已观察到有效结果。', completedAt, expiresAt: completedAt + 86400000, partial: false } }
+  await page.deliver(view)
+  assert.match(page.element('#summary').textContent, /总结恢复中/)
+  assert.match(page.element('#model-status').textContent, /GMD 缓存占用.*自动重试/)
+  assert.match(page.element('#health').textContent, /GMD 缓存占用/)
+  assert.doesNotMatch(page.element('#health').textContent, /监控故障/)
+  assert.equal(page.element('#recent-summary-text').textContent, view.recentModelActivity.summary.text)
+  assert.equal(page.element('#recent-summary-time').dateTime, new Date(completedAt).toISOString())
+})
+
 test('a partial summary lists observation gaps, stays gray and keeps the prior complete summary as history', async t => {
   const page = await harness(t), view = material('main-a', 'green'), completedAt = Date.now() - 1000
   view.analysis.coverage = { complete: false, gaps: ['analysis_evidence_budget'], verificationGaps: ['tool-result-image-omitted'] }
@@ -117,6 +132,67 @@ test('a partial summary lists observation gaps, stays gray and keeps the prior c
     assert.equal(page.element('#model-summary').hidden, true)
     assert.equal(page.element('#model-summary-gaps').textContent, '')
   }
+})
+
+test('same-chat polling updates only changed content and keeps the recent summary readable', async t => {
+  const page = await harness(t), view = material(), completedAt = Date.now() - 10000
+  view.recentModelActivity = {
+    prefill: { submittedAt: completedAt, state: 'prefilling' },
+    summary: { text: '已经核对了上次结果。', completedAt, expiresAt: completedAt + 86400000 },
+  }
+  await page.deliver(view)
+  const summary = page.element('#recent-summary-text'), written = summary.textWrites
+  const rows = [...page.element('#check-list').children]
+  await page.refresh()
+  assert.equal(summary.textContent, view.recentModelActivity.summary.text)
+  await page.deliver(view)
+  assert.equal(summary.textWrites, written)
+  assert.ok(page.element('#check-list').children.every((row, index) => row === rows[index]))
+
+  const refresh = page.element('#refresh').onclick()
+  await page.flush()
+  const checks = view.analysis.checks.map((check, index) => index === 0 ? { ...check, reason: '证据已更新' } : check)
+  await page.deliver({ ...view, analysis: { ...view.analysis, checks },
+    recentModelActivity: { ...view.recentModelActivity, prefill: { ...view.recentModelActivity.prefill, state: 'completed' } } })
+  await refresh
+  assert.equal(page.element('#recent-prefill-state').textContent, '已完成')
+  assert.equal(summary.textWrites, written)
+  assert.match(page.element('#check-list').children[0].textContent, /证据已更新/)
+  assert.ok(page.element('#check-list').children.slice(1).every((row, index) => row === rows[index + 1]))
+
+  const sent = page.sent.length
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed', params: { containerDimensions: { width: 315 } } } })
+  assert.equal(page.sent.length, sent, 'a display-only context change does not reset or restart polling')
+  assert.equal(summary.textWrites, written)
+  assert.equal(summary.textContent, view.recentModelActivity.summary.text)
+})
+
+test('a same-chat read failure keeps the last model activity marked as retained until the next confirmed result', async t => {
+  let clock = Date.now()
+  const page = await harness(t, { now: () => clock }), view = material(), completedAt = clock - 10000
+  view.recentModelActivity = { prefill: { submittedAt: completedAt, state: 'completed' },
+    summary: { text: '上次总结仍可阅读。', completedAt, expiresAt: completedAt + 86400000 } }
+  await page.deliver(view)
+  const request = await page.refresh()
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', id: request, error: { message: 'controlled transport failure' } } })
+  await page.flush()
+  assert.equal(page.element('#recent-summary-text').textContent, view.recentModelActivity.summary.text)
+  assert.equal(page.element('#recent-prefill-time').dateTime, new Date(completedAt).toISOString())
+  assert.match(page.element('#recent-model-status').textContent, /上次读取/)
+  assert.equal(page.element('#check-list').children.length, 0)
+  await page.refresh(); await page.deliver(result('main-a'))
+  assert.equal(page.element('#recent-summary-text').textContent, view.recentModelActivity.summary.text)
+  assert.match(page.element('#recent-model-status').textContent, /上次读取/)
+  await page.refresh(); await page.deliver({ ...view, recentModelActivity: { prefill: null, summary: null } })
+  assert.equal(page.element('#recent-summary-time').hidden, true)
+  assert.equal(page.element('#recent-summary-text').textContent, '暂无可显示的总结')
+  assert.equal(page.element('#recent-model-status').hidden, true)
+  await page.refresh(); await page.deliver(view)
+  clock = completedAt + 86400000
+  await page.refresh(); await page.deliver(result('main-a'))
+  assert.equal(page.element('#recent-prefill-time').hidden, true)
+  assert.equal(page.element('#recent-summary-time').hidden, true)
+  assert.equal(page.element('#recent-model-status').hidden, true)
 })
 
 test('recent model activity stays above the tabs and is cleared before a different chat is rendered', async t => {
@@ -492,6 +568,8 @@ test('the actual panel DOM omits excluded child-agent counts while retaining cur
 
 test('the panel selects its own monitored history, keeps evidence inline and returns to the current execution', async t => {
   const page = await harness(t), view = material('main-a')
+  const completedAt = Date.now() - 1000
+  view.recentModelActivity = { summary: { text: '当前聊天最近一次总结。', completedAt, expiresAt: completedAt + 86400000 } }
   view.monitoring = { registrationId: 'chatgpt:installation', taskId: 'main-a', paused: false, revision: 'revision-a' }
   view.execution = { key: 'current', lifecycleId: 'turn-current', historical: false, status: 'running', request: 'Current request' }
   view.history = { currentKey: 'current', selectedKey: 'current', executions: [{ key: 'current', lifecycleId: 'turn-current', status: 'running', observedAt: 1000 }, { key: 'prior', lifecycleId: 'turn-prior', status: 'ended', observedAt: 500 }], hasMore: false }
@@ -503,6 +581,7 @@ test('the panel selects its own monitored history, keeps evidence inline and ret
   const request = page.sent.findLast(row => row.method === 'tools/call')
   assert.deepEqual(JSON.parse(JSON.stringify(request.params.arguments)), { executionKey: 'prior', expectedThreadId: 'main-a' })
   assert.equal(page.element('#issues').textContent, '', 'the former execution evidence clears while selection is pending')
+  assert.equal(page.element('#recent-summary-text').textContent, view.recentModelActivity.summary.text, 'recent model activity belongs to the chat, not the selected execution')
   page.reply(request.id, { structuredContent: { ...view, execution: { key: 'prior', lifecycleId: 'turn-prior', historical: true, status: 'ended', request: 'Prior request' }, history: { ...view.history, selectedKey: 'prior' } } })
   await selection
   assert.match(page.element('#execution').textContent, /历史执行.*已结束/)

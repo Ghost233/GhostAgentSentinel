@@ -16,6 +16,7 @@ export const BOUNDED_SUMMARY_GENERATION_FEATURE = 'bounded-summary-generation/1'
 export const NATIVE_CAPTURE_LIVE_BUDGET_FEATURE = 'native-capture-live-budget/1'
 export const CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE = 'chatgpt-recent-model-activity/1'
 export const CHINESE_SUMMARY_PROMPT_FEATURE = 'chinese-summary-prompt/1'
+export const GMD_SUMMARY_CACHE_RECOVERY_FEATURE = 'gmd-summary-cache-recovery/1'
 export const CHATGPT_INSTALLATION_PURGE_FEATURE = 'chatgpt-installation-purge/1'
 export const CHATGPT_RETENTION_MAINTENANCE_FEATURE = 'chatgpt-retention-maintenance/1'
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000

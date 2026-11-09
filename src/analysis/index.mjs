@@ -4,6 +4,7 @@ import { renderJevRequest } from './jev-rendering.mjs';
 import { userWait, userWaitDuration, userWaitThresholdAt } from '../gs-status.mjs';
 import { createHash } from 'node:crypto';
 import { discoverGMDPrefill, createGMDOperation } from './gmd-prefill-client.mjs';
+import { isGMDCacheBusy } from './failure-info.mjs';
 
 export const CHECK_IDS = Object.freeze([
   'stalled_progress', 'request_drift', 'failure_loop',
@@ -52,9 +53,17 @@ export function createAnalyzer(config = {}) {
       return { payload: await requestInference(config[role], path, body, { ...options, timeoutMs, stage: role }), receipt: null };
     }
     const cacheSalt = modelCacheSalt(role, input, body);
-    const operation = createGMDOperation(config[role], { mode, capability,
-      body: { ...body, stream: false, cache_salt: cacheSalt, ...(prefill ? { max_tokens: 0 } : {}) } });
-    const response = await operation.execute({ ...options, timeoutMs });
+    const prepare = salt => createGMDOperation(config[role], { mode, capability,
+      body: { ...body, stream: false, cache_salt: salt, ...(prefill ? { max_tokens: 0 } : {}) } });
+    let operation = prepare(cacheSalt), response;
+    try { response = await operation.execute({ ...options, timeoutMs }); }
+    catch (error) {
+      if (prefill || role !== 'llm' || !isGMDCacheBusy(error)) throw error;
+      // A verified rejection did not dispatch this request. Use a separate,
+      // stable cache without touching the occupied cache or replaying its work.
+      operation = prepare('sentinel:' + digest(JSON.stringify(['analysis-cache-recovery/1', cacheSalt])));
+      response = await operation.execute({ ...options, timeoutMs });
+    }
     if (prefill) return { state: 'completed', receipt: operation.snapshot() };
     return { payload: response, receipt: operation.snapshot() };
   }

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { inferenceFailureInfo } from '../analysis/failure-info.mjs';
+import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
 
 const COLLECTION = 'failure-receipts';
 const STATES = 'failure-states', DAY = 86_400_000, LIMIT = 1024;
@@ -25,6 +25,7 @@ export function failureErrorInfo(error = {}) {
   if (typeof error.code === 'string' && /^(unsupported-record-type|unsupported-event-type):/.test(error.code)) error = { ...error, code: error.code.split(':', 1)[0] };
   const known = CATEGORIES.has(error.code), code = known ? error.code : error.code == null ? 'analysis_failed' : 'unrecognized_error';
   const value = { code, stage: STAGES.has(error.stage) ? error.stage : null, category: CATEGORIES.get(code) ?? 'other' };
+  if (isGMDCacheBusy(error)) { value.category = 'cache-busy'; value.remoteCode = 'prefill_context_busy'; }
   if (code === 'gmd_operation_failed' && error.details?.remoteCode === 'invalid_response') value.category = 'protocol';
   if (!known && typeof error.code === 'string') value.codeHash = createHash('sha256').update(error.code).digest('hex');
   else if (code === 'unrecognized_error' && /^[a-f0-9]{64}$/.test(error.codeHash ?? '')) value.codeHash = error.codeHash;
@@ -121,14 +122,15 @@ export function createFailureReceipts({ db, now = Date.now }) {
         // Ordering proof belongs to the channel, not to an individual cause.
         const scopeKey = JSON.stringify([sourceKey, mainId, lifecycleId, domain, channel]);
         if (input.outcome === 'succeeded') {
+          const cacheRecoveryOnly = input.cacheRecoveryOnly === true;
           const watermark = states.get(scopeKey);
-          if (!watermark || at > watermark.updatedAt) {
+          if (!cacheRecoveryOnly && (!watermark || at > watermark.updatedAt)) {
             const next = { key: scopeKey, kind: 'recovery', sourceKey, mainId, lifecycleId, domain, channel, updatedAt: at, active: false, lastRoundId: roundId };
             save(STATES, scopeKey, next); states.set(scopeKey, next);
           }
           const recovered = [];
-          for (const state of states.values()) if (sameScope(state, input) && state.active && at >= state.updatedAt) {
-            const next = { ...state, active: false, updatedAt: at, lastRoundId: roundId };
+          for (const state of states.values()) if (sameScope(state, input) && state.active && at >= state.updatedAt && (!cacheRecoveryOnly || state.error?.category === 'cache-busy')) {
+            const next = { ...state, active: false, updatedAt: at, lastRoundId: roundId, ...(cacheRecoveryOnly ? { cacheRecoveryOnly } : {}) };
             save(STATES, next.key, next); states.set(next.key, next);
             const receipt = receipts.get(state.episodeId);
             if (receipt) {
@@ -143,7 +145,7 @@ export function createFailureReceipts({ db, now = Date.now }) {
         const historical = [...receipts.values()].find(value => value.causeKey === causeKey && value.firstRoundId === roundId);
         if (historical) return { created: false, receipt: publicReceipt(historical) };
         const state = states.get(causeKey);
-        const watermark = Math.max(-1, ...[...states.values()].filter(value => sameScope(value, input) && value.active === false).map(value => value.updatedAt));
+        const watermark = Math.max(-1, ...[...states.values()].filter(value => sameScope(value, input) && value.active === false && (!value.cacheRecoveryOnly || value.key === causeKey)).map(value => value.updatedAt));
         const recoveredAt = at < watermark ? watermark : null;
         if (state && ((recoveredAt === null && at < state.updatedAt) || !state.active && state.lastRoundId === roundId)) return { created: false, receipt: null };
         if (recoveredAt !== null) {

@@ -22,6 +22,7 @@
   <div class="recent-model-row"><strong>上次送预填</strong><div class="recent-model-value"><time id="recent-prefill-time" hidden></time><span id="recent-prefill-state" class="recent-model-badge">待核对</span></div></div>
   <div class="recent-model-row" id="recent-summary-row"><strong>上次总结</strong><div class="recent-model-value"><span id="recent-summary-state" class="recent-model-badge" hidden></span><time id="recent-summary-time" hidden></time></div></div>
   <p id="recent-summary-text" class="muted">等待核对当前聊天</p><p id="recent-summary-gaps" class="muted" hidden></p>
+  <p id="recent-model-status" class="muted" role="status" hidden></p>
 </section>
 <p id="availability" class="muted" role="status" hidden></p>
 <nav id="monitor-tabs" role="tablist" aria-label="会话检查"><button id="monitor-tab-issues" type="button" role="tab" aria-controls="issues">当前问题</button><button id="monitor-tab-details" type="button" role="tab" aria-controls="monitor-details">详情</button></nav>
@@ -50,6 +51,19 @@ const lights={red:'🔴',yellow:'🟡',green:'🟢',gray:'⚪'};
 const states={queued:'检查排队中',analyzing:'正在检查',unavailable:'本地模型未配置或不可用',failed:'本轮分析失败',unknown:'当前分析不可判断',cooldown:'本轮检查已更新',idle:'最近检查结果',paused:'分析已暂停',stale:'检查已过期',interrupted:'本轮检查已取消','not-connected':'六项分析尚未接入'};
 const executions={running:'运行中',idle:'已结束',ended:'已结束',aborted:'已中断',unknown:'结束状态未确认'};
 const element=id=>document.querySelector('#'+id);
+function set(id,key,value){const target=element(id);if(target[key]!==value)target[key]=value;}
+const write=(id,value)=>set(id,'textContent',value);
+const show=(id,visible)=>set(id,'hidden',!visible);
+function attribute(id,key,value){const target=element(id);if(target.getAttribute(key)!==value)target.setAttribute(key,value);}
+function updateRows(id,rows){
+  const target=element(id),previous=[...target.children];
+  for(const [index,row] of rows.entries()){
+    const current=previous[index];
+    if(!current)target.append(row);
+    else if(!current.isEqualNode(row))target.replaceChild(row,current);
+  }
+  for(const row of previous.slice(rows.length))target.removeChild(row);
+}
 const text=(value,max=240)=>typeof value==='string'?value.trim().slice(0,max):'';
 const list=value=>Array.isArray(value)?value:[];
 const count=value=>Number.isSafeInteger(value)&&value>=0?String(value):'—';
@@ -59,27 +73,32 @@ const gapDescriptions={'tool-result-image-omitted':'图片未纳入文本观察'
 function summaryGaps(gaps){
   return [...new Set(gaps.filter(gap=>text(gap)).map(gap=>Object.hasOwn(gapDescriptions,gap)?gapDescriptions[gap]:gap.includes('unsupported-item-type:')?'存在未识别的原生事件':text(gap,160)))];
 }
-function renderRecentModelActivity(activity){
+function renderRecentModelActivity(activity,retained=false){
   const now=Date.now(),prefill=activity?.prefill,summary=activity?.summary;
+  const recent=at=>Number.isFinite(at)&&at<=now&&at>now-86400000;
   const time=(id,at)=>{
-    const value=element(id),visible=Number.isFinite(at)&&at<=now&&at>now-86400000;
-    value.hidden=!visible;value.textContent=visible?summaryTimeFormat.format(at):'';
-    value.dateTime=visible?new Date(at).toISOString():'';
+    const visible=recent(at);
+    show(id,visible);write(id,visible?summaryTimeFormat.format(at):'');
+    set(id,'dateTime',visible?new Date(at).toISOString():'');
   };
-  const [label,tone]=Object.hasOwn(prefillStates,prefill?.state)?prefillStates[prefill.state]:[activity?'暂无记录':'待核对',''];
-  element('recent-prefill-state').textContent=label;
-  element('recent-prefill-state').setAttribute('data-tone',tone);
+  const validPrefill=prefill&&(prefill.submittedAt==null||recent(prefill.submittedAt));
+  const [label,tone]=validPrefill&&Object.hasOwn(prefillStates,prefill.state)?prefillStates[prefill.state]:[activity?'暂无记录':'待核对',''];
+  write('recent-prefill-state',label);
+  attribute('recent-prefill-state','data-tone',tone);
   time('recent-prefill-time',prefill?.submittedAt);
-  const valid=Number.isFinite(summary?.completedAt)&&summary.completedAt<=now&&summary.expiresAt>now&&text(summary.text,600);
-  const badge=element('recent-summary-state'),body=element('recent-summary-text'),gaps=element('recent-summary-gaps');
-  badge.hidden=!valid;badge.textContent=valid?(summary.partial?'部分观察':'已生成'):'';
-  badge.setAttribute('data-tone',summary?.partial?'waiting':'ok');
-  body.className=valid?'':'muted';body.textContent=valid?text(summary.text,600):activity?'暂无可显示的总结':'等待核对当前聊天';
+  const valid=recent(summary?.completedAt)&&summary.expiresAt>now&&Boolean(text(summary.text,600));
+  show('recent-summary-state',valid);write('recent-summary-state',valid?(summary.partial?'部分观察':'已生成'):'');
+  attribute('recent-summary-state','data-tone',summary?.partial?'waiting':'ok');
+  set('recent-summary-text','className',valid?'':'muted');
+  write('recent-summary-text',valid?text(summary.text,600):activity?'暂无可显示的总结':'等待核对当前聊天');
   time('recent-summary-time',valid?summary.completedAt:null);
   const missing=valid&&summary.partial?summaryGaps(list(summary.gaps)):[];
-  gaps.hidden=!missing.length;gaps.textContent=missing.length?'观察缺口 · '+missing.join('、'):'';
+  show('recent-summary-gaps',missing.length>0);write('recent-summary-gaps',missing.length?'观察缺口 · '+missing.join('、'):'');
+  const showRetained=retained&&Boolean(valid||validPrefill);
+  show('recent-model-status',showRetained);write('recent-model-status',showRetained?'本次未能更新 · 显示上次读取':'');
+  return activity?{prefill:validPrefill?prefill:null,summary:valid?summary:null}:null;
 }
-let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false,controlState=null,scopeThreadId=null,selectedExecutionKey=null,historyCursor=null,nextHistoryCursor=null;
+let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false,controlState=null,scopeThreadId=null,selectedExecutionKey=null,historyCursor=null,nextHistoryCursor=null,recentActivity=null;
 const pending=new Map();
 function selectTab(tab){
   for(const name of ['issues','details'])element('monitor-tab-'+name).setAttribute('aria-selected',String(name===tab));
@@ -93,31 +112,36 @@ function renderGS(view,signal='gray'){
   const status=history?.currentStatus??(historical?'unknown':view?.execution?.status??view?.observation?.status);
   const active=Boolean(identity)&&!['ended','idle','disposed','aborted'].includes(status);
   const light=historical&&Object.hasOwn(lights,history?.currentSignal)?history.currentSignal:historical?'gray':signal;
-  for(const name of ['green','yellow','red','gray'])element('gs-'+name).textContent=lights[name]+' '+(active&&light===name?'1':'0');
+  for(const name of ['green','yellow','red','gray'])write('gs-'+name,lights[name]+' '+(active&&light===name?'1':'0'));
 }
 renderGS(null);
-function reset(){
-  renderRecentModelActivity(null);
-  controlState=null;element('pause').hidden=true;element('pause').disabled=false;
-  for(const name of ['identity','coverage','observation','technical','error','health','execution','record-status','current-request','current-activity','inheritance','history-gap','model-status','model-summary-text','availability'])element(name).textContent='';
-  element('availability').hidden=true;
-  element('model-summary').hidden=true;element('model-summary-evidence').replaceChildren();element('model-summary-title').textContent='模型总结';element('model-summary-gaps').textContent='';
-  element('last-summary').hidden=true;element('last-summary-time').textContent='';element('last-summary-text').textContent='';element('last-summary-evidence').replaceChildren();
-  element('current-facts').hidden=true;
-  for(const name of ['issues','detail-issues','check-list','gaps','history-list'])element(name).replaceChildren();
-  element('history').hidden=true;element('history-more').hidden=true;
-  element('analysis').textContent='当前分析不可判断';element('diagnostics-title').textContent='观察与覆盖';
+function resetDetails(){
+  controlState=null;set('pause','disabled',false);
+  for(const name of ['pause','availability','model-summary','last-summary','current-facts','history','history-more'])show(name,false);
+  for(const name of ['identity','coverage','observation','technical','error','health','execution','record-status','current-request','current-activity','inheritance','history-gap','model-status','model-summary-text','model-summary-gaps','last-summary-time','last-summary-text','availability'])write(name,'');
+  for(const name of ['issues','detail-issues','check-list','gaps','history-list','model-summary-evidence','last-summary-evidence'])updateRows(name,[]);
+  write('model-summary-title','模型总结');write('analysis','当前分析不可判断');write('diagnostics-title','观察与覆盖');
 }
-function clearView(message){reset();renderGS(null);scopeThreadId=null;selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;element('summary').textContent='⚪ '+message;element('summary').setAttribute('data-signal','gray');}
+function clearView(message){
+  resetDetails();renderGS(null);
+  scopeThreadId=null;selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;recentActivity=null;
+  renderRecentModelActivity(null);
+  write('summary','⚪ '+message);attribute('summary','data-signal','gray');
+}
 function node(tag,value,className){const child=document.createElement(tag);if(value)child.textContent=value;if(className)child.className=className;return child;}
 function renderHealth(health){
   if(health?.state==='failed'){
-    const reasons=list(health.failures).slice(0,3).map(failure=>(failure.domain==='collection'?'采集':'分析')+'失败'+(text(failure.error?.code,80)?'（'+text(failure.error.code,80)+'）':''));
-    element('health').textContent=(health.orderingGap?'监控曾有失败 · 恢复状态未确认 · ':'监控故障 · ')+(reasons.join('；')||'本轮监控不可用');
-  }else if(health?.state==='recovered')element('health').textContent='监控已恢复';
+    const failures=list(health.failures);
+    if(failures.length&&!health.hasMore&&failures.every(failure=>failure.domain==='analysis'&&failure.error?.category==='cache-busy')){
+      write('health','总结恢复中 · GMD 缓存占用');
+      return;
+    }
+    const reasons=failures.slice(0,3).map(failure=>failure.error?.category==='cache-busy'?'GMD 缓存占用':(failure.domain==='collection'?'采集':'分析')+'失败'+(text(failure.error?.code,80)?'（'+text(failure.error.code,80)+'）':''));
+    write('health',(health.orderingGap?'监控曾有失败 · 恢复状态未确认 · ':'监控故障 · ')+(reasons.join('；')||'本轮监控不可用'));
+  }else write('health',health?.state==='recovered'?'监控已恢复':'');
 }
 function stateLine(analysis){
-  const parts=[states[analysis.state]??'分析状态未确认'];
+  const parts=[analysis.error?.category==='cache-busy'?'总结恢复中':states[analysis.state]??'分析状态未确认'];
   if(Number.isFinite(analysis.waitMs)&&analysis.waitMs>=1000)parts.push('排队 '+Math.floor(analysis.waitMs/1000)+' 秒');
   if(Number.isFinite(analysis.lagMs)&&analysis.lagMs>=1000)parts.push('分析滞后 '+Math.floor(analysis.lagMs/1000)+' 秒');
   return parts.join(' · ');
@@ -126,28 +150,31 @@ function readArguments(){return selectedExecutionKey||historyCursor?{...(selecte
 function selectExecution(key,cursor=historyCursor){
   if(stopped||!ready||!scopeThreadId)return;
   if(key)selectTab('details');
-  selectedExecutionKey=key;historyCursor=cursor;generation++;clearTimeout(timer);timer=null;reset();
-  element('summary').textContent='⚪ 正在读取检查记录';element('summary').setAttribute('data-signal','gray');renderGS({identity:{threadId:scopeThreadId}},'gray');
+  selectedExecutionKey=key;historyCursor=cursor;generation++;clearTimeout(timer);timer=null;resetDetails();
+  write('summary','⚪ 正在读取检查记录');attribute('summary','data-signal','gray');renderGS({identity:{threadId:scopeThreadId}},'gray');
   return refresh();
 }
 function renderHistory(view){
-  const history=view.history;if(!history)return;
-  historyCursor=text(history.cursor,256)||null;nextHistoryCursor=text(history.nextCursor,256)||null;
-  element('history').hidden=false;
-  element('history-current').disabled=history.selectedKey===history.currentKey&&!historyCursor;
-  element('history-more').hidden=!nextHistoryCursor;
-  for(const execution of list(history.executions).slice(0,20)){
+  const history=view.history,entries=list(history?.executions),rows=[];
+  if(history){historyCursor=text(history.cursor,256)||null;nextHistoryCursor=text(history.nextCursor,256)||null;}
+  set('history-current','disabled',Boolean(history&&history.selectedKey===history.currentKey&&!historyCursor));
+  show('history-more',Boolean(history&&nextHistoryCursor));
+  for(const execution of entries.slice(0,20)){
     if(!text(execution?.key,256))continue;
     const time=Number.isFinite(execution.startedAt??execution.observedAt)?new Date(execution.startedAt??execution.observedAt).toLocaleString():'时间未确认';
     const button=node('button',time+' · '+(executions[execution.status]??'状态未确认'),'history-entry');
-    button.type='button';button.setAttribute('data-execution-key',execution.key);button.setAttribute('aria-current',String(execution.key===history.selectedKey));button.onclick=()=>selectExecution(execution.key);element('history-list').append(button);
+    button.type='button';button.setAttribute('data-execution-key',execution.key);button.setAttribute('aria-current',String(execution.key===history.selectedKey));button.onclick=()=>selectExecution(execution.key);rows.push(button);
   }
-  if(!list(history.executions).length)element('history-list').append(node('p','暂无保留的已监控执行','muted'));
-  if(history.historyGap)element('history-gap').textContent='先前的分页位置已过期，已返回最近记录';
-  const execution=view.execution;
-  if(execution?.historical)element('execution').textContent='历史执行 · '+(executions[execution.status]??'状态未确认')+(text(execution.request)?'\n'+text(execution.request):'');
-  else if(execution&&execution.status!=='running')element('execution').textContent='最近执行 · '+(executions[execution.status]??'状态未确认');
+  if(history&&!entries.length)rows.push(node('p','暂无保留的已监控执行','muted'));
+  updateRows('history-list',rows);
+  write('history-gap',history?.historyGap?'先前的分页位置已过期，已返回最近记录':'');
+  const execution=history&&view.execution;
+  let caption='';
+  if(execution?.historical)caption='历史执行 · '+(executions[execution.status]??'状态未确认')+(text(execution.request)?'\n'+text(execution.request):'');
+  else if(execution&&execution.status!=='running')caption='最近执行 · '+(executions[execution.status]??'状态未确认');
+  write('execution',caption);
 }
+const summaryEvidence=summary=>summary.evidence.slice(0,2).map(evidence=>node('p',[text(evidence.text,240),text(evidence.reference,2000)?'出处：'+text(evidence.reference,2000):''].filter(Boolean).join('\n'),'evidence'));
 function render(view){
   if(!view||!Object.hasOwn(lights,view.signal)||!view.analysis||typeof view.analysis.state!=='string')throw new Error('未收到兼容的检查结果');
   const identity=text(view.identity?.threadId,128);
@@ -161,77 +188,91 @@ function render(view){
     renderHealth(view.health);
     return;
   }
-  if(scopeThreadId&&scopeThreadId!==identity){selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;}
-  reset();scopeThreadId=identity;
-  renderRecentModelActivity(view.recentModelActivity);
+  if(scopeThreadId!==identity){selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;recentActivity=null;}
+  scopeThreadId=identity;
+  const activityMissing=view.recentModelActivity===undefined;
+  write('error','');write('availability','');show('availability',false);
   const analysis=view.analysis,byId=new Map(list(analysis.checks).filter(check=>check&&Object.hasOwn(labels,check.id)).map(check=>[check.id,check]));
   const inheritanceGap=view.inheritance&&(view.inheritance.state!=='complete'||list(view.inheritance.gaps).length>0);
   const recordRevalidating=!view.execution?.historical&&view.observation?.recordRevalidating===true;
+  const cacheRecovery=analysis.state==='failed'&&analysis.error?.category==='cache-busy';
   let signal=view.signal,summary=text(view.summary)||'当前状态不可判断';
   const green=!inheritanceGap&&!list(analysis.coverage?.contextGaps).length&&view.health?.state!=='failed'&&analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted','stale'].includes(analysis.state)&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>{const check=byId.get(id);return check&&(check.status==='clear'||check.applicability?.state==='not-triggered');});
   if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?(view.health.orderingGap?'监控恢复状态未确认':'监控故障，当前状态不可判断'):inheritanceGap?'当前执行已接入，继承要求待补齐':states[analysis.state]??'当前分析不可判断';}
   if(signal==='green'&&analysis.resultDisposition==='pending')summary='上轮正常 · 待分析';
-  if(recordRevalidating){signal='gray';summary='当前记录重验中';element('record-status').textContent='已核实资料保留 · 新活动尚未核实';}
-  else if(!view.execution?.historical&&view.observation?.recordSnapshotLag)element('record-status').textContent='显示已核实快照 · 正在追赶新增记录';
+  if(cacheRecovery&&signal==='gray'&&!view.execution?.historical)summary='总结恢复中';
+  if(recordRevalidating){signal='gray';summary='当前记录重验中';}
+  write('record-status',recordRevalidating?'已核实资料保留 · 新活动尚未核实':!view.execution?.historical&&view.observation?.recordSnapshotLag?'显示已核实快照 · 正在追赶新增记录':'');
   if(view.execution?.historical){signal='gray';summary=view.history?.currentGap?'当前执行尚未确认 · 显示最近检查记录':'历史执行 · 仅表示当时的检查记录';}
-  element('summary').textContent=lights[signal]+' '+summary;element('summary').setAttribute('data-signal',signal);
-  if(!view.execution?.historical&&text(view.currentFacts?.request?.text,120)){
-    element('current-facts').hidden=false;
-    element('current-request').textContent=(recordRevalidating?'已核实请求：':'当前请求：')+text(view.currentFacts.request.text,120);
-    if(text(view.currentFacts.activity?.summary,160))element('current-activity').textContent=(recordRevalidating?'已核实活动：':'最近活动：')+text(view.currentFacts.activity.summary,160);
-  }
-  if(inheritanceGap)element('inheritance').textContent=view.inheritance.state==='pending'?'继承要求待补齐 · 相关检查不可判断':'继承要求存在缺口 · 相关检查不可判断';
-  element('analysis').textContent=(view.execution?.historical?'历史检查 · ':'')+stateLine(analysis);
+  const requestText=!view.execution?.historical?text(view.currentFacts?.request?.text,120):'';
+  const activityText=requestText?text(view.currentFacts?.activity?.summary,160):'';
+  show('current-facts',Boolean(requestText));
+  write('current-request',requestText?(recordRevalidating?'已核实请求：':'当前请求：')+requestText:'');
+  write('current-activity',activityText?(recordRevalidating?'已核实活动：':'最近活动：')+activityText:'');
+  write('inheritance',inheritanceGap?(view.inheritance.state==='pending'?'继承要求待补齐 · 相关检查不可判断':'继承要求存在缺口 · 相关检查不可判断'):'');
   const partial=!analysis.generated&&analysis.coverage?.complete===false?analysis.partial:null;
   const generated=analysis.generated||partial,publishable=generated&&text(generated.text,600)&&Array.isArray(generated.evidence)&&generated.evidence.length&&!['failed','unavailable','interrupted','stale','unknown'].includes(analysis.state)&&(view.execution?.historical||['current','reused'].includes(analysis.resultDisposition));
+  show('model-summary',Boolean(publishable));
+  write('model-summary-text',publishable?text(generated.text,600):'');
+  updateRows('model-summary-evidence',publishable?summaryEvidence(generated):[]);
+  write('model-summary-title',publishable&&partial?'部分观察总结':'模型总结');
+  let modelStatus='',modelGaps='';
   if(publishable){
-    element('model-summary').hidden=false;element('model-summary-text').textContent=text(generated.text,600);
-    for(const evidence of generated.evidence.slice(0,2))element('model-summary-evidence').append(node('p',[text(evidence.text,240),text(evidence.reference,2000)?'出处：'+text(evidence.reference,2000):''].filter(Boolean).join('\n'),'evidence'));
     if(partial){
-      element('model-summary-title').textContent='部分观察总结';
       const gaps=[...list(analysis.coverage?.gaps),...list(analysis.coverage?.verificationGaps),...list(analysis.coverage?.contextGaps),...list(analysis.coverage?.extractionGaps)];
-      element('model-summary-gaps').textContent='观察缺口：'+summaryGaps(gaps).join('；');
-      element('model-status').textContent='总结模型：部分观察 · JEV：未形成完整判断';
-    }else element('model-status').textContent=analysis.resultDisposition==='reused'?'总结模型／JEV：复用仍有效的结果':'总结模型：本轮成功 · JEV：本轮完成';
-  }else if(analysis.error?.stage==='llm')element('model-status').textContent='总结模型：本轮失败 · JEV：未完成';
-  else if(analysis.error?.stage==='jev')element('model-status').textContent='总结模型：证据已整理 · JEV：本轮失败';
-  else if(analysis.state==='unavailable')element('model-status').textContent='总结模型／JEV：缺少配置或不可用，可在设置中核对';
+      modelGaps='观察缺口：'+summaryGaps(gaps).join('；');
+      modelStatus='总结模型：部分观察 · JEV：未形成完整判断';
+    }else modelStatus=analysis.resultDisposition==='reused'?'总结模型／JEV：复用仍有效的结果':'总结模型：本轮成功 · JEV：本轮完成';
+  }else if(cacheRecovery&&!view.execution?.historical){
+    const retry=Number.isFinite(analysis.nextEligibleAt)&&analysis.nextEligibleAt>Date.now()?' · '+summaryTimeFormat.format(analysis.nextEligibleAt)+' 后可重试':'';
+    modelStatus='GMD 缓存占用 · 自动重试'+retry;
+  }else if(analysis.error?.stage==='llm')modelStatus='总结模型：本轮失败 · JEV：未完成';
+  else if(analysis.error?.stage==='jev')modelStatus='总结模型：证据已整理 · JEV：本轮失败';
+  else if(analysis.state==='unavailable')modelStatus='总结模型／JEV：缺少配置或不可用，可在设置中核对';
+  write('model-status',modelStatus);write('model-summary-gaps',modelGaps);
   renderHealth(view.health);
   renderHistory(view);
   const prior=analysis.lastSuccessfulSummary,old=prior?.generated,readAt=Date.now();
-  if((!publishable||partial)&&Number.isFinite(prior?.completedAt)&&prior.completedAt<=readAt&&Number.isFinite(prior.expiresAt)&&prior.expiresAt>readAt&&text(old?.text,600)&&Array.isArray(old.evidence)&&old.evidence.length){
-    element('history').hidden=false;element('last-summary').hidden=false;
-    element('last-summary-time').textContent='历史记录 · 不代表当前结果 · '+new Date(prior.completedAt).toLocaleString();
-    element('last-summary-text').textContent=text(old.text,600);
-    for(const evidence of old.evidence.slice(0,2))element('last-summary-evidence').append(node('p',[text(evidence.text,240),text(evidence.reference,2000)?'出处：'+text(evidence.reference,2000):''].filter(Boolean).join('\n'),'evidence'));
-  }
+  const priorVisible=Boolean((!publishable||partial)&&Number.isFinite(prior?.completedAt)&&prior.completedAt<=readAt&&Number.isFinite(prior.expiresAt)&&prior.expiresAt>readAt&&text(old?.text,600)&&Array.isArray(old.evidence)&&old.evidence.length);
+  show('history',Boolean(view.history)||priorVisible);show('last-summary',priorVisible);
+  write('last-summary-time',priorVisible?'历史记录 · 不代表当前结果 · '+new Date(prior.completedAt).toLocaleString():'');
+  write('last-summary-text',priorVisible?text(old.text,600):'');
+  updateRows('last-summary-evidence',priorVisible?summaryEvidence(old):[]);
   const monitoring=view.monitoring;
-  if(monitoring?.taskId===identity&&typeof monitoring.paused==='boolean'&&text(monitoring.revision,2000)){
-    controlState={taskId:identity,paused:monitoring.paused,revision:monitoring.revision};
-    element('pause').hidden=false;element('pause').textContent=monitoring.paused?'恢复本聊天分析':'暂停本聊天分析';
-    if(monitoring.paused){element('summary').textContent='⚪ 本聊天分析已暂停';element('summary').setAttribute('data-signal','gray');element('analysis').textContent='继续采集 · 仅手动恢复分析';}
-  }
-  const currentSignal=element('summary').getAttribute('data-signal');renderGS(view,currentSignal);
+  controlState=monitoring?.taskId===identity&&typeof monitoring.paused==='boolean'&&text(monitoring.revision,2000)
+    ?{taskId:identity,paused:monitoring.paused,revision:monitoring.revision}:null;
+  const paused=controlState?.paused===true,currentSignal=paused?'gray':signal;
+  show('pause',Boolean(controlState));set('pause','disabled',false);
+  write('pause',paused?'恢复本聊天分析':'暂停本聊天分析');
+  write('summary',paused?'⚪ 本聊天分析已暂停':lights[signal]+' '+summary);
+  attribute('summary','data-signal',currentSignal);
+  write('analysis',paused?'继续采集 · 仅手动恢复分析':(view.execution?.historical?'历史检查 · ':'')+stateLine(analysis));
+  renderGS(view,currentSignal);
   const issues=list(analysis.issues).slice(0,6);
   if(!view.execution?.historical&&!issues.length&&['yellow','red'].includes(currentSignal))issues.push({reason:summary});
-  for(const target of view.execution?.historical?['detail-issues']:['issues','detail-issues'])for(const issue of issues){
-    if(!issue||!text(issue.reason))continue;
-    const article=node('article',null,'issue');article.append(node('h2',labels[issue.checkId]??'需要关注'));
-    if(target==='issues'||text(issue.reason)!==summary)article.append(node('p',text(issue.reason)));
-    const delivery=({pending:'等待通知',claimed:'通知投递中',submitted:'通知已提交',failed:'通知提交失败',cancelled:'通知已取消',expired:'通知结果未确认'})[issue.notificationStatus];
-    if(delivery)article.append(node('small',delivery,'muted'));
-    for(const evidence of list(issue.evidence).slice(0,2)){
-      const excerpt=text(evidence?.text,240),reference=text(evidence?.reference,2000);
-      if(excerpt||reference)article.append(node('p',[excerpt,reference?'出处：'+reference:''].filter(Boolean).join('\n'),'evidence'));
+  for(const target of ['issues','detail-issues']){
+    const rows=[];
+    if(target==='detail-issues'||!view.execution?.historical)for(const issue of issues){
+      if(!issue||!text(issue.reason))continue;
+      const article=node('article',null,'issue');article.append(node('h2',labels[issue.checkId]??'需要关注'));
+      if(target==='issues'||text(issue.reason)!==summary)article.append(node('p',text(issue.reason)));
+      const delivery=({pending:'等待通知',claimed:'通知投递中',submitted:'通知已提交',failed:'通知提交失败',cancelled:'通知已取消',expired:'通知结果未确认'})[issue.notificationStatus];
+      if(delivery)article.append(node('small',delivery,'muted'));
+      for(const evidence of list(issue.evidence).slice(0,2)){
+        const excerpt=text(evidence?.text,240),reference=text(evidence?.reference,2000);
+        if(excerpt||reference)article.append(node('p',[excerpt,reference?'出处：'+reference:''].filter(Boolean).join('\n'),'evidence'));
+      }
+      rows.push(article);
     }
-    element(target).append(article);
+    updateRows(target,rows);
   }
-  for(const [id,label]of Object.entries(labels)){
+  updateRows('check-list',Object.entries(labels).map(([id,label])=>{
     const check=byId.get(id),row=node('section',null,'check'),title=node('h2',label);
     const status=check?.judgmentState==='failed'?'判断失败':check?.applicability?.state==='not-triggered'?'未触发':check?.status==='attention'?'需要关注':check?.status==='clear'?'未见问题':'不可判断';
-    title.append(node('span',status,'check-status'));row.append(title,node('p',text(check?.reason)||'尚无此项检查结果','muted'));row.setAttribute('data-check',id);element('check-list').append(row);
-  }
-  element('identity').textContent='本机主会话：'+identity;
+    title.append(node('span',status,'check-status'));row.append(title,node('p',text(check?.reason)||'尚无此项检查结果','muted'));row.setAttribute('data-check',id);
+    return row;
+  }));
+  write('identity','本机主会话：'+identity);
   const discovery=view.discovery,coverage=[];
   if(discovery){
     coverage.push('本聊天：'+(discovery.currentIncluded===true?'已接入':'接入未确认'));
@@ -242,16 +283,17 @@ function render(view){
   }
   if(analysis.coverage)coverage.push((view.inheritance?'当前执行材料覆盖：':'分析材料覆盖：')+(analysis.coverage.complete===true?'已确认':'存在缺口'));
   if(view.inheritance)coverage.push('继承要求：'+(inheritanceGap?'待补齐或存在缺口':'已核实'));
-  element('coverage').textContent=coverage.join('\n');
+  write('coverage',coverage.join('\n'));
   const recordStates={'caught-up':'已追平','catching-up':'正在补读','partial-record':'等待记录写完','retained-history':'保留的历史记录',gap:'存在缺口'};
-  element('observation').textContent='执行记录：'+(recordStates[view.observation?.coverage]??'尚未确认');
+  write('observation','执行记录：'+(recordStates[view.observation?.coverage]??'尚未确认'));
   const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),...list(analysis.coverage?.contextGaps),...list(view.inheritance?.gaps),view.observation?.gap,view.history?.currentGap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
-  for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
-  if(gaps.length||inheritanceGap||discovery?.complete===false||analysis.coverage?.complete===false)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
+  updateRows('gaps',[...new Set(gaps)].map(gap=>node('p',text(gap,160))));
+  write('diagnostics-title',gaps.length||inheritanceGap||discovery?.complete===false||analysis.coverage?.complete===false?'观察与覆盖 · 有缺口':'观察与覆盖');
   const technical=['分析状态：'+text(analysis.state,80)];
   if(text(analysis.error?.code,120))technical.push('错误代码：'+text(analysis.error.code,120));
   if(text(analysis.error?.message))technical.push(text(analysis.error.message));
-  element('technical').textContent=technical.join('\n');
+  write('technical',technical.join('\n'));
+  recentActivity=renderRecentModelActivity(activityMissing?recentActivity:view.recentModelActivity,activityMissing);
 }
 function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);if(entry.method==='tools/call')parent.postMessage({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id,reason}},'*');entry.reject(new Error(reason));}
 function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
@@ -259,11 +301,43 @@ function completeOperation(){
   busy=false;clearTimeout(timer);timer=null;if(stopped||document.hidden)return;
   timer=setTimeout(refresh,1500);
 }
-function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');return;}if(message.method==='ui/notifications/host-context-changed'){generation++;clearView('会话已变化，重新核对中');clearTimeout(timer);timer=null;if(ready&&!busy)void refresh();}return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
+const displayContextFields=new Set(['theme','styles','displayMode','availableDisplayModes','containerDimensions','locale','timeZone','platform','deviceCapabilities','safeAreaInsets','userAgent']);
+function onMessage(event){
+  if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;
+  const message=event.data;
+  if(message.method){
+    if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');return;}
+    if(message.method==='ui/notifications/host-context-changed'){
+      const fields=Object.keys(message.params??{});
+      if(fields.length&&fields.every(field=>displayContextFields.has(field)))return;
+      generation++;clearView('会话已变化，重新核对中');clearTimeout(timer);timer=null;
+      if(ready&&!busy)void refresh();
+    }
+    return;
+  }
+  const entry=pending.get(message.id);if(!entry)return;
+  pending.delete(message.id);clearTimeout(entry.timeout);
+  message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);
+}
 addEventListener('message',onMessage);
 let dismissedGeneration=-1;
 async function dismissDisplayed(view,g){const threadId=view?.identity?.threadId;if(!threadId||!view.notifications?.scope?.sourceKey||document.hidden||stopped||g!==generation||dismissedGeneration===g)return;dismissedGeneration=g;try{await request('tools/call',{name:'sentinel_dismiss_chat_notifications',arguments:{expectedThreadId:threadId}});}catch{}}
-async function refresh(){if(stopped||document.hidden||busy||!ready)return;busy=true;const g=generation;try{const response=await request('tools/call',{name:'sentinel_current_chat',arguments:readArguments()});if(stopped||g!==generation)return;if(response.isError)throw new Error('当前检查读取失败');render(response.structuredContent);void dismissDisplayed(response.structuredContent,g);}catch(error){if(!stopped&&g===generation){clearView('本次读取失败，当前状态不可判断');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}}finally{completeOperation();}}
+async function refresh(){
+  if(stopped||document.hidden||busy||!ready)return;
+  busy=true;const g=generation;
+  try{
+    const response=await request('tools/call',{name:'sentinel_current_chat',arguments:readArguments()});
+    if(stopped||g!==generation)return;
+    if(response.isError)throw new Error('当前检查读取失败');
+    render(response.structuredContent);void dismissDisplayed(response.structuredContent,g);
+  }catch(error){
+    if(!stopped&&g===generation){
+      resetDetails();renderGS(null);recentActivity=renderRecentModelActivity(recentActivity,true);
+      write('summary','⚪ 本次读取失败，当前状态不可判断');attribute('summary','data-signal','gray');
+      write('error','可稍后重试');write('technical',text(error.message));
+    }
+  }finally{completeOperation();}
+}
 element('refresh').onclick=()=>refresh();
 async function setPaused(){
   if(stopped||busy||!ready||!controlState)return;

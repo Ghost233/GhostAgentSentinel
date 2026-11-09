@@ -21,9 +21,11 @@ const observation = {
   ], coverage: { complete: true, gaps: [] },
 };
 
-async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgment = false, holdSummary = false, invalidConsumeReceipt = false, holdJudgment = false, rejectFirstSummary = false, minimumOutputTokens = 0, requiresThinkingControl = false } = {}) {
+async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgment = false, holdSummary = false, invalidConsumeReceipt = false, holdJudgment = false, rejectFirstSummary = false, busySummaryCaches = 0, summaryGaps = [], minimumOutputTokens = 0, requiresThinkingControl = false } = {}) {
   const requests = [];
   const operations = new Map();
+  const busyCaches = new Set();
+  let busyCacheLimit = busySummaryCaches;
   let released = !holdSummary, nativeSequence = 0;
   let releaseJudge;
   const judgeGate = new Promise(resolve => { releaseJudge = resolve; });
@@ -46,10 +48,14 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
     let raw = ''; for await (const chunk of req) raw += chunk;
     const body = JSON.parse(raw);
     requests.push({ path: req.url, body, id: req.headers['idempotency-key'] });
-    if (rejectFirstSummary && body.model === 'summary' && body.max_tokens > 0 && requests.filter(request => request.body.model === 'summary' && request.body.max_tokens > 0).length === 1) {
-      res.statusCode = 503;
-      return send({ request_id: req.headers['idempotency-key'], runtime_generation: generation(body.model), state: 'rejected', terminal: true, lease_released: true,
-        native_dispatch: 'not_started', proof_scope: 'identity_only', error: { code: 'capacity_unavailable', stage: 'admission' } });
+    if (body.model === 'summary' && body.max_tokens > 0) {
+      if (busyCaches.size < busyCacheLimit) busyCaches.add(body.cache_salt);
+      const busy = busyCaches.has(body.cache_salt);
+      if (busy || rejectFirstSummary && requests.filter(request => request.body.model === 'summary' && request.body.max_tokens > 0).length === 1) {
+        res.statusCode = busy ? 409 : 503;
+        return send({ request_id: req.headers['idempotency-key'], runtime_generation: generation(body.model), state: 'rejected', terminal: true, lease_released: true,
+          native_dispatch: 'not_started', proof_scope: 'identity_only', error: { code: busy ? 'prefill_context_busy' : 'capacity_unavailable', stage: 'admission' } });
+      }
     }
     const existing = operations.get(req.headers['idempotency-key']);
     if (existing) return send(existing.result);
@@ -66,7 +72,7 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
       return send(failed);
     }
     const result = prefill ? { model: body.model, choices: [], prefill: { ...metadata, generated_tokens: 0 } }
-      : req.url === '/v1/chat/completions' ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }], ...(metadata ? { cache: invalidConsumeReceipt ? { ...metadata, request_id: 'foreign-operation' } : metadata } : {}), ...(spoofReceipt ? { gmdOperation: { lease_released: true, secret: 'unverified-provider-field' } } : {}) }
+      : req.url === '/v1/chat/completions' ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: summaryGaps })) } }], ...(metadata ? { cache: invalidConsumeReceipt ? { ...metadata, request_id: 'foreign-operation' } : metadata } : {}), ...(spoofReceipt ? { gmdOperation: { lease_released: true, secret: 'unverified-provider-field' } } : {}) }
         : { model: body.model, answers: invalidJudgment ? {} : Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown' }])), ...(metadata ? { cache: metadata } : {}) };
     const held = !released && body.model === 'summary' && !prefill;
     if (metadata) operations.set(metadata.request_id, { metadata, result, held });
@@ -78,6 +84,7 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const config = { llm: { baseUrl, model: 'summary' }, jev: { baseUrl, model: 'judge' }, now: () => now + 100 };
   return { requests, config, analyzer: createAnalyzer(config), options: { lifetimeSignal: lifetime.signal }, release() { released = true; },
+    releaseBusyCaches() { busyCacheLimit = 0; busyCaches.clear(); },
     releaseJudge, stopLifetime() { lifetime.abort(new Error('Observer lifetime closed')); } };
 }
 
@@ -129,6 +136,65 @@ test('an undeclared prefill provider retains the existing two-model analysis wit
   assert.ok(result.summary.generated);
   assert.deepEqual(f.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
   assert.ok(f.requests.every(request => request.id === undefined && request.body.cache_salt === undefined && request.body.thinking_token_budget === undefined));
+});
+
+test('verified summary cache contention generates in one isolated cache without replaying the rejected operation', async t => {
+  const f = await fixture(t, { busySummaryCaches: 1 });
+  for (let round = 0; round < 2; round++) {
+    const result = await f.analyzer.analyze(observation, f.options);
+    assert.ok(result.summary.generated);
+    const [rejected, generated, judgment] = f.requests.slice(round * 3);
+    assert.equal(rejected.body.max_tokens, 4096);
+    assert.equal(generated.body.max_tokens, rejected.body.max_tokens);
+    assert.deepEqual(generated.body.messages, rejected.body.messages);
+    assert.notEqual(generated.body.cache_salt, rejected.body.cache_salt);
+    assert.notEqual(generated.id, rejected.id);
+    assert.equal(result.usage.gmd.llm.request_id, generated.id);
+    assert.equal(judgment.path, '/v1/systemone');
+  }
+  assert.equal(f.requests.length, 6);
+  assert.equal(f.requests[1].body.cache_salt, f.requests[4].body.cache_salt, 'recovery does not create a new cache every round');
+});
+
+test('a busy isolated summary cache does not trigger another isolated attempt', async t => {
+  const f = await fixture(t, { busySummaryCaches: 2 });
+  await assert.rejects(f.analyzer.analyze(observation, f.options), error => error.code === 'gmd_not_admitted' && error.details?.remoteCode === 'prefill_context_busy');
+  assert.equal(f.requests.length, 2);
+});
+
+for (const summaryType of ['generated', 'partial']) test(`summary cache contention retains one quiet recovery receipt until a ${summaryType} result`, async t => {
+  const f = await fixture(t, { busySummaryCaches: 2, summaryGaps: summaryType === 'partial' ? ['controlled observation gap'] : [] });
+  const dir = await mkdtemp(join(tmpdir(), 'gmd-cache-recovery-'));
+  let clock = now + 100, core;
+  t.after(async () => { await core?.close(); await rm(dir, { recursive: true, force: true }); });
+  core = await createCore({ dataDir: dir, analyzer: f.analyzer, now: () => clock, cooldownMs: 1000, leaseMs: 1_000_000 });
+  const source = await core.registerSource({ ...observation.source, hostRunId: 'host', policy: 'chatgpt-main/1' });
+  const ref = eventId => ({ taskId: 'task', lifecycleId: 'run', eventId });
+  const start = { ...observation.events[0], id: 'start', kind: 'status', text: 'Started', capturedAt: now - 2000,
+    data: { nativeType: 'task_started', sourceKind: 'chatgpt-native', sourceForm: 'event_msg', runId: 'run', turnTrigger: 'composer', status: 'running' } };
+  const request = { ...observation.events[0], data: { nativeType: 'item_completed/UserMessage', sourceKind: 'chatgpt-native', sourceForm: 'event_msg/item_completed', runId: 'run', messageId: 'typed-user', inputOrigin: 'user-entry', inputPhase: 'consumed', inherited: false } };
+  await core.ingest(source, { tasks: [{ id: 'task', lifecycleId: 'run', sessionId: 'task', status: 'running', title: 'Read the log' }],
+    events: [start, request, observation.events[1]], hierarchyContext: { schemaVersion: 1, revision: 1, sessions: [{ sessionId: 'task' }], relations: [],
+      activations: [{ taskId: 'task', lifecycleId: 'run', sessionId: 'task', runId: 'run', state: 'running', stateRefs: [ref('start')] }],
+      instructionBindings: [{ taskId: 'task', lifecycleId: 'run', inputRef: ref('request'), origin: 'user-entry', phase: 'consumed', originRefs: [ref('start'), ref('request')], ancestorLimitRefs: [] }],
+      coverage: { complete: true, branchGaps: [] } } });
+  await core.setNativeNotificationEligibility({ sourceKey: source.key ?? source, hostRunId: 'host', appRunning: true, pluginEnabled: true });
+  const analysis = async () => (await core.snapshot()).tasks[0].analysis;
+  const until = async predicate => { const deadline = Date.now() + 1500; while (!await predicate(await analysis())) { assert.ok(Date.now() < deadline); await delay(5); } };
+  await until(value => value.retryAttempt === 1);
+  assert.equal((await analysis()).error.category, 'cache-busy');
+  const sourceKey = source.key ?? source;
+  assert.deepEqual((await core.nativeNotificationRecords({ sourceKey })).records, []);
+  clock = (await analysis()).nextEligibleAt;
+  await until(value => value.retryAttempt === 2);
+  const [pending] = (await core.failureReceipts({ sourceKey })).receipts;
+  assert.equal(pending.error.category, 'cache-busy');
+  assert.deepEqual(await core.claimNotifications(sourceKey), []);
+  f.releaseBusyCaches();
+  clock = (await analysis()).nextEligibleAt;
+  await until(value => Boolean(value.summary?.[summaryType]));
+  const receipts = (await core.failureReceipts({ sourceKey })).receipts;
+  assert.deepEqual(receipts.map(value => [value.id, value.state]), [[pending.id, 'recovered']]);
 });
 
 test('the complete managed summary envelope fits its input budget without dropping the current request', async t => {

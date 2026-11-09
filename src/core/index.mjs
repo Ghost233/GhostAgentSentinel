@@ -10,7 +10,7 @@ import { validateHierarchy, projectHierarchy } from '../hierarchy.mjs';
 import { createInstructionLookup, instructionContext, eventRef, referenceKey } from '../instruction-context.mjs';
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
 import { analysisTimeConditions } from '../analysis/index.mjs';
-import { inferenceFailureInfo } from '../analysis/failure-info.mjs';
+import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
 import { normalizeAnalysisConfig, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
 import { createNativeNotificationStore } from './native-notifications.mjs';
@@ -1069,6 +1069,7 @@ export async function createCore({
       task.resultScope = null;
       task.analysis.state = 'failed';
       task.analysis.error = { code: error.code ?? 'analysis_failed', stage: error.stage ?? null, message: error.message ?? String(error) };
+      if (isGMDCacheBusy(error)) Object.assign(task.analysis.error, failureErrorInfo(error));
       if (error.code === 'network') {
         let details;
         try { details = inferenceFailureInfo(error.details); } catch {}
@@ -1106,9 +1107,10 @@ export async function createCore({
       task.analysis.state = 'failed';
       task.analysis.error = { ...failureErrorInfo(settledError), message: 'One or more analysis checks failed' };
     }
-    if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' && (settledError || !result.summary.partial && !result.coverage?.dependencies?.length)) {
+    if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' && (settledError || !result.coverage?.dependencies?.length)) {
       const settled = failureStore.settle({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId, roundId: round.id,
-        domain: 'analysis', outcome: settledError ? 'failed' : 'succeeded', attempted: true, settled: true, settledAt: completedAt, error: settledError });
+        domain: 'analysis', outcome: settledError ? 'failed' : 'succeeded', attempted: true, settled: true, settledAt: completedAt, error: settledError,
+        cacheRecoveryOnly: Boolean(partial) });
       nativeNotifications.observeFailure(settled.receipt);
     }
     save('tasks', task);

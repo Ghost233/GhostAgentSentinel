@@ -2,6 +2,10 @@ const NAMES = new Set(['Error', 'TypeError', 'DOMException', 'AbortError', 'Time
 const CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'EPERM', 'EACCES', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_ABORTED']);
 const read = (value, key) => { try { return value?.[key]; } catch { return null; } };
 
+export function isGMDCacheBusy(error) {
+  return error?.stage === 'llm' && error.code === 'gmd_not_admitted' && error.details?.status === 409 && error.details.remoteCode === 'prefill_context_busy';
+}
+
 export function inferenceFailureInfo(value, operation = read(value, 'operation')) {
   if (!['fetch', 'response-body'].includes(operation)) return null;
   const cause = read(value, 'cause');

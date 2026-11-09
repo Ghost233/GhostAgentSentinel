@@ -136,7 +136,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
   }
   function observeFailure(receipt) {
     prune();
-    if (!receipt || links.has(receipt.id) || receipt.sequence <= receiptPrunedThrough || receipt.firstFailedAt <= now() - DAY) return;
+    if (!receipt || receipt.domain === 'analysis' && receipt.error.category === 'cache-busy' || links.has(receipt.id) || receipt.sequence <= receiptPrunedThrough || receipt.firstFailedAt <= now() - DAY) return;
     const owner = sources.get(receipt.sourceKey);
     if (owner?.descriptor.policy !== 'chatgpt-main/1') return;
     const current = now(), initial = receipt.enrollmentPhase === 'initial-unanchored' && receipt.domain === 'collection' && receipt.mainId !== null && receipt.lifecycleId === null;
