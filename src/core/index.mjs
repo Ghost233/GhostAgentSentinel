@@ -531,6 +531,12 @@ export async function createCore({
     }
   }
 
+  function updateSubmittedPrefill(task, round, state) {
+    if (Number.isSafeInteger(round?.prefillSubmittedAt) && task.analysis.lastPrefill?.submittedAt === round.prefillSubmittedAt) {
+      task.analysis.lastPrefill.state = state;
+    }
+  }
+
   function cancelRound(reason, onlyTask, retainTransport = false, persist = true) {
     const error = new Error(reason);
     if (!retainTransport && cancelledRound && (!onlyTask || cancelledRound.taskKey === onlyTask.key)) cancelledRound.transportController.abort(error);
@@ -550,6 +556,7 @@ export async function createCore({
     if (task) {
       if (round.kind === 'prefill') {
         task.analysis.prefill = { state: 'cancelled', throughRevision: round.revision, updatedAt: now() };
+        updateSubmittedPrefill(task, round, 'cancelled');
         if (persist) save('tasks', task);
         return;
       }
@@ -576,6 +583,7 @@ export async function createCore({
       task.status = 'unknown';
       task.baselineConfirmed = false;
       if (task.analysis.prefill?.state === 'prefilling') task.analysis.prefill.state = 'unknown';
+      if (['prefilling', 'cancel_requested'].includes(task.analysis.lastPrefill?.state)) task.analysis.lastPrefill.state = 'unknown';
       task.analysis.state = interrupted ? 'interrupted' : task.analysis.completedAt ? 'stale' : 'unknown';
       if (interrupted) task.analysis.error = { code: 'analysis_interrupted', message: reason };
       invalidateAlerts(task, 'source-disconnected');
@@ -585,6 +593,17 @@ export async function createCore({
 
   // Bootstrap legacy capture facts before the first retention pass can delete their bodies.
   for (const source of sources.values()) initializeHierarchyCaptures(source);
+  for (const task of tasks.values()) {
+    const { summary, summaryAt, inputEventIds, contextEvidenceRefs, lastPartialSummary } = task.analysis;
+    if (lastPartialSummary || sources.get(task.sourceKey)?.descriptor.policy !== 'chatgpt-main/1' || !summary?.partial || !Number.isSafeInteger(summaryAt) || !inputEventIds?.length) continue;
+    const references = [...inputEventIds.map(eventId => ({ taskId: task.id, lifecycleId: task.lifecycleId, eventId })), ...(contextEvidenceRefs ?? []), ...summary.partial.evidenceRefs];
+    let expiresAt = summaryAt + DAY;
+    for (const ref of references) {
+      const event = events.get(identity(task.sourceKey, ref.taskId, ref.lifecycleId, ref.eventId));
+      expiresAt = Math.min(expiresAt, event ? event.capturedAt + DAY : 0);
+    }
+    if (expiresAt > now()) retainPartialSummary(task, expiresAt);
+  }
   // Stored activity is history, not proof that the original host is still running.
   for (const source of sources.values()) resetSource(source, 'Core restarted; source baseline is unknown');
   for (const notification of notifications.values()) {
@@ -675,6 +694,8 @@ export async function createCore({
     for (const task of tasks.values()) {
       let changed = pendingPrunedTasks.has(task.key);
       if (task.analysis.lastSuccessfulSummary?.expiresAt <= current) { delete task.analysis.lastSuccessfulSummary; changed = true; }
+      if (task.analysis.lastPartialSummary?.expiresAt <= current) { delete task.analysis.lastPartialSummary; changed = true; }
+      if (task.analysis.lastPrefill?.submittedAt <= cutoff) { delete task.analysis.lastPrefill; changed = true; }
       const expired = new Set(expiredByTask.get(task.key) ?? []);
       const references = [task.requestId, ...(task.analysis.inputEventIds ?? []),
         ...task.analysis.checks.flatMap(check => check.evidenceIds ?? []),
@@ -1016,6 +1037,13 @@ export async function createCore({
     return value;
   }
 
+  function retainPartialSummary(task, expiresAt) {
+    const { summary, summaryAt, coverage, configScope } = task.analysis;
+    const gaps = ['gaps', 'verificationGaps', 'contextGaps', 'extractionGaps'].flatMap(key => Array.isArray(coverage?.[key]) ? coverage[key] : []);
+    task.analysis.lastPartialSummary = { partial: copy(summary.partial), completedAt: summaryAt, configScope: copy(configScope), expiresAt,
+      gaps: [...new Set(gaps.filter(gap => typeof gap === 'string' && gap).map(gap => gap.slice(0, 160)))].slice(0, 24) };
+  }
+
   function completeRound(round, result, error) {
     if (round.cancelled) {
       pendingCancelledRequests = Math.max(0, pendingCancelledRequests - 1);
@@ -1064,10 +1092,12 @@ export async function createCore({
     }
     const failedCheck = !error && sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' ? result.checks.find(check => check.judgmentState === 'failed') : null;
     const settledError = error ?? failedCheck?.error ?? (failedCheck ? { code: 'analysis_failed' } : null);
-    if (!settledError && result.summary.generated && !result.coverage?.dependencies?.length) {
+    const partial = !settledError && result.summary.partial && round.input.source.policy === 'chatgpt-main/1';
+    if (!settledError && (result.summary.generated || partial) && !result.coverage?.dependencies?.length) {
       let expiresAt = completedAt + DAY;
       for (const material of [round.input.events, round.input.instructionContext?.inheritedEvents ?? []]) for (const event of material) expiresAt = Math.min(expiresAt, event.capturedAt + DAY);
-      task.analysis.lastSuccessfulSummary = { generated: copy(result.summary.generated), completedAt, configScope: copy(round.configScope), expiresAt };
+      if (partial) retainPartialSummary(task, expiresAt);
+      else task.analysis.lastSuccessfulSummary = { generated: copy(result.summary.generated), completedAt, configScope: copy(round.configScope), expiresAt };
     }
     task.analysis.retryAttempt = settledError ? Math.min(32, (task.analysis.retryAttempt ?? 0) + 1) : 0;
     if (settledError) task.analysis.nextEligibleAt = completedAt + Math.max(cooldownMs, Math.min(15 * 60_000, cooldownMs * 2 ** (task.analysis.retryAttempt - 1)));
@@ -1124,7 +1154,9 @@ export async function createCore({
       const attempt = error ? Math.min(32, (prefillAttempts.get(task)?.attempt ?? 0) + 1) : 0;
       prefillAttempts.set(task, { analyzer: round.analyzer, revision: round.revision, state, attempt, retryAt: state === 'completed' ? current : current + Math.min(900_000, Math.max(1_000, cooldownMs) * 2 ** Math.max(0, attempt - 1)) });
       task.analysis.prefill = { state, throughRevision: round.revision, updatedAt: current, ...(error ? { error: failureErrorInfo(error) } : {}),
+        ...(state === 'unsupported' && result.reason === 'not-supported' ? { reason: result.reason } : {}),
         ...(state === 'completed' && result.receipt ? { receipt: copy(result.receipt) } : {}) };
+      updateSubmittedPrefill(task, round, state);
       save('tasks', task);
     }
     tick();
@@ -1176,10 +1208,19 @@ export async function createCore({
         const currentTask = tasks.get(round.taskKey);
         if (!currentTask || currentTask.analysis.prefill?.state === state) return;
         currentTask.analysis.prefill = { state, throughRevision: round.revision, updatedAt: now() };
+        updateSubmittedPrefill(currentTask, round, state);
+        save('tasks', currentTask);
+      };
+      const onSubmitted = () => {
+        if (closed || round.cancelled || active !== round || round.prefillSubmittedAt !== undefined) return;
+        const currentTask = tasks.get(round.taskKey);
+        if (!currentTask) return;
+        round.prefillSubmittedAt = now();
+        currentTask.analysis.lastPrefill = { submittedAt: round.prefillSubmittedAt, state: 'prefilling' };
         save('tasks', currentTask);
       };
       // The adapter promise owns the admission through real native release, not HTTP disconnect.
-      Promise.resolve().then(() => round.cancelled ? null : round.analyzer.prefill(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal, lifetimeSignal: inferenceLifetime.signal, onState }))
+      Promise.resolve().then(() => round.cancelled ? null : round.analyzer.prefill(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal, lifetimeSignal: inferenceLifetime.signal, onState, onSubmitted }))
         .then(result => completePrefill(round, result, null), error => completePrefill(round, null, error));
       break;
     }
@@ -1437,11 +1478,11 @@ export async function createCore({
         if (nativeId && !first && event.capturedAt <= now()) nativeCaptures.set(nativeId, { ...eventRef(event), capturedAt: event.capturedAt });
         return !first || first.capturedAt > now() - DAY && referenceKey(first) === referenceKey(eventRef(event));
       }) };
-      const incoming = batch.hierarchyContext, previous = source.hierarchyContext;
+      let incoming = batch.hierarchyContext;
+      const previous = source.hierarchyContext;
       let acceptedRuns, acceptedCaptures;
       if (incoming) {
         if (previous && incoming.revision < previous.revision) return { accepted: 0, duplicate: 0, expired: 0, paused, hierarchyContext: { schemaVersion: 1, acceptedRevision: previous.revision } };
-        if (previous && incoming.revision === previous.revision && JSON.stringify(incoming) !== JSON.stringify(previous)) throw Object.assign(new Error('hierarchy revision content conflict'), { code: 'hierarchy_context_invalid' });
         const captures = new Map((source.hierarchyEvidenceCaptures ?? []).map(value => [referenceKey(value), value]));
         for (const event of batch.events ?? []) if (captures.get(referenceKey(eventRef(event)))?.capturedAt <= now() - DAY) {
           throw Object.assign(new Error('Expired hierarchy evidence cannot acquire a new first capture timestamp'), { code: 'hierarchy_context_invalid' });
@@ -1450,6 +1491,27 @@ export async function createCore({
         for (const task of batch.tasks ?? []) prospectiveTasks.set(identity(task.id, task.lifecycleId), task);
         const prospectiveEvents = new Map(Array.from(events.values()).filter(event => tasks.get(event.taskKey)?.sourceKey === sourceKey).map(event => [identity(event.taskId, event.taskLifecycleId, event.id), event]));
         for (const event of batch.events ?? []) if (!prospectiveEvents.has(identity(event.taskId, event.taskLifecycleId, event.id))) prospectiveEvents.set(identity(event.taskId, event.taskLifecycleId, event.id), event);
+        if (nativePlan?.expired.length) {
+          // A cursor can replay after its first capture expires. Drop only the
+          // references lost to that retention decision before validating the rest.
+          const expired = new Set(nativePlan.expired.filter(event => {
+            const retained = prospectiveEvents.get(identity(event.taskId, event.taskLifecycleId, event.id));
+            return !retained || retained.capturedAt <= nativeCaptureTime - DAY;
+          }).map(event => referenceKey(eventRef(event))));
+          const expiredReference = reference => expired.has(referenceKey(reference));
+          const unconfirmed = new Set();
+          const activations = incoming.activations.map(activation => {
+            const stateRefs = activation.stateRefs.filter(reference => !expiredReference(reference));
+            if (stateRefs.length === activation.stateRefs.length) return activation;
+            unconfirmed.add(identity(activation.taskId, activation.lifecycleId));
+            return { ...activation, runId: null, state: 'unknown', stateRefs };
+          });
+          const instructionBindings = incoming.instructionBindings.filter(binding => ![binding.inputRef, ...binding.originRefs, ...binding.ancestorLimitRefs].some(expiredReference));
+          incoming = { ...incoming, activations, instructionBindings };
+          batch = { ...batch, tasks: batch.tasks?.map(task => unconfirmed.has(identity(task.id, task.lifecycleId))
+            ? { ...task, status: 'unknown', gaps: [...(task.gaps ?? []), 'Earlier evidence expired after 24 hours'] } : task) };
+        }
+        if (previous && incoming.revision === previous.revision && JSON.stringify(incoming) !== JSON.stringify(previous)) throw Object.assign(new Error('hierarchy revision content conflict'), { code: 'hierarchy_context_invalid' });
         acceptedRuns = validateHierarchy(incoming, { tasks: [...prospectiveTasks.values()], events: [...prospectiveEvents.values()], now: now(), acceptedRuns: source.hierarchyRunBindings ?? [], sourcePolicy: source.descriptor.policy });
         const references = [...incoming.activations.flatMap(item => item.stateRefs), ...incoming.relations.flatMap(item => item.evidenceRefs), ...incoming.instructionBindings.flatMap(item => [item.inputRef, ...item.originRefs, ...item.ancestorLimitRefs]), ...(incoming.waitBindings ?? []).flatMap(item => item.evidenceRefs)];
         for (const reference of references) {
@@ -1644,7 +1706,10 @@ export async function createCore({
           // content stays intact; its result remains conservatively unknown.
           if (transaction.activeTaskKey && active?.taskKey !== transaction.activeTaskKey) {
             const task = tasks.get(transaction.activeTaskKey);
-            if (task) { task.analysis.state = 'interrupted'; task.analysis.summary = null; task.resultKey = null; task.resultScope = null; save('tasks', task); }
+            if (task) {
+              updateSubmittedPrefill(task, cancelledRound, 'cancelled');
+              task.analysis.state = 'interrupted'; task.analysis.summary = null; task.resultKey = null; task.resultScope = null; save('tasks', task);
+            }
           }
         }
         throw error;
@@ -1781,6 +1846,8 @@ export async function createCore({
       for (const task of tasks.values()) {
         if (task.analysis.summary) captured(task.analysis.summaryAt ?? task.analysis.completedAt);
         if (task.analysis.lastSuccessfulSummary) deadline(task.analysis.lastSuccessfulSummary.expiresAt);
+        if (task.analysis.lastPartialSummary) deadline(task.analysis.lastPartialSummary.expiresAt);
+        if (task.analysis.lastPrefill) captured(task.analysis.lastPrefill.submittedAt);
         if (!liveIdentity(task) && task.updatedAt + DAY > diagnostics.generatedAt) captured(task.updatedAt);
         for (const alert of task.alerts) captured(alert.firstAt);
         gaps(task.gapRecords);
@@ -2000,6 +2067,7 @@ export async function createCore({
         task.analysis.retryAttempt = 0;
         task.analysis.nextEligibleAt = Math.max(now(), task.analysis.completedAt == null ? 0 : task.analysis.completedAt + cooldownMs);
         if (active?.taskKey === task.key) {
+          updateSubmittedPrefill(task, active, 'cancelled');
           task.analysis.state = 'interrupted'; task.analysis.error = { code: 'cancelled', message: 'Installation inference configuration changed' };
           task.analysis.cancelledComputeMayContinue = true;
         }

@@ -90,12 +90,17 @@ test('a cited partial observation survives Core restart without replacing comple
   assert.equal(task.analysis.coverage.complete, false);
   assert.notEqual(task.gs.light, 'green');
   assert.deepEqual(task.analysis.lastSuccessfulSummary, first);
+  const recent = task.analysis.lastPartialSummary;
+  assert.deepEqual(recent.partial, task.analysis.summary.partial);
+  assert.equal(recent.completedAt, task.analysis.summaryAt);
+  assert.ok(recent.gaps.includes('tool-result-image-omitted'));
   assert.equal(task.monitoringHealth.state, 'failed', 'summary-only success does not prove JEV recovery');
   assert.equal(f.calls.filter(call => call.path === '/v1/systemone').length, 2);
   await f.restart();
   const restored = await f.task(source);
   assert.deepEqual(restored.analysis.summary.partial, task.analysis.summary.partial);
   assert.deepEqual(restored.analysis.lastSuccessfulSummary, first);
+  assert.deepEqual(restored.analysis.lastPartialSummary, recent);
   assert.equal(restored.monitoringHealth.state, 'failed');
 });
 

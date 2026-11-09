@@ -119,6 +119,30 @@ test('a partial summary lists observation gaps, stays gray and keeps the prior c
   }
 })
 
+test('recent model activity stays above the tabs and is cleared before a different chat is rendered', async t => {
+  const page = await harness(t), view = material('main-a', 'gray'), completedAt = Date.now() - 10000
+  view.analysis.state = 'failed'
+  view.recentModelActivity = {
+    prefill: { submittedAt: completedAt + 1000, state: 'failed' },
+    summary: { text: '上次仅核对了 <部分> 结果。', completedAt, expiresAt: completedAt + 86400000, partial: true, gaps: ['tool-result-image-omitted'] },
+  }
+  await page.deliver(view)
+  assert.ok(page.html.indexOf('id="recent-model-activity"') < page.html.indexOf('id="monitor-tabs"'))
+  assert.equal(page.element('#recent-prefill-state').textContent, '失败')
+  assert.equal(page.element('#recent-prefill-time').dateTime, new Date(completedAt + 1000).toISOString())
+  assert.equal(page.element('#recent-summary-state').textContent, '部分观察')
+  assert.equal(page.element('#recent-summary-text').textContent, view.recentModelActivity.summary.text)
+  assert.equal(page.element('#recent-summary-time').dateTime, new Date(completedAt).toISOString())
+  assert.match(page.element('#recent-summary-gaps').textContent, /图片未纳入/)
+  page.handlers.get('message')({ source: page.parent, data: { jsonrpc: '2.0', method: 'ui/notifications/host-context-changed' } })
+  await page.flush()
+  assert.equal(page.element('#recent-summary-time').hidden, true)
+  await page.deliver({ ...result('main-b'), recentModelActivity: { prefill: { state: 'unsupported' }, summary: null } })
+  assert.equal(page.element('#recent-prefill-state').textContent, '当前模型不支持')
+  assert.equal(page.element('#recent-prefill-time').hidden, true)
+  assert.equal(page.element('#recent-summary-text').textContent, '暂无可显示的总结')
+})
+
 test('an unconfirmed chat explains the actual collection boundary without inline configuration', async t => {
   const page = await harness(t)
   await page.deliver({ ...result(null), observation: { gap: 'observation-unavailable', failureStage: 'core-connection' }, health: { state: 'failed', failures: [{ domain: 'collection', error: { code: 'ECONNREFUSED', stage: 'core' } }] }, notifications: { permission: { authorization: 'denied' } } })

@@ -133,10 +133,12 @@ test('prefill freezes UTF-8 bytes, issues a generation-bound gmd1 ID and keeps c
 
 test('202 and unknown reuse one operation and replay the original response after confirmed release', async t => {
   const states = [];
+  let submissions = 0;
   const f = await fixture(t, { pending: true, state: index => index === 1 ? 'unknown' : 'completed' });
   const operation = await f.operation(body());
-  await operation.execute({ onState: state => states.push(state) });
+  await operation.execute({ onState: state => states.push(state), onSubmitted: () => submissions++ });
   assert.ok(states.includes('unknown'));
+  assert.equal(submissions, 1, 'same-ID result replay does not replace the submission time');
   assert.equal(f.executions, 1);
   assert.equal(f.posts.length, 2);
   assert.equal(f.posts[0].id, f.posts[1].id);

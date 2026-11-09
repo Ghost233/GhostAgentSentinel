@@ -183,7 +183,7 @@ export function createGMDOperation(config, { mode = 'chat_max_tokens_zero', capa
     id,
     snapshot() { return structuredClone({ ...last, ...(communicationFailure ? { communicationFailure } : {}) }); },
     query, cancel,
-    async execute({ signal, transportSignal, lifetimeSignal, timeoutMs = 120_000, onState } = {}) {
+    async execute({ signal, transportSignal, lifetimeSignal, timeoutMs = 120_000, onState, onSubmitted } = {}) {
       if (executing || posted) throw fail('gmd_operation_reentry', '已有操作只能查询或恢复，不能作为新请求执行');
       if (cancelError) throw cancelError;
       signal?.throwIfAborted(); transportSignal?.throwIfAborted(); lifetimeSignal?.throwIfAborted();
@@ -220,7 +220,13 @@ export function createGMDOperation(config, { mode = 'chat_max_tokens_zero', capa
       try {
         posted = true;
         report(phase);
-        try { result = await submit(); }
+        try {
+          const request = submit();
+          if (prefill && !initial.signal.aborted && !lifetimeSignal?.aborted) {
+            try { onSubmitted?.(); } catch (error) { callbackError ??= error; }
+          }
+          result = await request;
+        }
         catch (error) {
           lifetimeSignal?.throwIfAborted();
           // A transport error may have lost a completed response. It does not

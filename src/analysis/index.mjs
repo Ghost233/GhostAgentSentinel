@@ -58,7 +58,7 @@ export function createAnalyzer(config = {}) {
     if (prefill) return { state: 'completed', receipt: operation.snapshot() };
     return { payload: response, receipt: operation.snapshot() };
   }
-  async function runAnalysis(input, { signal, transportSignal, lifetimeSignal, onState } = {}, prewarming = false) {
+  async function runAnalysis(input, { signal, transportSignal, lifetimeSignal, onState, onSubmitted } = {}, prewarming = false) {
       if (lifetimeSignal) {
         signal = signal ? AbortSignal.any([signal, lifetimeSignal]) : lifetimeSignal;
         if (transportSignal) transportSignal = AbortSignal.any([transportSignal, lifetimeSignal]);
@@ -125,7 +125,7 @@ export function createAnalyzer(config = {}) {
         result.summary.attention = '本轮没有仍在保留期限内的任务证据';
         return prewarming ? { state: 'skipped' } : result;
       }
-      const options = { signal, transportSignal, lifetimeSignal, onState };
+      const options = { signal, transportSignal, lifetimeSignal, onState, onSubmitted };
       const llmCapability = await modelCapability('llm', options);
       const generation = llmCapability.supported ? { thinking_token_budget: 0 } : {};
       const managed = llmCapability.supported ? { ...generation, cache_salt: modelCacheSalt('llm', input, generation) } : {};

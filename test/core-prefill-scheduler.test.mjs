@@ -21,7 +21,7 @@ async function fixture(t) {
     timeConditions() { return []; },
     async analyze(input) { calls.push({ kind: 'analysis', input }); return result(input); },
     prefill(input, options) {
-      calls.push({ kind: 'prefill', input, signal: options.signal, onState: options.onState });
+      calls.push({ kind: 'prefill', input, signal: options.signal, onState: options.onState, onSubmitted: options.onSubmitted });
       return new Promise((resolve, reject) => pending.push({ resolve: () => resolve({ state: 'completed' }), reject }));
     },
   };
@@ -157,4 +157,30 @@ test('unknown prefill is visible while collection and control reads continue wit
   await f.core.pause();
   f.calls[1].onState('unknown');
   assert.equal((await f.core.snapshot()).tasks[0].analysis.prefill.state, 'cancelled', 'late progress cannot undo a sealed round');
+});
+
+test('the most recent prefill submission keeps its original time through progress and a failed retry', async t => {
+  const f = await fixture(t);
+  const latest = async () => (await f.core.snapshot()).tasks[0].analysis.lastPrefill;
+  await f.start(['a']);
+  await f.observe('a', 'one');
+  await until(() => f.pending.length === 1);
+  assert.equal(await latest(), undefined, 'scheduling has not sent a request');
+  f.advance(15);
+  const submittedAt = f.clock;
+  f.calls[1].onSubmitted();
+  assert.deepEqual(await latest(), { submittedAt, state: 'prefilling' });
+  f.advance(20);
+  f.calls[1].onState('unknown');
+  assert.deepEqual(await latest(), { submittedAt, state: 'unknown' });
+  f.pending.shift().resolve();
+  await until(async () => (await latest())?.state === 'completed');
+  await f.observe('a', 'two');
+  await until(() => f.pending.length === 1);
+  assert.deepEqual(await latest(), { submittedAt, state: 'completed' });
+  const nextSubmittedAt = f.clock;
+  f.calls[2].onSubmitted();
+  f.pending.shift().reject(new Error('Controlled failure'));
+  await until(async () => (await latest())?.state === 'failed');
+  assert.deepEqual(await latest(), { submittedAt: nextSubmittedAt, state: 'failed' });
 });

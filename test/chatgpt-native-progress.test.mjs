@@ -160,6 +160,55 @@ test('a successful expired-cursor replay records only an expired fence and canno
   assert.equal(progress.records, 1); assert.equal(progress.expired, 1); assert.equal(progress.locators, 0); assert.equal(progress.expiredTimestamps, 0)
 })
 
+test('an expired cursor batch releases its hierarchy references and a new request reaches summary generation', async t => {
+  const f = await fixture(t), source = await f.register();
+  const models = await controlledModelService(t);
+  await configureInstallationModels(f.core, 'chatgpt:install-one', models.config);
+  const turn = (id, capturedAt, ended) => {
+    const lifecycleId = id + '-run';
+    const event = (suffix, kind, text, data) => {
+      const value = f.batch(id, id + '-' + suffix, capturedAt, text).events[0];
+      return { ...value, taskLifecycleId: lifecycleId, kind, data: { ...value.data, ...data, runId: lifecycleId } };
+    };
+    const ref = suffix => ({ taskId: id, lifecycleId, eventId: id + '-' + suffix });
+    const events = [
+      event('start', 'status', 'task_started', { nativeType: 'task_started', sourceForm: 'event_msg', turnTrigger: 'composer', status: 'running' }),
+      event('input', 'input', 'Read the current log only', { nativeType: 'item_completed/UserMessage', messageId: id + '-user', inputOrigin: 'user-entry', inputPhase: 'consumed' }),
+      ended ? event('end', 'status', 'task_complete', { nativeType: 'task_complete', sourceForm: 'event_msg', status: 'idle' }) : event('output', 'output', 'Read the current log', {}),
+    ];
+    return { events, task: { id, sessionId: id, lifecycleId, title: id, status: ended ? 'idle' : 'running' },
+      activation: { taskId: id, lifecycleId, sessionId: id, runId: lifecycleId, state: ended ? 'ended' : 'running', stateRefs: [ref(ended ? 'end' : 'start')] },
+      instruction: { taskId: id, lifecycleId, inputRef: ref('input'), origin: 'user-entry', phase: 'consumed', originRefs: [ref('start'), ref('input')], ancestorLimitRefs: [] } };
+  };
+  const batch = (revision, ...turns) => ({ tasks: turns.map(t => t.task), events: turns.flatMap(t => t.events), hierarchyContext: {
+    schemaVersion: 1, revision, sessions: turns.map(t => ({ sessionId: t.task.id })), relations: [],
+    activations: turns.map(t => t.activation), instructionBindings: turns.map(t => t.instruction), coverage: { complete: true, branchGaps: [] },
+  } });
+  const old = turn('expired-fork', f.now - DAY - 1, true);
+  const stale = batch(1, old);
+  assert.equal((await f.core.ingest(source, stale)).accepted, 0);
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.expired, old.events.length);
+  const retimed = turn(old.task.id, f.now, true);
+  assert.equal((await f.core.ingest(source, batch(1, retimed))).accepted, 0, 'an acknowledgement retry cannot revive expired native evidence');
+  const fresh = turn('current-fork', f.now, false);
+  const invalid = batch(2, retimed, fresh);
+  invalid.hierarchyContext.activations[1] = { ...fresh.activation, stateRefs: [{ ...fresh.activation.stateRefs[0], eventId: 'unknown-proof' }] };
+  await assert.rejects(f.core.ingest(source, invalid), error => error.status === 422 && error.code === 'hierarchy_context_invalid');
+  assert.equal((await f.core.ingest(source, batch(2, retimed, fresh))).accepted, fresh.events.length);
+  let task, oldTask;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const snapshot = await f.core.snapshot();
+    task = snapshot.tasks.find(t => t.id === fresh.task.id); oldTask = snapshot.tasks.find(t => t.id === old.task.id);
+    if (task.analysis.completedAt) break;
+    await delay(5);
+  }
+  assert.deepEqual(oldTask.events, []);
+  assert.equal(oldTask.status, 'unknown');
+  assert.equal(oldTask.currentRequest, '');
+  assert.equal(task.analysis.error, null);
+  assert.ok(task.analysis.summary?.generated ?? task.analysis.summary?.partial, 'current material reaches the real summary HTTP boundary');
+});
+
 test('an accepted earlier native clock shortens every registration copy including two scopes in the same batch', async t => {
   const f = await fixture(t), firstSource = await f.register(), earliest = f.now - 500
   const batch = f.batch('scope-one'), other = f.batch('scope-two', 'record-one', earliest)

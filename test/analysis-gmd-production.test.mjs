@@ -95,10 +95,13 @@ test('a bounded output allowance above the observed truncation ceiling can publi
 
 test('managed summary prefill and generation bound thinking before publishing a JEV-validated result', async t => {
   const f = await fixture(t, { requiresThinkingControl: true });
-  const warmed = await f.analyzer.prefill(observation, f.options);
+  let submissions = 0;
+  const options = { ...f.options, onSubmitted: () => submissions++ };
+  const warmed = await f.analyzer.prefill(observation, options);
   assert.equal(warmed.state, 'completed');
   const newer = { ...observation, events: [...observation.events, { ...observation.events[1], id: 'latest', text: 'Found the newer requested log entry.' }] };
-  const result = await f.analyzer.analyze(newer, f.options);
+  const result = await f.analyzer.analyze(newer, options);
+  assert.equal(submissions, 1, 'only the zero-output request reports a prefill submission');
   assert.ok(result.summary.generated);
   assert.equal(result.checks.length, 6);
   assert.deepEqual(f.requests.map(request => [request.path, request.body.max_tokens ?? null]), [

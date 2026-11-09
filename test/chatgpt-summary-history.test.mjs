@@ -65,6 +65,8 @@ test('real native material and model HTTP keep a reused summary visible and a la
   const first = await until(view => Boolean(view.analysis.generated)), original = first.analysis.lastSuccessfulSummary
   assert.match(first.analysis.generated.evidence[0].text, /synthetic log/)
   assert.equal(original.configScope.registrationId, 'chatgpt:summary-history')
+  assert.equal(first.recentModelActivity.summary.text, original.generated.text)
+  assert.equal(first.recentModelActivity.summary.completedAt, original.completedAt)
   clock += 10
   const reused = await until(view => view.analysis.resultDisposition === 'reused')
   assert.deepEqual(reused.analysis.lastSuccessfulSummary, original)
@@ -78,11 +80,13 @@ test('real native material and model HTTP keep a reused summary visible and a la
   const failed = await until(view => view.analysis.state === 'failed')
   assert.equal(failed.analysis.generated, null)
   assert.deepEqual(failed.analysis.lastSuccessfulSummary, original)
+  assert.deepEqual(failed.recentModelActivity.summary, first.recentModelActivity.summary)
   assert.notEqual(failed.analysis.currentConfigScope.revision, original.configScope.revision)
   await page.refresh(); await page.deliver(failed)
   assert.equal(page.element('#model-summary').hidden, true)
   assert.equal(page.element('#last-summary').hidden, false)
   assert.equal(page.element('#last-summary').tagName, 'SECTION', 'a prior summary remains historical but is directly readable in Details')
   assert.match(page.element('#last-summary-evidence').textContent, /synthetic log/)
+  assert.equal(page.element('#recent-summary-text').textContent, original.generated.text)
   assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/systemone'])
 })

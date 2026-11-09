@@ -11,7 +11,7 @@ import { readModelDirectory } from './model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
-import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE } from '../src/protocol.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -102,6 +102,31 @@ function materialView(view, task, { historical = false, snapshot } = {}) {
       resultDisposition: task.analysis.resultDisposition, completedAt: task.analysis.completedAt, through: task.analysis.through, waitMs: task.analysis.waitMs, lagMs: task.analysis.lagMs, error: task.analysis.error, coverage: task.analysis.coverage ?? task.coverage } }
 }
 
+function recentModelActivity(chatTasks, currentTask, registrationId, readAt) {
+  const cutoff = readAt - 86400000
+  let prefill = null, summary = null
+  for (const task of chatTasks) {
+    const { lastPrefill, lastSuccessfulSummary, lastPartialSummary } = task.analysis
+    if (lastPrefill?.submittedAt > cutoff && lastPrefill.submittedAt <= readAt && (!prefill || lastPrefill.submittedAt > prefill.submittedAt)) {
+      prefill = { submittedAt: lastPrefill.submittedAt, state: lastPrefill.state }
+    }
+    for (const record of [lastSuccessfulSummary, lastPartialSummary]) {
+      const result = record?.generated ?? record?.partial
+      if (!result?.text || !(record.completedAt > cutoff && record.completedAt <= readAt && record.expiresAt > readAt)
+        || summary && record.completedAt <= summary.completedAt || record.configScope && record.configScope.registrationId !== registrationId) continue
+      if (!result.evidenceRefs?.length || !result.evidenceRefs.every(ref => chatTasks.some(owner => owner.sourceKey === task.sourceKey
+        && owner.id === ref.taskId && owner.lifecycleId === ref.lifecycleId && owner.events.some(event => event.id === ref.eventId && event.capturedAt > cutoff && event.capturedAt <= readAt)))) continue
+      summary = { text: result.text, completedAt: record.completedAt, expiresAt: record.expiresAt, partial: Boolean(record.partial), gaps: record.gaps ?? [] }
+    }
+  }
+  const attempt = currentTask?.analysis.prefill
+  if (!prefill && attempt?.updatedAt > cutoff && attempt.updatedAt <= readAt) {
+    if (attempt.state === 'unsupported') prefill = { state: attempt.reason === 'not-supported' ? 'unsupported' : 'unconfirmed' }
+    if (attempt.state === 'completed') prefill = { state: 'time-unrecorded' }
+  }
+  return { prefill, summary }
+}
+
 // Native is the read-only host IO boundary; all qualification and lifecycle
 // decisions remain in this adapter and the shared core.
 export async function startChatGPTAdapter({ core, native, notificationIO, runtimeStatus, displayName = 'Sentinel', sessionsRoot, dataDir, installationId, token, pollMs = 1500, port = 0, now = Date.now, collectMaterials = false, nativeOriginVersion = 1, initialEnrollmentBaseline, onQualificationLost }) {
@@ -131,7 +156,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
   const capability = async () => {
     const health = await core.health(), features = health.features
-    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
+    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
     required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
     if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
     if (delivery) required.push('monitoring-notifications/1', RECOVERY_ROLLUP_FEATURE)
@@ -475,7 +500,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       failureStage = 'core-connection'
       const supported = await capability()
       if (closed || epoch !== sourceEpoch) return
-      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
+      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
       if (coreInstanceId && supported.instanceId && coreInstanceId !== supported.instanceId) {
         try { await stopSource('core-generation-changed') } catch (error) { if (error.status !== 400) throw error }
         if (closed) return
@@ -564,8 +589,12 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       if (after.gap) return fail(entry, after.gap, after.scope)
     }
     if (closed || source !== owner || epoch !== sourceEpoch || generation !== entry.generation) return gapView('observation-superseded')
-    const ownSources = new Set(snapshot.sources.filter(value => value.descriptor.registrationId === 'chatgpt:' + installationId && value.descriptor.policy === 'chatgpt-main/1').map(value => value.key))
-    const records = snapshot.tasks.filter(task => ownSources.has(task.sourceKey) && task.id === entry.id).flatMap(task => {
+    const registrationId = 'chatgpt:' + installationId
+    const ownSources = new Set(snapshot.sources.filter(value => value.descriptor.registrationId === registrationId && value.descriptor.policy === 'chatgpt-main/1').map(value => value.key))
+    const chatTasks = snapshot.tasks.filter(task => ownSources.has(task.sourceKey) && task.id === entry.id)
+    const currentTask = chatTasks.find(task => task.sourceKey === owner.key && task.lifecycleId === entry.lifecycleId)
+    const recent = recentModelActivity(chatTasks, currentTask, registrationId, snapshot.generatedAt)
+    const records = chatTasks.flatMap(task => {
       const events = task.events.filter(event => event.taskId === task.id && event.taskLifecycleId === task.lifecycleId && event.data?.runId === task.lifecycleId && event.data?.sourceKind === 'chatgpt-native' && !event.data.history && !event.data.inherited && event.capturedAt > now() - 86400000)
       if (!events.length) return []
       const start = events.find(event => event.data.nativeType === 'task_started'), end = events.findLast(event => ['task_complete', 'turn_aborted'].includes(event.data.nativeType))
@@ -579,7 +608,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null,
       currentStatus: currentVerified ? current.task.status : 'unknown', currentSignal: currentVerified && current.task.analysis.state !== 'paused' && !snapshot.monitoring?.paused ? current.task.gs?.light ?? 'gray' : 'gray',
       hasMore, cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0), currentGap: retainedOnly ? entry.view.observation?.gap ?? 'current-turn-not-observed' : null, retentionMs: 86400000 }
-    if (!selected) return { ...(entry.view.observation?.coldReadStage || !selection.executionKey && entry.view.observation?.recordRevalidating ? entry.view : gapView(selection.executionKey ? 'history-unavailable' : entry.view.observation?.gap ?? 'current-turn-not-observed', entry.id)), health: entry.health, history }
+    if (!selected) return { ...(entry.view.observation?.coldReadStage || !selection.executionKey && entry.view.observation?.recordRevalidating ? entry.view : gapView(selection.executionKey ? 'history-unavailable' : entry.view.observation?.gap ?? 'current-turn-not-observed', entry.id)), health: entry.health, history, recentModelActivity: recent }
     const historical = retainedOnly || selected !== current || ['ended', 'aborted'].includes(selected.item.status)
     const view = materialView({ ...entry.view, ...(historical ? { currentFacts: undefined, inheritance: undefined } : {}), identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical, snapshot })
     if (selected === current) view.health = combineHealth(view.health, entry.health)
@@ -587,7 +616,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       view.signal = 'gray'; view.summary = retainedOnly ? '当前执行尚未确认 · 显示最近检查记录' : '历史执行 · 仅表示当时的检查记录'
       view.observation = { phase: selected.item.status === 'ended' ? 'completed' : selected.item.status === 'aborted' ? 'aborted' : 'unknown', status: selected.task.status, coverage: 'retained-history', gap: history.currentGap ?? selected.task.events.find(event => event.kind === 'gap' && !event.data?.history && event.data?.verificationGaps?.length)?.data.verificationGaps[0] ?? (selected.task.currentRequest ? null : 'historical-user-request-unverified'), observedAt: selected.item.observedAt }
     }
-    return { ...view, history, execution: { ...selected.item, request: selected.task.currentRequest.slice(0, 240), historical } }
+    return { ...view, history, recentModelActivity: recent, execution: { ...selected.item, request: selected.task.currentRequest.slice(0, 240), historical } }
   }
   async function read(meta, selection = {}) {
     const id = requestIdentity(meta)
