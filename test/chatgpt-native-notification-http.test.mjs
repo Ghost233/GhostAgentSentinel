@@ -46,6 +46,18 @@ test('a persisted first collection failure creates one linked native notice even
   assert.equal((await f.core.claimNotifications(f.sourceKey)).length, 1)
 })
 
+test('an updated native source retires a queued automatic recovery notice but retains its receipt', async t => {
+  const f = await fixture(t)
+  const scope = { sourceKey: f.sourceKey, mainId: 'main', lifecycleId: null, channel: 'default', settledAt: f.now() }
+  await f.core.recordCollectionOutcome({ ...scope, roundId: 'old-record-replaced', outcome: 'failed', error: { code: 'record-file-replaced', stage: 'collection' } })
+  assert.equal((await f.core.nativeNotificationRecords({ sourceKey: f.sourceKey })).records[0].status, 'pending')
+  assert.equal(await f.core.registerSource({ registrationId: 'chatgpt:native-notification', hostRunId: 'native-host', name: 'ChatGPT', policy: 'chatgpt-main/1', nativeOriginVersion: 2 }), f.sourceKey)
+  await f.core.setNativeNotificationEligibility({ sourceKey: f.sourceKey, hostRunId: 'native-host', appRunning: true, pluginEnabled: true })
+  assert.deepEqual(await f.core.claimNotifications(f.sourceKey), [])
+  assert.equal((await f.core.nativeNotificationRecords({ sourceKey: f.sourceKey })).records[0].status, 'cancelled')
+  assert.equal((await f.core.failureReceipts({ sourceKey: f.sourceKey })).receipts[0].state, 'active')
+})
+
 async function firstNotice(f, roundId = 'first-failure') {
   await f.core.recordCollectionOutcome({ sourceKey: f.sourceKey, mainId: null, lifecycleId: null, channel: 'directory', roundId, outcome: 'failed', settledAt: f.now(), error: { code: 'EIO', stage: 'collection' } })
   await f.core.setNativeNotificationEligibility({ sourceKey: f.sourceKey, hostRunId: 'native-host', appRunning: true, pluginEnabled: true })

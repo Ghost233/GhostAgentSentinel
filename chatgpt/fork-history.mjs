@@ -531,6 +531,10 @@ export class ForkHistoryReader {
           this.currentGuardedOutput = null; this.currentGuardedCheckpoint = null
         }
         if (this.current.reader.io?.revalidation || this.current.reader.view().coldRead || this.historyGap) return this.view(output)
+        if (options.deferHistory && (!this.current.resolved || this.current.parent && (!this.current.parent.complete || !this.current.boundaryDelivered) || this.guardedOutput)) {
+          this.budgetWaiting = true
+          return this.view(output)
+        }
         this.historyPhase = true
         for (const node of this.nodes.filter(node => node.history)) {
           if (!await this.qualifiedHistory(node, budget)) continue

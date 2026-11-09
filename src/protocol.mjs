@@ -14,6 +14,7 @@ export const RECOVERY_ROLLUP_FEATURE = 'monitoring-recovery-rollup/1'
 export const PARTIAL_SUMMARY_FEATURE = 'partial-observation-summary/1'
 export const BOUNDED_SUMMARY_GENERATION_FEATURE = 'bounded-summary-generation/1'
 export const NATIVE_CAPTURE_LIVE_BUDGET_FEATURE = 'native-capture-live-budget/1'
+export const NATIVE_CAPTURE_PRIORITY_FEATURE = 'native-capture-priority/1'
 export const CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE = 'chatgpt-recent-model-activity/1'
 export const CHINESE_SUMMARY_PROMPT_FEATURE = 'chinese-summary-prompt/1'
 export const GMD_SUMMARY_CACHE_RECOVERY_FEATURE = 'gmd-summary-cache-recovery/1'
@@ -194,6 +195,10 @@ export function normalizeBatch(value) {
   const input = object(value, 'batch')
   const result = {}
   if (input.nativeOrigins !== undefined) result.nativeOrigins = normalizeNativeOrigins(input.nativeOrigins)
+  if (input.nativeActive !== undefined) {
+    const active = object(input.nativeActive, 'nativeActive')
+    result.nativeActive = { taskId: string(active.taskId, 'nativeActive.taskId'), lifecycleId: string(active.lifecycleId, 'nativeActive.lifecycleId') }
+  }
   if (input.tasks !== undefined) {
     if (!Array.isArray(input.tasks) || input.tasks.length > 2000) throw new Error('tasks must be a bounded list')
     result.tasks = input.tasks.map(item => {

@@ -10,7 +10,7 @@ import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.m
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { setTimeout as delay } from 'node:timers/promises'
 
-for (const missing of ['monitoring-recovery-rollup/1', 'native-capture-live-budget/1', 'partial-observation-summary/1', 'bounded-summary-generation/1', 'chatgpt-recent-model-activity/1', 'chinese-summary-prompt/1', 'gmd-summary-cache-recovery/1']) test('an older Core without ' + missing + ' is reported before collection or notification starts', async t => {
+for (const missing of ['monitoring-recovery-rollup/1', 'native-capture-live-budget/1', 'native-capture-priority/1', 'partial-observation-summary/1', 'bounded-summary-generation/1', 'chatgpt-recent-model-activity/1', 'chinese-summary-prompt/1', 'gmd-summary-cache-recovery/1']) test('an older Core without ' + missing + ' is reported before collection or notification starts', async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-old-recovery-core-')), clock = Date.now()
   let server, core, adapter, compatible = false, lists = 0
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); await fs.rm(dir, { recursive: true, force: true }) })
@@ -120,7 +120,7 @@ for (const [anchored, guard] of [[true, null], [false, null], [false, 'recovered
 })
 
 // Uses fixed notification IO and the real fresh-install runtime path.
-test('six verified never-monitored main chats keep six ENOENT receipts and submit one immediate initial-enrollment summary', { timeout: 10_000 }, async t => {
+for (const code of ['ENOENT', 'EACCES']) test(`six never-monitored chats retain independent ${code} receipts and notify only for a permission problem`, { timeout: 10_000 }, async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-initial-enrollment-red-'))
   const sessionsRoot = join(dir, 'sessions'), archiveRoot = join(dir, 'archived_sessions'), coreDataDir = join(dir, 'core')
   let server, client, runtime, primary
@@ -128,6 +128,13 @@ test('six verified never-monitored main chats keep six ENOENT receipts and submi
   try {
     await fs.mkdir(sessionsRoot); await fs.mkdir(archiveRoot)
     const threads = Array.from({ length: 6 }, (_, i) => ({ id: 'owned-initial-' + i, path: join(archiveRoot, i + '.jsonl'), cwd: dir, source: 'vscode', originator: 'Codex Desktop', parentThreadId: null, forkedFromId: null, archived: true }))
+    if (code === 'EACCES') {
+      const lstat = fs.lstat, paths = new Set(threads.map(thread => thread.path))
+      t.mock.method(fs, 'lstat', async (path, ...args) => {
+        if (paths.has(path)) throw Object.assign(new Error('controlled permission failure'), { code })
+        return lstat(path, ...args)
+      })
+    }
     const native = {
       async sampleHost() { return { available: true, hostRunId: 'owned-initial-host', hostStartedAt, profile: supportedProfile } },
       async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
@@ -159,11 +166,12 @@ test('six verified never-monitored main chats keep six ENOENT receipts and submi
     assert.equal(first.hasMore, false); assert.equal(first.historyGap, false)
     assert.equal(first.receipts.length, 6)
     assert.equal(new Set(first.receipts.map(value => value.mainId)).size, 6)
-    assert.ok(first.receipts.every(value => value.domain === 'collection' && value.error.code === 'ENOENT' && value.state === 'active' && value.lifecycleId === null && value.recoveredAt === null))
+    assert.ok(first.receipts.every(value => value.domain === 'collection' && value.error.code === code && value.state === 'active' && value.lifecycleId === null && value.recoveredAt === null))
     assert.equal(snapshot.tasks.length, 0, 'no nonexistent execution was fabricated')
-    assert.equal(submissions.length, 1, 'the first eligible failure submits immediately; five other initial failures only join the summary')
+    assert.equal(submissions.length, code === 'EACCES' ? 1 : 0)
     assert.ok(submissions.every(value => value.metadata.mainId !== null), 'aggregation must retain a real main scope')
-    assert.equal(new Set(notices.records.flatMap(value => value.receiptIds)).size, 6)
+    if (code === 'EACCES') { assert.equal(submissions[0].subtitle, '需要你处理'); assert.match(submissions[0].body, /权限/) }
+    assert.equal(new Set(notices.records.flatMap(value => value.receiptIds)).size, code === 'EACCES' ? 6 : 0)
     const originalIds = first.receipts.map(value => value.id).sort()
     for (let round = 0; round < 3; round++) await runtime.refresh()
     const end = performance.now() + 2000
@@ -173,7 +181,7 @@ test('six verified never-monitored main chats keep six ENOENT receipts and submi
     }
     const after = await client.failureReceipts({ sourceKey: source.key })
     assert.deepEqual(after.receipts.map(value => value.id).sort(), originalIds)
-    assert.equal(submissions.length, 1, 'repeated polls do not resubmit the summary')
+    assert.equal(submissions.length, code === 'EACCES' ? 1 : 0, 'repeated polls do not create more notifications')
     t.diagnostic(JSON.stringify({ syntheticOnly: true, mainChats: 6, independentFailures: 6, notificationSubmissions: submissions.length, rounds: 4, nativeIO: 'fixed-no-OS', actualModelCalls: 0 }))
   } catch (error) { primary = error }
   const cleanup = []
@@ -223,5 +231,5 @@ test('a header-only unanchored success drains source recovery and never blocks a
   assert.equal(receipts[0].mainId, missing.id); assert.equal(receipts[0].error.code, 'ENOENT')
   assert.equal(receipts[0].enrollmentPhase, 'initial-unanchored', 'per-main initial enrollment classification is retained')
   assert.equal(runtime.diagnostics().healthOutbox.pending, 0)
-  assert.equal(submissions.length, 1, 'the later first failure still submits its notification')
+  assert.equal(submissions.length, 0, 'an unavailable record is reported in diagnostics')
 })

@@ -20,6 +20,7 @@ const DAY = 24 * 60 * 60 * 1000;
 const CLAIM_MS = 60_000;
 const GROUP_MS = 3_000;
 const HIERARCHY_CAPTURE_LIMIT = 10_000;
+const NATIVE_CAPACITY_GAP = 'Older native records were removed at the capture limit';
 const CONVERSATION_MONITORING_LIMIT = 1_000;
 const SUBMISSION_LIMIT = 1_000;
 const HIERARCHY_CAPTURE_GAP = 'Hierarchy evidence identity retention budget exceeded';
@@ -675,12 +676,12 @@ export async function createCore({
     return { summary: `${boundary}${label}：${latest.text}${exit}${linkage}`, observedAt: latest.capturedAt, evidenceIds: latest.activityEvidence ?? [latest.id] };
   }
 
-  function prune() {
+  function prune(capacityEvicted = null) {
     const current = now();
     const expiredNativeProgress = nativeProgress.prune(current);
     failureStore.prune(current);
     const cutoff = current - DAY;
-    const expiredByTask = new Map();
+    const expiredByTask = new Map(capacityEvicted);
     if (current >= nextEventExpiryAt) {
       let next = Infinity;
       for (const event of events.values()) {
@@ -703,8 +704,9 @@ export async function createCore({
       for (const id of references) if (id && !events.has(identity(task.sourceKey, task.id, task.lifecycleId, id))) expired.add(id);
       if (expired.size > 0) {
         pendingPrunedTasks.add(task.key);
-        cancelRound('Analysis evidence expired after 24 hours', task);
-        rememberGap(task, { reason: 'Earlier evidence expired after 24 hours', at: now(), endAt: now() - DAY });
+        const removedForCapacity = capacityEvicted?.has(task.key);
+        cancelRound(removedForCapacity ? NATIVE_CAPACITY_GAP : 'Analysis evidence expired after 24 hours', task);
+        if (!removedForCapacity) rememberGap(task, { reason: 'Earlier evidence expired after 24 hours', at: now(), endAt: now() - DAY });
         if (expired.has(task.requestId)) { task.currentRequest = ''; task.requestId = null; task.contextFingerprint = null; }
         if (task.analysis.inputEventIds?.some(id => expired.has(id)) || task.analysis.checks?.some(check => check.evidenceIds?.some(id => expired.has(id)))) {
           task.analysis.state = 'stale';
@@ -1248,13 +1250,13 @@ export async function createCore({
     }
   }
 
-  function tick() {
+  function tick(capacityEvicted = null) {
     if (closed) return;
     const current = now();
     for (const source of sources.values()) {
       if (connected(source) && current - source.lastSeenAt >= leaseMs) resetSource(source, 'Source heartbeat lease expired');
     }
-    prune();
+    prune(capacityEvicted);
     cleanQueue();
     for (const task of tasks.values()) {
       if (taskPaused(task)) {
@@ -1420,6 +1422,7 @@ export async function createCore({
       return source.key;
     },
     async nativeOriginFence(sourceKey, key) { ensureOpen(); const source = getSource(sourceKey); if (source.descriptor.policy !== 'chatgpt-main/1' || source.descriptor.nativeOriginVersion !== 2 || !/^[a-f0-9]{64}$/.test(key ?? '')) throw Object.assign(new Error('invalid native origin scope'), { code: 'native_origin_invalid' }); return nativeOrigins.read(source.descriptor.registrationId, key); },
+    nativeCaptureBudget() { return nativeProgress.budget(); },
     async heartbeat(sourceKey) {
       ensureOpen();
       const source = getSource(sourceKey);
@@ -1438,7 +1441,8 @@ export async function createCore({
       const nativeCaptureTime = source.descriptor.policy === 'chatgpt-main/1' && batch.events?.some(event => event.data?.nativeRecordId) ? now() : null;
       let nativePlan;
       if (nativeCaptureTime !== null) {
-        try { nativePlan = nativeProgress.project(source.descriptor.registrationId, batch.events, nativeCaptureTime, locator => locator && events.get(identity(locator.sourceKey, locator.taskId, locator.lifecycleId, locator.eventId))); }
+        const active = source.descriptor.nativeOriginVersion === 2 && batch.events.length <= 16 && batch.nativeActive;
+        try { nativePlan = nativeProgress.project(source.descriptor.registrationId, batch.events, nativeCaptureTime, locator => locator && events.get(identity(locator.sourceKey, locator.taskId, locator.lifecycleId, locator.eventId)), active); }
         catch (error) {
           if (['native_capture_capacity', 'native_capture_body_unavailable'].includes(error.code)) { rememberGap(source, { reason: error.code, at: nativeCaptureTime }); save('sources', source); }
           throw error;
@@ -1536,14 +1540,22 @@ export async function createCore({
       // Only native ChatGPT batches need the new progress dependency. Persist
       // its SQL first, but publish neither its memory nor the batch until both
       // sides release this savepoint. Legacy/DSH ingestion keeps its old path.
-      let transaction = null, applyNativeProgress = null, applyNativeOrigins = null;
+      let transaction = null, applyNativeProgress = null, applyNativeOrigins = null, evictions = [];
+      const capacityEvicted = new Map();
       if (nativePlan || originPlan) {
         transaction = { rows: new Map(), sequence, activeTaskKey: active?.taskKey ?? null };
         db.exec('SAVEPOINT native_ingest'); nativeJournal = transaction;
       }
       try {
         if (originPlan) applyNativeOrigins = originPlan.stage(nativePlan?.hasProgress ?? false);
-        if (nativePlan) applyNativeProgress = nativePlan.stage((batch.events ?? []).map(event => ({ event: events.get(identity(sourceKey, event.taskId, event.taskLifecycleId, event.id)) ?? event, locator: { sourceKey, taskId: event.taskId, lifecycleId: event.taskLifecycleId, eventId: event.id } })));
+        if (nativePlan) {
+          const accepted = (batch.events ?? []).map(event => ({ event: events.get(identity(sourceKey, event.taskId, event.taskLifecycleId, event.id)) ?? event, locator: { sourceKey, taskId: event.taskId, lifecycleId: event.taskLifecycleId, eventId: event.id } }));
+          const admission = nativePlan.stage(accepted, event => {
+            const task = event && tasks.get(event.taskKey);
+            return task?.status === 'running' && !historical(event) && (event.id === task.requestId || event.data?.nativeType === 'task_started');
+          });
+          applyNativeProgress = admission.apply; evictions = admission.evicted;
+        }
         if (source.descriptor.policy === 'chatgpt-main/1') {
           const captures = new Map((acceptedCaptures ?? source.hierarchyEvidenceCaptures ?? []).map(value => [referenceKey(value), value]));
           for (const event of batch.events ?? []) {
@@ -1689,10 +1701,43 @@ export async function createCore({
           }
           save('sources', source); counts.hierarchyContext = { schemaVersion: 1, acceptedRevision: incoming.revision };
         }
+        if (evictions.length) {
+          // Retire every stored copy of an identity in the same transaction as
+          // its replay fence and the new material.
+          const evicted = new Set(evictions), removedRefs = new Map();
+          for (const event of events.values()) {
+            if (!event.data?.nativeRecordId) continue;
+            const task = tasks.get(event.taskKey), owner = sources.get(task?.sourceKey);
+            if (owner?.descriptor.policy !== 'chatgpt-main/1' || !evicted.has(identity(owner.descriptor.registrationId, event.data.nativeRecordId))) continue;
+            if (!capacityEvicted.has(task.key)) capacityEvicted.set(task.key, new Set());
+            capacityEvicted.get(task.key).add(event.id);
+            if (!removedRefs.has(owner.key)) removedRefs.set(owner.key, new Set());
+            removedRefs.get(owner.key).add(referenceKey(eventRef(event)));
+            const previousEnd = task.gapRecords?.find(gap => gap.reason === NATIVE_CAPACITY_GAP)?.endAt ?? 0;
+            rememberGap(task, { reason: NATIVE_CAPACITY_GAP, at: nativeCaptureTime, endAt: Math.max(previousEnd, event.capturedAt) });
+            erase('events', event.key);
+          }
+          for (const owner of sources.values()) {
+            if (owner.descriptor.policy !== 'chatgpt-main/1' || !owner.hierarchyEvidenceCaptures?.length) continue;
+            const refs = removedRefs.get(owner.key);
+            const kept = owner.hierarchyEvidenceCaptures.filter(value => !refs?.has(referenceKey(value)) && !evicted.has(identity(owner.descriptor.registrationId, value.nativeOriginId)));
+            if (kept.length !== owner.hierarchyEvidenceCaptures.length) { owner.hierarchyEvidenceCaptures = kept; save('sources', owner); }
+          }
+          for (const task of tasks.values()) {
+            let changed = capacityEvicted.has(task.key);
+            for (const [field, result] of [['lastSuccessfulSummary', 'generated'], ['lastPartialSummary', 'partial']]) {
+              const refs = task.analysis[field]?.[result]?.evidenceRefs;
+              if (refs?.some(ref => !events.has(identity(task.sourceKey, ref.taskId, ref.lifecycleId, ref.eventId)))) {
+                delete task.analysis[field]; changed = true;
+              }
+            }
+            if (changed) save('tasks', task);
+          }
+        }
         if (transaction) { db.exec('RELEASE native_ingest'); nativeJournal = null; transaction = null; applyNativeProgress?.(); applyNativeOrigins?.(); }
         if (source.descriptor.policy === 'chatgpt-main/1') for (const descriptor of batch.tasks ?? []) nativeNotifications.markMonitored(source.descriptor.registrationId, descriptor.id);
         if (batch.nativeOrigins) counts.nativeOrigins = batch.nativeOrigins.map(proof => nativeOrigins.read(source.descriptor.registrationId, proof.key));
-        tick();
+        tick(capacityEvicted.size ? capacityEvicted : null);
         return counts;
       } catch (error) {
         if (transaction) {

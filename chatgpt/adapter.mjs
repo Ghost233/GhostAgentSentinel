@@ -11,7 +11,7 @@ import { readModelDirectory } from './model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
-import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE } from '../src/protocol.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -156,14 +156,14 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
   const capability = async () => {
     const health = await core.health(), features = health.features
-    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
+    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
     required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
     if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
     if (delivery) required.push('monitoring-notifications/1', RECOVERY_ROLLUP_FEATURE)
     const missingFeatures = required.filter(feature => !Array.isArray(features) || !features.includes(feature)), available = missingFeatures.length === 0
     if (available && baselineCoreInstanceId === null) baselineCoreInstanceId = health.instanceId
     else if (available && baselineCoreInstanceId !== health.instanceId) baselineInitializationAvailable = false
-    return { available, instanceId: health.instanceId, missingFeatures }
+    return { available, instanceId: health.instanceId, missingFeatures, nativeCaptureBudget: health.nativeCaptureBudget }
   }
 
   async function qualifyNotification(notice) {
@@ -239,6 +239,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       refreshNotifications(facts)
     }
     if (reason !== 'observation-unavailable') { sourceHealth = null; outboxError = null; availabilityFailure = null; for (const entry of threads.values()) entry.health = null }
+    for (const entry of threads.values()) { delete entry.deferredAnchor; delete entry.historyDeferred; delete entry.capacityWaiting; delete entry.recordVerification }
     await Promise.all([unregistering, metadataClosing, ...[...threads.values()].map(entry => stop(entry, reason, false))])
     for (const [id, entry] of threads) if (!entry.lifecycleId && !entry.blocked) threads.delete(id)
     if (previous && !onQualificationLost) await core.unregisterSource(previous.key, reason)
@@ -318,13 +319,18 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     return { source, chatTitle: [thread.name, thread.title, thread.preview].find(value => typeof value === 'string' && value.trim()) }
   }
 
-  async function prepare(entry, context, epoch) {
+  async function prepare(entry, context, epoch, budget) {
     const roundId = randomUUID()
     entry.qualifiedHostRunId = null
     try {
       const before = await qualify(entry.id, entry.reader?.source, context)
       if (before.gap) { await fail(entry, before.gap, before.scope); return null }
       entry.qualifiedHostRunId = before.source.hostRunId
+      const deferHistory = budget?.historyDeferred === true, anchor = before.source.anchorTurnId
+      entry.historyDeferred = deferHistory && entry.historyDeferred === true
+      if (!deferHistory) delete entry.deferredAnchor
+      if (deferHistory && (!anchor || entry.deferredAnchor === anchor)) { entry.historyDeferred = true; return null }
+      if (entry.capacityWaiting !== anchor) delete entry.capacityWaiting
       const originSource = collectMaterials && nativeOriginVersion === 2 ? await sourceFor(before.source, epoch) : null
       const origins = originSource ? { read: key => core.nativeOriginFence(originSource.key, key) } : null
       entry.fork = before.source.forkedFromId
@@ -348,7 +354,8 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         entry.reader = before.source.forkedFromId ? new ForkHistoryReader(before.source, cursor?.reader, { native, sessionsRoot, mode: 'material', origins }) : new BoundedReader(before.source, cursor?.reader, { mode: collectMaterials ? 'material' : 'metadata', origins })
       }
       if (closed) return null
-      const previousCheckpoint = entry.reader.checkpoint(), observed = await entry.reader.pump({ anchorTurnId: before.source.anchorTurnId })
+      const previousCheckpoint = entry.reader.checkpoint(), observed = await entry.reader.pump({ anchorTurnId: anchor, deferHistory })
+      entry.recordVerification = observed.recordVerification ?? null
       if (observed.coldRead) { entry.view = { ...gapView('historical-execution-unconfirmed', entry.id), observation: { phase: 'unknown', status: 'unknown', coverage: 'catching-up', gap: 'historical-execution-unconfirmed', coldReadStage: observed.coldRead.phase, metadataOffset: observed.coldRead.offset, readBytes: observed.readBytes, decodedBytes: observed.decodedBytes } }; return null }
       if (observed.coverage === 'gap') {
         const code = observed.gap?.split(':')[0]
@@ -356,8 +363,30 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         if (['start-predates-host', 'host-start-time-overlap'].includes(observed.gap)) entry.blocked = { scope: fingerprint(before.source), reason: observed.gap }
         await fail(entry, observed.gap); await updateHealth(entry); return null
       }
-      return { source: before.source, previousCheckpoint, observed, epoch, generation, roundId }
+      const prior = previousCheckpoint.frames?.[0]?.reader ?? previousCheckpoint
+      const { anchored, orphan, turnId, phase, at } = observed.observed
+      const hostBoundary = before.source.hostStartedAt + 1000
+      const live = collectMaterials && nativeOriginVersion === 2 && anchored && !orphan && anchor === turnId && !observed.historicalTerminal && (
+        phase === 'started' && at >= hostBoundary ||
+        prior.state?.turnId === turnId && prior.state.phase === 'started' && prior.state.at >= hostBoundary ||
+        observed.recentLifecycle.some(event => event.turnId === turnId && event.type === 'task_started' && event.at >= Math.max(hostBoundary, now() - 60000))
+      )
+      if (deferHistory && !live && [observed.recentLifecycle, observed.materials, observed.historyLifecycle, observed.historyMaterials, observed.historyBoundaries].some(events => events?.length)) {
+        await deferEntryHistory(entry, anchor)
+        return null
+      }
+      entry.historyDeferred = deferHistory && Boolean(observed.forkProvenance && !observed.forkProvenance.complete)
+      return { source: before.source, previousCheckpoint, observed, epoch, generation, roundId, live }
     } catch (error) { if (closed || epoch !== sourceEpoch) return null; await collectionOutcome(entry, 'failed', error, roundId); await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {}); await updateHealth(entry); return null }
+  }
+
+  async function deferEntryHistory(entry, anchor) {
+    entry.deferredAnchor = anchor
+    entry.historyDeferred = true
+    const reader = entry.reader
+    entry.reader = null
+    delete entry.publishedCheckpoint
+    await reader?.close()
   }
 
   async function publish(entry, prepared) {
@@ -450,9 +479,11 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
           }
         }
         batch.hierarchyContext = materialContext(before, connection.key, batch, fork ? { taskId: entry.id, complete: observed.forkProvenance.complete, receiptId: observed.forkProvenance.receiptId, generation: observed.forkProvenance.generation } : null)
+        if (prepared.live) batch.nativeActive = { taskId: entry.id, lifecycleId }
       }
       const accepted = await core.ingest(connection.key, batch)
       if (closed || epoch !== sourceEpoch || generation !== entry.generation) return entry.view
+      delete entry.capacityWaiting
       entry.reader?.acknowledgeOrigins?.(accepted.nativeOrigins)
       await saveCursor(target, checkpoint, entry.captured, entry.captureThroughOffset, { fork, deliveryThrough: entry.deliveryThrough })
       // A partial replay has not yet reached the previously failed material.
@@ -473,7 +504,18 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       await updateHealth(entry, snapshot)
       entry.publishedCheckpoint = fingerprint(checkpoint)
       return entry.view
-    } catch (error) { if (closed || prepared.epoch !== sourceEpoch || prepared.generation !== entry.generation) return entry.view; if (error.code === 'native_origin_revision_conflict') { await stop(entry, 'native-origin-revalidating', false); return entry.view } await collectionOutcome(entry, 'failed', error, prepared.roundId); await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {}); await updateHealth(entry); return entry.view }
+    } catch (error) {
+      if (closed || prepared.epoch !== sourceEpoch || prepared.generation !== entry.generation) return entry.view
+      if (error.code === 'native_origin_revision_conflict') { await stop(entry, 'native-origin-revalidating', false); return entry.view }
+      if (error.code === 'native_capture_capacity' && nativeOriginVersion === 2) {
+        if (!prepared.live) { await deferEntryHistory(entry, prepared.source.anchorTurnId); return entry.view }
+        entry.capacityWaiting = prepared.source.anchorTurnId
+      }
+      await collectionOutcome(entry, 'failed', error, prepared.roundId)
+      await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {})
+      await updateHealth(entry)
+      return entry.view
+    }
   }
 
   function rememberCapture(entry, offset) { const at = now(); if (!Number.isSafeInteger(at) || at < 0) throw new Error('invalid capture clock'); entry.captured.set(offset, at); if (entry.captured.size > 16) entry.captured.delete(entry.captured.keys().next().value); return at }
@@ -500,7 +542,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       failureStage = 'core-connection'
       const supported = await capability()
       if (closed || epoch !== sourceEpoch) return
-      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
+      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
       if (coreInstanceId && supported.instanceId && coreInstanceId !== supported.instanceId) {
         try { await stopSource('core-generation-changed') } catch (error) { if (error.status !== 400) throw error }
         if (closed) return
@@ -534,9 +576,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         if (closed || epoch !== sourceEpoch) break
         const entry = entryFor(id)
         if (entry) {
-          const value = await prepare(entry, before, epoch)
+          const value = await prepare(entry, before, epoch, storageVersion === 2 ? supported.nativeCaptureBudget : null)
           if (value) prepared.set(entry, value)
-          else if (!entry.reader && !entry.lifecycleId && !entry.blocked) threads.delete(id)
+          else if (!entry.reader && !entry.lifecycleId && !entry.blocked && !entry.historyDeferred) threads.delete(id)
         }
       }
       if (closed || epoch !== sourceEpoch) return
@@ -548,9 +590,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         if (closed || epoch !== sourceEpoch) break
         const proof = await qualify(entry.id, value.source, after)
         if (proof.gap) await fail(entry, proof.gap, proof.scope)
-        else valid.set(entry, value)
+        else valid.set(entry, { ...value, live: value.live && proof.source.anchorTurnId === value.source.anchorTurnId })
       }
-      for (const [entry, value] of valid) {
+      for (const [entry, value] of [...valid].sort((a, b) => Number(b[1].live) - Number(a[1].live))) {
         if (closed || epoch !== sourceEpoch || value.generation !== entry.generation) break
         await publish(entry, value)
       }
@@ -631,7 +673,15 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       if (closed) return decorate(gapView('adapter-closed'))
       if (gap) { await stopSource(gap); return decorate(entry.view) }
     }
-    const pending = enqueue(async () => { await collect([id]); return closed ? gapView('adapter-closed') : observedView(entry, selection) })
+    const pending = enqueue(async () => {
+      await collect([id])
+      if (closed) return gapView('adapter-closed')
+      const view = await observedView(entry, selection)
+      if (entry.qualifiedHostRunId !== source?.hostRunId) return view
+      const gap = entry.view.observation?.gap
+      const state = ['native_origin_prefix_changed', 'native_origin_header_changed'].includes(gap) ? 'prefix-mismatch' : entry.view.observation?.recordRevalidating ? 'verifying-prefix' : entry.capacityWaiting ? 'active-waiting' : entry.historyDeferred ? 'history-deferred' : null
+      return state ? { ...view, collectionRecovery: { state, ...(state === 'verifying-prefix' && entry.recordVerification ? entry.recordVerification : {}) } } : view
+    })
     if (!pending) return decorate(gapView(closed ? 'adapter-closed' : 'collection-queue-capacity'))
     const view = await pending
     return decorate(closed ? gapView('adapter-closed') : view)

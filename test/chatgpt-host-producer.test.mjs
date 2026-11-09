@@ -321,7 +321,7 @@ test('a remapped device number revalidates the same inode and retained prefix be
   })
 })
 
-test('device rebinding does not accept a different inode, missing fence, truncation or rewritten content', async t => {
+test('device rebinding preserves a pinned inode and rejects a missing fence, truncation or rewritten content', async t => {
   for (const mutation of ['inode', 'missing-fence', 'truncate', 'rewrite', 'rewrite-and-append']) await t.test(mutation, async t => {
     const f = await fixture(t, { records: row(1, 'event_msg', start('turn')) + row(2, 'event_msg', user(owner, 'turn', 'Existing captured request')) + row(3, 'event_msg', { type: 'task_complete', turn_id: 'turn' }) })
     const old = f.open(); await collect(old)
@@ -331,7 +331,7 @@ test('device rebinding does not accept a different inode, missing fence, truncat
     if (mutation === 'inode') { await fs.writeFile(f.plain + '.next', f.bytes); await fs.rename(f.plain + '.next', f.plain) }
     if (mutation === 'truncate') await fs.truncate(f.plain, f.bytes.length - 1)
     if (mutation.startsWith('rewrite')) await fs.writeFile(f.plain, f.bytes.toString().replace('Existing captured request', 'Modified captured request') + (mutation.endsWith('append') ? row(4, 'token_usage_record', {}) : ''))
-    const restored = f.open({}, saved, { origins: { async read(key) { return mutation === 'missing-fence' ? null : { key, headerHash: proof.headerHash, prefix: proof.next, revision: 1 } } } }), result = await collect(restored)
+    const restored = f.open(mutation === 'inode' ? { expectedFileId: saved.fileId } : {}, saved, { origins: { async read(key) { return mutation === 'missing-fence' ? null : { key, headerHash: proof.headerHash, prefix: proof.next, revision: 1 } } } }), result = await collect(restored)
     const expected = mutation === 'truncate' ? 'record-file-truncated' : mutation === 'rewrite' ? 'record-rewrite-suspected' : mutation === 'rewrite-and-append' ? 'native_origin_prefix_changed' : 'record-file-replaced'
     assert.equal(result.view.gap, expected)
     assert.equal(result.view.effectivePhase, 'unknown')

@@ -176,12 +176,20 @@ test('decode diagnostics expose the interface without private response or query 
 test('a real Core deadline is retained while caller and close cancellation do not create source failures', async t => {
   const f = await fixture(t)
   f.faults.set('/v1/snapshot', 'held')
-  const started = performance.now(), failed = await f.adapter.snapshot()
+  const started = performance.now(), snapshot = f.adapter.snapshot()
+  await until(() => f.held.size === 1)
+  // Hold the later heartbeat until the timeout response has been observed.
+  f.faults.set('/v1/source/heartbeat', 'held')
+  await until(() => f.held.size === 2)
+  const heartbeat = [...f.held].find(response => response.req.url === '/v1/source/heartbeat')
+  const failed = await snapshot
   assert.equal(failed.adapter.connected, false)
   assert.equal(failed.monitoring, 'unknown')
   const deadline = f.adapter.diagnostics().adapter.communicationFailure.first
   assert.equal(deadline.kind, 'timeout'); assert.equal(deadline.operation, '/v1/snapshot'); assert.equal(deadline.timeoutMs, 5000)
   assert.ok(deadline.elapsedMs >= 4900 && performance.now() - started >= 4900)
+  f.faults.delete('/v1/source/heartbeat')
+  heartbeat.end(JSON.stringify({ accepted: 0 }))
   await until(() => f.held.size === 0 && f.adapter.connected && !f.adapter.diagnostics().adapter.communicationFailure.active)
   const retained = f.adapter.diagnostics().adapter.communicationFailure
   const controller = new AbortController(), reason = new Error(`private cancellation ${f.token}`)

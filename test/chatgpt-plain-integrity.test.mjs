@@ -86,6 +86,41 @@ for (const mutation of ['header', 'body']) test(`an acknowledged plain ${mutatio
   assert.deepEqual((await f.core.snapshot()).tasks[0].events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text]), original)
 })
 
+for (const variant of ['plain', 'compressed', 'changed-body', 'changed-header']) test(`a replacement of an acknowledged file resumes only after bounded prefix verification (${variant})`, async t => {
+  const f = await fixture(t, { padding: 'p'.repeat(600000), compressed: variant === 'compressed' })
+  assert.equal((await f.catchUp()).observation.coverage, 'caught-up')
+  const events = async () => (await f.core.snapshot()).tasks.flatMap(task => task.events).map(event => [event.data.nativeRecordId, event.capturedAt, event.text])
+  const original = await events()
+  await fs.rename(f.path, f.path + '.old')
+  const replaced = variant === 'changed-body' ? f.bytes.replace('Original owned body', 'Replaced owned body') : variant === 'changed-header' ? f.bytes.replace('/owned', '/other') : f.bytes
+  await fs.writeFile(f.path, f.encode(replaced + f.tail))
+  await f.restart()
+  const verifying = await f.read()
+  if (variant !== 'changed-header') {
+    assert.equal(verifying.observation.recordRevalidating, true, JSON.stringify(verifying.observation))
+    assert.equal(verifying.collectionRecovery?.state, 'verifying-prefix')
+    assert.ok(verifying.collectionRecovery.checkedBytes > 0 && verifying.collectionRecovery.checkedBytes < verifying.collectionRecovery.totalBytes)
+  }
+  assert.deepEqual(await events(), original)
+  await f.restart()
+  let view
+  for (let pump = 0; pump < 24; pump++) {
+    view = await f.read()
+    if (view.observation.coverage === 'caught-up' || view.collectionRecovery?.state === 'prefix-mismatch') break
+  }
+  if (variant.startsWith('changed-')) {
+    assert.equal(view.observation.gap, variant === 'changed-header' ? 'native_origin_header_changed' : 'native_origin_prefix_changed')
+    assert.equal(view.collectionRecovery?.state, 'prefix-mismatch')
+    assert.deepEqual(await events(), original)
+  } else {
+    assert.equal(view.observation.coverage, 'caught-up')
+    assert.equal(view.collectionRecovery, undefined)
+    const retained = await events()
+    assert.deepEqual(retained.filter(event => event[2] !== 'New verified tail'), original)
+    assert.equal(retained.filter(event => event[2] === 'New verified tail').length, 1)
+  }
+})
+
 test('a normal append spends bounded prefix-validation work before publishing its new tail without a collection failure', async t => {
   const f = await fixture(t, { padding: 'p'.repeat(600000) }); assert.equal((await f.catchUp()).observation.coverage, 'caught-up')
   const original = (await f.core.snapshot()).tasks[0].events.map(event => [event.data.nativeRecordId, event.capturedAt])
@@ -212,14 +247,14 @@ test('several old executions share one lifecycle pre-scan before the verified cu
   assert.equal(scans.size, 1, 'old ends cannot trigger repeated full-file pre-scans before the already confirmed current anchor')
 })
 
-test('a confirmed bad compressed frame creates one immediate collection notice and recovers without another notice', async t => {
+test('a confirmed bad compressed frame keeps a collection receipt and recovers without a desktop notice', async t => {
   const f = await fixture(t, { compressed: true, invalidFrame: true }), view = await f.catchUp(), sourceKey = await f.source()
   assert.equal(view.health.state, 'failed')
   let receipts = (await f.core.failureReceipts({ sourceKey })).receipts
   assert.equal(receipts.length, 1); assert.equal(receipts[0].error.code, 'compressed-data-invalid'); assert.equal(receipts[0].error.category, 'collection')
   await f.core.setNativeNotificationEligibility({ sourceKey, hostRunId: 'host', appRunning: true, pluginEnabled: true })
   const claims = await f.core.claimNotifications(sourceKey)
-  assert.equal(claims.length, 1); assert.equal(claims[0].kind, 'monitoring-failure'); assert.deepEqual(claims[0].receiptIds, [receipts[0].id])
+  assert.deepEqual(claims, [])
   await f.read(); assert.deepEqual(await f.core.claimNotifications(sourceKey), [])
   assert.equal((await f.core.failureReceipts({ sourceKey })).receipts.length, 1)
   await fs.writeFile(f.path, f.encode(f.bytes)); assert.equal((await f.catchUp(false)).observation.coverage, 'caught-up')
@@ -227,7 +262,7 @@ test('a confirmed bad compressed frame creates one immediate collection notice a
   receipts = (await f.core.failureReceipts({ sourceKey })).receipts
   assert.equal(receipts.length, 1); assert.equal(receipts[0].state, 'recovered')
   assert.deepEqual(await f.core.claimNotifications(sourceKey), [])
-  assert.equal((await f.core.nativeNotificationRecords({ sourceKey })).records.length, 1)
+  assert.equal((await f.core.nativeNotificationRecords({ sourceKey })).records.length, 0)
 })
 
 for (const rewrite of [false, true]) test(`a checkpoint during bounded append revalidation remains untrusted after restart (${rewrite ? 'rewritten' : 'unchanged'})`, async t => {

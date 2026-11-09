@@ -59,8 +59,10 @@ export function createNativeCaptureProgress({ db, seed = [] }) {
 
   return {
     prepareClearRegistration,
-    project(registrationId, incoming, current, lookup) {
-      const changes = new Map(), earlier = new Map(), output = [], expired = []; let existingProgress = false
+    budget() { return { historyDeferred: LIMIT - records.size < 16 } },
+    project(registrationId, incoming, current, lookup, active) {
+      const changes = new Map(), earlier = new Map(), output = [], expired = []; let existingProgress = false, resident = records.size
+      const activeGenerations = new Set(active ? incoming.filter(event => event.taskId === active.taskId && event.taskLifecycleId === active.lifecycleId && !event.data?.history && !event.data?.inherited).map(event => event.data?.nativeGenerationKey) : [])
       for (const event of incoming) {
         const nativeRecordId = event.data?.nativeRecordId
         if (!nativeRecordId || event.capturedAt > current) { output.push(event); continue }
@@ -80,7 +82,12 @@ export function createNativeCaptureProgress({ db, seed = [] }) {
           output.push({ ...event, capturedAt, evidence: original.evidence ?? event.evidence })
         } else {
           if (event.capturedAt <= current - DAY) { changes.set(key, { key, registrationId, nativeRecordId, expired: true }); expired.push(event); continue }
-          if (liveSize(changes) >= LIMIT) throw error('native_capture_capacity')
+          // The preceding turn's closing record can share the same atomic
+          // cursor advance as the active turn's first records.
+          const closesPredecessor = event.kind === 'status' && ['task_complete', 'turn_aborted'].includes(event.data.nativeType)
+          const priority = active && event.taskId === active.taskId && activeGenerations.has(event.data.nativeGenerationKey) && !event.data.history && !event.data.inherited && (event.taskLifecycleId === active.lifecycleId || closesPredecessor)
+          if (resident >= LIMIT && !priority) throw error('native_capture_capacity')
+          resident++
           changes.set(key, { key, registrationId, nativeRecordId, firstCapturedAt: event.capturedAt, locator: null })
           output.push(event)
         }
@@ -89,7 +96,7 @@ export function createNativeCaptureProgress({ db, seed = [] }) {
         const first = changes.get(keyOf(registrationId, event.data?.nativeRecordId))
         return first && !first.expired && event.capturedAt > first.firstCapturedAt ? { ...event, capturedAt: first.firstCapturedAt } : event
       })
-      return { events: projected, expired, earlier, hasProgress: existingProgress || changes.size > 0, stage(accepted) {
+      return { events: projected, expired, earlier, hasProgress: existingProgress || changes.size > 0, stage(accepted, keepsLiveContext) {
         const actual = new Map([...changes].filter(([, record]) => record.expired))
         for (const value of accepted) {
           const key = keyOf(registrationId, value.event.data?.nativeRecordId), proposed = changes.get(key)
@@ -98,7 +105,17 @@ export function createNativeCaptureProgress({ db, seed = [] }) {
           if (known?.expired) continue
           actual.set(key, { ...proposed, firstCapturedAt: Math.min(proposed.firstCapturedAt, value.event.capturedAt, known?.firstCapturedAt ?? Infinity), locator: known?.locator ?? proposed.locator ?? copy(value.locator) })
         }
-        return commit(actual, false, true)
+        const evicted = [], excess = liveSize(actual) - LIMIT
+        if (excess > 0) {
+          const candidates = [...records.values()].filter(record => !actual.has(record.key))
+            .map(record => ({ record, liveContext: keepsLiveContext(lookup(record.locator)) }))
+            .sort((a, b) => Number(a.liveContext) - Number(b.liveContext) || a.record.firstCapturedAt - b.record.firstCapturedAt || a.record.key.localeCompare(b.record.key))
+          for (const { record: { key, registrationId, nativeRecordId } } of candidates.slice(0, excess)) {
+            actual.set(key, { key, registrationId, nativeRecordId, expired: true })
+            evicted.push(key)
+          }
+        }
+        return { apply: commit(actual, false, true), evicted }
       } }
     },
     prune(current) {

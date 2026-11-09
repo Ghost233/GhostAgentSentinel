@@ -71,7 +71,7 @@ async function nativeSeed(f, installationId) {
   prefix.update(Buffer.from('owned native bytes ' + installationId))
   const proof = { key, headerHash: hash('header-' + installationId), revision: 0, base: null, verifiedBase: null, next: prefix.snapshot(), complete: true }, nativeType = 'item_completed/AgentMessage'
   await f.core.ingest(source, { nativeOrigins: [proof], tasks: [{ id: 'native', lifecycleId: 'run', title: 'Owned native', status: 'idle' }], events: [{ id: 'native-body', taskId: 'native', taskLifecycleId: 'run', kind: 'output', capturedAt: f.now, occurredAt: f.now, text: 'private native ' + installationId, data: { sourceKind: 'chatgpt-native', nativeType, nativeGenerationKey: key, nativeRecordStart: 0, nativeRecordEnd: proof.next.offset, nativeRecordId: nativeRecordIdentity('native-storage/2:' + key, null, 0, nativeType) } }] })
-  const failure = await f.core.recordCollectionOutcome({ sourceKey: source, mainId: 'native', lifecycleId: 'run', channel: 'default', roundId: 'failure-' + installationId, outcome: 'failed', settledAt: f.now, error: { code: 'EIO', stage: 'collection' } })
+  const failure = await f.core.recordCollectionOutcome({ sourceKey: source, mainId: 'native', lifecycleId: 'run', channel: 'default', roundId: 'failure-' + installationId, outcome: 'failed', settledAt: f.now, error: { code: 'EACCES', stage: 'collection' } })
   await f.core.setNativeNotificationEligibility({ sourceKey: source, hostRunId, appRunning: true, pluginEnabled: true })
   const [notice] = await f.core.claimNotifications(source)
   assert.ok(notice)

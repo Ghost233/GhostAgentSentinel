@@ -6,6 +6,17 @@ const META = 'native-notification-metadata', LINKS = 'native-notification-links'
 const BASELINES = 'native-initial-baselines', MONITORED = 'native-initial-monitored', ROLLUPS = 'native-initial-rollups', GROUP_LIMIT = 256;
 const copy = value => structuredClone(value);
 const recoveryFailure = receipt => /^(?:cursor-|record-|native_origin_)/.test(receipt.error.code);
+function requiredAction(receipt) {
+  if (receipt?.state !== 'active') return null;
+  const { code, stage } = receipt.error;
+  if (receipt.domain === 'collection') {
+    if (['EACCES', 'EPERM'].includes(code)) return '请检查 Sentinel 是否有权限读取 Codex 会话记录或写入监控数据。';
+    if (code === 'ENOSPC') return '请释放本机磁盘空间，采集会自动重试。';
+    if (code === 'EROFS') return '请恢复监控数据目录所在磁盘的写入权限。';
+  }
+  if (receipt.domain === 'analysis' && code === 'configuration' && stage === 'configuration') return '请打开 GhostSentinel 设置，检查总结模型和 JEV 配置。';
+  return null;
+}
 
 // Native facts extend the core's notification records; DSH records are untouched.
 export function createNativeNotificationStore({ db, now, leaseMs, notifications, sources, save, erase, monitoringPaused, chatPaused, taskNoticeEligible, accepted, readReceipt, notificationEnabled = () => true, notificationHistoryGap = () => false }) {
@@ -107,6 +118,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     if (!owner || owner.descriptor.policy !== 'chatgpt-main/1' || owner.descriptor.hostRunId !== value.hostRunId || monitoringPaused() || value.evidenceThrough <= (current ?? now()) - DAY) return false;
     if (value.mainId !== null && chatPaused(value.sourceKey, value.mainId)) return false;
     if (value.kind === 'task-alert') return taskNoticeEligible(value);
+    if (owner.descriptor.nativeOriginVersion === 2) return value.receiptIds.some(id => requiredAction(readReceipt(id)));
     // A settled monitoring failure describes the observer. Its first notice
     // keeps that original scope across recovery and execution changes.
     return true;
@@ -139,6 +151,7 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     if (!receipt || receipt.domain === 'analysis' && receipt.error.category === 'cache-busy' || links.has(receipt.id) || receipt.sequence <= receiptPrunedThrough || receipt.firstFailedAt <= now() - DAY) return;
     const owner = sources.get(receipt.sourceKey);
     if (owner?.descriptor.policy !== 'chatgpt-main/1') return;
+    if (owner.descriptor.nativeOriginVersion === 2 && !requiredAction(receipt)) return;
     const current = now(), initial = receipt.enrollmentPhase === 'initial-unanchored' && receipt.domain === 'collection' && receipt.mainId !== null && receipt.lifecycleId === null;
     const recovery = !initial && receipt.domain === 'collection' && receipt.mainId !== null && receipt.lifecycleId === null && recoveryFailure(receipt);
     let rollup = initial || recovery ? [...rollups.values()].find(value => value.key === rollupKey(receipt, owner) && !value.closedAt) : null;
@@ -187,6 +200,10 @@ export function createNativeNotificationStore({ db, now, leaseMs, notifications,
     if (value.kind === 'task-alert') {
       const reasons = [...new Set(value.members.flatMap(member => member.reasons ?? []))];
       presentation = { subtitle: '需要关注', body: (sanitizeObservation(reasons.join('；')).text.slice(0, 180) || '发现需要关注的异常。') + ' 点击进入聊天查看依据。' };
+    } else if (sources.get(value.sourceKey)?.descriptor.nativeOriginVersion === 2) {
+      const action = value.receiptIds.map(id => requiredAction(readReceipt(id))).find(Boolean);
+      if (!action) return;
+      presentation = { subtitle: '需要你处理', body: action };
     } else {
       const receipts = value.receiptIds.map(id => readReceipt(id)).filter(Boolean), first = receipts.find(receipt => receipt.state === 'active') ?? receipts[0];
       const recovered = receipts.length === value.receiptIds.length && receipts.length > 0 && receipts.every(receipt => receipt.state === 'recovered');

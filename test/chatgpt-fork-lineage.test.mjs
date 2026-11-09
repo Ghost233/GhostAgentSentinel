@@ -19,7 +19,7 @@ const id = number => '00000000-0000-4000-8000-' + number.toString(16).padStart(1
 const B = id(1), C = id(2), F = id(3), keys = [16, 17, 18, 19].map(id)
 const app = '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT', binary = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
 
-async function fixture(t, mutation = null, { generations = keys.length, sharedOwner = true, original = true, lostAck = false, legacyLineage = false, cwdBytes = 8, historyPaddingBytes = 0, failBootstrap = null, bootstrapError = null, onBootstrap = null, nativeOriginVersion = 1, compressedOriginal = false, compressedGenerations = false, duplicateOriginal = null, originalProducer = null, compressionCapability = true, disabledProducer = false, archivedMains = false, compressedCurrent = false, oldCurrentStart = false, currentPaddingBytes = 0, currentTerminal = null, exactHistoryBytes = 0, exactGenerationBytes = 0, currentTool = false, lostCurrentAck = false } = {}) {
+async function fixture(t, mutation = null, { generations = keys.length, sharedOwner = true, original = true, lostAck = false, legacyLineage = false, cwdBytes = 8, historyPaddingBytes = 0, failBootstrap = null, bootstrapError = null, onBootstrap = null, nativeOriginVersion = 1, compressedOriginal = false, compressedGenerations = false, duplicateOriginal = null, originalProducer = null, compressionCapability = true, disabledProducer = false, archivedMains = false, compressedCurrent = false, oldCurrentStart = false, currentPaddingBytes = 0, currentTerminal = null, exactHistoryBytes = 0, exactGenerationBytes = 0, currentTool = false, lostCurrentAck = false, captureBudget = null } = {}) {
   const records = Array.from({ length: generations }, (_, index) => id(16 + index)), owners = records.map((record, index) => sharedOwner || index === generations - 1 ? B : record), project = '/' + 'p'.repeat(cwdBytes - 1)
   let clock = Date.now(), changed = false, pumpBytes = 0, maximumPumpBytes = 0, maximumReaders = 0, metadataCalls = 0, maximumMetadataCalls = 0, ownerTurn = 'B-' + (generations - 1), growOnForkRead = false, originalGrewAfterRead = false
   let dir, socketPath, unix, ws, server, core, adapter, cleanupPromise
@@ -144,6 +144,7 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
       if (!deliveryLost && batch.events?.some(event => lostCurrentAck ? event.data?.forkHistoryPending : lostAck && event.data?.forkReceipt)) { deliveryLost = true; throw new Error('controlled lineage HTTP acknowledgement loss') }
       return value
     } }
+    if (captureBudget) connection.health = async () => ({ ...await core.health(), nativeCaptureBudget: captureBudget() })
     if (!compressionCapability) connection.health = async () => { const health = await core.health(); return { ...health, features: health.features.filter(feature => feature !== 'chatgpt-fork-compression/1') } }
     if (legacyLineage) connection.health = async () => { const health = await core.health(); return { ...health, features: health.features.filter(feature => feature !== 'chatgpt-fork-lineage/1') } }
     adapter = await startChatGPTAdapter({ core: connection, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'lineage-fixture', token: 'e'.repeat(64), collectMaterials: true, nativeOriginVersion, pollMs: 0, now: () => clock })
@@ -422,6 +423,33 @@ test('an in-progress inherited prefix resumes while already verified current mat
   assert.equal(task.currentRequest, 'Check this independent fork request')
   assert.equal(task.instructionContext.userLimitRefs.length, 2); assert.deepEqual(task.instructionContext.gaps, [])
   assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumPumpBytes <= 262144)
+})
+
+test('capacity pressure pauses fork ancestry while current records keep their own durable cursor', async t => {
+  let historyDeferred = true
+  const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2, historyPaddingBytes: 300000, captureBudget: () => ({ historyDeferred }) })
+  let view = await f.read(F)
+  assert.equal(view.collectionRecovery?.state, 'history-deferred')
+  assert.equal(view.forkProvenance?.complete, false)
+  await f.appendCurrentActivity()
+  const retained = async () => (await f.core.snapshot()).tasks.find(task => task.id === F)?.events ?? []
+  let before
+  for (let pump = 0; pump < 10; pump++) {
+    await f.read(F); before = await retained()
+    if (before.some(event => event.text.startsWith('Fresh activity '))) break
+  }
+  assert.ok(before.some(event => event.text === 'Check this independent fork request'))
+  assert.ok(before.some(event => event.text.startsWith('Fresh activity ')))
+  assert.ok(before.every(event => !event.data.history))
+  await f.restart()
+  historyDeferred = false
+  view = await f.catchUp(F)
+  assert.equal(view.forkProvenance.complete, true)
+  assert.equal(view.collectionRecovery, undefined)
+  const after = await retained()
+  assert.ok(after.some(event => event.data.history))
+  const capture = event => [event.data.nativeRecordId, event.capturedAt, event.text]
+  assert.deepEqual(after.filter(event => !event.data.history).map(capture), before.map(capture))
 })
 
 test('fixed fork quota and ordinary cursor default are independently enforced before restoration', async t => {

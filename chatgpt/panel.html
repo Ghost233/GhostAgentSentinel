@@ -25,6 +25,7 @@
   <p id="recent-model-status" class="muted" role="status" hidden></p>
 </section>
 <p id="availability" class="muted" role="status" hidden></p>
+<p id="collection-recovery" class="muted" role="status" hidden></p>
 <nav id="monitor-tabs" role="tablist" aria-label="会话检查"><button id="monitor-tab-issues" type="button" role="tab" aria-controls="issues">当前问题</button><button id="monitor-tab-details" type="button" role="tab" aria-controls="monitor-details">详情</button></nav>
 <section id="issues" role="tabpanel" aria-labelledby="monitor-tab-issues" aria-label="需要关注的问题"></section>
 <section id="monitor-details" role="tabpanel" aria-labelledby="monitor-tab-details" hidden>
@@ -69,7 +70,7 @@ const list=value=>Array.isArray(value)?value:[];
 const count=value=>Number.isSafeInteger(value)&&value>=0?String(value):'—';
 const prefillStates={prefilling:['预填中','waiting'],completed:['已完成','ok'],failed:['失败','failed'],unknown:['状态未确认','waiting'],cancel_requested:['取消中','waiting'],cancelled:['已取消',''],unsupported:['当前模型不支持',''],unconfirmed:['预填支持未确认',''],'time-unrecorded':['发送时间未记录','']};
 const summaryTimeFormat=new Intl.DateTimeFormat(undefined,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
-const gapDescriptions={'tool-result-image-omitted':'图片未纳入文本观察',analysis_evidence_budget:'本轮仅使用预算内的部分记录',event_excerpt_or_capture_gap:'部分记录截断或存在采集缺口','Some observed excerpts are truncated':'部分记录截断','Some observed content was omitted for privacy':'敏感内容已省略',native_file_change_contents_unverified:'文件变更正文未完整核实',capture_coverage_unconfirmed:'采集覆盖未完整确认',analysis_input_budget:'判断材料超过预算',judgment_evidence_insufficient:'判断执行活动的证据不足',extraction_evidence_gap:'模型提取的证据存在缺口'};
+const gapDescriptions={'Older native records were removed at the capture limit':'采集达到上限，部分旧记录已淘汰','tool-result-image-omitted':'图片未纳入文本观察',analysis_evidence_budget:'本轮仅使用预算内的部分记录',event_excerpt_or_capture_gap:'部分记录截断或存在采集缺口','Some observed excerpts are truncated':'部分记录截断','Some observed content was omitted for privacy':'敏感内容已省略',native_file_change_contents_unverified:'文件变更正文未完整核实',capture_coverage_unconfirmed:'采集覆盖未完整确认',analysis_input_budget:'判断材料超过预算',judgment_evidence_insufficient:'判断执行活动的证据不足',extraction_evidence_gap:'模型提取的证据存在缺口'};
 function summaryGaps(gaps){
   return [...new Set(gaps.filter(gap=>text(gap)).map(gap=>Object.hasOwn(gapDescriptions,gap)?gapDescriptions[gap]:gap.includes('unsupported-item-type:')?'存在未识别的原生事件':text(gap,160)))];
 }
@@ -117,7 +118,7 @@ function renderGS(view,signal='gray'){
 renderGS(null);
 function resetDetails(){
   controlState=null;set('pause','disabled',false);
-  for(const name of ['pause','availability','model-summary','last-summary','current-facts','history','history-more'])show(name,false);
+  for(const name of ['pause','availability','collection-recovery','model-summary','last-summary','current-facts','history','history-more'])show(name,false);
   for(const name of ['identity','coverage','observation','technical','error','health','execution','record-status','current-request','current-activity','inheritance','history-gap','model-status','model-summary-text','model-summary-gaps','last-summary-time','last-summary-text','availability'])write(name,'');
   for(const name of ['issues','detail-issues','check-list','gaps','history-list','model-summary-evidence','last-summary-evidence'])updateRows(name,[]);
   write('model-summary-title','模型总结');write('analysis','当前分析不可判断');write('diagnostics-title','观察与覆盖');
@@ -190,6 +191,15 @@ function render(view){
   }
   if(scopeThreadId!==identity){selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;recentActivity=null;}
   scopeThreadId=identity;
+  const recovery=view.collectionRecovery;
+  const progress=Number.isFinite(recovery?.checkedBytes)&&recovery.totalBytes>0?'（'+Math.min(100,Math.floor(100*recovery.checkedBytes/recovery.totalBytes))+'%）':'';
+  const recoveryMessage=({
+    'verifying-prefix':'会话记录文件已变化 · 正在核验已读前缀，核验通过后自动续读',
+    'prefix-mismatch':'会话记录与已核验前缀不一致 · 暂停续读，保留已有结果',
+    'history-deferred':'历史补读已延后 · 正优先采集活跃会话，容量释放后自动恢复',
+    'active-waiting':'当前采集暂缓 · 正在自动重试'
+  })[recovery?.state]??'';
+  write('collection-recovery',recoveryMessage+progress);show('collection-recovery',Boolean(recoveryMessage));
   const activityMissing=view.recentModelActivity===undefined;
   write('error','');write('availability','');show('availability',false);
   const analysis=view.analysis,byId=new Map(list(analysis.checks).filter(check=>check&&Object.hasOwn(labels,check.id)).map(check=>[check.id,check]));

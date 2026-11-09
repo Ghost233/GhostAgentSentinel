@@ -254,19 +254,26 @@ test('current record revalidation is gray, retains verified facts and recovers w
   view.analysis.checks = ids.map(id => ({ id, status: 'clear', reason: '已核对现有材料' }))
   view.currentFacts = { request: { text: '只改文案', evidenceIds: ['input-current'] }, activity: { summary: '文案已更新', evidenceIds: ['result-current'], observedAt: 1000 } }
   view.observation.recordRevalidating = true
+  view.collectionRecovery = { state: 'verifying-prefix', checkedBytes: 200, totalBytes: 400 }
   await page.deliver(view)
   assert.equal(page.element('#summary').getAttribute('data-signal'), 'gray')
   assert.match(page.element('#summary').textContent, /当前记录重验中/)
   assert.match(page.element('#record-status').textContent, /已核实.*新活动尚未核实/)
   assert.match(page.element('#current-request').textContent, /已核实请求：只改文案/)
   assert.match(page.element('#current-activity').textContent, /已核实活动：文案已更新/)
+  assert.equal(page.element('#collection-recovery').hidden, false)
+  assert.match(page.element('#collection-recovery').textContent, /核验已读前缀.*50%/)
   await page.refresh()
-  await page.deliver({ ...view, observation: { ...view.observation, recordRevalidating: false, recordSnapshotLag: true } })
+  assert.match(page.element('#collection-recovery').textContent, /50%/, 'refresh keeps the last recovery progress visible')
+  await page.deliver({ ...view, collectionRecovery: { state: 'history-deferred' }, observation: { ...view.observation, recordRevalidating: false, recordSnapshotLag: true } })
   assert.match(page.element('#record-status').textContent, /已核实快照.*追赶新增记录/)
+  assert.match(page.element('#collection-recovery').textContent, /容量释放后自动恢复/)
+  delete view.collectionRecovery
   await page.refresh()
   await page.deliver({ ...view, observation: { ...view.observation, recordRevalidating: false } })
   assert.equal(page.element('#summary').getAttribute('data-signal'), 'green')
   assert.equal(page.element('#record-status').textContent, '')
+  assert.equal(page.element('#collection-recovery').hidden, true)
   assert.match(page.element('#current-request').textContent, /^当前请求：/)
   await page.refresh()
   await page.deliver({ ...view, execution: { historical: true, key: 'older-execution', status: 'idle' } })

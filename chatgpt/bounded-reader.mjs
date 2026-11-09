@@ -155,6 +155,10 @@ export class BoundedReader {
   view(reason = null) {
     reason ??= this.closed ? 'reader-closed' : this.gap ?? (this.available === false ? 'source-unavailable' : null);
     const verification = this.nativeOriginVersion === 2 ? { recordRevalidating: Boolean(this.io?.revalidation), recordSnapshotLag: this.ioView?.snapshotLag === true } : {};
+    if (this.io?.fileReplaced && this.io.expected && !this.io.proof()) {
+      const totalBytes = this.io.expected.prefix.offset;
+      verification.recordVerification = { checkedBytes: Math.min(totalBytes, this.io.revalidation?.prefix.offset ?? this.io.position), totalBytes };
+    }
     if (this.recoveryCheckpoint && !reason) return { ...verification, recordRevalidating: true, coverage: 'catching-up', gap: 'cursor-revalidating', observed: emptyState(), effectivePhase: 'unknown', offset: this.committed, committedOffset: this.committed, pendingBytes: 0, recentLifecycle: [], materials: [], metrics: { ...this.metrics } };
     // ps lstart is precise to one second. Recompute this for restored cursors too.
     const terminalVerified = this.io?.terminalVerified && this.io.baseVerified && !this.io.revalidation && (!this.io.compressed || this.io.validated);
@@ -389,16 +393,17 @@ export class BoundedReader {
         return { ...this.view(), readBytes, decodedBytes, nativeOrigins: [] };
       }
       const recoveryFence = this.recoveryFence, origins = recoveryFence ? { read: async key => key === recoveryFence.key ? recoveryFence : this.origins.read(key) } : this.origins;
-      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: 'history-source-unverified' }); const header = nativeHeader(row); if (this.header && headerIdentity(this.header) !== headerIdentity(header)) throw Object.assign(new Error('saved header differs from native record'), { code: 'cursor-invalid' }); if (!supportsRecordHeader(this.source, header)) throw Object.assign(new Error('unsupported native record schema'), { code: 'unsupported-record-schema' }); return header; } });
-      const value = await this.io.pump({ physicalBudget: budgetBytes, decodedBudget: decodedBudgetBytes, limit: this.historyRange?.endByteOffset ?? Infinity, verifyOnly: verifyOnly && !this.recoveryCheckpoint && !(this.io.deviceRemapped && !this.io.proof()) }, bytes => {
+      this.io ??= new NativeJsonlSource({ ...this.source, ...(!this.historyMode && (this.terminalProof || this.successorProof) ? { terminalProof: this.terminalProof ?? this.successorProof } : {}) }, { ...(this.ioCheckpoint ?? {}), offset: this.committed }, { validateFrame: this.mode !== 'header', origins, onHeader: bytes => { const projection = new Projection(); projection.write(bytes); const row = projection.finish(); if (row.type !== 'session_meta' || row.payload?.id !== this.source.threadId) throw Object.assign(new Error('invalid native header'), { code: this.io.fileReplaced ? 'native_origin_header_changed' : 'history-source-unverified' }); const header = nativeHeader(row); if (this.header && headerIdentity(this.header) !== headerIdentity(header)) throw Object.assign(new Error('saved header differs from native record'), { code: this.io.fileReplaced ? 'native_origin_header_changed' : 'cursor-invalid' }); if (!supportsRecordHeader(this.source, header)) throw Object.assign(new Error('unsupported native record schema'), { code: 'unsupported-record-schema' }); return header; } });
+      const value = await this.io.pump({ physicalBudget: budgetBytes, decodedBudget: decodedBudgetBytes, limit: this.historyRange?.endByteOffset ?? Infinity, verifyOnly: verifyOnly && !this.recoveryCheckpoint && !(this.io.bindingChanged && !this.io.proof()) }, bytes => {
         this.attachSize ??= this.io.decodedSize;
         const before = this.offset; this.consume(bytes); return this.offset - before;
       });
       readBytes = value.physicalBytes; decodedBytes = value.decodedBytes; this.ioView = value;
-      if (this.io.deviceRemapped && !this.io.proof()) this.recoveryCheckpoint ??= previous;
+      if (this.io.bindingChanged && !this.io.proof()) this.recoveryCheckpoint ??= previous;
       if (this.recoveryCheckpoint && this.io.proof()) this.recoveryCheckpoint = null;
       this.handle = this.io.handle; if (!this.handle) return { ...this.view(), coverage: 'catching-up', readBytes, decodedBytes, nativeOrigins: [] }; this.fileId = this.io.physical.fileId;
       this.attachSize ??= value.decodedSize; this.knownSize = value.decodedSize;
+      if (this.io.fileReplaced && this.io.proof()) this.attachSize = Math.min(this.attachSize, value.decodedSize);
       this.stat = value.decodedSize === null ? null : { size: value.decodedSize, mtimeMs: this.io.stat.mtimeMs };
       const sameRetainedInode = this.io.expected && this.io.saved?.key === this.io.key && this.source.expectedFileId?.split(':')[1] === this.fileId.split(':')[1];
       if (this.source.expectedFileId && this.source.expectedFileId !== this.fileId && !sameRetainedInode) this.gap = 'record-file-replaced';
