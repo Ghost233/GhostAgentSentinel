@@ -43,7 +43,7 @@ test('partial metadata replay cannot recover an unaccepted native material batch
   assert.ok((await core.snapshot()).tasks.flatMap(task => task.events).some(event => event.text === 'New native output'))
 })
 
-test('a full collector evicts the oldest body for active turns and resumes deferred history after expiry', async t => {
+test('a full collector evicts the oldest body for active turns and keeps idle history parked until new activity', async t => {
   let clock = Date.now(), server, core, adapter
   t.mock.method(Date, 'now', () => clock)
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-priority-')), coreDir = join(dir, 'core'), hostStartedAt = clock - 10000
@@ -54,14 +54,16 @@ test('a full collector evicts the oldest body for active turns and resumes defer
     const events = Array.from({ length: Math.min(1000, 9999 - offset) }, (_, index) => {
       const id = String(offset + index)
       const at = clock - 86400000 + (id === '0' ? 9000 : 10000)
-      return { id, taskId: 'retained', taskLifecycleId: 'old', kind: 'output', capturedAt: at, occurredAt: at, text: id === '0' ? 'Oldest body' : 'Retained body', data: { nativeRecordId: createHash('sha256').update(id).digest('hex'), ...(id === '0' ? { sourceKind: 'chatgpt-native' } : {}) } }
+      return { id, taskId: 'retained-' + Math.floor(Number(id) / 100), taskLifecycleId: 'old', kind: 'output', capturedAt: at, occurredAt: at, text: id === '0' ? 'Oldest body' : 'Retained body', data: { nativeRecordId: createHash('sha256').update(id).digest('hex'), ...(id === '0' ? { sourceKind: 'chatgpt-native' } : {}) } }
     })
-    await core.ingest(seed, { tasks: [{ id: 'retained', lifecycleId: 'old', title: 'Retained history', status: 'idle' }], events })
+    await core.ingest(seed, { tasks: Array.from({ length: Math.ceil(events.length / 100) }, (_, index) => ({ id: 'retained-' + (offset / 100 + index), lifecycleId: 'old', title: 'Retained history', status: 'idle' })), events })
   }
   const baselineHierarchy = (await core.diagnostics()).retained.hierarchyEvidenceIdentities
   const thread = id => ({ id, path: join(dir, id + '.jsonl'), cwd: dir, source: 'vscode', originator: 'Codex Desktop', parentThreadId: null, forkedFromId: null })
   const history = thread('history'), live = thread('live')
-  let liveAnchor = 'live-run'
+  let liveAnchor = 'live-run', historyAnchor = 'history-run'
+  history.status = { type: 'notLoaded' }; history.updatedAt = (hostStartedAt - 5000) / 1000 | 0
+  live.status = { type: 'active' }; live.updatedAt = clock / 1000 | 0
   for (const [record, at] of [[history, hostStartedAt - 5000], [live, clock]]) {
     let ordinal = 0
     const row = (type, payload) => JSON.stringify({ ordinal: ordinal++, type, timestamp: new Date(at).toISOString(), payload }) + '\n'
@@ -70,7 +72,7 @@ test('a full collector evicts the oldest body for active turns and resumes defer
       + row('event_msg', { type: 'item_completed', thread_id: record.id, turn_id: record.id + '-run', item: { type: 'UserMessage', id: 'request', content: [{ type: 'text', text: record.id + ' request' }] } })
       + (record === history ? row('event_msg', { type: 'token_count', padding: 'x'.repeat(600000) }) + row('event_msg', { type: 'task_complete', turn_id: record.id + '-run' }) : ''))
   }
-  const native = { async sampleHost() { return { available: true, hostRunId: 'host', hostStartedAt, profile: supportedProfile } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async listThreads({ archived }) { return { data: archived ? [] : [history, live], nextCursor: null } }, async readThread(id) { return { thread: id === live.id ? live : history, anchorTurnId: id === live.id ? liveAnchor : 'history-run' } }, async close() {} }
+  const native = { async sampleHost() { return { available: true, hostRunId: 'host', hostStartedAt, profile: supportedProfile } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async listThreads({ archived }) { return { data: archived ? [] : [history, live], nextCursor: null } }, async readThread(id) { return { thread: id === live.id ? live : history, anchorTurnId: id === live.id ? liveAnchor : historyAnchor, activity: id === live.id || history.status.type === 'active' ? 'active' : 'unknown' } }, async close() {} }
   const models = await controlledModelService(t)
   await configureInstallationModels(core, 'chatgpt:capture-priority', models.config)
   adapter = await startChatGPTAdapter({ core, native, sessionsRoot: dir, dataDir: join(dir, 'adapter'), installationId: 'capture-priority', token: 'b'.repeat(64), collectMaterials: true, nativeOriginVersion: 2, pollMs: 0, now: () => clock })
@@ -91,11 +93,11 @@ test('a full collector evicts the oldest body for active turns and resumes defer
   assert.equal(retained.residentRecords, 10000)
   assert.equal(retained.expired, 1)
   assert.equal(diagnostics.hierarchyEvidenceIdentities, baselineHierarchy + 1, 'old hierarchy locator is discarded along with the body')
-  assert.equal(snapshot.tasks.find(task => task.id === 'retained').events.some(event => event.text === 'Oldest body'), false)
-  await core.ingest(seed, { events: [{ id: 'oldest-replay', taskId: 'retained', taskLifecycleId: 'old', kind: 'output', capturedAt: clock, occurredAt: clock, text: 'Oldest body', data: { nativeRecordId: createHash('sha256').update('0').digest('hex') } }] })
-  assert.equal((await core.snapshot()).tasks.find(task => task.id === 'retained').events.some(event => event.text === 'Oldest body'), false)
+  assert.equal(snapshot.tasks.find(task => task.id === 'retained-0').events.some(event => event.text === 'Oldest body'), false)
+  await core.ingest(seed, { events: [{ id: 'oldest-replay', taskId: 'retained-0', taskLifecycleId: 'old', kind: 'output', capturedAt: clock, occurredAt: clock, text: 'Oldest body', data: { nativeRecordId: createHash('sha256').update('0').digest('hex') } }] })
+  assert.equal((await core.snapshot()).tasks.find(task => task.id === 'retained-0').events.some(event => event.text === 'Oldest body'), false)
   const deferred = await adapter.read({ thread_id: 'history' })
-  assert.equal(deferred.collectionRecovery?.state, 'history-deferred')
+  assert.equal(deferred.observation.gap, 'chat-idle')
   liveAnchor = 'live-next'
   const liveRow = (ordinal, payload) => JSON.stringify({ ordinal, type: 'event_msg', timestamp: new Date(clock).toISOString(), payload }) + '\n'
   await fs.appendFile(live.path, liveRow(3, { type: 'task_complete', turn_id: 'live-run' })
@@ -118,6 +120,11 @@ test('a full collector evicts the oldest body for active turns and resumes defer
   clock += 10001
   for (let cycle = 0; cycle < 12; cycle++) { clock += 10; await adapter.refresh() }
   snapshot = await core.snapshot()
-  assert.ok(snapshot.tasks.find(task => task.lifecycleId === 'history-run')?.events.some(event => event.text === 'history request'))
-  assert.equal((await adapter.read({ thread_id: 'history' })).collectionRecovery, undefined)
+  assert.equal(snapshot.tasks.filter(task => task.id === 'history').flatMap(task => task.events).length, 0, 'capacity becoming free does not reactivate an idle chat')
+  history.status = { type: 'active' }; history.updatedAt = clock / 1000 | 0; historyAnchor = 'history-next'
+  const historyRow = (ordinal, payload) => JSON.stringify({ ordinal, type: 'event_msg', timestamp: new Date(clock).toISOString(), payload }) + '\n'
+  await fs.appendFile(history.path, historyRow(5, { type: 'task_started', turn_id: historyAnchor, turn_attribution: { turn_id: historyAnchor, turn_trigger: 'composer' } })
+    + historyRow(6, { type: 'item_completed', thread_id: history.id, turn_id: historyAnchor, item: { type: 'UserMessage', id: 'history-new-request', content: [{ type: 'text', text: 'new activity request' }] } }))
+  for (let cycle = 0; cycle < 12; cycle++) { clock += 10; await adapter.refresh() }
+  assert.equal((await core.snapshot()).tasks.find(task => task.lifecycleId === historyAnchor)?.currentRequest, 'new activity request')
 })

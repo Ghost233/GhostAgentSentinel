@@ -56,17 +56,66 @@ test('background directory pagination discovers existing and new independent loc
   assert.equal(view.discovery.complete, false, 'cached directory completion does not prove all execution domains are discovered')
 })
 
-test('directory observation finds completed plain main records in the fixed sibling archive', async t => {
+test('archived chats are excluded from directory collection and direct panel visits', async t => {
   const f = await fixture(t, { fixedStorageRoots: true }), thread = await f.add('archived-main', { archived: true })
   await appendFile(thread.path, record('event_msg', { type: 'task_complete', turn_id: 'turn-archived-main' }, Date.now() - 1000))
   const archivedPath = join(f.archiveRoot, 'archived-main.jsonl')
   await rename(thread.path, archivedPath); thread.path = archivedPath
   await f.adapter.refresh()
   const view = await f.read('archived-main')
-  assert.equal(view.identity.threadId, 'archived-main')
-  assert.equal(view.observation.phase, 'completed')
+  assert.equal(view.observation.gap, 'chat-archived')
+  assert.deepEqual((await f.core.snapshot()).tasks, [])
+  assert.equal(f.adapter.discovery().counts.main, 0)
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
+})
+
+test('idle chats only receive metadata discovery, then resume capture on activity and drain their final record once', async t => {
+  const f = await fixture(t)
+  const idle = await f.add('idle', { status: { type: 'idle' }, updatedAt: 1 })
+  const originalRead = f.native.readThread
+  let active = false
+  f.native.readThread = async id => ({ ...await originalRead(id), activity: active ? 'active' : 'idle' })
+  await f.adapter.refresh(); await f.adapter.refresh()
+  assert.equal(f.facts.reads.length, 0, 'idle directory entries do not qualify or open native records')
+  assert.deepEqual((await f.core.snapshot()).tasks, [])
+  assert.equal((await f.read(idle.id)).observation.gap, 'chat-idle')
+  assert.equal(f.adapter.diagnostics().openReaders, 0, 'opening an idle chat panel must not start collection')
+  active = true; idle.status = { type: 'active' }; idle.updatedAt++
+  await f.adapter.refresh()
+  assert.equal((await f.core.snapshot()).tasks[0].status, 'running')
+  active = false; idle.status = { type: 'idle' }; idle.updatedAt++
+  await appendFile(idle.path, record('event_msg', { type: 'task_complete', turn_id: 'turn-idle' }, Date.now()))
+  await f.adapter.refresh()
+  assert.equal((await f.core.snapshot()).tasks[0].status, 'idle', 'terminal records must be captured before parking the reader')
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
+  const reads = f.facts.reads.length
+  await f.adapter.refresh(); await f.adapter.refresh()
+  assert.equal(f.facts.reads.length, reads, 'parked chats do not consume per-chat polling')
+  active = true; idle.status = { type: 'active' }; idle.updatedAt++
+  await f.adapter.refresh()
+  assert.ok(f.facts.reads.length > reads)
+})
+
+test('an unloaded old chat wakes on updated metadata without scanning its idle body on every poll', async t => {
+  const f = await fixture(t), thread = await f.add('unloaded', { status: { type: 'notLoaded' }, updatedAt: 1 })
+  const originalRead = f.native.readThread
+  f.native.readThread = async id => ({ ...await originalRead(id), activity: 'unknown' })
+  await f.adapter.refresh(); await f.adapter.refresh()
+  assert.equal(f.facts.reads.length, 0)
+  await f.read(thread.id)
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
+  thread.updatedAt = Date.now() / 1000 | 0
+  await f.adapter.refresh()
+  assert.equal((await f.core.snapshot()).tasks[0].status, 'running', 'a saved interrupted turn cannot hide new verified lifecycle evidence')
+  await appendFile(thread.path, record('event_msg', { type: 'task_complete', turn_id: 'turn-unloaded' }, Date.now()))
+  await f.adapter.refresh()
   assert.equal((await f.core.snapshot()).tasks[0].status, 'idle')
-  assert.equal(f.adapter.discovery().counts.main, 1)
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
+  const reads = f.facts.reads.length
+  await f.adapter.refresh(); await f.adapter.refresh()
+  assert.equal(f.facts.reads.length, reads)
+  await f.read(thread.id); await f.read(thread.id)
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
 })
 
 test('fixed archive eligibility rejects lookalike roots, escaped paths and relative storage before opening records', async t => {
@@ -198,7 +247,7 @@ test('a fresh after sample invalidates every staged record when the execution do
   assert.equal(f.adapter.diagnostics().openReaders, 0)
 })
 
-test('stable bounded scan cycles revisit the head and include archived main chats under active updates', async t => {
+test('stable bounded scan cycles revisit the head while excluding archived chats under active updates', async t => {
   const f = await fixture(t)
   for (let index = 1; index <= 8; index++) await f.add('main-' + index, { createdAt: index })
   await f.add('archived-main', { createdAt: 9, archived: true })
@@ -221,7 +270,7 @@ test('stable bounded scan cycles revisit the head and include archived main chat
     if (f.adapter.discovery().directoryComplete) break
   }
   assert.equal(f.adapter.discovery().directoryComplete, true)
-  assert.deepEqual((await f.core.snapshot()).tasks.map(task => task.id).sort(), [...f.rows.keys()].sort())
+  assert.deepEqual((await f.core.snapshot()).tasks.map(task => task.id).sort(), [...f.rows.values()].filter(thread => !thread.archived).map(thread => thread.id).sort())
   assert.equal(f.adapter.discovery().complete, false)
 })
 
@@ -334,6 +383,26 @@ function excludedDirectoryEntry(f, kind, index) {
   const id = kind + '-' + index
   return { id, createdAt: index, parentThreadId: kind === 'child' ? 'parent' : null, originator: kind === 'non-desktop' ? 'Other Client' : 'Codex Desktop', source: 'vscode', path: join(f.dir, id + '.jsonl'), cwd: join(f.dir, 'project-a'), ...(kind === 'unknown' ? { environments: [{ environmentId: 'opaque-selection' }] } : {}) }
 }
+
+test('a newly active old chat displaces parked metadata when both bounded registries are full', async t => {
+  const f = await fixture(t); pagedDirectory(f)
+  const readThread = f.native.readThread
+  f.native.readThread = async id => ({ ...await readThread(id), activity: id === 'woken' ? 'unknown' : 'idle' })
+  for (let index = 0; index < 256; index++) {
+    const id = 'parked-' + index
+    f.rows.set(id, { ...excludedDirectoryEntry(f, 'main', index), id, status: { type: 'idle' }, updatedAt: 1 })
+    await f.adapter.read({ thread_id: id })
+  }
+  await f.adapter.refresh(); await f.adapter.refresh()
+  assert.equal(f.adapter.diagnostics().trackedThreads, 256)
+  assert.equal(f.adapter.diagnostics().directoryEntries, 256)
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
+  await f.add('woken', { createdAt: -1, status: { type: 'notLoaded' }, updatedAt: Date.now() / 1000 | 0 })
+  for (let cycle = 0; cycle < 4; cycle++) await f.adapter.refresh()
+  assert.deepEqual((await f.core.snapshot()).tasks.map(task => task.id), ['woken'])
+  assert.equal(f.adapter.diagnostics().openReaders, 1)
+  assert.equal(f.adapter.discovery().tracked, 1)
+})
 async function boundedRefresh(f) {
   const pages = f.facts.pages, reads = f.facts.reads.length
   await f.adapter.refresh()

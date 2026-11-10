@@ -404,7 +404,7 @@ export class ForkHistoryReader {
       currentCoverage: gap ? 'gap' : currentWaiting ? 'catching-up' : current.coverage,
       effectivePhase: !gap && !currentWaiting ? current.effectivePhase : 'unknown', captureThroughOffset: Math.max(this.currentGuardedCheckpoint?.deliveryThrough.current ?? this.deliveryThrough.current, this.guardedCheckpoint?.deliveryThrough.history ?? this.deliveryThrough.history),
       deliveryThrough: { current: this.currentGuardedCheckpoint?.deliveryThrough.current ?? this.deliveryThrough.current, history: this.guardedCheckpoint?.deliveryThrough.history ?? this.deliveryThrough.history },
-      forkProvenance: { ...(current.forkProvenance ?? {}), ...(complete && this.current.parent ? { receiptId: this.receipt(this.current).id, generation: this.generation(this.current) } : {}), complete: Boolean(complete && !gap), gap: this.historyGap ?? gap ?? null, ...(this.historyError ? { error: this.historyError } : {}) }, ...(this.error ? { error: this.error } : {}) }
+      forkProvenance: { ...(current.forkProvenance ?? {}), ...(complete && !gap && this.current.parent ? { receiptId: this.receipt(this.current).id, generation: this.generation(this.current) } : {}), complete: Boolean(complete && !gap), gap: this.historyGap ?? gap ?? null, ...(this.historyError ? { error: this.historyError } : {}) }, ...(this.error ? { error: this.error } : {}) }
   }
 
   async guardHeld(node, target, budget, output, reserve) {

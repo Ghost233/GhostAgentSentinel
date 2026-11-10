@@ -60,6 +60,19 @@ export function createNativeCaptureProgress({ db, seed = [] }) {
   return {
     prepareClearRegistration,
     budget() { return { historyDeferred: LIMIT - records.size < 16 } },
+    stageRetiredCopies(replacements) {
+      const changes = new Map()
+      for (const [key, locator] of replacements) {
+        // Ingest has staged its progress SQL but has not published its memory.
+        const row = storedRecord.get(COLLECTION, key), record = row && JSON.parse(row.value)
+        if (!record || record.expired) continue
+        changes.set(key, locator ? { ...record, locator: copy(locator) } : { key, registrationId: record.registrationId, nativeRecordId: record.nativeRecordId, expired: true })
+      }
+      // The caller owns the ingestion/upgrade savepoint. Admission has
+      // already bounded its staged SQL; publishing follows that admission.
+      for (const [key, value] of changes) write.run(COLLECTION, key, JSON.stringify(value))
+      return () => { for (const [key, value] of changes) { if (value.expired) records.delete(key); else records.set(key, copy(value)) }; if (changes.size) expiry() }
+    },
     project(registrationId, incoming, current, lookup, active) {
       const changes = new Map(), earlier = new Map(), output = [], expired = []; let existingProgress = false, resident = records.size
       const activeGenerations = new Set(active ? incoming.filter(event => event.taskId === active.taskId && event.taskLifecycleId === active.lifecycleId && !event.data?.history && !event.data?.inherited).map(event => event.data?.nativeGenerationKey) : [])

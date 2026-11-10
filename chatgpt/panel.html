@@ -182,7 +182,8 @@ function render(view){
   if(!identity){
     clearView('当前会话未确认');
     if(view.observation?.gap==='observer-unavailable'){element('availability').textContent=text(view.summary)||'观察服务尚未就绪，等待数据';element('availability').hidden=false;}
-    const gaps=[...list(view.discovery?.gaps),view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
+    if(view.observation?.gap==='chat-archived'){write('availability','此聊天已归档，已退出监控');show('availability',true);}
+    const gaps=[...list(view.discovery?.gaps),view.observation?.gap==='chat-archived'?null:view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
     for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
     if(gaps.length)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
     if(view.observation?.failureStage)element('observation').textContent='采集失败环节：'+(view.observation.failureStage==='core-connection'?'共享核心连接':text(view.observation.failureStage,120));
@@ -213,7 +214,7 @@ function render(view){
   if(cacheRecovery&&signal==='gray'&&!view.execution?.historical)summary='总结恢复中';
   if(recordRevalidating){signal='gray';summary='当前记录重验中';}
   write('record-status',recordRevalidating?'已核实资料保留 · 新活动尚未核实':!view.execution?.historical&&view.observation?.recordSnapshotLag?'显示已核实快照 · 正在追赶新增记录':'');
-  if(view.execution?.historical){signal='gray';summary=view.history?.currentGap?'当前执行尚未确认 · 显示最近检查记录':'历史执行 · 仅表示当时的检查记录';}
+  if(view.execution?.historical){signal='gray';summary=view.history?.currentGap==='chat-idle'?'会话空闲 · 显示上次检查结果，有新活动后自动监控':view.history?.currentGap?'当前执行尚未确认 · 显示最近检查记录':'历史执行 · 仅表示当时的检查记录';}
   const requestText=!view.execution?.historical?text(view.currentFacts?.request?.text,120):'';
   const activityText=requestText?text(view.currentFacts?.activity?.summary,160):'';
   show('current-facts',Boolean(requestText));
@@ -295,8 +296,8 @@ function render(view){
   if(view.inheritance)coverage.push('继承要求：'+(inheritanceGap?'待补齐或存在缺口':'已核实'));
   write('coverage',coverage.join('\n'));
   const recordStates={'caught-up':'已追平','catching-up':'正在补读','partial-record':'等待记录写完','retained-history':'保留的历史记录',gap:'存在缺口'};
-  write('observation','执行记录：'+(recordStates[view.observation?.coverage]??'尚未确认'));
-  const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),...list(analysis.coverage?.contextGaps),...list(view.inheritance?.gaps),view.observation?.gap,view.history?.currentGap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
+  write('observation',view.observation?.gap==='chat-idle'?'暂无新活动 · 有新活动后自动监控':'执行记录：'+(recordStates[view.observation?.coverage]??'尚未确认'));
+  const gaps=[...list(discovery?.gaps),...list(analysis.coverage?.gaps),...list(analysis.coverage?.contextGaps),...list(view.inheritance?.gaps),view.observation?.gap,view.history?.currentGap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value)&&value!=='chat-idle');
   updateRows('gaps',[...new Set(gaps)].map(gap=>node('p',text(gap,160))));
   write('diagnostics-title',gaps.length||inheritanceGap||discovery?.complete===false||analysis.coverage?.complete===false?'观察与覆盖 · 有缺口':'观察与覆盖');
   const technical=['分析状态：'+text(analysis.state,80)];

@@ -40,7 +40,7 @@ async function qualifiedFixture(t, { collectMaterials = false, omitFeature } = {
   const calls = [], coreCalls = [], releases = new Set(), websocket = new WebSocketServer({ noServer: true }), unix = createServer()
   let present = true, enabled = true, native, server, core, adapter, client, nextHealth = null, nextThread = null, nextIngest = null, hostPid = 12
   const born = Date.now() - 10000, started = new Date(born).toUTCString().replace(',', '').replace(/ GMT$/, ''), path = join(dir, 'main.jsonl')
-  const thread = { id: 'owned-main', parentThreadId: null, source: 'vscode', originator: 'Codex Desktop', forkedFromId: null, cwd: dir, path }
+  const thread = { id: 'owned-main', parentThreadId: null, source: 'vscode', originator: 'Codex Desktop', forkedFromId: null, cwd: dir, path, status: { type: 'active' } }
   t.after(async () => {
     for (const release of releases) release()
     await adapter?.close(); await native?.close(); await core?.close(); await server?.close()

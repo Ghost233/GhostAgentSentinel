@@ -191,7 +191,7 @@ export function createNativeIO({ pluginId, socketPath, processSample, profileSam
     },
     async listThreads({ cursor = null, limit = 50, archived = false } = {}) {
       if (cursor !== null && (typeof cursor !== 'string' || cursor.length > 4096) || !Number.isSafeInteger(limit) || limit < 1 || limit > 50 || typeof archived !== 'boolean') throw new Error('invalid directory budget')
-      return rpc.request('thread/list', { cursor, limit, archived, useStateDbOnly: true, sortKey: 'created_at', sortDirection: 'desc', sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'] })
+      return rpc.request('thread/list', { cursor, limit, archived, useStateDbOnly: true, sortKey: 'updated_at', sortDirection: 'desc', sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'] })
     },
     async readThread(id) {
       const result = await rpc.request('thread/read', { threadId: id, includeTurns: false })
@@ -199,7 +199,9 @@ export function createNativeIO({ pluginId, socketPath, processSample, profileSam
       if (!thread || thread.id !== id || thread.parentThreadId !== null || typeof thread.source !== 'string' || thread.originator !== 'Codex Desktop') return { thread }
       const turns = await rpc.request('thread/turns/list', { threadId: id, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' })
       if (!Array.isArray(turns?.data) || turns.data.length > 1 || turns.data.some(turn => typeof turn?.id !== 'string' || !turn.id || turn.id.length > 128)) throw metadataError('metadata-invalid-response')
-      return { thread, anchorTurnId: turns?.data?.[0]?.id ?? null }
+      const turn = turns.data[0]
+      const activity = thread.status?.type === 'active' || turn?.status === 'inProgress' ? 'active' : thread.status?.type === 'idle' && (!turn || ['completed', 'interrupted', 'failed'].includes(turn.status)) ? 'idle' : 'unknown'
+      return { thread, anchorTurnId: turn?.id ?? null, activity }
     },
     async readEnablement(cwd) {
       const result = await rpc.request('config/read', { cwd, includeLayers: true })

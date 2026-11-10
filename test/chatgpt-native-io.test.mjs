@@ -34,7 +34,7 @@ test('production native IO qualifies actual app-server facts and readonly metada
     if (!message.id) return
     let result
     if (message.method === 'initialize') result = { serverInfo: { name: 'controlled-readonly-metadata' } }
-    if (message.method === 'thread/read') result = { thread: { id: 'native-main', parentThreadId: null, source: 'vscode', originator: 'Codex Desktop', forkedFromId: null, cwd: dir, path: recordPath, status: { type: 'notLoaded' } } }
+    if (message.method === 'thread/read') result = { thread: { id: 'native-main', parentThreadId: null, source: 'vscode', originator: 'Codex Desktop', forkedFromId: null, cwd: dir, path: recordPath, status: { type: 'active', activeFlags: [] } } }
     if (message.method === 'thread/list') { directoryParams.push(message.params); result = { data: [{ id: 'native-main' }], nextCursor: null } }
     if (message.method === 'thread/turns/list') result = { data: [{ id: 'native-turn', status: 'interrupted' }], nextCursor: null }
     if (message.method === 'config/read') result = { config: { plugins: { 'sentinel@test': { enabled } } }, layers: [{ name: { type: 'user' }, config: { plugins: { 'sentinel@test': { enabled } } } }] }
@@ -49,7 +49,7 @@ test('production native IO qualifies actual app-server facts and readonly metada
   assert.equal(dirname(unix.address()), tmpdir(), 'native IO sockets must use the platform temporary directory')
   assert.ok(Buffer.byteLength(unix.address()) < 104, 'Unix socket endpoint must fit the supported macOS path limit')
   const result = await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'd'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'native-main' } } }) }).then(response => response.json())
-  assert.equal(result.result.structuredContent.observation.phase, 'started', 'saved notLoaded/interrupted metadata is not runtime truth')
+  assert.equal(result.result.structuredContent.observation.phase, 'started', 'active runtime metadata admits capture; lifecycle proof still comes from the record')
   assert.equal((await core.snapshot()).tasks[0].status, 'running')
   const quotedPrefix = ' -c note="app-server with \\"quoted words\\"" --config other=\'opaque app-server words\''
   actualCommand = nativePath + quotedPrefix + ' app-server --analytics-default-enabled'
@@ -63,7 +63,7 @@ test('production native IO qualifies actual app-server facts and readonly metada
   assert.equal((await adapter.read({ thread_id: 'native-main' })).observation.gap, 'plugin-disabled')
   assert.deepEqual((await native.listThreads({ archived: true })).data, [{ id: 'native-main' }])
   assert.equal(directoryParams[0].useStateDbOnly, true)
-  assert.equal(directoryParams[0].sortKey, 'created_at')
+  assert.equal(directoryParams[0].sortKey, 'updated_at')
   assert.equal(directoryParams[0].sortDirection, 'desc')
   assert.equal(directoryParams[0].archived, true)
   assert.equal(directoryParams[0].limit, 50)
@@ -88,4 +88,20 @@ test('turn metadata capability is checked by response structure', async t => {
   const native = createNativeIO({ pluginId: 'sentinel@test', metadataClient: { async request(method) { return method === 'thread/read' ? { thread: { id: 'main', parentThreadId: null, source: 'vscode', originator: 'Codex Desktop' } } : { data: { id: 'not-a-page' } } }, async close() {} } })
   t.after(() => native.close())
   await assert.rejects(native.readThread('main'), { code: 'metadata-invalid-response' })
+})
+
+test('unloaded persisted turn status does not declare a chat idle or authorize runtime evidence', async t => {
+  let status = 'notLoaded', turnStatus = 'interrupted'
+  const native = createNativeIO({ pluginId: 'sentinel@test', metadataClient: {
+    async request(method) { return method === 'thread/read' ? { thread: { id: 'main', parentThreadId: null, source: 'vscode', originator: 'Codex Desktop', status: { type: status } } } : { data: [{ id: 'turn', status: turnStatus }] } },
+    async close() {},
+  } })
+  t.after(() => native.close())
+  assert.equal((await native.readThread('main')).activity, 'unknown')
+  status = 'idle'
+  assert.equal((await native.readThread('main')).activity, 'idle')
+  status = 'active'
+  assert.equal((await native.readThread('main')).activity, 'active')
+  status = 'notLoaded'; turnStatus = 'inProgress'
+  assert.equal((await native.readThread('main')).activity, 'active')
 })

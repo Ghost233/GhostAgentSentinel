@@ -37,7 +37,7 @@ async function fixture(t, options = {}) {
   await fs.writeFile(forkPath, row(5, 'session_meta', { ...header(F), forked_from_id: B, forked_from_ordinal_exclusive: 5, history_base: { thread_id: A, end_ordinal_exclusive: 5, end_byte_offset: Buffer.byteLength(prefix) } })
     + row(6, 'event_msg', start('fork')) + row(7, 'event_msg', user(F, 'fork', 'Inspect this independent fork request'))
     + row(8, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'fork', item: { type: 'AgentMessage', id: 'fork-output', content: [{ type: 'Text', text: 'Inspecting only the fork request' }] } }))
-  const metadata = id => ({ id: id === F ? F : B, sessionId: id === F ? F : B, path: id === F ? forkPath : ownerPath, cwd: '/p', parentThreadId: null, forkedFromId: id === F ? B : null, source: 'vscode', originator: 'Codex Desktop', cliVersion: 'historical-creation-version', historyMode: 'paginated' })
+  const metadata = id => ({ id: id === F ? F : B, sessionId: id === F ? F : B, path: id === F ? forkPath : ownerPath, cwd: '/p', parentThreadId: null, forkedFromId: id === F ? B : null, source: 'vscode', originator: 'Codex Desktop', cliVersion: 'historical-creation-version', status: { type: 'active' }, historyMode: 'paginated' })
   const calls = [], socketPath = join(tmpdir(), 'ss-' + randomUUID().slice(0, 8) + '.sock'), unix = createServer(), ws = new WebSocketServer({ server: unix })
   ws.on('connection', connection => connection.on('message', bytes => {
     const message = JSON.parse(bytes); if (!message.id) return

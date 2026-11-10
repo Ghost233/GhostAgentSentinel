@@ -3,15 +3,16 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BoundedReader } from './bounded-reader.mjs'
 import { ForkHistoryReader } from './fork-history.mjs'
+import { nativeStorageKey } from './native-jsonl-source.mjs'
 import { startPanelServer } from './panel-server.mjs'
 import { loadCursor, saveCursor } from './cursor-store.mjs'
-import { classifyThread, createDiscovery, nativeStorageRoot } from './discovery.mjs'
+import { archivedThread, classifyThread, createDiscovery, nativeStorageRoot } from './discovery.mjs'
 import { openHealthOutbox } from './health-outbox.mjs'
 import { readModelDirectory } from './model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
-import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE } from '../src/protocol.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -156,7 +157,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
   const capability = async () => {
     const health = await core.health(), features = health.features
-    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
+    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
     required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
     if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
     if (delivery) required.push('monitoring-notifications/1', RECOVERY_ROLLUP_FEATURE)
@@ -300,6 +301,10 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
   function entryFor(id) {
     let entry = threads.get(id)
+    if (!entry && threads.size >= 256) {
+      const parked = [...threads.values()].filter(value => !value.reader).sort((a, b) => a.lastViewedAt - b.lastViewedAt)[0]
+      if (parked) threads.delete(parked.id)
+    }
     if (!entry && threads.size < 256) { entry = { id, cursorKey: fingerprint(collectMaterials ? [installationId, id, 'material/1'] : [installationId, id]), generation: 0, captured: new Map(), captureThroughOffset: -1, deliveryThrough: { current: -1, history: -1 }, lastViewedAt: now(), view: gapView('not-observed', id), enrollmentPhase: 'unknown' }; threads.set(id, entry) }
     return entry
   }
@@ -309,6 +314,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const thread = metadata?.thread
     const kind = classifyThread(thread, sessionsRoot, storageVersion)
     if (!thread || thread.id !== id || kind !== 'main' && !(collectMaterials && kind === 'fork')) return { gap: kind === 'fork' ? 'fork-provenance-unverified' : 'main-identity-unverified' }
+    if (archivedThread(thread, sessionsRoot)) return { gap: 'chat-archived' }
     const host = context.host
     const project = await projectSetting(context, thread.cwd)
     if (project.unavailable) return { gap: 'plugin-enablement-unconfirmed', scope: 'task' }
@@ -316,7 +322,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (enabled?.user !== 'enabled' || enabled?.effective !== 'enabled') return { gap: enabled?.user === 'disabled' || enabled?.effective === 'disabled' ? 'plugin-disabled' : 'plugin-enablement-unconfirmed', scope: enabled?.user !== 'enabled' ? 'source' : 'task' }
     const source = { ...(collectMaterials && nativeOriginVersion === 2 ? { nativeOriginVersion: 2 } : {}), path: thread.path, allowedRoot: nativeStorageRoot(thread.path, sessionsRoot, storageVersion), threadId: id, parentId: null, sourceKind: thread.source, originator: thread.originator, cwd: thread.cwd, forkedFromId: thread.forkedFromId ?? null, anchorTurnId: metadata.anchorTurnId ?? null, hostRunId: host.hostRunId, hostStartedAt: host.hostStartedAt, profile: host.profile }
     if (expected && fingerprint([source.path, source.cwd, source.sourceKind, source.originator, source.forkedFromId, source.hostRunId, source.hostStartedAt]) !== fingerprint([expected.path, expected.cwd, expected.sourceKind, expected.originator, expected.forkedFromId, expected.hostRunId, expected.hostStartedAt])) return { gap: 'source-generation-changed', scope: source.hostRunId !== expected.hostRunId ? 'source' : 'task' }
-    return { source, chatTitle: [thread.name, thread.title, thread.preview].find(value => typeof value === 'string' && value.trim()) }
+    return { source, activity: metadata.activity ?? (thread.status?.type === 'idle' ? 'idle' : undefined), activityToken: fingerprint([thread.updatedAt, thread.path, metadata.anchorTurnId]), recentlyUpdated: Number.isFinite(thread.updatedAt) && thread.updatedAt * 1000 >= now() - 60000, chatTitle: [thread.name, thread.title, thread.preview].find(value => typeof value === 'string' && value.trim()) }
   }
 
   async function prepare(entry, context, epoch, budget) {
@@ -326,6 +332,14 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       const before = await qualify(entry.id, entry.reader?.source, context)
       if (before.gap) { await fail(entry, before.gap, before.scope); return null }
       entry.qualifiedHostRunId = before.source.hostRunId
+      const changed = entry.activityToken ? entry.activityToken !== before.activityToken : before.recentlyUpdated || discovery.candidates().includes(entry.id)
+      entry.parked = before.activity && before.activity !== 'active'
+      entry.activityToken = before.activityToken
+      discovery.checked(entry.id)
+      if ((before.activity === 'idle' || before.activity === 'unknown' && !changed) && !entry.reader) {
+        entry.view = { ...gapView('chat-idle', entry.id), summary: '暂无新活动 · 有新活动后自动监控' }
+        return null
+      }
       const deferHistory = budget?.historyDeferred === true, anchor = before.source.anchorTurnId
       entry.historyDeferred = deferHistory && entry.historyDeferred === true
       if (!deferHistory) delete entry.deferredAnchor
@@ -344,8 +358,19 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         const cursorKey = fingerprint(collectMaterials ? [installationId, entry.id, before.source.forkedFromId ? 'fork-material/' + nativeOriginVersion : 'material/' + nativeOriginVersion] : [installationId, entry.id])
         if (entry.cursorKey !== cursorKey) { entry.cursorKey = cursorKey; entry.captured.clear(); entry.captureThroughOffset = -1; entry.deliveryThrough = { current: -1, history: -1 } }
         let cursor = null
-        try { cursor = await loadCursor(join(dataDir, 'cursors', entry.cursorKey + '.json'), { fork: Boolean(before.source.forkedFromId) }) } catch (error) { await collectionOutcome(entry, 'failed', error, roundId); await stop(entry, error.code ?? 'cursor-unavailable'); await updateHealth(entry); return null }
-        if (!cursor && collectMaterials && nativeOriginVersion === 2) {
+        try {
+          const options = { fork: Boolean(before.source.forkedFromId) }
+          cursor = await loadCursor(join(dataDir, 'cursors', entry.cursorKey + '.json'), options)
+          const saved = cursor?.reader.frames?.[0]?.reader ?? cursor?.reader
+          const storageKey = nativeStorageKey(before.source.path)
+          if (collectMaterials && nativeOriginVersion === 2 && saved?.io?.key && saved.io.key !== storageKey) {
+            // A chat can switch native storage records. Keep the old cursor
+            // for returning to that record, including its capture timestamps.
+            entry.cursorKey = fingerprint([cursorKey, storageKey])
+            cursor = await loadCursor(join(dataDir, 'cursors', entry.cursorKey + '.json'), options)
+          }
+        } catch (error) { await collectionOutcome(entry, 'failed', error, roundId); await stop(entry, error.code ?? 'cursor-unavailable'); await updateHealth(entry); return null }
+        if (!cursor && entry.cursorKey === cursorKey && collectMaterials && nativeOriginVersion === 2) {
           const oldKey = fingerprint([installationId, entry.id, before.source.forkedFromId ? 'fork-material/1' : 'material/1'])
           if (await loadCursor(join(dataDir, 'cursors', oldKey + '.json'), { fork: Boolean(before.source.forkedFromId) })) { await stop(entry, 'origin-upgrade-unverified'); return null }
         }
@@ -376,7 +401,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         return null
       }
       entry.historyDeferred = deferHistory && Boolean(observed.forkProvenance && !observed.forkProvenance.complete)
-      return { source: before.source, previousCheckpoint, observed, epoch, generation, roundId, live }
+      return { source: before.source, activity: before.activity, previousCheckpoint, observed, epoch, generation, roundId, live }
     } catch (error) { if (closed || epoch !== sourceEpoch) return null; await collectionOutcome(entry, 'failed', error, roundId); await stop(entry, error.code?.startsWith('native_origin_') ? error.code : 'observation-unavailable').catch(() => {}); await updateHealth(entry); return null }
   }
 
@@ -528,9 +553,9 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
   function decorate(view) {
     const retained = healthOutbox?.diagnostics()
-    const directory = discovery.snapshot(), forks = new Set([...discovery.candidates().filter(id => discovery.kind(id) === 'fork'), ...[...threads.values()].filter(entry => entry.fork).map(entry => entry.id)])
+    const directory = discovery.snapshot(), forks = new Set([...discovery.candidates().filter(id => discovery.kind(id) === 'fork'), ...[...threads.values()].filter(entry => entry.reader && entry.fork).map(entry => entry.id)])
     const verified = [...forks].filter(id => threads.get(id)?.view.forkProvenance?.complete && threads.get(id).view.observation.coverage === 'caught-up').length
-    return { ...view, ...(availabilityFailure ? { observation: { ...view.observation, failureStage: availabilityFailure.stage } } : {}), ...(delivery ? { notifications: { permission: delivery.authorization(), errorCode: notificationError, scope: { sourceKey: view.execution?.sourceKey ?? source?.key ?? null, lifecycleId: view.execution?.lifecycleId ?? null, executionKey: view.execution?.key ?? null } } } : {}), ...(healthOutbox ? { health: { ...combineHealth(view.health, sourceHealth, outboxError, availabilityFailure?.health), historyGap: retained.rejected > 0 || retained.expired > 0 } } : {}), discovery: { ...directory, gaps: [...new Set([...directory.gaps, ...(forks.size > verified ? ['fork-coverage-pending'] : [])])], forkCoverage: { known: forks.size, verified, pending: forks.size - verified }, tracked: threads.size, connected: source ? 1 : 0, currentIncluded: Boolean(view.identity.threadId && threads.has(view.identity.threadId)) } }
+    return { ...view, ...(availabilityFailure ? { observation: { ...view.observation, failureStage: availabilityFailure.stage } } : {}), ...(delivery ? { notifications: { permission: delivery.authorization(), errorCode: notificationError, scope: { sourceKey: view.execution?.sourceKey ?? source?.key ?? null, lifecycleId: view.execution?.lifecycleId ?? null, executionKey: view.execution?.key ?? null } } } : {}), ...(healthOutbox ? { health: { ...combineHealth(view.health, sourceHealth, outboxError, availabilityFailure?.health), historyGap: retained.rejected > 0 || retained.expired > 0 } } : {}), discovery: { ...directory, gaps: [...new Set([...directory.gaps, ...(forks.size > verified ? ['fork-coverage-pending'] : [])])], forkCoverage: { known: forks.size, verified, pending: forks.size - verified }, tracked: [...threads.values()].filter(entry => entry.reader).length, connected: source ? 1 : 0, currentIncluded: Boolean(view.identity.threadId && threads.get(view.identity.threadId)?.reader) } }
   }
 
   async function collect(requested = [], discover = false, catchUpOnly = false) {
@@ -542,7 +567,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       failureStage = 'core-connection'
       const supported = await capability()
       if (closed || epoch !== sourceEpoch) return
-      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
+      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
       if (coreInstanceId && supported.instanceId && coreInstanceId !== supported.instanceId) {
         try { await stopSource('core-generation-changed') } catch (error) { if (error.status !== 400) throw error }
         if (closed) return
@@ -567,7 +592,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       let ids = requested
       if (discover) {
         const candidates = discovery.candidates()
-        for (const id of threads.keys()) if (!discovery.has(id) && !candidates.includes(id)) candidates.push(id)
+        for (const [id, entry] of threads) if (entry.reader && !candidates.includes(id)) candidates.push(id)
         ids = candidates.length ? Array.from({ length: Math.min(20, candidates.length) }, (_, index) => candidates[(rotation + index) % candidates.length]) : []
         rotation = candidates.length ? (rotation + ids.length) % candidates.length : 0
       }
@@ -578,7 +603,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         if (entry) {
           const value = await prepare(entry, before, epoch, storageVersion === 2 ? supported.nativeCaptureBudget : null)
           if (value) prepared.set(entry, value)
-          else if (!entry.reader && !entry.lifecycleId && !entry.blocked && !entry.historyDeferred) threads.delete(id)
+          else if (!entry.reader && !entry.lifecycleId && !entry.blocked && !entry.historyDeferred && !entry.parked) threads.delete(id)
         }
       }
       if (closed || epoch !== sourceEpoch) return
@@ -590,11 +615,17 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         if (closed || epoch !== sourceEpoch) break
         const proof = await qualify(entry.id, value.source, after)
         if (proof.gap) await fail(entry, proof.gap, proof.scope)
-        else valid.set(entry, { ...value, live: value.live && proof.source.anchorTurnId === value.source.anchorTurnId })
+        else valid.set(entry, { ...value, activity: proof.activity, live: value.live && proof.source.anchorTurnId === value.source.anchorTurnId })
       }
       for (const [entry, value] of [...valid].sort((a, b) => Number(b[1].live) - Number(a[1].live))) {
         if (closed || epoch !== sourceEpoch || value.generation !== entry.generation) break
         await publish(entry, value)
+        if ((value.activity === 'idle' || value.activity === 'unknown' && entry.view.observation?.phase !== 'started') && !catchingUp(entry) && !entry.view.observation?.recordRevalidating) {
+          const reader = entry.reader; entry.reader = null
+          await reader?.close()
+          // Idle metadata cannot leave a retained execution claiming to run.
+          if (phaseStatus(entry.view.observation?.phase) === 'running') await stop(entry, 'chat-idle')
+        }
       }
       failureStage = 'source-heartbeat'
       if (source && !closed && epoch === sourceEpoch && !catchUpOnly) await core.heartbeat(source.key)
@@ -655,7 +686,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const view = materialView({ ...entry.view, ...(historical ? { currentFacts: undefined, inheritance: undefined } : {}), identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical, snapshot })
     if (selected === current) view.health = combineHealth(view.health, entry.health)
     if (historical) {
-      view.signal = 'gray'; view.summary = retainedOnly ? '当前执行尚未确认 · 显示最近检查记录' : '历史执行 · 仅表示当时的检查记录'
+      view.signal = 'gray'; view.summary = entry.view.observation?.gap === 'chat-idle' ? '会话空闲 · 显示上次检查结果，有新活动后自动监控' : retainedOnly ? '当前执行尚未确认 · 显示最近检查记录' : '历史执行 · 仅表示当时的检查记录'
       view.observation = { phase: selected.item.status === 'ended' ? 'completed' : selected.item.status === 'aborted' ? 'aborted' : 'unknown', status: selected.task.status, coverage: 'retained-history', gap: history.currentGap ?? selected.task.events.find(event => event.kind === 'gap' && !event.data?.history && event.data?.verificationGaps?.length)?.data.verificationGaps[0] ?? (selected.task.currentRequest ? null : 'historical-user-request-unverified'), observedAt: selected.item.observedAt }
     }
     return { ...view, history, recentModelActivity: recent, execution: { ...selected.item, request: selected.task.currentRequest.slice(0, 240), historical } }

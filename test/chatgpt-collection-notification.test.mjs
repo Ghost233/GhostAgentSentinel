@@ -10,7 +10,7 @@ import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.m
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { setTimeout as delay } from 'node:timers/promises'
 
-for (const missing of ['monitoring-recovery-rollup/1', 'native-capture-live-budget/1', 'native-capture-priority/1', 'partial-observation-summary/1', 'bounded-summary-generation/1', 'chatgpt-recent-model-activity/1', 'chinese-summary-prompt/1', 'gmd-summary-cache-recovery/1']) test('an older Core without ' + missing + ' is reported before collection or notification starts', async t => {
+for (const missing of ['monitoring-recovery-rollup/1', 'native-capture-live-budget/1', 'native-capture-priority/1', 'native-capture-chat-limit/1', 'partial-observation-summary/1', 'bounded-summary-generation/1', 'chatgpt-recent-model-activity/1', 'chinese-summary-prompt/1', 'gmd-summary-cache-recovery/1']) test('an older Core without ' + missing + ' is reported before collection or notification starts', async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-old-recovery-core-')), clock = Date.now()
   let server, core, adapter, compatible = false, lists = 0
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); await fs.rm(dir, { recursive: true, force: true }) })
@@ -122,12 +122,12 @@ for (const [anchored, guard] of [[true, null], [false, null], [false, 'recovered
 // Uses fixed notification IO and the real fresh-install runtime path.
 for (const code of ['ENOENT', 'EACCES']) test(`six never-monitored chats retain independent ${code} receipts and notify only for a permission problem`, { timeout: 10_000 }, async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-initial-enrollment-red-'))
-  const sessionsRoot = join(dir, 'sessions'), archiveRoot = join(dir, 'archived_sessions'), coreDataDir = join(dir, 'core')
+  const sessionsRoot = join(dir, 'sessions'), coreDataDir = join(dir, 'core')
   let server, client, runtime, primary
   const submissions = [], clock = Date.now(), hostStartedAt = clock - 10_000
   try {
-    await fs.mkdir(sessionsRoot); await fs.mkdir(archiveRoot)
-    const threads = Array.from({ length: 6 }, (_, i) => ({ id: 'owned-initial-' + i, path: join(archiveRoot, i + '.jsonl'), cwd: dir, source: 'vscode', originator: 'Codex Desktop', parentThreadId: null, forkedFromId: null, archived: true }))
+    await fs.mkdir(sessionsRoot)
+    const threads = Array.from({ length: 6 }, (_, i) => ({ id: 'owned-initial-' + i, path: join(sessionsRoot, i + '.jsonl'), cwd: dir, source: 'vscode', originator: 'Codex Desktop', parentThreadId: null, forkedFromId: null, archived: false }))
     if (code === 'EACCES') {
       const lstat = fs.lstat, paths = new Set(threads.map(thread => thread.path))
       t.mock.method(fs, 'lstat', async (path, ...args) => {
@@ -138,7 +138,7 @@ for (const code of ['ENOENT', 'EACCES']) test(`six never-monitored chats retain 
     const native = {
       async sampleHost() { return { available: true, hostRunId: 'owned-initial-host', hostStartedAt, profile: supportedProfile } },
       async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
-      async listThreads({ archived }) { return { data: archived ? threads : [], nextCursor: null } },
+      async listThreads({ archived }) { return { data: archived ? [] : threads, nextCursor: null } },
       async readThread(id) { return { thread: threads.find(thread => thread.id === id), anchorTurnId: null } },
       async close() {},
     }
@@ -196,15 +196,15 @@ test('a header-only unanchored success drains source recovery and never blocks a
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-unanchored-settlement-')), clock = Date.now(), submissions = []
   let runtime, client, server, includeFailure = false
   t.after(async () => { await runtime?.close(); await client?.close(); await server?.close(); await fs.rm(dir, { recursive: true, force: true }) })
-  const sessionsRoot = join(dir, 'sessions'), archiveRoot = join(dir, 'archived_sessions'), coreDataDir = join(dir, 'core')
-  await fs.mkdir(sessionsRoot); await fs.mkdir(archiveRoot)
+  const sessionsRoot = join(dir, 'sessions'), coreDataDir = join(dir, 'core')
+  await fs.mkdir(sessionsRoot)
   const header = { id: 'header-only', path: join(sessionsRoot, 'header.jsonl'), cwd: dir, source: 'vscode', originator: 'Codex Desktop', parentThreadId: null, forkedFromId: null }
-  const missing = { ...header, id: 'later-failure', path: join(archiveRoot, 'missing.jsonl'), archived: true }
+  const missing = { ...header, id: 'later-failure', path: join(sessionsRoot, 'missing.jsonl'), archived: false }
   await fs.writeFile(header.path, JSON.stringify({ type: 'session_meta', timestamp: new Date(clock).toISOString(), payload: { id: header.id } }) + '\n')
   const native = {
     async sampleHost() { return { available: true, hostRunId: 'settlement-host', hostStartedAt: clock - 1000, profile: supportedProfile } },
     async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
-    async listThreads({ archived }) { return { data: archived ? includeFailure ? [missing] : [] : [header], nextCursor: null } },
+    async listThreads({ archived }) { return { data: archived ? [] : includeFailure ? [header, missing] : [header], nextCursor: null } },
     async readThread(id) { return { thread: id === header.id ? header : missing, anchorTurnId: null } }, async close() {},
   }
   const notificationIO = {

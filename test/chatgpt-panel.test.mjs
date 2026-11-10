@@ -5,6 +5,17 @@ import { panelHarness as harness } from './helpers/chatgpt-panel.mjs'
 const ids = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait']
 const result = id => ({ signal: 'gray', summary: id ? id + ' 执行开始' : '无法确认当前观察', identity: { threadId: id }, observation: { coverage: 'caught-up', gap: null }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
 
+test('parked and archived chats explain their monitoring state in Chinese', async t => {
+  const page = await harness(t)
+  await page.deliver({ ...result(null), observation: { gap: 'chat-archived' } })
+  assert.equal(page.element('#availability').hidden, false)
+  assert.match(page.element('#availability').textContent, /已归档.*退出监控/)
+  await page.refresh()
+  await page.deliver({ ...result('idle-chat'), summary: '暂无新活动 · 有新活动后自动监控', observation: { gap: 'chat-idle', status: 'idle' } })
+  assert.match(page.element('#summary').textContent, /新活动后自动监控/)
+  assert.doesNotMatch(page.element('#gaps').textContent, /chat-idle/)
+})
+
 test('visible chat entry dismisses its displayed notices once per activation without affecting monitor refresh', async t => {
   const page = await harness(t), view = { ...result('main-a'), notifications: { scope: { sourceKey: 'owned-source' } } }
   await page.deliver(view)

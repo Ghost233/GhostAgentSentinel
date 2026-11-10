@@ -24,7 +24,7 @@ async function fixture(t) {
   const register = (registrationId = 'chatgpt:install-one', hostRunId = 'host-one', policy = 'chatgpt-main/1') => core.registerSource({ registrationId, hostRunId, name: 'Controlled native origin', ...(policy ? { policy } : {}) })
   const batch = (task = 'own-task', record = 'record-one', capturedAt = clock, text = 'First native body') => ({ tasks: [{ id: task, lifecycleId: 'own-run', title: 'Controlled execution', status: 'idle' }], events: [{ id: record, taskId: task, taskLifecycleId: 'own-run', kind: 'output', capturedAt, occurredAt: capturedAt, text, evidence: 'native-evidence:' + record, data: { nativeRecordId: nativeId(record), sourceKind: 'chatgpt-native', sourceForm: 'event_msg/item_completed', nativeType: 'item_completed/AgentMessage', runId: 'own-run', history: false, inherited: false } }] })
   const emit = (source, ...args) => core.ingest(source, batch(...args))
-  return { dir, register, emit, batch, get core() { return core }, get now() { return clock }, advance(ms = 500) { clock += ms }, async restart() { await core.close(); await server.close(); await start() } }
+  return { dir, register, emit, batch, get core() { return core }, get now() { return clock }, advance(ms = 500) { clock += ms }, async restart(beforeStart = async () => {}) { await core.close(); await server.close(); await beforeStart(); await start() } }
 }
 
 test('registration-native progress survives source GC without reviving its old content, while a new append and other scopes still work', async t => {
@@ -84,11 +84,105 @@ test('a genuinely missing first body is refused with its fixed classification an
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 1)
 })
 
+test('each chat retains at most 100 native records across sources without replaying evicted bodies or breaking another chat copy', async t => {
+  const f = await fixture(t), source = await f.register(), next = await f.register('chatgpt:install-one', 'host-two')
+  await f.emit(source, 'busy-chat', 'shared-oldest')
+  const firstAt = f.now
+  await f.emit(source, 'other-chat', 'shared-oldest')
+  for (let index = 0; index < 105; index++) {
+    f.advance(1)
+    await f.emit(index < 50 ? source : next, 'busy-chat', 'record-' + index)
+  }
+  let snapshot = await f.core.snapshot()
+  const own = snapshot.tasks.filter(task => task.id === 'busy-chat').flatMap(task => task.events)
+  assert.equal(own.length, 100)
+  assert.deepEqual(new Set(own.map(event => event.id)), new Set(Array.from({ length: 100 }, (_, index) => 'record-' + (index + 5))))
+  assert.equal(snapshot.tasks.find(task => task.id === 'other-chat').events[0].capturedAt, firstAt)
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.bodyGaps, 0)
+  await f.restart()
+  const reopened = await f.register('chatgpt:install-one', 'host-three')
+  await f.emit(reopened, 'replayed', 'record-0')
+  assert.equal((await f.core.snapshot()).tasks.find(task => task.id === 'replayed').events.length, 0)
+  await f.emit(reopened, 'shared-copy', 'shared-oldest')
+  snapshot = await f.core.snapshot()
+  assert.equal(snapshot.tasks.find(task => task.id === 'shared-copy').events[0].capturedAt, firstAt)
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.bodyGaps, 0)
+  const independent = await f.register('dsh:independent', 'host', null)
+  const dsh = f.batch('dsh-chat', 'dsh-0')
+  for (let index = 1; index < 110; index++) dsh.events.push(...f.batch('dsh-chat', 'dsh-' + index).events)
+  await f.core.ingest(independent, dsh)
+  assert.equal((await f.core.snapshot()).tasks.find(task => task.id === 'dsh-chat').events.length, 110)
+})
+
+test('per-chat retirement rolls back both bodies and replay fences when storage rejects a deletion', async t => {
+  const f = await fixture(t), source = await f.register()
+  const batch = f.batch('chat', 'r0')
+  for (let index = 1; index < 100; index++) batch.events.push(...f.batch('chat', 'r' + index).events)
+  await f.core.ingest(source, batch)
+  const before = (await f.core.diagnostics()).retained.nativeCaptureProgress
+  const db = new DatabaseSync(join(f.dir, 'observations.sqlite'))
+  try {
+    db.exec("CREATE TRIGGER fail_trim BEFORE DELETE ON records WHEN OLD.collection='events' BEGIN SELECT RAISE(FAIL, 'controlled trim failure'); END")
+    f.advance()
+    await assert.rejects(f.emit(source, 'chat', 'new-record'), /controlled trim failure/)
+    assert.equal((await f.core.snapshot()).tasks[0].events.length, 100)
+    assert.deepEqual((await f.core.diagnostics()).retained.nativeCaptureProgress, before)
+  } finally { db.exec('DROP TRIGGER IF EXISTS fail_trim'); db.close() }
+  await f.emit(source, 'chat', 'new-record')
+  assert.equal((await f.core.snapshot()).tasks[0].events.length, 100)
+  assert.ok((await f.core.snapshot()).tasks[0].events.some(event => event.id === 'new-record'))
+})
+
+test('opening material retained by an older core applies the per-chat bound and persists its replay fences', async t => {
+  const f = await fixture(t), source = await f.register('chatgpt:install-one', 'old-version', null)
+  const batch = f.batch('chat', 'old-0')
+  for (let index = 1; index < 110; index++) batch.events.push(...f.batch('chat', 'old-' + index).events)
+  await f.core.ingest(source, batch)
+  await f.restart(async () => {
+    const db = new DatabaseSync(join(f.dir, 'observations.sqlite'))
+    try {
+      const row = db.prepare("SELECT key,value FROM records WHERE collection='sources'").get(), owner = JSON.parse(row.value)
+      owner.descriptor.policy = 'chatgpt-main/1'
+      owner.hierarchyEvidenceCaptures = batch.events.map(event => ({ taskId: event.taskId, lifecycleId: event.taskLifecycleId, eventId: event.id, capturedAt: event.capturedAt, nativeOriginId: event.data.nativeRecordId, nativeHistorical: false }))
+      db.prepare("UPDATE records SET value=? WHERE collection='sources' AND key=?").run(JSON.stringify(owner), row.key)
+      db.prepare("DELETE FROM records WHERE collection='settings' AND key='native-capture-progress'").run()
+    } finally { db.close() }
+  })
+  assert.equal((await f.core.snapshot()).tasks[0].events.length, 100)
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.expired, 10)
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.bodyGaps, 0)
+  await f.restart()
+  const next = await f.register('chatgpt:install-one', 'new-host')
+  await f.emit(next, 'replayed', 'old-0')
+  assert.equal((await f.core.snapshot()).tasks.find(task => task.id === 'replayed').events.length, 0)
+})
+
+test('trimming a busy chat preserves its current request and still completes partial model analysis', async t => {
+  const f = await fixture(t), source = await f.register(), models = await controlledModelService(t)
+  await configureInstallationModels(f.core, 'chatgpt:install-one', models.config)
+  const taskId = 'busy', lifecycleId = 'own-run', ref = eventId => ({ taskId, lifecycleId, eventId })
+  const event = (id, kind, text, data) => { const value = f.batch(taskId, id, f.now, text).events[0]; return { ...value, kind, data: { ...value.data, ...data } } }
+  await f.core.ingest(source, { tasks: [{ id: taskId, sessionId: taskId, lifecycleId, title: 'Busy chat', status: 'running' }], events: [
+    event('start', 'status', 'Started', { nativeType: 'task_started', sourceForm: 'event_msg', turnTrigger: 'composer', status: 'running' }),
+    event('request', 'input', 'Read the current log only', { nativeType: 'item_completed/UserMessage', messageId: 'user', inputOrigin: 'user-entry', inputPhase: 'consumed' }),
+    ...Array.from({ length: 110 }, (_, index) => event('output-' + index, 'output', 'Read current log ' + index, {})),
+  ], hierarchyContext: { schemaVersion: 1, revision: 1, sessions: [{ sessionId: taskId }], relations: [], activations: [{ taskId, lifecycleId, sessionId: taskId, runId: lifecycleId, state: 'running', stateRefs: [ref('start')] }], instructionBindings: [{ taskId, lifecycleId, inputRef: ref('request'), origin: 'user-entry', phase: 'consumed', originRefs: [ref('start'), ref('request')], ancestorLimitRefs: [] }], coverage: { complete: true, branchGaps: [] } } })
+  let task
+  for (let attempt = 0; attempt < 100; attempt++) { task = (await f.core.snapshot()).tasks[0]; if (task.analysis.completedAt) break; await delay(5) }
+  assert.equal(task.events.length, 100)
+  assert.equal(task.currentRequest, 'Read the current log only')
+  assert.ok(task.events.some(event => event.id === 'output-109'))
+  assert.ok(task.analysis.completedAt, JSON.stringify(task.analysis.error))
+  assert.equal(task.analysis.error, null)
+  assert.equal(task.analysis.coverage.complete, false, 'retirement stays an explicit observation gap')
+})
+
 test('the global native progress quota fails explicitly without forgetting old identities or affecting DSH', async t => {
   const f = await fixture(t), first = await f.register(), second = await f.register('chatgpt:install-one', 'host-two')
   for (let offset = 0; offset < 10000; offset += 1000) {
-    const batch = f.batch('bulk-task', 'bulk-' + offset, f.now, 'Bulk body ' + offset)
-    for (let index = offset + 1; index < offset + 1000; index++) batch.events.push(...f.batch('bulk-task', 'bulk-' + index, f.now, 'Bulk body ' + index).events)
+    const batch = f.batch('bulk-task-' + Math.floor(offset / 100), 'bulk-' + offset, f.now, 'Bulk body ' + offset)
+    for (let index = offset + 1; index < offset + 1000; index++) batch.events.push(...f.batch('bulk-task-' + Math.floor(index / 100), 'bulk-' + index, f.now, 'Bulk body ' + index).events)
+    batch.tasks = Array.from({ length: 10 }, (_, index) => ({ ...batch.tasks[0], id: 'bulk-task-' + (offset / 100 + index) }))
     await f.core.ingest(offset < 5000 ? first : second, batch)
   }
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 10000)

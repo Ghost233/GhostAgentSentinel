@@ -21,7 +21,7 @@ const app = '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT', binary = '/Appli
 
 async function fixture(t, mutation = null, { generations = keys.length, sharedOwner = true, original = true, lostAck = false, legacyLineage = false, cwdBytes = 8, historyPaddingBytes = 0, failBootstrap = null, bootstrapError = null, onBootstrap = null, nativeOriginVersion = 1, compressedOriginal = false, compressedGenerations = false, duplicateOriginal = null, originalProducer = null, compressionCapability = true, disabledProducer = false, archivedMains = false, compressedCurrent = false, oldCurrentStart = false, currentPaddingBytes = 0, currentTerminal = null, exactHistoryBytes = 0, exactGenerationBytes = 0, currentTool = false, lostCurrentAck = false, captureBudget = null } = {}) {
   const records = Array.from({ length: generations }, (_, index) => id(16 + index)), owners = records.map((record, index) => sharedOwner || index === generations - 1 ? B : record), project = '/' + 'p'.repeat(cwdBytes - 1)
-  let clock = Date.now(), changed = false, pumpBytes = 0, maximumPumpBytes = 0, maximumReaders = 0, metadataCalls = 0, maximumMetadataCalls = 0, ownerTurn = 'B-' + (generations - 1), growOnForkRead = false, originalGrewAfterRead = false
+  let clock = Date.now(), changed = false, pumpBytes = 0, maximumPumpBytes = 0, maximumReaders = 0, metadataCalls = 0, maximumMetadataCalls = 0, ownerTurn = 'B-' + (generations - 1), currentTurn = 'F', growOnForkRead = false, originalGrewAfterRead = false
   let dir, socketPath, unix, ws, server, core, adapter, cleanupPromise
   const opened = new Set(), natives = new Set()
   const cleanup = () => cleanupPromise ??= (async () => {
@@ -107,7 +107,7 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
   })
   const metadata = requested => {
     const index = sharedOwner ? records.indexOf(requested) : owners.indexOf(requested), owner = requested === F ? F : requested === C ? C : index >= 0 ? owners[index] : B
-    const thread = { id: owner, path: owner === F ? currentPath : owner === C ? originalPath : index >= 0 ? paths[index] : paths.at(-1), cwd: project, originator: 'Codex Desktop', source: 'vscode', parentThreadId: null, forkedFromId: owner === F ? B : owner === C || !original ? null : C, historyMode: 'paginated' }
+    const thread = { id: owner, path: owner === F ? currentPath : owner === C ? originalPath : index >= 0 ? paths[index] : paths.at(-1), cwd: project, originator: 'Codex Desktop', source: 'vscode', parentThreadId: null, forkedFromId: owner === F ? B : owner === C || !original ? null : C, status: { type: 'active' }, historyMode: 'paginated' }
     if (mutation && (mutation.phase === 'cross-role' && requested === records[0] || mutation.phase === 'record-after' && requested === records.at(-1) && changed || mutation.phase === 'owner-after' && requested === B && changed)) mutation.change(thread)
     return thread
   }
@@ -118,7 +118,7 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
     if (request.method === 'initialize') result = { serverInfo: { name: 'controlled-lineage' } }
     if (request.method === 'thread/read') result = { thread: metadata(request.params.threadId) }
     if (request.method === 'thread/list') result = { data: request.params.archived === archivedMains ? [metadata(B), metadata(F)] : [], nextCursor: null }
-    if (request.method === 'thread/turns/list') result = { data: [{ id: request.params.threadId === F ? 'F' : request.params.threadId === C ? 'C' : ownerTurn }], nextCursor: null }
+    if (request.method === 'thread/turns/list') result = { data: [{ id: request.params.threadId === F ? currentTurn : request.params.threadId === C ? 'C' : ownerTurn }], nextCursor: null }
     if (request.method === 'config/read') result = { config: { plugins: { 'sentinel@test': { enabled: true } } }, layers: [{ name: { type: 'user' }, config: { plugins: { 'sentinel@test': { enabled: true } } } }] }
     if (request.method === 'config/read' && disabledProducer && request.params.cwd === '/disabled-producer') result = { config: { plugins: { 'sentinel@test': { enabled: false } } }, layers: [{ name: { type: 'user' }, config: { plugins: { 'sentinel@test': { enabled: true } } } }, { name: { type: 'project' }, config: { plugins: { 'sentinel@test': { enabled: false } } } }] }
     peer.send(JSON.stringify({ id: request.id, result }))
@@ -158,13 +158,24 @@ async function fixture(t, mutation = null, { generations = keys.length, sharedOw
     maximumMetadataCalls = Math.max(maximumMetadataCalls, metadataCalls)
     return body.result.structuredContent
   }
-  const archiveMains = async () => {
+  const archiveMains = async (includeCurrent = true) => {
     for (const [index, prior] of paths.entries()) { const next = join(archive, basename(prior)); await fs.rename(prior, next); sourcePaths.set(await fs.realpath(next), next); paths[index] = next }
+    if (!includeCurrent) return
     const prior = currentPath; currentPath = join(archive, basename(prior)); await fs.rename(prior, currentPath); sourcePaths.set(await fs.realpath(currentPath), currentPath)
   }
   const growOriginal = async rewrite => { const bytes = await fs.readFile(originalPath, 'utf8'); await fs.writeFile(originalPath, (rewrite ? bytes.replace('Keep the original project restriction', 'Swap the original project restriction') : bytes) + row(4, 'event_msg', { type: 'task_complete', turn_id: 'C' })) }
   const appendForkOutput = () => fs.appendFile(currentPath, row(ordinal + 4, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'AgentMessage', id: 'F-later', content: [{ type: 'Text', text: 'New tail after ancestor growth' }] } }))
-  return { async appendCurrentActivity() { const number = nextCurrentOrdinal++; await fs.appendFile(currentPath, row(number, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'AgentMessage', id: 'F-ongoing-' + number, content: [{ type: 'Text', text: 'Fresh activity ' + number }] } })) }, async replaceCurrent() { const bytes = await fs.readFile(currentPath); const next = currentPath + '.replacement'; await fs.writeFile(next, bytes); await fs.rename(next, currentPath) }, close: cleanup, get native() { return [...natives].at(-1) }, get core() { return core }, get adapter() { return adapter }, dir, read, archiveMains, growOriginal, appendForkOutput, armOriginalGrowth() { growOnForkRead = true }, get originalGrewAfterRead() { return originalGrewAfterRead }, async catchUp(thread) { let view; for (let pump = 0; pump < 32; pump++) { view = await read(thread); if (['caught-up', 'retained-history'].includes(view.observation.coverage) && (!view.forkProvenance || view.forkProvenance.complete)) break } return view }, advance(ms = 500) { clock += ms }, get clock() { return clock }, get maxIngest() { return maxIngest }, get maximumPumpBytes() { return maximumPumpBytes }, get maximumReaders() { return maximumReaders }, get maximumMetadataCalls() { return maximumMetadataCalls }, get liveReaders() { return opened.size }, async compressOriginal() { const prior = originalPath; originalPath += '.zst'; await fs.writeFile(originalPath, zstdCompressSync(await fs.readFile(prior))); sourcePaths.set(await fs.realpath(originalPath), originalPath); await fs.rm(prior) }, async restart() { await adapter.close(); await core.close(); await server.close(); assert.equal(opened.size, 0); server = await startServer({ dataDir: join(dir, 'core'), now: () => clock }); core = await connectCore({ dataDir: join(dir, 'core') }); await openAdapter() }, async appendOwnerRequest() { ownerTurn = 'B-next'; const next = generations * 4 + Number(original) * 4; await fs.appendFile(paths.at(-1), row(next, 'event_msg', start(ownerTurn)) + row(next + 1, 'event_msg', user(B, ownerTurn, 'Inspect one new native owner request'))); return read(B) } }
+  const changeCurrentRecord = async path => {
+    const prior = currentPath
+    if (path) { currentPath = path; currentTurn = 'F'; return prior }
+    currentPath = join(currentRoot, 'rollout-' + F + '_' + id(100) + '.jsonl')
+    currentTurn = 'F-next'
+    const content = forkBytes.replaceAll('"turn_id":"F"', '"turn_id":"F-next"').replace('F-user', 'F-next-user').replace('F-output', 'F-next-output').replace('Check this independent fork request', 'Check the new storage record')
+    await fs.writeFile(currentPath, content)
+    sourcePaths.set(await fs.realpath(currentPath), currentPath)
+    return prior
+  }
+  return { changeCurrentRecord, async appendCurrentActivity() { const number = nextCurrentOrdinal++; await fs.appendFile(currentPath, row(number, 'event_msg', { type: 'item_completed', thread_id: F, turn_id: 'F', item: { type: 'AgentMessage', id: 'F-ongoing-' + number, content: [{ type: 'Text', text: 'Fresh activity ' + number }] } })) }, async replaceCurrent() { const bytes = await fs.readFile(currentPath); const next = currentPath + '.replacement'; await fs.writeFile(next, bytes); await fs.rename(next, currentPath) }, close: cleanup, get native() { return [...natives].at(-1) }, get core() { return core }, get adapter() { return adapter }, dir, read, archiveMains, growOriginal, appendForkOutput, armOriginalGrowth() { growOnForkRead = true }, get originalGrewAfterRead() { return originalGrewAfterRead }, async catchUp(thread) { let view; for (let pump = 0; pump < 32; pump++) { view = await read(thread); if (['caught-up', 'retained-history'].includes(view.observation.coverage) && (!view.forkProvenance || view.forkProvenance.complete)) break } return view }, advance(ms = 500) { clock += ms }, get clock() { return clock }, get maxIngest() { return maxIngest }, get maximumPumpBytes() { return maximumPumpBytes }, get maximumReaders() { return maximumReaders }, get maximumMetadataCalls() { return maximumMetadataCalls }, get liveReaders() { return opened.size }, async compressOriginal() { const prior = originalPath; originalPath += '.zst'; await fs.writeFile(originalPath, zstdCompressSync(await fs.readFile(prior))); sourcePaths.set(await fs.realpath(originalPath), originalPath); await fs.rm(prior) }, async restart() { await adapter.close(); await core.close(); await server.close(); assert.equal(opened.size, 0); server = await startServer({ dataDir: join(dir, 'core'), now: () => clock }); core = await connectCore({ dataDir: join(dir, 'core') }); await openAdapter() }, async appendOwnerRequest() { ownerTurn = 'B-next'; const next = generations * 4 + Number(original) * 4; await fs.appendFile(paths.at(-1), row(next, 'event_msg', start(ownerTurn)) + row(next + 1, 'event_msg', user(B, ownerTurn, 'Inspect one new native owner request'))); return read(B) } }
   } catch (error) {
     try { await cleanup() } catch (cleanupError) { throw new AggregateError([error, cleanupError], 'lineage fixture bootstrap and cleanup failed', { cause: error }) }
     throw error
@@ -214,35 +225,26 @@ test('a shorter native lineage with identical record and canonical paths reaches
   assert.ok(f.maximumPumpBytes <= 262144); assert.ok(f.maxIngest <= 16)
 })
 
-test('completed main and fork records in the fixed sibling archive reach their own public checks', async t => {
+test('archived main and fork chats never enter collection in either native protocol', async t => {
   for (const nativeOriginVersion of [1, 2]) await t.test('native-origin/' + nativeOriginVersion, async t => {
-  const f = await fixture(t, null, { generations: 1, original: false, nativeOriginVersion, archivedMains: true })
-  await f.adapter.refresh()
-  assert.equal(f.adapter.discovery().counts.main, 1); assert.equal(f.adapter.discovery().counts.fork, 1)
-  for (const thread of [B, F]) {
-    const view = await f.catchUp(thread)
-    assert.equal(view.identity.threadId, thread)
-    assert.equal(view.observation.coverage, 'retained-history', JSON.stringify(view.observation))
-    assert.equal(view.observation.phase, 'completed')
-  }
-  const snapshot = await f.core.snapshot(), base = snapshot.tasks.find(task => task.id === B), fork = snapshot.tasks.find(task => task.id === F)
-  assert.equal(base.status, 'idle'); assert.equal(fork.status, 'idle')
-  assert.equal(base.currentRequest, 'Retain native requirement 0')
-  assert.equal(fork.currentRequest, 'Check this independent fork request')
-  assert.equal(fork.instructionContext.userLimitRefs.length, 1, JSON.stringify(fork.instructionContext))
-  assert.deepEqual(fork.instructionContext.gaps, [])
-  assert.ok(fork.events.some(event => event.text === base.currentRequest && event.data.history && event.data.inherited && !event.authorizationEligible))
-  assert.equal(fork.events.filter(event => event.data?.forkReceipt).length, 1)
-  const before = snapshot.tasks.map(task => [task.id, task.lastActivity, task.events.length])
-  f.advance(); await f.catchUp(B); await f.catchUp(F)
-  assert.deepEqual((await f.core.snapshot()).tasks.map(task => [task.id, task.lastActivity, task.events.length]), before, 're-observing archived completed records does not manufacture new activity')
+    const f = await fixture(t, null, { generations: 1, original: false, nativeOriginVersion, archivedMains: true })
+    await f.adapter.refresh()
+    assert.equal(f.adapter.discovery().counts.main, 0); assert.equal(f.adapter.discovery().counts.fork, 0)
+    for (const thread of [B, F]) assert.equal((await f.read(thread)).observation.gap, 'chat-archived')
+    assert.deepEqual((await f.core.snapshot()).tasks, [])
+    assert.equal(f.liveReaders, 0)
   })
 })
 
-test('version two current main and fork compressed records reach the public seam in both fixed storage roots', async t => {
+test('compressed current records are collected in sessions and excluded in the archive', async t => {
   for (const archivedMains of [false, true]) await t.test(archivedMains ? 'archived' : 'sessions', async t => {
     const f = await fixture(t, null, { generations: 1, original: false, nativeOriginVersion: 2, compressedGenerations: true, compressedCurrent: true, archivedMains })
     await f.adapter.refresh()
+    if (archivedMains) {
+      for (const id of [B, F]) assert.equal((await f.read(id)).observation.gap, 'chat-archived')
+      assert.deepEqual((await f.core.snapshot()).tasks, []); assert.equal(f.liveReaders, 0)
+      return
+    }
     assert.equal(f.adapter.discovery().counts.main, 1); assert.equal(f.adapter.discovery().counts.fork, 1)
     await f.catchUp(B)
     const view = await f.catchUp(F)
@@ -269,25 +271,27 @@ test('legacy material observation does not admit compressed current main or fork
   assert.equal(f.liveReaders, 0)
 })
 
-test('moving verified current records into the fixed archive preserves native identities and first capture times', async t => {
+test('archiving monitored chats stops collection while retaining their previous capture identities', async t => {
   const f = await fixture(t, null, { generations: 1, original: false, nativeOriginVersion: 2 })
   await f.catchUp(B); await f.catchUp(F)
   const events = snapshot => snapshot.tasks.flatMap(task => task.events).map(event => [event.taskId, event.data.nativeRecordId, event.evidence, event.capturedAt, event.text]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
   const before = await f.core.snapshot(), originalEvents = events(before)
   await f.archiveMains(); f.advance(1000)
-  for (const thread of [B, F]) {
-    let view
-    for (let pump = 0; pump < 32; pump++) {
-      view = await f.read(thread)
-      if (!view.observation.gap && ['caught-up', 'retained-history'].includes(view.observation.coverage)) break
-    }
-    assert.equal(view.identity.threadId, thread)
-    assert.equal(view.observation.gap, null, JSON.stringify(view.observation))
-    assert.equal(view.observation.coverage, thread === B ? 'retained-history' : 'caught-up', JSON.stringify(view.observation))
-  }
+  for (const thread of [B, F]) assert.equal((await f.read(thread)).observation.gap, 'chat-archived')
+  assert.equal(f.liveReaders, 0)
   const after = await f.core.snapshot()
   assert.deepEqual(events(after), originalEvents)
   assert.deepEqual(after.tasks.map(task => [task.id, task.lastActivity]), before.tasks.map(task => [task.id, task.lastActivity]))
+})
+
+test('an active fork can still verify an archived ancestor without monitoring the archived chat', async t => {
+  const f = await fixture(t, null, { generations: 1, original: false, nativeOriginVersion: 2 })
+  await f.archiveMains(false)
+  const view = await f.catchUp(F)
+  assert.equal(view.forkProvenance.complete, true)
+  const snapshot = await f.core.snapshot()
+  assert.equal(snapshot.tasks.some(task => task.id === B), false)
+  assert.ok(snapshot.tasks.find(task => task.id === F).events.some(event => event.data.history && event.text === 'Retain native requirement 0'))
 })
 
 for (const [name, options] of [
@@ -423,6 +427,37 @@ test('an in-progress inherited prefix resumes while already verified current mat
   assert.equal(task.currentRequest, 'Check this independent fork request')
   assert.equal(task.instructionContext.userLimitRefs.length, 2); assert.deepEqual(task.instructionContext.gaps, [])
   assert.ok(f.maximumReaders <= 4); assert.ok(f.maximumPumpBytes <= 262144)
+})
+
+test('a changed native storage record starts its own cursor and returning to the old record preserves its first captures', async t => {
+  const f = await fixture(t, null, { generations: 1, nativeOriginVersion: 2 })
+  const before = await f.catchUp(F)
+  assert.equal(before.forkProvenance.complete, true)
+  const capture = event => [event.data.nativeRecordId, event.capturedAt, event.text]
+  const priorEvents = (await f.core.snapshot()).tasks.find(task => task.id === F).events.map(capture)
+  const oldCursor = join(f.dir, 'adapter/cursors', before.identity.cursorKey + '.json')
+  const saved = await fs.readFile(oldCursor)
+  const priorPath = await f.changeCurrentRecord()
+  await f.restart()
+  const after = await f.catchUp(F)
+  assert.equal(after.observation.gap, null, JSON.stringify({ observation: after.observation, health: after.health }))
+  assert.equal(after.currentFacts?.request?.text, 'Check the new storage record')
+  assert.notEqual(after.identity.cursorKey, before.identity.cursorKey)
+  assert.deepEqual(await fs.readFile(oldCursor), saved, 'the old storage cursor stays available')
+  const currentCursor = join(f.dir, 'adapter/cursors', after.identity.cursorKey + '.json')
+  const currentSaved = await fs.readFile(currentCursor)
+  const invalid = JSON.parse(currentSaved)
+  invalid.reader.frames[0].reader.storageScope = '0'.repeat(64)
+  await fs.writeFile(currentCursor, JSON.stringify(invalid))
+  await f.restart()
+  assert.equal((await f.read(F)).observation.gap, 'cursor-invalid', 'a damaged cursor for the same record cannot fall back to another record')
+  await fs.writeFile(currentCursor, currentSaved)
+  await f.changeCurrentRecord(priorPath)
+  await f.restart()
+  const returned = await f.catchUp(F)
+  assert.equal(returned.identity.cursorKey, before.identity.cursorKey)
+  const oldTask = (await f.core.snapshot()).tasks.find(task => task.id === F && task.lifecycleId === 'F')
+  assert.deepEqual(oldTask.events.map(capture), priorEvents)
 })
 
 test('capacity pressure pauses fork ancestry while current records keep their own durable cursor', async t => {
