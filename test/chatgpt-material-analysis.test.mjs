@@ -116,6 +116,65 @@ async function settled(core) {
   assert.fail('controlled analysis did not settle')
 }
 
+test('running ChatGPT executions analyze activity without a user request and respect pause and completion', async t => {
+  for (const choice of ['clear', 'attention']) await t.test(choice, async t => {
+    const dir = await mkdtemp(join(tmpdir(), 'sentinel-running-without-request-')), io = await modelIO(t, { choice })
+    let time = at
+    const core = await createCore({ dataDir: dir, analyzer: io.analyzer(() => time), now: () => time, leaseMs: 1_000_000 })
+    t.after(async () => { await core.close(); await rm(dir, { recursive: true, force: true }) })
+    const source = await core.registerSource({ registrationId: 'running-chat', hostRunId: 'host', name: 'Native', policy: 'chatgpt-main/1' })
+    time -= 10_000
+    await core.unregisterSource(source, 'Previous connection ended')
+    await core.registerSource({ registrationId: 'running-chat', hostRunId: 'host', name: 'Native', policy: 'chatgpt-main/1' })
+    time = at
+    await core.ingest(source, { tasks: [{ ...task, sessionId: 'main' }] })
+    assert.equal((await core.snapshot()).tasks[0].analysis.startedAt, null, 'discovery stays active while no execution material is available')
+    const ref = eventId => ({ taskId: 'main', lifecycleId: 'turn', eventId })
+    await core.ingest(source, { tasks: [{ ...task, sessionId: 'main' }], events: [
+      event('start', 'status', -9000, { nativeType: 'task_started', runId: 'turn', sourceKind: 'chatgpt-native', sourceForm: 'event_msg', turnTrigger: 'queue', status: 'running' }),
+      event('action-1', 'tool-start', -8000, { callId: 'first', validationScope: 'full' }), event('failure-1', 'tool-result', -6000, { callId: 'first', validationScope: 'full', exitCode: 1 }),
+      event('repair', 'output', -5000, { artifactChanged: true }),
+      event('action-2', 'tool-start', -2000, { callId: 'second', validationScope: 'full' }), event('failure-2', 'tool-result', 0, { callId: 'second', validationScope: 'full', exitCode: 1 }),
+    ], hierarchyContext: { schemaVersion: 1, revision: 1, sessions: [{ sessionId: 'main' }],
+      activations: [{ taskId: 'main', lifecycleId: 'turn', sessionId: 'main', runId: 'turn', state: 'running', stateRefs: [ref('start')] }],
+      relations: [], instructionBindings: [], coverage: { complete: true, branchGaps: [] } } })
+    const first = await settled(core)
+    assert.equal(first.currentRequest, '')
+    assert.equal(first.instructionContext.binding, null)
+    assert.ok(first.analysis.summary.partial.evidenceRefs.length)
+    assert.deepEqual(first.analysis.coverage.blockingGaps, [])
+    assert.equal(first.analysis.checks.find(check => check.id === 'failure_loop').status, choice)
+    assert.equal(first.analysis.checks.find(check => check.id === 'validation_cost').status, choice)
+    for (const id of ['stalled_progress', 'request_drift', 'validation_gap']) {
+      const check = first.analysis.checks.find(check => check.id === id)
+      assert.equal(check.status, 'unknown'); assert.match(check.reason, /当前请求/)
+    }
+    assert.match(first.activity.summary, /failure-2/)
+    assert.equal(first.gs.light, choice === 'attention' ? 'red' : 'green')
+    assert.deepEqual(io.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone'])
+    const judged = io.requests[1].body
+    assert.equal(judged.state.request, null)
+    assert.deepEqual(Object.keys(judged.questions), ['failure_loop', 'validation_cost'])
+    if (choice === 'attention') { time += 3001; assert.ok((await core.claimNotifications(source)).length) }
+
+    await core.setConversationMonitoring({ registrationId: 'running-chat', taskId: 'main', paused: true, revision: first.conversationMonitoring.revision })
+    time += 60_001
+    await core.ingest(source, { events: [{ ...event('new-output', 'output', 0), capturedAt: time, occurredAt: time }] })
+    const paused = (await core.snapshot()).tasks[0]
+    assert.equal(paused.analysis.state, 'paused'); assert.equal(io.requests.length, 2)
+    await core.setConversationMonitoring({ registrationId: 'running-chat', taskId: 'main', paused: false, revision: paused.conversationMonitoring.revision })
+    const resumed = await settled(core)
+    assert.ok(resumed.analysis.completedAt > first.analysis.completedAt)
+    assert.ok(resumed.analysis.inputEventIds.includes('new-output'))
+    assert.equal(resumed.currentRequest, '')
+    await core.ingest(source, { tasks: [{ ...task, status: 'idle' }] })
+    const calls = io.requests.length
+    time += 60_001
+    assert.equal((await core.snapshot()).tasks[0].status, 'idle')
+    assert.equal(io.requests.length, calls)
+  })
+})
+
 test('recent normal activity returns from unconfirmed waiting through the public core without a permanent coverage gap', async t => {
   const f = await nativeInput(t), io = await modelIO(t)
   let time = at

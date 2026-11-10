@@ -947,6 +947,31 @@ test('current-profile composer and nonhuman triggers retain separate authorizati
   })
 })
 
+test('an already running native chat publishes activity and summary without any user message', async t => {
+  for (const trigger of ['composer', 'queue', 'goal']) await t.test(trigger, async t => {
+    const f = await fixture(t, { records: row(1, 'event_msg', start('turn', trigger)) + row(2, 'event_msg', agent(owner, 'turn')), cooldownMs: 60_000 })
+    await f.caughtUp()
+    let task
+    for (let i = 0; i < 100; i++) {
+      task = (await f.core.snapshot()).tasks.find(task => task.id === owner)
+      if (task.analysis.summary?.partial) break
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    assert.equal(task.currentRequest, '')
+    assert.equal(task.events.some(event => event.kind === 'input'), false)
+    assert.ok(task.analysis.summary?.partial.evidenceRefs.length)
+    assert.match(task.activity.summary, /synthetic log has been inspected/)
+    const view = await f.read(), panel = await panelHarness(t)
+    assert.equal(view.currentFacts.request, undefined)
+    assert.match(view.currentFacts.activity.summary, /synthetic log has been inspected/)
+    assert.ok(view.recentModelActivity.summary.text)
+    await panel.deliver(view)
+    assert.equal(panel.element('#current-facts').hidden, false)
+    assert.match(panel.element('#current-activity').textContent, /synthetic log has been inspected/)
+    assert.equal(panel.element('#recent-summary-state').textContent, '已总结')
+  })
+})
+
 test('admitting another supported Host permits verified recovery without refreshing already captured evidence', async t => {
   const f = await fixture(t, { profile: supportedProfile }); await f.caughtUp()
   const before = (await f.core.snapshot()).tasks[0], captures = before.events.map(event => [event.data.nativeRecordId, event.capturedAt, event.text, event.evidence])

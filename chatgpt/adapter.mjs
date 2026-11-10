@@ -12,7 +12,7 @@ import { readModelDirectory } from './model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
-import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE } from '../src/protocol.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_EXECUTION_MONITORING_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -79,7 +79,7 @@ function materialView(view, task, { historical = false, snapshot } = {}) {
   const own = task.events.filter(event => event.taskLifecycleId === task.lifecycleId && !event.data?.history && !event.data?.inherited)
   const inputRef = task.instructionContext?.binding?.inputRef
   const request = own.find(event => event.kind === 'input' && event.id === inputRef?.eventId && event.taskId === inputRef.taskId && event.taskLifecycleId === inputRef.lifecycleId && event.authorizationEligible)
-  const currentFacts = !historical && request ? { request: { text: task.currentRequest, evidenceIds: [request.id] }, activity: { ...task.activity, evidenceIds: (task.activity?.evidenceIds ?? []).filter(id => own.some(event => event.id === id)) } } : null
+  const currentFacts = !historical ? { ...(request ? { request: { text: task.currentRequest, evidenceIds: [request.id] } } : {}), activity: { ...task.activity, evidenceIds: (task.activity?.evidenceIds ?? []).filter(id => own.some(event => event.id === id)) } } : null
   const forkBinding = task.instructionContext?.binding?.forkContext
   const inheritance = forkBinding ? { state: forkBinding.receiptId ? 'complete' : 'pending', gaps: [...new Set([...(task.instructionContext.gaps ?? []), ...(!historical ? view.inheritance?.gaps ?? [] : [])])] } : null
   const revalidating = !historical && view.observation?.recordRevalidating === true
@@ -94,7 +94,7 @@ function materialView(view, task, { historical = false, snapshot } = {}) {
   const prior = task.analysis.lastSuccessfulSummary, readAt = snapshot?.generatedAt ?? Date.now()
   const lastSuccessfulSummary = prior && prior.completedAt <= readAt && prior.expiresAt > readAt && (!prior.configScope || prior.configScope.registrationId === task.analysis.currentConfigScope?.registrationId)
     ? { ...prior, generated: generatedView(prior.generated) } : null
-  return { ...view, ...(currentFacts ? { currentFacts } : {}), ...(!historical && inheritance ? { inheritance } : {}), signal: task.conversationMonitoring?.paused || revalidating ? 'gray' : task.gs?.light ?? 'gray', summary: (task.conversationMonitoring?.paused ? '本聊天分析已暂停，继续只读采集' : revalidating ? '当前记录重验中' : task.currentRequest ? task.gs?.reason ?? view.summary : '当前用户请求尚未核实，检查结论不可判断').slice(0, 240),
+  return { ...view, ...(currentFacts ? { currentFacts } : {}), ...(!historical && inheritance ? { inheritance } : {}), signal: task.conversationMonitoring?.paused || revalidating ? 'gray' : task.gs?.light ?? 'gray', summary: (task.conversationMonitoring?.paused ? '本聊天分析已暂停，继续只读采集' : revalidating ? '当前记录重验中' : task.gs?.reason ?? view.summary).slice(0, 240),
     ...(task.conversationMonitoring ? { monitoring: task.conversationMonitoring } : {}),
     health: task.monitoringHealth,
     observation: { ...view.observation, gap: view.observation.gap ?? own.find(event => event.kind === 'gap' && event.data?.verificationGaps?.length)?.data.verificationGaps[0] ?? (!task.currentRequest ? 'current-user-request-unverified' : null) },
@@ -157,7 +157,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   const track = promise => { operations.add(promise); promise.then(() => operations.delete(promise), () => operations.delete(promise)); return promise }
   const capability = async () => {
     const health = await core.health(), features = health.features
-    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
+    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_EXECUTION_MONITORING_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
     required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
     if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
     if (delivery) required.push('monitoring-notifications/1', RECOVERY_ROLLUP_FEATURE)
@@ -567,7 +567,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       failureStage = 'core-connection'
       const supported = await capability()
       if (closed || epoch !== sourceEpoch) return
-      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
+      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_EXECUTION_MONITORING_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
       if (coreInstanceId && supported.instanceId && coreInstanceId !== supported.instanceId) {
         try { await stopSource('core-generation-changed') } catch (error) { if (error.status !== 400) throw error }
         if (closed) return

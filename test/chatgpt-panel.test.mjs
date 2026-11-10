@@ -273,6 +273,15 @@ test('current facts stay visible while inherited requirements remain pending and
   assert.match(page.element('#diagnostics-title').textContent, /有缺口/)
 })
 
+test('current activity stays visible without a verified user request', async t => {
+  const page = await harness(t), view = material('main-a', 'gray')
+  view.currentFacts = { activity: { summary: '工具结果：发现新的失败原因', evidenceIds: ['result-current'], observedAt: 1000 } }
+  await page.deliver(view)
+  assert.equal(page.element('#current-facts').hidden, false)
+  assert.match(page.element('#current-request').textContent, /当前请求尚未核实/)
+  assert.match(page.element('#current-activity').textContent, /发现新的失败原因/)
+})
+
 test('current record revalidation is gray, retains verified facts and recovers without leaking into history', async t => {
   const page = await harness(t), view = material('main-a', 'green')
   view.summary = '正常'

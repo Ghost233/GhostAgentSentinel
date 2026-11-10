@@ -10,14 +10,14 @@ import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { candidateHostProfile } from '../chatgpt/storage-compatibility.mjs'
 
-test('a capability-blocked private Core retires naturally and the observer reconnects while the separate DSH Core stays running', async t => {
+for (const missing of ['bounded-summary-generation/1', 'chatgpt-execution-monitoring/1']) test('a private Core missing ' + missing + ' retires naturally and reconnects while the separate DSH Core stays running', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-core-capability-upgrade-')), dataDir = join(dir, 'codex')
   let old, oldClient, replacement, dsh, dshClient, adapter, retired = false, reads = 0, connections = 0
   const core = createLazyCore({ dataDir, connect: async () => {
     connections++
     if (retired && !replacement) replacement = await startServer({ dataDir })
     const client = await connectCore({ dataDir }), health = client.health
-    if (!retired) client.health = async (...args) => { const value = await health(...args); return { ...value, features: value.features.filter(feature => feature !== 'bounded-summary-generation/1') } }
+    if (!retired) client.health = async (...args) => { const value = await health(...args); return { ...value, features: value.features.filter(feature => feature !== missing) } }
     return client
   } })
   t.after(async () => { await adapter?.close(); await core.close(); await oldClient?.close(); await dshClient?.close(); await old?.close(); await replacement?.close(); await dsh?.close(); await rm(dir, { recursive: true, force: true }) })

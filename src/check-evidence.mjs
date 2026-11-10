@@ -7,6 +7,10 @@ const limits = new Set([
   'analysis_evidence_budget',
   'no_applicable_semantic_checks',
   '未识别原生响应材料类型：additional_tools',
+  // A missing request limits goal checks, not observations of the execution.
+  'Current user request is unverified',
+  'current_request_evidence_missing',
+  'current_request_text_missing',
 ]);
 const derived = new Set(['event_excerpt_or_capture_gap', 'capture_coverage_unconfirmed', 'extraction_evidence_gap']);
 
@@ -26,7 +30,7 @@ export function checkEvidence(events, request, coverage, ids) {
   const blocked = coverageBlockers(coverage);
   return Object.fromEntries(ids.map(id => {
     const missing = blocked.length ? ['当前执行记录存在实际采集缺口：' + blocked[0]] : [];
-    if (id !== 'long_wait' && !request?.text?.trim()) missing.push('缺少可引用的当前请求正文');
+    if (['stalled_progress', 'request_drift', 'validation_gap'].includes(id) && !request?.text?.trim()) missing.push('缺少可引用的当前请求正文');
     if (['stalled_progress', 'request_drift', 'validation_gap'].includes(id)) {
       if (request?.data?.truncated || request?.data?.redacted) missing.push('当前请求正文截断或已脱敏，无法完整核对目标和限制');
       if (events.some(event => event.contextRole && (event.data?.truncated || event.data?.redacted))) missing.push('继承限制正文不完整');

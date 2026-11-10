@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { startServer } from '../src/server.mjs';
 import { connectCore } from '../src/core-client.mjs';
 
-test('ChatGPT policy requires native request proof while legacy inputs retain their behavior through HTTP', async t => {
+test('ChatGPT request proof stays separate from execution analysis while legacy inputs retain their behavior through HTTP', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-chatgpt-policy-'));
   const server = await startServer({ dataDir });
   const client = await connectCore({ dataDir });
@@ -22,7 +22,9 @@ test('ChatGPT policy requires native request proof while legacy inputs retain th
   const snapshot = await client.snapshot();
   const observed = snapshot.tasks.find(value => value.sourceKey === sourceKey);
   assert.equal(observed.currentRequest, '');
-  assert.equal(observed.analysis.completedAt, null);
+  assert.notEqual(observed.analysis.completedAt, null);
+  assert.equal(observed.analysis.state, 'unavailable');
+  assert.equal(observed.events.find(value => value.id === event.id).authorizationEligible, false);
   assert.ok(observed.coverage.gaps.includes('Current user request is unverified'));
   assert.equal(snapshot.tasks.find(value => value.sourceKey === peer).currentRequest, event.text);
   assert.equal(snapshot.sources.find(value => value.key === sourceKey).descriptor.policy, 'chatgpt-main/1');
@@ -44,8 +46,10 @@ test('adopting ChatGPT policy does not reuse a request admitted under legacy rul
   assert.equal(await client.registerSource({ ...descriptor, policy: 'chatgpt-main/1' }), sourceKey);
   const current = (await client.snapshot()).tasks[0];
   assert.equal(current.currentRequest, '');
-  assert.equal(current.analysis.summary, null);
-  assert.equal(current.analysis.completedAt, null);
+  assert.equal(current.analysis.summary.currentTask, '当前请求未确认');
+  assert.equal(current.analysis.summary.generated, undefined);
+  assert.equal(current.analysis.state, 'unavailable');
+  assert.equal(current.events.find(event => event.id === 'old-role').authorizationEligible, false);
   assert.deepEqual(await client.claimNotifications(sourceKey), []);
 });
 

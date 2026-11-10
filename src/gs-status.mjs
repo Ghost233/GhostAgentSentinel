@@ -86,7 +86,8 @@ export function gsStatus(task, source, current, descendantWait = null) {
   const coverage = { complete: task.coverage.complete, gaps: task.coverage.gaps }
   const waiting = source.status === 'connected' && !conservative ? userWait(task, scope, current) ?? descendantWait : null
   const requestId = task.requestId ?? task.instructionContext?.binding?.inputRef?.eventId
-  const completed = task.analysis.completedAt != null && requestId != null && task.analysis.inputEventIds?.includes(requestId) && (!task.analysis.resultDisposition || ['current', 'reused'].includes(task.analysis.resultDisposition))
+  const analyzed = requestId != null ? task.analysis.inputEventIds?.includes(requestId) : conservative && scope.some(event => task.analysis.inputEventIds?.includes(event.id))
+  const completed = task.analysis.completedAt != null && analyzed && (!task.analysis.resultDisposition || ['current', 'reused'].includes(task.analysis.resultDisposition))
   const semanticGap = task.analysis.checks.some(check => check.judgmentState === 'failed' || check.id !== 'long_wait' && check.applicability?.state === 'triggered' && check.status === 'unknown') || completed && task.analysis.coverage?.complete === false
   if (waiting) waiting.semanticState = semanticGap ? 'insufficient' : completed ? 'complete' : 'pending'
   const base = { silence: { ...silence, exempt: Boolean(waiting) }, waiting, coverage }
@@ -107,7 +108,7 @@ export function gsStatus(task, source, current, descendantWait = null) {
   const scoped = task.analysis.coverage?.checkEvidenceVersion === 1;
   const known = check => check.status === 'clear' || check.applicability?.state === 'not-triggered';
   const checked = task.analysis.checks.filter(known), unknown = task.analysis.checks.filter(check => !known(check));
-  const reviewed = task.analysis.completedAt != null && requestId != null && task.analysis.inputEventIds?.includes(requestId) && (!task.analysis.resultDisposition || ['current', 'reused', 'pending'].includes(task.analysis.resultDisposition));
+  const reviewed = task.analysis.completedAt != null && analyzed && (!task.analysis.resultDisposition || ['current', 'reused', 'pending'].includes(task.analysis.resultDisposition));
   if (scoped && reviewed && !coverageBlockers(task.coverage).length && !coverageBlockers(task.analysis.coverage).length && !task.analysis.error && !task.analysis.coverage?.dependencies?.length && (unknown.length === 0 || checked.some(check => check.id !== 'long_wait' && check.status === 'clear'))) {
     return { light: 'green', label: '已检查项未见异常', reason: `本次观察窗口内，${checked.length} 项检查未见异常` + (unknown.length ? `；${unknown.length} 项证据不足，见各项说明` : '；六项检查均已核对') + (task.analysis.resultDisposition === 'pending' ? '；新增材料待检查' : ''), ...base, assessment: { checked: checked.length, unknown: unknown.map(check => check.id), scope: 'observed-window' } };
   }

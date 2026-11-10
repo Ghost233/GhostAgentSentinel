@@ -70,7 +70,7 @@ const list=value=>Array.isArray(value)?value:[];
 const count=value=>Number.isSafeInteger(value)&&value>=0?String(value):'—';
 const prefillStates={prefilling:['预填中','waiting'],completed:['已完成','ok'],failed:['失败','failed'],unknown:['状态未确认','waiting'],cancel_requested:['取消中','waiting'],cancelled:['已取消',''],unsupported:['当前模型不支持',''],unconfirmed:['预填支持未确认',''],'time-unrecorded':['发送时间未记录','']};
 const summaryTimeFormat=new Intl.DateTimeFormat(undefined,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
-const gapDescriptions={'Older native records were removed at the capture limit':'采集缓存最多 100 条，较旧材料已移出观察窗口','未识别原生响应材料类型：additional_tools':'旧版工具目录提示，已按声明元数据处理',no_applicable_semantic_checks:'本次观察未触发语义检查','tool-result-image-omitted':'图片未纳入文本观察',analysis_evidence_budget:'本轮仅使用预算内的部分记录',event_excerpt_or_capture_gap:'部分记录截断或存在采集缺口','Some observed excerpts are truncated':'部分记录截断','Some observed content was omitted for privacy':'敏感内容已省略',native_file_change_contents_unverified:'文件变更正文未完整核实',capture_coverage_unconfirmed:'采集覆盖未完整确认',analysis_input_budget:'判断材料超过预算',judgment_evidence_insufficient:'判断执行活动的证据不足',extraction_evidence_gap:'模型提取的证据存在缺口'};
+const gapDescriptions={'Current user request is unverified':'当前请求尚未核实，执行活动继续监控',current_request_evidence_missing:'缺少当前请求证据',current_request_text_missing:'缺少当前请求正文','Older native records were removed at the capture limit':'采集缓存最多 100 条，较旧材料已移出观察窗口','未识别原生响应材料类型：additional_tools':'旧版工具目录提示，已按声明元数据处理',no_applicable_semantic_checks:'本次观察未触发语义检查','tool-result-image-omitted':'图片未纳入文本观察',analysis_evidence_budget:'本轮仅使用预算内的部分记录',event_excerpt_or_capture_gap:'部分记录截断或存在采集缺口','Some observed excerpts are truncated':'部分记录截断','Some observed content was omitted for privacy':'敏感内容已省略',native_file_change_contents_unverified:'文件变更正文未完整核实',capture_coverage_unconfirmed:'采集覆盖未完整确认',analysis_input_budget:'判断材料超过预算',judgment_evidence_insufficient:'判断执行活动的证据不足',extraction_evidence_gap:'模型提取的证据存在缺口'};
 function summaryGaps(gaps){
   const derived=new Set(['event_excerpt_or_capture_gap','capture_coverage_unconfirmed','extraction_evidence_gap']);
   const specific=gaps.some(gap=>text(gap)&&!derived.has(gap));
@@ -222,9 +222,9 @@ function render(view){
   write('record-status',recordRevalidating?'已核实资料保留 · 新活动尚未核实':!view.execution?.historical&&view.observation?.recordSnapshotLag?'显示已核实快照 · 正在追赶新增记录':'');
   if(view.execution?.historical){signal='gray';summary=view.history?.currentGap==='chat-idle'?'会话空闲 · 显示上次检查结果，有新活动后自动监控':view.history?.currentGap?'当前执行尚未确认 · 显示最近检查记录':'历史执行 · 仅表示当时的检查记录';}
   const requestText=!view.execution?.historical?text(view.currentFacts?.request?.text,120):'';
-  const activityText=requestText?text(view.currentFacts?.activity?.summary,160):'';
-  show('current-facts',Boolean(requestText));
-  write('current-request',requestText?(recordRevalidating?'已核实请求：':'当前请求：')+requestText:'');
+  const activityText=!view.execution?.historical?text(view.currentFacts?.activity?.summary,160):'';
+  show('current-facts',Boolean(requestText||activityText));
+  write('current-request',requestText?(recordRevalidating?'已核实请求：':'当前请求：')+requestText:activityText?'当前请求尚未核实 · 按执行记录监控':'');
   write('current-activity',activityText?(recordRevalidating?'已核实活动：':'最近活动：')+activityText:'');
   write('inheritance',inheritanceGap?(view.inheritance.state==='pending'?'继承要求待补齐 · 相关检查不可判断':'继承要求存在缺口 · 相关检查不可判断'):'');
   const partial=!analysis.generated&&analysis.coverage?.complete===false?analysis.partial:null;

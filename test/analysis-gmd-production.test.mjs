@@ -250,6 +250,25 @@ test('an explicitly unconfirmed request cannot borrow a historical input to pref
   assert.equal(f.requests.length, 0);
 });
 
+test('ChatGPT activity without a request uses an execution-scoped managed cache for prefill and summary', async t => {
+  const f = await fixture(t);
+  const input = { ...observation, source: { ...observation.source, policy: 'chatgpt-main/1' },
+    task: { ...observation.task, currentRequestId: null, currentRequest: '' }, events: observation.events.filter(event => event.kind !== 'input'),
+    instructionContext: { binding: null, gaps: [], inheritedEvents: [{ id: 'historical-limit', taskId: 'parent', taskLifecycleId: 'parent-run',
+      kind: 'input', text: 'UNBOUND_HISTORICAL_LIMIT', capturedAt: now, contextRole: 'user-limit', authorizationEligible: true }] },
+    coverage: { complete: false, gaps: ['Current user request is unverified'] } };
+  assert.equal((await f.analyzer.prefill(input, f.options)).state, 'completed');
+  const result = await f.analyzer.analyze(input, f.options);
+  assert.ok(result.summary.partial.evidenceRefs.length);
+  assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'unknown');
+  assert.equal(f.requests[0].body.cache_salt, f.requests[1].body.cache_salt);
+  const next = { ...input, task: { ...input.task, lifecycleId: 'next-run' }, events: input.events.map(event => ({ ...event, taskLifecycleId: 'next-run' })) };
+  await f.analyzer.prefill(next, f.options);
+  assert.notEqual(f.requests[0].body.cache_salt, f.requests[2].body.cache_salt);
+  assert.ok(f.requests.every(request => JSON.parse(request.body.messages[1].content).evidence.every(group => !group.isCurrentInput)));
+  assert.ok(f.requests.every(request => !JSON.stringify(request.body).includes('UNBOUND_HISTORICAL_LIMIT')));
+});
+
 test('the actual Core and analyzer remain responsive and freeze their input while GMD status is unknown', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'gmd-production-core-'));
   let core;

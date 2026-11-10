@@ -183,7 +183,7 @@ export async function createCore({
   const connected = source => source?.status === 'connected';
   const findTask = (sourceKey, id, lifecycleId) => Array.from(tasks.values()).find(task => identity(task.sourceKey, task.id, task.lifecycleId) === identity(sourceKey, id, lifecycleId));
   const liveIdentity = task => task.status === 'running' && task.baselineConfirmed && connected(sources.get(task.sourceKey));
-  const usable = task => liveIdentity(task) && (!(sources.get(task.sourceKey)?.hierarchyContext || sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1') || task.requestId != null);
+  const usable = task => liveIdentity(task) && (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' ? taskEvents(task).some(event => !historical(event)) : !sources.get(task.sourceKey)?.hierarchyContext || task.requestId != null);
   const observationOnly = task => sources.get(task.sourceKey)?.descriptor.mode === 'observation-only';
   const conversationFor = task => {
     const source = sources.get(task.sourceKey);
@@ -387,7 +387,7 @@ export async function createCore({
   const publicEvents = (task, context = contextFor(task), read) => {
     return taskEvents(task, read).map(({ key, taskKey, sequence: eventSequence, ...event }) => {
       const value = copy(event);
-      if (context && value.kind === 'input') value.authorizationEligible = context.eligible(value);
+      if (value.kind === 'input' && (context || sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1')) value.authorizationEligible = context?.eligible(value) ?? false;
       return value;
     });
   };
@@ -626,7 +626,8 @@ export async function createCore({
         if (request >= 0) scopedEvents = scopedEvents.slice(request);
       }
     }
-    const inCurrentScope = gap => task.requestStartedAt == null || (gap.endAt ?? gap.at) >= task.requestStartedAt;
+    const scopeStartedAt = task.requestStartedAt ?? (source?.descriptor.policy === 'chatgpt-main/1' ? scopedEvents.find(event => event.kind === 'status' && event.data?.nativeType === 'task_started')?.capturedAt : null);
+    const inCurrentScope = gap => scopeStartedAt == null || (gap.endAt ?? gap.at) >= scopeStartedAt;
     const gaps = [
       ...(source?.descriptor.gaps ?? []),
       ...(source?.gapRecords ?? []).filter(inCurrentScope).map(gap => gap.reason),
@@ -644,8 +645,8 @@ export async function createCore({
   function activityFor(task, retained, coverage, current) {
     const request = retained.findIndex(event => event.id === task.requestId && event.kind === 'input');
     const boundary = !connected(sources.get(task.sourceKey)) ? '来源失联，以下仅为历史观察：' : !task.baselineConfirmed ? '任务基线未知，以下仅为历史观察：' : task.status !== 'running' ? '任务当前不在运行或状态未知，以下仅为历史观察：' : coverageBlockers(coverage).length ? '观察覆盖不足，无法确认当前活动；最近观察：' : '';
-    if (request < 0 || !task.currentRequest.trim()) return { summary: `${boundary}当前请求未知，无法确认当前活动`, observedAt: null, evidenceIds: [] };
-    const scope = retained.slice(request).filter(event => !historical(event)), byId = new Map(scope.map(event => [event.id, event]));
+    if ((request < 0 || !task.currentRequest.trim()) && sources.get(task.sourceKey)?.descriptor.policy !== 'chatgpt-main/1') return { summary: `${boundary}当前请求未知，无法确认当前活动`, observedAt: null, evidenceIds: [] };
+    const scope = (request >= 0 ? retained.slice(request) : retained).filter(event => !historical(event)), byId = new Map(scope.map(event => [event.id, event]));
     const replacements = new Map(), refinements = new Set();
     const interrupted = event => event.data?.interrupted === true || event.data?.aborted === true || event.data?.timedOut === true || Boolean(event.data?.signal);
     for (const event of scope) {
@@ -670,7 +671,7 @@ export async function createCore({
       return { summary: `工具 ${oldest.data.toolName || '调用'} 尚未观察到结束，已观察至少 ${seconds} 秒${open.length > 1 ? `；共 ${open.length} 个未配对开始记录` : ''}`, observedAt: open.reduce((latest, event) => Math.max(latest, event.capturedAt), 0), evidenceIds: open.map(event => event.id) };
     }
     const latest = canonical.filter(event => ['output', 'tool-start', 'tool-result'].includes(event.kind)).at(-1);
-    if (!latest) return { summary: `${boundary}当前请求已采集，尚无动作记录`, observedAt: retained[request].capturedAt, evidenceIds: [retained[request].id] };
+    if (!latest) return { summary: `${boundary}${request >= 0 ? '当前请求已采集，尚无动作记录' : '已接入当前执行，尚无动作记录'}`, observedAt: scope[0]?.capturedAt ?? null, evidenceIds: scope[0] ? [scope[0].id] : [] };
     const label = latest.kind === 'output' ? '代理输出' : latest.kind === 'tool-start' ? '工具开始' : interrupted(latest) ? '工具结果（执行中断）' : latest.data?.isError === true ? '工具结果（工具报告错误）' : '工具结果';
     const linkage = latest.kind !== 'output' && (!latest.data?.callId || (latest.data.refinesEventId && !latest.activityEvidence)) ? '；调用关联未知' : '';
     const exit = latest.kind === 'tool-result' ? Number.isFinite(latest.data?.exitCode) ? `；退出码 ${latest.data.exitCode}` : '；退出码未知' : '';
@@ -1193,7 +1194,7 @@ export async function createCore({
   }
 
   function wantsPrefill(task, current) {
-    if (closed || paused || !task || !usable(task) || observationOnly(task) || taskPaused(task) || task.requestId == null) return false;
+    if (closed || paused || !task || !usable(task) || observationOnly(task) || taskPaused(task) || (task.requestId == null && sources.get(task.sourceKey)?.descriptor.policy !== 'chatgpt-main/1')) return false;
     const currentAnalyzer = analyzerFor(task);
     if (typeof currentAnalyzer?.prefill !== 'function') return false;
     if (!task.analysis.error && task.analysis.completedAt != null && task.analysis.throughRevision === task.revision) return false;
