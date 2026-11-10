@@ -211,6 +211,10 @@ export class BoundedReader {
       // Only a known old request is needed to attribute an unselected prior run.
       // Its tool/output bodies are neither current evidence nor inherited context.
       if (priorUnselected && (row.type === 'response_item' || row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type)) && !(row.type === 'event_msg' && row.payload.type === 'item_completed' && itemType === 'UserMessage')) { this.excluded++; return; }
+      if (row.type === 'response_item' && row.payload.type === 'additional_tools') {
+        if (!row.material.additionalToolsValid) { this.gap = 'unsupported-additional-tools-shape'; return; }
+        this.excluded++; return;
+      }
       // Child activity is a known parent-log sideband, outside main-chat scope.
       if (row.type === 'event_msg' && row.payload.type === 'item_completed' && row.payload.turn_id === turnId && itemType === 'SubAgentActivity' && ['started', 'completed'].includes(row.material.fields['payload.item.kind']?.text)) { this.excluded++; return; }
       if (row.type === 'event_msg' && ['item_started', 'item_completed'].includes(row.payload.type) && row.payload.turn_id === turnId && !materialItems.has(itemType) && !isWebSearchItem(row) && !isClockSleepItem(row)) {

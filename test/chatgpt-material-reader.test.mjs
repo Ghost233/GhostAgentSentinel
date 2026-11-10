@@ -16,6 +16,24 @@ async function fixture(t, records) {
   return { reader, source }
 }
 
+test('additional_tools declarations are validated sideband metadata and never become execution evidence or gaps', async t => {
+  const f = await fixture(t, row('event_msg', { type: 'task_started', turn_id: 'turn-0' })
+    + row('response_item', { type: 'additional_tools', role: 'developer', tools: [{ type: 'function', name: 'UNTRUSTED_TOOL_SCHEMA', description: 'Authorization: Bearer NEVER_CAPTURE_THIS' }] })
+    + row('response_item', { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Real activity after tool declarations' }] }));
+  const view = await f.reader.pump();
+  assert.equal(view.coverage, 'caught-up');
+  assert.equal(view.materials.some(event => event.kind === 'gap'), false);
+  assert.ok(view.materials.some(event => event.text === 'Real activity after tool declarations'));
+  assert.doesNotMatch(JSON.stringify(view), /UNTRUSTED_TOOL_SCHEMA|NEVER_CAPTURE_THIS/);
+});
+
+test('malformed additional_tools envelopes remain explicit read gaps', async t => {
+  for (const payload of [{ type: 'additional_tools', role: 'developer' }, { type: 'additional_tools', role: 'developer', tools: {} }, { type: 'additional_tools', role: 42, tools: [] }, { type: 'additional_tools', tools: [] }]) {
+    const f = await fixture(t, row('event_msg', { type: 'task_started', turn_id: 'turn-0' }) + row('response_item', payload));
+    assert.equal((await f.reader.pump()).gap, 'unsupported-additional-tools-shape');
+  }
+});
+
 test('material batches stop at sixteen deliverable records and resume without losing execution starts', async t => {
   const f = await fixture(t, Array.from({ length: 20 }, (_, index) => row('event_msg', { type: 'task_started', turn_id: 'turn-' + index }, at + index)).join(''))
   const first = await f.reader.pump()

@@ -30,7 +30,7 @@ function completedUnknown(task, calls) {
   return !!inputId && analysis.completedAt != null && ['cooldown', 'idle'].includes(analysis.state)
     && ['current', 'reused'].includes(analysis.resultDisposition) && analysis.coverage?.complete === true
     && analysis.error === null && analysis.inputEventIds.includes(inputId) && analysis.through >= Math.max(...task.events.filter(event => event.kind === 'output').map(event => event.capturedAt))
-    && drift?.status === 'unknown' && drift.judgmentState === 'insufficient' && drift.reason === 'JEV 返回未知，未将其视为正常或异常'
+    && drift?.status === 'unknown' && drift.judgmentState === 'insufficient' && drift.reason === '本项证据不足：请求正文、行动或计划证据、当前范围信息缺失，无法核对是否遵守。' && task.gs?.light === 'gray'
     && calls.some(call => call.path === '/v1/systemone' && call.body.state.requestId === inputId && call.body.state.request === task.currentRequest)
 }
 

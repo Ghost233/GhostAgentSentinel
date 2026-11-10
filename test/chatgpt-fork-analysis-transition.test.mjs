@@ -103,12 +103,24 @@ for (const holdPending of [false, true]) test(`a real fork binding transition up
   assert.equal(pending.currentFacts.request.text, 'Inspect the failing test.')
   await page.deliver(pending)
   assert.match(page.element('#inheritance').textContent, /待补齐/)
-  assert.notEqual(page.element('#summary').getAttribute('data-signal'), 'green')
+  if (pending.signal === 'green') {
+    assert.equal(pending.analysis.checks.find(check => check.id === 'failure_loop').status, 'clear')
+    assert.equal(pending.analysis.checks.find(check => check.id === 'request_drift').status, 'unknown')
+    assert.equal(pending.analysis.checks.find(check => check.id === 'validation_gap').status, 'unknown')
+    assert.ok(pending.analysis.coverage.checkGaps.request_drift.length)
+    assert.ok(pending.analysis.coverage.checkGaps.validation_gap.length)
+  }
+  assert.equal(page.element('#summary').getAttribute('data-signal'), pending.signal)
   if (holdPending) await until(() => held.length === 1, 'pending analysis is held at the actual judgment HTTP boundary')
   else await until(async () => (await current()).analysis.checks.find(check => check.id === 'failure_loop').status === 'clear', 'an independent check can finish while inherited context remains pending')
   const first = await current(), original = first.events.filter(event => !event.data.history).map(event => [event.id, event.text, event.capturedAt, event.data.nativeRecordId])
   assert.equal(first.analysis.checks.find(check => check.id === 'request_drift').status, 'unknown')
-  if (!holdPending) assert.equal(first.analysis.resultDisposition, 'current', 'the completed local result is valid before only the inherited context changes')
+  if (!holdPending) {
+    assert.equal(first.analysis.resultDisposition, 'current', 'the completed local result is valid before only the inherited context changes')
+    assert.equal(first.gs.light, 'green', 'the completed independent judgment remains usable while inherited restrictions are pending')
+    assert.ok(first.gs.assessment.unknown.includes('request_drift'))
+    assert.ok(first.gs.assessment.unknown.includes('validation_gap'))
+  }
   const firstJudge = requests.find(request => request.path === '/v1/systemone').body
   assert.ok(firstJudge.questions.failure_loop)
   assert.equal(firstJudge.questions.request_drift, undefined)

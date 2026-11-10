@@ -518,8 +518,8 @@ test('invalid canonical linkage cannot hide original failure and a valid refinem
       assert.equal(result.checks.find(check => check.id === 'failure_loop').status, mode === 'wrong-call' ? 'attention' : 'unknown');
     } else {
       assert.equal(result.coverage.complete, false);
-      assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'unknown');
-      assert.equal(models.requests.filter(request => request.path === '/v1/systemone').length, 0);
+      assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'clear', 'verified replacement results allow a separate scope judgment');
+      assert.equal(models.requests.filter(request => request.path === '/v1/systemone').length, 1);
     }
   }
 });
@@ -809,13 +809,13 @@ test('coverage gaps block unsupported semantic alarms and retained expired snipp
   assert.equal(result.coverage.complete, false);
 });
 
-test('model-declared evidence gaps suppress semantic judgments even with plausible quotations', async t => {
-  const models = await withModels(t, { facts: [{ kind: 'request', eventId: 'request', quote: 'Add a log' }, { kind: 'action', eventId: 'action', quote: 'different work' }], gaps: ['Latest authorization was not present'] }, { request_drift: 'attention' });
+test('model-declared missing authorization accompanies a separate JEV scope judgment', async t => {
+  const models = await withModels(t, { facts: [{ kind: 'request', eventId: 'request', quote: 'Add a log' }, { kind: 'action', eventId: 'action', quote: 'different work' }], gaps: ['Latest authorization was not present'] }, { request_drift: 'unknown' });
   const result = await models.analyzer().analyze({ ...input, events: [...input.events, event('action', 'output', 'different work')] });
   assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'unknown');
   assert.equal(result.coverage.complete, false);
   assert.deepEqual(result.coverage.extractionGaps, ['Latest authorization was not present']);
-  assert.equal(models.requests.length, 1);
+  assert.equal(models.requests.length, 2);
 });
 
 test('a malformed JEV answer fails the round, while a valid unknown decision stays unknown', async t => {
@@ -831,7 +831,7 @@ test('a malformed JEV answer fails the round, while a valid unknown decision sta
   const valid = await withModels(t, { facts, gaps: [] });
   const unknown = await valid.analyzer().analyze(work);
   assert.equal(unknown.checks.find(check => check.id === 'request_drift').status, 'unknown');
-  assert.match(unknown.checks.find(check => check.id === 'request_drift').reason, /JEV 返回未知/);
+  assert.match(unknown.checks.find(check => check.id === 'request_drift').reason, /本项证据不足：请求正文、行动或计划证据/);
 });
 
 test('HTTP business refusal, incomplete Chat and unexpected unclosed SSE are errors, never clear', async t => {

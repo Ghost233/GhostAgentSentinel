@@ -203,7 +203,8 @@ test('the complete managed summary envelope fits its input budget without droppi
   const result = await f.analyzer.analyze({ ...observation, events }, f.options);
   assert.ok(result.summary.partial.evidenceRefs.length);
   assert.ok(result.coverage.gaps.includes('analysis_evidence_budget'));
-  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests.length, 2, 'managed bounded observations still reach per-check judgment');
+  assert.ok(JSON.stringify(f.requests[1].body).length <= 24_000);
   assert.ok(JSON.stringify(f.requests[0].body).length <= 24_000, 'budget includes the thinking policy and cache namespace actually sent');
   const evidence = JSON.parse(f.requests[0].body.messages[1].content).evidence;
   assert.ok(evidence.some(group => group.isCurrentInput));

@@ -65,12 +65,70 @@ test('an incomplete observation publishes only a cited partial summary and prese
   assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions']);
 });
 
+test('normal excerpt limits still execute evidence-supported checks through JEV instead of stopping at a partial summary', async t => {
+  const { analyzer, requests } = await models(t, { judgment: wire => ({ answers: Object.fromEntries(Object.keys(wire.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) }) });
+  const result = await analyzer.analyze({ ...observation,
+    events: [observation.events[0], { ...observation.events[1], data: { truncated: true } }],
+    coverage: { complete: false, gaps: ['Some observed excerpts are truncated'] },
+  });
+  assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'clear');
+  assert.equal(result.coverage.complete, false, 'a supported check does not pretend the original material was exhaustive');
+  assert.ok(result.summary.partial, 'the bounded summary keeps its observation scope');
+});
+
+test('missing validation evidence blocks only its own checks while progress, drift and failure judgments still execute', async t => {
+  const { analyzer, requests } = await models(t, { judgment: wire => ({ answers: Object.fromEntries(Object.keys(wire.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) }) });
+  const event = (id, kind, data) => ({ ...observation.events[1], id, kind, data });
+  const result = await analyzer.analyze({ ...observation, events: [observation.events[0], observation.events[1],
+    event('action2', 'output', {}), event('failure1', 'tool-result', { callId: 'one', exitCode: 1 }),
+    event('failure2', 'tool-result', { callId: 'two', exitCode: 1, verificationGaps: ['native_file_change_contents_unverified'] }),
+  ] });
+  const jev = requests.find(request => request.path === '/v1/systemone');
+  assert.ok(jev, 'JEV must run for unaffected questions');
+  for (const id of ['request_drift', 'stalled_progress', 'failure_loop']) assert.equal(result.checks.find(check => check.id === id).status, 'clear');
+  for (const id of ['validation_cost', 'validation_gap']) {
+    const check = result.checks.find(check => check.id === id);
+    assert.equal(check.status, 'unknown');
+    assert.match(check.reason, /验证.*证据/);
+  }
+});
+
+test('a clipped current request isolates scope checks without blocking comparison of actual failures', async t => {
+  const { analyzer, requests } = await models(t, { judgment: wire => ({ answers: Object.fromEntries(Object.keys(wire.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) }) });
+  const result = await analyzer.analyze({ ...observation, events: [{ ...observation.events[0], data: { truncated: true } }, observation.events[1],
+    ...['one', 'two'].map(id => ({ ...observation.events[1], id, kind: 'tool-result', data: { callId: id, exitCode: 1 } })),
+  ] });
+  assert.ok(requests.some(request => request.path === '/v1/systemone'));
+  assert.equal(result.checks.find(check => check.id === 'failure_loop').status, 'clear');
+  for (const id of ['request_drift', 'stalled_progress', 'validation_gap']) {
+    const check = result.checks.find(check => check.id === id);
+    assert.equal(check.status, 'unknown'); assert.match(check.reason, /请求正文截断/);
+  }
+});
+
+test('retained additional_tools diagnostics from an older observer do not poison a new analysis, while unknown material still blocks it', async t => {
+  for (const type of ['additional_tools', 'future_unknown_material']) await t.test(type, async t => {
+    const { analyzer, requests } = await models(t);
+    const reason = '未识别原生响应材料类型：' + type;
+    const gap = { ...observation.events[1], id: 'old-diagnostic', kind: 'gap', text: reason, data: { sourceKind: 'chatgpt-native', nativeType: 'response_item/' + type, truncated: true } };
+    await analyzer.analyze({ ...observation, events: [observation.events[0], gap, observation.events[1]], coverage: { complete: false, gaps: [reason] } });
+    assert.equal(requests.some(request => request.path === '/v1/systemone'), type === 'additional_tools');
+    assert.doesNotMatch(JSON.stringify(requests.find(request => request.path === '/v1/chat/completions').body.messages), /response_item\/additional_tools/);
+  });
+});
+
 test('long observations select recent evidence within the unchanged budget while retaining the request and all inherited limits', async t => {
   const { analyzer, requests } = await models(t);
   const events = [observation.events[0], ...Array.from({ length: 180 }, (_, index) => ({ ...observation.events[1], id: 'action-' + index, text: ('Observed action ' + index + ': ').padEnd(230, 'x'), capturedAt: now - 180 + index }))];
   const inherited = { id: 'limit', taskId: 'parent', taskLifecycleId: 'parent-run', kind: 'input', text: 'Keep the inherited user restriction.', capturedAt: now - 2000, contextRole: 'ancestor-limit', authorizationEligible: true, sourceRef: { taskId: 'parent', lifecycleId: 'parent-run', eventId: 'limit' } };
   const result = await analyzer.analyze({ ...observation, events, instructionContext: { inheritedEvents: [inherited], binding: { origin: 'delegated' }, gaps: [] } });
-  assert.equal(requests.length, 1, 'a bounded partial summary reaches the summary model');
+  assert.equal(requests.length, 2, 'budgeted evidence reaches both summary and per-check judgment');
+  assert.ok(JSON.stringify(requests[1].body).length <= 24000);
+  const judged = decodeJevRequest(requests[1].body);
+  assert.ok(judged.state.events.some(event => event.id === events.at(-1).id));
+  assert.ok(judged.state.events.some(event => event.id === 'limit'));
+  assert.ok(judged.state.events.length < events.length);
   assert.ok(JSON.stringify(requests[0].body).length <= 24000);
   const payload = JSON.parse(requests[0].body.messages[1].content);
   assert.ok(payload.evidence.some(group => group.isCurrentInput && group.text === observation.events[0].text));

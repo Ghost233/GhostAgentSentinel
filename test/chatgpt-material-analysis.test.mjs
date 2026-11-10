@@ -30,13 +30,13 @@ import { BoundedReader, supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
 import { createCore } from '../src/core/index.mjs'
 
-async function nativeInput(t) {
+async function nativeInput(t, output = 'Read the requested log and found the failing assertion') {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-material-io-')), path = join(dir, 'native.jsonl')
   const row = (type, payload) => JSON.stringify({ type, timestamp: new Date(at).toISOString(), payload }) + '\n'
   await writeFile(path, row('session_meta', { id: 'main' })
     + row('event_msg', { type: 'task_started', turn_id: 'turn', turn_attribution: { turn_id: 'turn', turn_trigger: 'composer' } })
     + row('event_msg', { type: 'item_completed', thread_id: 'main', turn_id: 'turn', item: { type: 'UserMessage', id: 'user-producer', content: [{ type: 'text', text: 'Read only the requested log' }] } })
-    + row('response_item', { type: 'message', id: 'assistant-output', role: 'assistant', content: [{ type: 'output_text', text: 'Read the requested log and found the failing assertion' }], internal_chat_message_metadata_passthrough: { turn_id: 'turn' } }))
+    + row('response_item', { type: 'message', id: 'assistant-output', role: 'assistant', content: [{ type: 'output_text', text: output }], internal_chat_message_metadata_passthrough: { turn_id: 'turn' } }))
   const reader = new BoundedReader({ path, allowedRoot: dir, threadId: 'main', parentId: null, sourceKind: 'vscode', originator: 'Codex Desktop', hostRunId: 'host', hostStartedAt: at - 10000, profile: supportedProfile, anchorTurnId: 'turn' }, null, { mode: 'material' })
   t.after(async () => { await reader.close(); await rm(dir, { recursive: true, force: true }) })
   const view = await reader.pump()
@@ -134,4 +134,27 @@ test('recent normal activity returns from unconfirmed waiting through the public
   assert.equal(actor.gs.light, 'green')
   assert.equal(actor.gs.waiting, null)
   assert.deepEqual(actor.coverage.gaps, [])
+})
+
+test('bounded native output reaches real model judgment and a scoped green Core result without claiming exhaustive capture', async t => {
+  for (const choice of ['clear', 'attention', 'unknown', 'missing-verification']) await t.test(choice, async t => {
+  const f = await nativeInput(t, 'Read the requested log. ' + 'x'.repeat(400)), io = await modelIO(t, { choice: choice === 'missing-verification' ? 'clear' : choice })
+  const core = await createCore({ dataDir: join(f.dir, 'core'), analyzer: io.analyzer(() => at), now: () => at, leaseMs: 1_000_000 })
+  t.after(() => core.close())
+  const source = await core.registerSource({ registrationId: 'bounded-native', hostRunId: 'host', name: 'Native', policy: 'chatgpt-main/1' })
+  const ref = eventId => ({ taskId: 'main', lifecycleId: 'turn', eventId })
+  const start = { id: 'start', taskId: 'main', taskLifecycleId: 'turn', kind: 'status', occurredAt: at, capturedAt: at, text: 'task_started', data: { nativeType: 'task_started', runId: 'turn', sourceKind: 'chatgpt-native', sourceForm: 'event_msg', turnTrigger: 'composer', status: 'running' } }
+  await core.ingest(source, { tasks: [{ id: 'main', lifecycleId: 'turn', sessionId: 'main', title: 'Main', status: 'running' }], events: [start, ...f.input.events, ...(choice === 'missing-verification' ? ['git push', 'npm verify'].map((command, i) => ({ id: 'tool-' + i, taskId: 'main', taskLifecycleId: 'turn', kind: 'tool-start', occurredAt: at, capturedAt: at, text: command, data: { callId: 'tool-' + i, command } })) : [])], hierarchyContext: { schemaVersion: 1, revision: 1, sessions: [{ sessionId: 'main' }], activations: [{ taskId: 'main', lifecycleId: 'turn', sessionId: 'main', runId: 'turn', state: 'running', stateRefs: [ref('start')] }], relations: [], instructionBindings: [{ taskId: 'main', lifecycleId: 'turn', inputRef: ref('material-0'), phase: 'consumed', origin: 'user-entry', originRefs: [ref('start'), ref('material-0')], ancestorLimitRefs: [] }], coverage: { complete: true, branchGaps: [] } } })
+  const actor = await settled(core)
+  assert.deepEqual(io.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone'])
+  assert.equal(actor.analysis.checks.find(check => check.id === 'request_drift').status, choice === 'missing-verification' ? 'clear' : choice)
+  assert.equal(actor.gs.light, { clear: 'green', attention: 'red', unknown: 'gray', 'missing-verification': 'green' }[choice])
+  if (choice === 'missing-verification') for (const id of ['validation_cost', 'validation_gap']) {
+    assert.equal(actor.analysis.checks.find(check => check.id === id).status, 'unknown')
+    assert.ok(actor.gs.assessment.unknown.includes(id))
+  }
+  if (choice === 'clear') assert.match(actor.gs.label, /已检查项|本次观察/)
+  assert.equal(actor.coverage.complete, false)
+  assert.ok(actor.analysis.summary.partial)
+  })
 })

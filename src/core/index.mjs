@@ -1,3 +1,4 @@
+import { coverageBlockers } from '../check-evidence.mjs';
 import { createNativeOriginFences } from './native-origin-fences.mjs';
 import { nativeForkIdentity } from '../fork-proof.mjs';
 import { DatabaseSync } from 'node:sqlite';
@@ -11,7 +12,7 @@ import { createInstructionLookup, instructionContext, eventRef, referenceKey } f
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
 import { analysisTimeConditions } from '../analysis/index.mjs';
 import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
-import { normalizeAnalysisConfig, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
+import { normalizeAnalysisConfig, CHECK_EVIDENCE_FEATURE, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
 import { createNativeNotificationStore } from './native-notifications.mjs';
 import { createNativeCaptureProgress } from './native-capture-progress.mjs';
@@ -409,7 +410,7 @@ export async function createCore({
   const resultScopeFor = (task, read, coverage) => {
     const source = sources.get(task.sourceKey), activation = source?.hierarchyContext?.activations.find(item => item.taskId === task.id && item.lifecycleId === task.lifecycleId);
     const parent = source?.hierarchyContext?.relations.find(item => item.kind === 'delegation' && (item.childSessionId === task.sessionId || item.childActivationRef?.taskId === task.id && item.childActivationRef?.lifecycleId === task.lifecycleId));
-    return fingerprint([task.requestId, task.contextFingerprint, task.status, activation?.sessionId, activation?.runId, parent?.parentSessionId, source?.descriptor, coverage ?? coverageFor(task, read), configScopeFor(task)]);
+    return fingerprint([CHECK_EVIDENCE_FEATURE, task.requestId, task.contextFingerprint, task.status, activation?.sessionId, activation?.runId, parent?.parentSessionId, source?.descriptor, coverage ?? coverageFor(task, read), configScopeFor(task)]);
   };
   const resultDispositionFor = (task, context, read) => {
     if (!task.resultScope || !task.analysis.summary) return task.resultScope != null || task.analysis.completedAt != null || ['analysis_expired', 'evidence_expired'].includes(task.analysis.error?.code) ? 'invalid' : 'none';
@@ -642,7 +643,7 @@ export async function createCore({
 
   function activityFor(task, retained, coverage, current) {
     const request = retained.findIndex(event => event.id === task.requestId && event.kind === 'input');
-    const boundary = !connected(sources.get(task.sourceKey)) ? '来源失联，以下仅为历史观察：' : !task.baselineConfirmed ? '任务基线未知，以下仅为历史观察：' : task.status !== 'running' ? '任务当前不在运行或状态未知，以下仅为历史观察：' : !coverage.complete ? '观察覆盖不足，无法确认当前活动；最近观察：' : '';
+    const boundary = !connected(sources.get(task.sourceKey)) ? '来源失联，以下仅为历史观察：' : !task.baselineConfirmed ? '任务基线未知，以下仅为历史观察：' : task.status !== 'running' ? '任务当前不在运行或状态未知，以下仅为历史观察：' : coverageBlockers(coverage).length ? '观察覆盖不足，无法确认当前活动；最近观察：' : '';
     if (request < 0 || !task.currentRequest.trim()) return { summary: `${boundary}当前请求未知，无法确认当前活动`, observedAt: null, evidenceIds: [] };
     const scope = retained.slice(request).filter(event => !historical(event)), byId = new Map(scope.map(event => [event.id, event]));
     const replacements = new Map(), refinements = new Set();
@@ -1170,7 +1171,7 @@ export async function createCore({
     if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' && (settledError || !result.coverage?.dependencies?.length)) {
       const settled = failureStore.settle({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId, roundId: round.id,
         domain: 'analysis', outcome: settledError ? 'failed' : 'succeeded', attempted: true, settled: true, settledAt: completedAt, error: settledError,
-        cacheRecoveryOnly: Boolean(partial) });
+        cacheRecoveryOnly: Boolean(partial && !result.coverage?.judgedCheckIds?.length) });
       nativeNotifications.observeFailure(settled.receipt);
     }
     save('tasks', task);

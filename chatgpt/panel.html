@@ -70,9 +70,11 @@ const list=value=>Array.isArray(value)?value:[];
 const count=value=>Number.isSafeInteger(value)&&value>=0?String(value):'—';
 const prefillStates={prefilling:['预填中','waiting'],completed:['已完成','ok'],failed:['失败','failed'],unknown:['状态未确认','waiting'],cancel_requested:['取消中','waiting'],cancelled:['已取消',''],unsupported:['当前模型不支持',''],unconfirmed:['预填支持未确认',''],'time-unrecorded':['发送时间未记录','']};
 const summaryTimeFormat=new Intl.DateTimeFormat(undefined,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
-const gapDescriptions={'Older native records were removed at the capture limit':'采集达到上限，部分旧记录已淘汰','tool-result-image-omitted':'图片未纳入文本观察',analysis_evidence_budget:'本轮仅使用预算内的部分记录',event_excerpt_or_capture_gap:'部分记录截断或存在采集缺口','Some observed excerpts are truncated':'部分记录截断','Some observed content was omitted for privacy':'敏感内容已省略',native_file_change_contents_unverified:'文件变更正文未完整核实',capture_coverage_unconfirmed:'采集覆盖未完整确认',analysis_input_budget:'判断材料超过预算',judgment_evidence_insufficient:'判断执行活动的证据不足',extraction_evidence_gap:'模型提取的证据存在缺口'};
+const gapDescriptions={'Older native records were removed at the capture limit':'采集缓存最多 100 条，较旧材料已移出观察窗口','未识别原生响应材料类型：additional_tools':'旧版工具目录提示，已按声明元数据处理',no_applicable_semantic_checks:'本次观察未触发语义检查','tool-result-image-omitted':'图片未纳入文本观察',analysis_evidence_budget:'本轮仅使用预算内的部分记录',event_excerpt_or_capture_gap:'部分记录截断或存在采集缺口','Some observed excerpts are truncated':'部分记录截断','Some observed content was omitted for privacy':'敏感内容已省略',native_file_change_contents_unverified:'文件变更正文未完整核实',capture_coverage_unconfirmed:'采集覆盖未完整确认',analysis_input_budget:'判断材料超过预算',judgment_evidence_insufficient:'判断执行活动的证据不足',extraction_evidence_gap:'模型提取的证据存在缺口'};
 function summaryGaps(gaps){
-  return [...new Set(gaps.filter(gap=>text(gap)).map(gap=>Object.hasOwn(gapDescriptions,gap)?gapDescriptions[gap]:gap.includes('unsupported-item-type:')?'存在未识别的原生事件':text(gap,160)))];
+  const derived=new Set(['event_excerpt_or_capture_gap','capture_coverage_unconfirmed','extraction_evidence_gap']);
+  const specific=gaps.some(gap=>text(gap)&&!derived.has(gap));
+  return [...new Set(gaps.filter(gap=>text(gap)&&(!specific||!derived.has(gap))).map(gap=>Object.hasOwn(gapDescriptions,gap)?gapDescriptions[gap]:gap.includes('unsupported-item-type:')?'存在未识别的原生事件':text(gap,160)))];
 }
 function renderRecentModelActivity(activity,retained=false){
   const now=Date.now(),prefill=activity?.prefill,summary=activity?.summary;
@@ -88,13 +90,13 @@ function renderRecentModelActivity(activity,retained=false){
   attribute('recent-prefill-state','data-tone',tone);
   time('recent-prefill-time',prefill?.submittedAt);
   const valid=recent(summary?.completedAt)&&summary.expiresAt>now&&Boolean(text(summary.text,600));
-  show('recent-summary-state',valid);write('recent-summary-state',valid?(summary.partial?'部分观察':'已生成'):'');
-  attribute('recent-summary-state','data-tone',summary?.partial?'waiting':'ok');
+  show('recent-summary-state',valid);write('recent-summary-state',valid?'已总结':'');
+  attribute('recent-summary-state','data-tone','ok');
   set('recent-summary-text','className',valid?'':'muted');
   write('recent-summary-text',valid?text(summary.text,600):activity?'暂无可显示的总结':'等待核对当前聊天');
   time('recent-summary-time',valid?summary.completedAt:null);
   const missing=valid&&summary.partial?summaryGaps(list(summary.gaps)):[];
-  show('recent-summary-gaps',missing.length>0);write('recent-summary-gaps',missing.length?'观察缺口 · '+missing.join('、'):'');
+  show('recent-summary-gaps',missing.length>0);write('recent-summary-gaps',missing.length?'观察范围与说明 · '+missing.join('、'):'');
   const showRetained=retained&&Boolean(valid||validPrefill);
   show('recent-model-status',showRetained);write('recent-model-status',showRetained?'本次未能更新 · 显示上次读取':'');
   return activity?{prefill:validPrefill?prefill:null,summary:valid?summary:null}:null;
@@ -208,9 +210,13 @@ function render(view){
   const recordRevalidating=!view.execution?.historical&&view.observation?.recordRevalidating===true;
   const cacheRecovery=analysis.state==='failed'&&analysis.error?.category==='cache-busy';
   let signal=view.signal,summary=text(view.summary)||'当前状态不可判断';
-  const green=!inheritanceGap&&!list(analysis.coverage?.contextGaps).length&&view.health?.state!=='failed'&&analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted','stale'].includes(analysis.state)&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>{const check=byId.get(id);return check&&(check.status==='clear'||check.applicability?.state==='not-triggered');});
+  const knownCheck=check=>check&&(check.status==='clear'||check.applicability?.state==='not-triggered');
+  const checked=Object.keys(labels).filter(id=>knownCheck(byId.get(id))),missingChecks=Object.keys(labels).filter(id=>!knownCheck(byId.get(id)));
+  const scoped=analysis.coverage?.checkEvidenceVersion===1&&Array.isArray(analysis.coverage.blockingGaps)&&analysis.coverage.blockingGaps.length===0;
+  const scopedReady=scoped&&!list(analysis.checks).some(check=>check.status==='attention')&&(missingChecks.length===0||list(analysis.checks).some(check=>check.id!=='long_wait'&&check.status==='clear'));
+  const green=(scoped?scopedReady:!inheritanceGap&&!list(analysis.coverage?.contextGaps).length&&analysis.coverage?.complete!==false&&!list(analysis.coverage?.dependencies).length&&Object.keys(labels).every(id=>knownCheck(byId.get(id))))&&view.health?.state!=='failed'&&!list(analysis.coverage?.dependencies).length&&analysis.connected===true&&['current','reused','pending'].includes(analysis.resultDisposition)&&!['not-connected','unknown','unavailable','failed','interrupted','stale'].includes(analysis.state);
   if(signal==='green'&&!green){signal='gray';summary=view.health?.state==='failed'?(view.health.orderingGap?'监控恢复状态未确认':'监控故障，当前状态不可判断'):inheritanceGap?'当前执行已接入，继承要求待补齐':states[analysis.state]??'当前分析不可判断';}
-  if(signal==='green'&&analysis.resultDisposition==='pending')summary='上轮正常 · 待分析';
+  if(signal==='green'&&analysis.resultDisposition==='pending')summary=scoped?'已检查项未见异常'+(missingChecks.length?' · '+missingChecks.length+' 项证据不足':'')+' · 新材料待分析':'上轮正常 · 待分析';
   if(cacheRecovery&&signal==='gray'&&!view.execution?.historical)summary='总结恢复中';
   if(recordRevalidating){signal='gray';summary='当前记录重验中';}
   write('record-status',recordRevalidating?'已核实资料保留 · 新活动尚未核实':!view.execution?.historical&&view.observation?.recordSnapshotLag?'显示已核实快照 · 正在追赶新增记录':'');
@@ -226,13 +232,13 @@ function render(view){
   show('model-summary',Boolean(publishable));
   write('model-summary-text',publishable?text(generated.text,600):'');
   updateRows('model-summary-evidence',publishable?summaryEvidence(generated):[]);
-  write('model-summary-title',publishable&&partial?'部分观察总结':'模型总结');
+  write('model-summary-title',publishable&&partial?(scoped?'本次观察总结':'部分观察总结'):'模型总结');
   let modelStatus='',modelGaps='';
   if(publishable){
     if(partial){
       const gaps=[...list(analysis.coverage?.gaps),...list(analysis.coverage?.verificationGaps),...list(analysis.coverage?.contextGaps),...list(analysis.coverage?.extractionGaps)];
-      modelGaps='观察缺口：'+summaryGaps(gaps).join('；');
-      modelStatus='总结模型：部分观察 · JEV：未形成完整判断';
+      modelGaps=(scoped?'观察范围：':'观察缺口：')+summaryGaps(gaps).join('；');
+      modelStatus=analysis.coverage?.checkEvidenceVersion===1?'总结已生成 · 已核对 '+checked.length+' 项'+(missingChecks.length?' · '+missingChecks.length+' 项证据不足':''):'总结模型：部分观察 · JEV：未形成完整判断';
     }else modelStatus=analysis.resultDisposition==='reused'?'总结模型／JEV：复用仍有效的结果':'总结模型：本轮成功 · JEV：本轮完成';
   }else if(cacheRecovery&&!view.execution?.historical){
     const retry=Number.isFinite(analysis.nextEligibleAt)&&analysis.nextEligibleAt>Date.now()?' · '+summaryTimeFormat.format(analysis.nextEligibleAt)+' 后可重试':'';
@@ -292,7 +298,7 @@ function render(view){
     if(counts)coverage.push('目录：主聊天 '+count(counts.main)+' · 分叉 '+count(counts.fork)+' · 远程 '+count(counts.remote)+' · 云端 '+count(counts.cloud)+' · 未分类 '+count(counts.unknown));
     coverage.push('发现覆盖：'+(discovery.complete===true?'已确认':'完整性尚未确认'));
   }
-  if(analysis.coverage)coverage.push((view.inheritance?'当前执行材料覆盖：':'分析材料覆盖：')+(analysis.coverage.complete===true?'已确认':'存在缺口'));
+  if(analysis.coverage)coverage.push((view.inheritance?'当前执行材料覆盖：':'分析材料覆盖：')+(analysis.coverage.complete===true?'已确认':scoped?'有限观察窗口，检查按各自证据判断':'存在缺口'));
   if(view.inheritance)coverage.push('继承要求：'+(inheritanceGap?'待补齐或存在缺口':'已核实'));
   write('coverage',coverage.join('\n'));
   const recordStates={'caught-up':'已追平','catching-up':'正在补读','partial-record':'等待记录写完','retained-history':'保留的历史记录',gap:'存在缺口'};

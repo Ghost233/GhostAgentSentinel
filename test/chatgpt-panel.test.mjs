@@ -145,6 +145,21 @@ test('a partial summary lists observation gaps, stays gray and keeps the prior c
   }
 })
 
+test('evidence-scoped judgments keep their real green signal and identify only the checks missing key evidence', async t => {
+  const page = await harness(t), view = material('main-a', 'green')
+  view.summary = '本次观察窗口内，4 项检查未见异常；2 项证据不足，见各项说明'
+  view.analysis.coverage = { complete: false, gaps: ['Some observed excerpts are truncated', 'event_excerpt_or_capture_gap', 'capture_coverage_unconfirmed'], checkEvidenceVersion: 1, blockingGaps: [], checkGaps: { validation_cost: ['缺少验证范围'], validation_gap: ['缺少版本证据'] } }
+  view.analysis.partial = { text: '已完成本次观察范围内的检查。', evidence: [{ text: 'checked', reference: 'native:scoped' }] }
+  view.analysis.checks = view.analysis.checks.map(check => ['validation_cost', 'validation_gap'].includes(check.id) ? { ...check, status: 'unknown', applicability: { state: 'unknown' }, reason: '缺少验证范围或版本证据' } : { ...check, status: 'clear' })
+  view.analysis.issues = []
+  await page.deliver(view)
+  assert.match(page.element('#summary').textContent, /^🟢.*2 项证据不足/)
+  assert.match(page.element('#detail-issues').textContent + page.element('#check-list').textContent, /缺少验证范围或版本证据/)
+  assert.equal(page.element('#model-summary-title').textContent, '本次观察总结')
+  assert.match(page.element('#model-summary-gaps').textContent, /观察范围/)
+  assert.doesNotMatch(page.element('#model-summary-gaps').textContent, /采集覆盖未完整确认|截断或存在采集缺口/)
+})
+
 test('same-chat polling updates only changed content and keeps the recent summary readable', async t => {
   const page = await harness(t), view = material(), completedAt = Date.now() - 10000
   view.recentModelActivity = {
@@ -217,7 +232,7 @@ test('recent model activity stays above the tabs and is cleared before a differe
   assert.ok(page.html.indexOf('id="recent-model-activity"') < page.html.indexOf('id="monitor-tabs"'))
   assert.equal(page.element('#recent-prefill-state').textContent, '失败')
   assert.equal(page.element('#recent-prefill-time').dateTime, new Date(completedAt + 1000).toISOString())
-  assert.equal(page.element('#recent-summary-state').textContent, '部分观察')
+  assert.equal(page.element('#recent-summary-state').textContent, '已总结')
   assert.equal(page.element('#recent-summary-text').textContent, view.recentModelActivity.summary.text)
   assert.equal(page.element('#recent-summary-time').dateTime, new Date(completedAt).toISOString())
   assert.match(page.element('#recent-summary-gaps').textContent, /图片未纳入/)

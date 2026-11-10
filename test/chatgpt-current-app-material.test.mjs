@@ -88,6 +88,62 @@ test('installation diagnostics report bounded backfill positions without pumping
   assert.equal((await later.json()).result.structuredContent.collection.backfill, undefined)
 })
 
+test('native additional_tools and normal excerpts reach per-check judgment and the real MCP panel for plain and compressed main/fork records', async t => {
+  for (const fork of [false, true]) for (const compressed of [false, true]) await t.test(`${fork ? 'fork' : 'main'}/${compressed ? 'zstd' : 'plain'}`, async t => {
+    const ordinal = fork ? 9 : 4
+    const later = agent(owner, 'turn', 'The requested log was inspected. ' + 'x'.repeat(400)); later.item.id = 'later-agent'
+    const suffix = row(ordinal, 'response_item', { type: 'additional_tools', role: 'developer', tools: [{ name: 'PRIVATE_SCHEMA_MARKER', description: 'Authorization: Bearer DO_NOT_CAPTURE_SCHEMA' }] })
+      + row(ordinal + 1, 'event_msg', later)
+    const f = await fixture(t, { fork, compressed, suffix })
+    await f.caughtUp()
+    let task
+    for (let i = 0; i < 100; i++) {
+      task = (await f.core.snapshot()).tasks.find(task => task.id === owner)
+      if (task?.analysis.completedAt) break
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    assert.ok(f.state.summaryCalls > 0); assert.ok(f.state.jevCalls > 0, JSON.stringify({error:task.analysis.error,coverage:task.analysis.coverage,checks:task.analysis.checks.map(c=>({id:c.id,reason:c.reason}))}))
+    assert.equal(task.analysis.checks.find(check => check.id === 'request_drift').status, 'clear')
+    assert.equal(task.gs.light, 'green')
+    assert.doesNotMatch(JSON.stringify(task.events), /PRIVATE_SCHEMA_MARKER|DO_NOT_CAPTURE_SCHEMA|response_item\/additional_tools/)
+    const view = await f.caughtUp(), panel = await panelHarness(t)
+    assert.equal(view.signal, 'green')
+    assert.ok(view.analysis.partial?.text)
+    await panel.deliver(view)
+    assert.match(panel.element('#summary').textContent, /^🟢.*观察窗口/)
+    assert.equal(panel.element('#recent-summary-state').textContent, '已总结')
+  })
+})
+
+test('a successful bounded summary with real JEV decisions recovers an earlier analysis fault', async t => {
+  const f = await fixture(t, { cooldownMs: 1000 })
+  f.state.modelFailure = true
+  await f.caughtUp()
+  let snapshot, task
+  for (let i = 0; i < 100; i++) {
+    snapshot = await f.core.snapshot(); task = snapshot.tasks.find(task => task.id === owner)
+    if (task?.analysis.state === 'failed') break
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  assert.equal(task.analysis.state, 'failed')
+  const sourceKey = task.sourceKey
+  assert.ok((await f.core.failureReceipts({ sourceKey })).receipts.some(receipt => receipt.domain === 'analysis' && receipt.state === 'active'))
+  const later = agent(owner, 'turn', 'Verified recovery activity. ' + 'x'.repeat(400)); later.item.id = 'recovery-agent'
+  await fs.appendFile(f.path, row(4, 'event_msg', later))
+  await f.caughtUp()
+  f.state.modelFailure = false; f.advance(); f.advance()
+  await f.caughtUp()
+  for (let i = 0; i < 100; i++) {
+    task = (await f.core.snapshot()).tasks.find(task => task.id === owner)
+    if (task?.analysis.summary?.partial && task.analysis.coverage?.judgedCheckIds?.length) break
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  assert.ok(task.analysis.summary?.partial)
+  assert.ok(task.analysis.coverage.judgedCheckIds?.length, JSON.stringify({coverage:task.analysis.coverage, state:task.status, checks:task.analysis.checks.map(c=>({id:c.id,reason:c.reason}))}))
+  assert.equal(task.analysis.error, null)
+  assert.ok((await f.core.failureReceipts({ sourceKey })).receipts.filter(receipt => receipt.domain === 'analysis').every(receipt => receipt.state === 'recovered'))
+})
+
 test('a fresh read failure remains current even after its execution becomes unknown, and verified EOF clears only that current failure', async t => {
   const f = await fixture(t), recordPath = await fs.realpath(f.path), open = fs.open
   let broken = false
@@ -691,7 +747,13 @@ for (const type of ['function_call_output', 'custom_tool_call_output']) for (con
   const result = task.events.find(event => event.data?.callId === 'image-result')
   assert.equal(result.text, text); assert.equal(result.data.truncated, true)
   assert.ok(result.data.verificationGaps.includes('tool-result-image-omitted'))
-  assert.equal(task.coverage.complete, false); assert.notEqual(task.gs.light, 'green')
+  assert.equal(task.coverage.complete, false); assert.equal(task.gs.light, 'green')
+  assert.ok(f.state.jevCalls > 0)
+  assert.match(task.gs.label, /已检查项未见异常/)
+  for (const id of ['validation_cost', 'validation_gap']) {
+    assert.equal(task.analysis.checks.find(check => check.id === id).status, 'unknown')
+    assert.ok(task.gs.assessment.unknown.includes(id))
+  }
   assert.equal(task.analysis.summary.generated, undefined); assert.ok(task.analysis.summary.partial.evidenceRefs.length)
   const partialView = await f.caughtUp(); assert.ok(partialView.analysis.partial?.text); assert.equal(partialView.analysis.generated, null)
   assert.doesNotMatch(JSON.stringify(task), /PRIVATE-OMITTED-IMAGE|image_url|data:image/)

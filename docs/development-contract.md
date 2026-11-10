@@ -1,6 +1,6 @@
 # 开发接缝与验收
 
-当前源码按仓库的版本规则从 0.3.4 递增到 0.3.5。本次变更和既有验证的覆盖范围见[发布验证范围](release-status.md)。
+当前源码按仓库的版本规则从 0.3.5 递增到 0.3.6。本次变更和既有验证的覆盖范围见[发布验证范围](release-status.md)。
 
 ## 范围和分工
 
@@ -50,7 +50,7 @@
 
 用户已确认首版沿用聊天和工具现有的版本、验证范围与退出结果。缺失时显示不可判断，六项检测全部保留。额外读取工作区的版本指纹采集后置；适配器不主动读取工作区来补全证据。
 
-分析模块导出 `createAnalyzer(config)`，对象提供 `analyze({task,source,events,coverage},options)`、`prefill(input,options)` 与 `timeConditions(input,now)`。options 支持业务取消、传输停止和观察实例生命周期信号，以及模型状态回调。analyze 返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`；summary 保留 currentTask/currentState/recentProgress/attention 字符串。执行短总结使用可选的 `summary.generated = {text,evidenceIds,evidenceRefs}`，只在本轮总结模型和 JEV 实际调用成功且输出、引用合法后赋值。text 为附依据的 1～2 句，最多 600 字符单元；任一环节失败或未完成均不发布完整总结。材料覆盖不足或 JEV 输入超预算时，总结模型已成功且引用合法的短总结可单独保存为 `summary.partial`，结构与 generated 相同，两者互斥；partial 要求 coverage.complete 为 false，不更新完整成功历史，也不证明此前分析故障已恢复。Codex 显示“部分观察总结”及缺口，六项检查按证据充分性保留未知。
+分析模块导出 `createAnalyzer(config)`，对象提供 `analyze({task,source,events,coverage},options)`、`prefill(input,options)` 与 `timeConditions(input,now)`。options 支持业务取消、传输停止和观察实例生命周期信号，以及模型状态回调。analyze 返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`；summary 保留 currentTask/currentState/recentProgress/attention 字符串。执行短总结使用可选的 `summary.generated = {text,evidenceIds,evidenceRefs}`，只在本轮总结模型和 JEV 实际调用成功且输出、引用合法后赋值。text 为附依据的 1～2 句，最多 600 字符单元；任一环节失败或未完成均不发布完整总结。材料覆盖不足或 JEV 输入超预算时，总结模型已成功且引用合法的短总结可单独保存为 `summary.partial`，结构与 generated 相同，两者互斥；partial 要求 coverage.complete 为 false，不更新完整成功历史；它只表示观察材料范围有限。六项检查按各自证据独立执行，有充分依据的项目继续请求 JEV，缺当前请求、操作、验证或来源等关键证据的项目单独保留未知。仅成功生成总结不能结算分析故障恢复；本轮 JEV 实际返回有效判断后，可结算该轮已恢复的分析故障。Codex 显示“本次观察总结”和观察范围，绿色表示已检查项未见异常，并单列仍缺证据的项目，不代表完整历史均已核实。
 
 Codex 会话检查在 GS 栏下方显示本安装同一聊天最近一次预填请求的首次发送时间和状态，以及最近一条保留的带引用总结正文和完成时间。状态变化和同操作重放沿用原发送时间。旧记录缺少发送时间时如实显示。部分总结按原证据保留期限单独保存，保留其观察缺口和原完成时间。
 
@@ -62,9 +62,9 @@ checks 固定六项 ID：stalled_progress/request_drift/failure_loop/validation_
 
 分析模块的私有 LLM 接缝使用有限证据目录，每组原文只提供一次，可选项使用 `optionId`。模型必须严格返回 `{selectedOptionIds,gaps,summary:{text,evidenceOptionIds}}`；总结依据也使用目录选项，代码再映射为公开的事件引用。模型载荷不展示结构化的来源事件 ID 或当前请求 ID，以 `isCurrentInput` 标明已确认锚点；真实事件定位、原文和来源允许的事实分类仍由代码绑定。
 
-目录项仅表示可选择资格，实际门禁、授权等语义仍需选择与判断。未知或重复选项、额外字段、旧键、无效总结或引用均报错，不自动修复，也不接受事件 ID 作为选项。还原后继续校验原文引用与来源权限。当前请求从保留范围内已确认的真实非空 input 确定，空、缺失或过期时保留未知，不以任务标题或元数据补造。完整 LLM 请求 JSON 受原 24,000 字符预算约束；超限时保留当前请求和全部授权继承限制，并选择预算内最近观察，标 analysis_evidence_budget 及省略数量，原始留存记录不裁剪。必需材料仍超限则明确返回 analysis_input_budget，不静默丢弃约束。生成输出上限为 4,096 token，预填仍为零输出；声明受管预填能力的 GMD 总结请求显式设置 thinking_token_budget 为 0，预填与生成使用同一策略，缓存命名空间绑定该策略。完整请求预算包含实际发送的思考参数和缓存命名空间。普通提供方和 JEV 不增加该参数，GMD 全局配置不改写。Codex 观察器要求 bounded-summary-generation/1 能力，旧私有 Core 在旧来源退出后自然结束，再由观察器连接新版；独立 DSH Core 不受替换。可发布短总结仍限 600 字符、1～2 句，截断或无效结果继续拒绝。JEV 的判断职责和既有适配器输入协议保持。
+目录项仅表示可选择资格，实际门禁、授权等语义仍需选择与判断。未知或重复选项、额外字段、旧键、无效总结或引用均报错，不自动修复，也不接受事件 ID 作为选项。还原后继续校验原文引用与来源权限。当前请求从保留范围内已确认的真实非空 input 确定，空、缺失或过期时保留未知，不以任务标题或元数据补造。完整 LLM 请求 JSON 受原 24,000 字符预算约束；超限时保留当前请求和全部授权继承限制，并选择预算内最近观察，标 analysis_evidence_budget 及省略数量，原始留存记录不裁剪。JEV 使用同一份预算内材料核对可支持的检查，不因正常选材而整轮跳过；当前请求和授权继承限制仍必须保留。必需材料仍超限则明确返回 analysis_input_budget，不静默丢弃约束。生成输出上限为 4,096 token，预填仍为零输出；声明受管预填能力的 GMD 总结请求显式设置 thinking_token_budget 为 0，预填与生成使用同一策略，缓存命名空间绑定该策略。完整请求预算包含实际发送的思考参数和缓存命名空间。普通提供方和 JEV 不增加该参数，GMD 全局配置不改写。Codex 观察器要求 bounded-summary-generation/1 能力，旧私有 Core 在旧来源退出后自然结束，再由观察器连接新版；独立 DSH Core 不受替换。可发布短总结仍限 600 字符、1～2 句，截断或无效结果继续拒绝。JEV 的判断职责和既有适配器输入协议保持。
 
-偏离检查的询问资格依据真实当前请求、完整覆盖以及本轮非空输出或工具开始活动，不要求模型再选出 action 分类。活动只说明有材料可问，偏离、合理调查或必要前置仍由 JEV 核对；不直接设置判断，也不补造分类。仅有工具结果、缺少请求或活动、覆盖不足时保持未知。引用保留本轮相关原文，便于展开核对权限和调查理由。
+偏离检查的询问资格依据真实当前请求、与该项有关的关键证据以及本轮非空输出或工具开始活动，不要求模型再选出 action 分类。活动只说明有材料可问，偏离、合理调查或必要前置仍由 JEV 核对；不直接设置判断，也不补造分类。仅有工具结果、缺少请求或活动、相关关键证据不足时保持未知。引用保留本轮相关原文，便于展开核对权限和调查理由。
 
 任务另有 `activity: {summary, observedAt, evidenceIds}`，由核心在读取快照时依据本任务保留观察事件临时生成。它描述已采集的输出、工具记录和未配对结束记录，不代表模型推断或完成证明。当前请求范围、来源失联及采集缺口须明确；等待时长只表示已观察到的时间下界，不能据此断言工具仍在执行或卡死。分析暂停、依赖未配置或旧轮次等待时，新采集活动仍能更新该字段。该字段不新增持久记录或专用计时器；旧核心未提供时，客户端明确显示活动摘要未提供。
 

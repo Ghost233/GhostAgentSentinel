@@ -1,3 +1,4 @@
+import { coverageBlockers } from './check-evidence.mjs'
 export const GS_FEATURE = 'gs-status/1'
 const activityKinds = new Set(['output', 'tool-start', 'tool-result'])
 
@@ -103,7 +104,15 @@ export function gsStatus(task, source, current, descendantWait = null) {
   if (conservative && base.waiting?.kind === 'unconfirmed') return { light: 'gray', label: '等待原因未确认', reason: base.waiting.durationMs === null ? '尚无可见执行活动；等待原因及观察时长未确认' : `已观察至少 ${Math.floor(base.waiting.durationMs / 1000)} 秒；现有材料无法区分正常执行、等待与停滞`, ...base }
   if (waiting && task.coverage.complete && !task.instructionContext?.gaps?.length && !semanticGap) return { light: 'green', label: waiting.kind === 'user' ? '等待你' : '等待子代理', reason: (waiting.kind === 'user' ? '已观察到当前执行的用户等待开闭依据' : '已核对父等待审计及仍有活动的委派后代；下级状态独立保留') + (waiting.semanticState === 'pending' ? '；六项语义尚待完成' : ''), ...base }
   if (!waiting && (!latest || silence.durationMs >= 60_000)) return { light: 'yellow', label: '观察', reason: !latest ? '尚无可见执行活动' : `已 ${Math.floor(silence.durationMs / 1000)} 秒无新可见执行活动；是否卡死不可判断`, ...base }
+  const scoped = task.analysis.coverage?.checkEvidenceVersion === 1;
+  const known = check => check.status === 'clear' || check.applicability?.state === 'not-triggered';
+  const checked = task.analysis.checks.filter(known), unknown = task.analysis.checks.filter(check => !known(check));
+  const reviewed = task.analysis.completedAt != null && requestId != null && task.analysis.inputEventIds?.includes(requestId) && (!task.analysis.resultDisposition || ['current', 'reused', 'pending'].includes(task.analysis.resultDisposition));
+  if (scoped && reviewed && !coverageBlockers(task.coverage).length && !coverageBlockers(task.analysis.coverage).length && !task.analysis.error && !task.analysis.coverage?.dependencies?.length && (unknown.length === 0 || checked.some(check => check.id !== 'long_wait' && check.status === 'clear'))) {
+    return { light: 'green', label: '已检查项未见异常', reason: `本次观察窗口内，${checked.length} 项检查未见异常` + (unknown.length ? `；${unknown.length} 项证据不足，见各项说明` : '；六项检查均已核对') + (task.analysis.resultDisposition === 'pending' ? '；新增材料待检查' : ''), ...base, assessment: { checked: checked.length, unknown: unknown.map(check => check.id), scope: 'observed-window' } };
+  }
   const complete = task.coverage.complete && task.analysis.coverage?.complete && !task.instructionContext?.gaps?.length && !task.analysis.error && !task.analysis.coverage?.dependencies?.length && task.analysis.checks.every(check => check.applicability?.state === 'not-triggered' || check.applicability?.state === 'triggered' && check.status === 'clear')
   if (complete && (!task.analysis.resultDisposition || task.analysis.resultDisposition !== 'invalid')) return { light: 'green', label: task.analysis.resultDisposition === 'pending' ? '上轮正常 · 待分析' : '正常', reason: task.analysis.resultDisposition === 'pending' ? '上轮正常判断仍适用于同一请求与执行范围；新增材料尚未完成分析' : '适用检查未见疑点；有据的未触发项不影响灯号', ...base }
+  if (scoped && reviewed && unknown.length) return { light: 'gray', label: '检查证据不足', reason: '尚无足够的已完成判断，缺少的关键证据见六项检查说明', ...base, assessment: { checked: checked.length, unknown: unknown.map(check => check.id), scope: 'observed-window' } };
   return { light: 'gray', label: '不可判断', reason: waiting ? `${waiting.kind === 'user' ? '等待你' : '等待子代理'}依据保留；其他判断或关键材料不足` : '尚无足够的当前判断依据', ...base }
 }
