@@ -84,19 +84,19 @@ test('a genuinely missing first body is refused with its fixed classification an
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 1)
 })
 
-test('each chat retains at most 100 native records across sources without replaying evicted bodies or breaking another chat copy', async t => {
+test('each chat retains at most 500 native records across sources without replaying evicted bodies or breaking another chat copy', async t => {
   const f = await fixture(t), source = await f.register(), next = await f.register('chatgpt:install-one', 'host-two')
   await f.emit(source, 'busy-chat', 'shared-oldest')
   const firstAt = f.now
   await f.emit(source, 'other-chat', 'shared-oldest')
-  for (let index = 0; index < 105; index++) {
+  for (let index = 0; index < 505; index++) {
     f.advance(1)
-    await f.emit(index < 50 ? source : next, 'busy-chat', 'record-' + index)
+    await f.emit(index < 100 ? source : next, 'busy-chat', 'record-' + index)
   }
   let snapshot = await f.core.snapshot()
   const own = snapshot.tasks.filter(task => task.id === 'busy-chat').flatMap(task => task.events)
-  assert.equal(own.length, 100)
-  assert.deepEqual(new Set(own.map(event => event.id)), new Set(Array.from({ length: 100 }, (_, index) => 'record-' + (index + 5))))
+  assert.equal(own.length, 500)
+  assert.deepEqual(new Set(own.map(event => event.id)), new Set(Array.from({ length: 500 }, (_, index) => 'record-' + (index + 5))))
   assert.equal(snapshot.tasks.find(task => task.id === 'other-chat').events[0].capturedAt, firstAt)
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.bodyGaps, 0)
   await f.restart()
@@ -109,15 +109,15 @@ test('each chat retains at most 100 native records across sources without replay
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.bodyGaps, 0)
   const independent = await f.register('dsh:independent', 'host', null)
   const dsh = f.batch('dsh-chat', 'dsh-0')
-  for (let index = 1; index < 110; index++) dsh.events.push(...f.batch('dsh-chat', 'dsh-' + index).events)
+  for (let index = 1; index < 210; index++) dsh.events.push(...f.batch('dsh-chat', 'dsh-' + index).events)
   await f.core.ingest(independent, dsh)
-  assert.equal((await f.core.snapshot()).tasks.find(task => task.id === 'dsh-chat').events.length, 110)
+  assert.equal((await f.core.snapshot()).tasks.find(task => task.id === 'dsh-chat').events.length, 210)
 })
 
 test('per-chat retirement rolls back both bodies and replay fences when storage rejects a deletion', async t => {
   const f = await fixture(t), source = await f.register()
   const batch = f.batch('chat', 'r0')
-  for (let index = 1; index < 100; index++) batch.events.push(...f.batch('chat', 'r' + index).events)
+  for (let index = 1; index < 500; index++) batch.events.push(...f.batch('chat', 'r' + index).events)
   await f.core.ingest(source, batch)
   const before = (await f.core.diagnostics()).retained.nativeCaptureProgress
   const db = new DatabaseSync(join(f.dir, 'observations.sqlite'))
@@ -125,18 +125,18 @@ test('per-chat retirement rolls back both bodies and replay fences when storage 
     db.exec("CREATE TRIGGER fail_trim BEFORE DELETE ON records WHEN OLD.collection='events' BEGIN SELECT RAISE(FAIL, 'controlled trim failure'); END")
     f.advance()
     await assert.rejects(f.emit(source, 'chat', 'new-record'), /controlled trim failure/)
-    assert.equal((await f.core.snapshot()).tasks[0].events.length, 100)
+    assert.equal((await f.core.snapshot()).tasks[0].events.length, 500)
     assert.deepEqual((await f.core.diagnostics()).retained.nativeCaptureProgress, before)
   } finally { db.exec('DROP TRIGGER IF EXISTS fail_trim'); db.close() }
   await f.emit(source, 'chat', 'new-record')
-  assert.equal((await f.core.snapshot()).tasks[0].events.length, 100)
+  assert.equal((await f.core.snapshot()).tasks[0].events.length, 500)
   assert.ok((await f.core.snapshot()).tasks[0].events.some(event => event.id === 'new-record'))
 })
 
 test('opening material retained by an older core applies the per-chat bound and persists its replay fences', async t => {
   const f = await fixture(t), source = await f.register('chatgpt:install-one', 'old-version', null)
   const batch = f.batch('chat', 'old-0')
-  for (let index = 1; index < 110; index++) batch.events.push(...f.batch('chat', 'old-' + index).events)
+  for (let index = 1; index < 510; index++) batch.events.push(...f.batch('chat', 'old-' + index).events)
   await f.core.ingest(source, batch)
   await f.restart(async () => {
     const db = new DatabaseSync(join(f.dir, 'observations.sqlite'))
@@ -148,7 +148,7 @@ test('opening material retained by an older core applies the per-chat bound and 
       db.prepare("DELETE FROM records WHERE collection='settings' AND key='native-capture-progress'").run()
     } finally { db.close() }
   })
-  assert.equal((await f.core.snapshot()).tasks[0].events.length, 100)
+  assert.equal((await f.core.snapshot()).tasks[0].events.length, 500)
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.expired, 10)
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.bodyGaps, 0)
   await f.restart()
@@ -165,13 +165,13 @@ test('trimming a busy chat preserves its current request and still completes par
   await f.core.ingest(source, { tasks: [{ id: taskId, sessionId: taskId, lifecycleId, title: 'Busy chat', status: 'running' }], events: [
     event('start', 'status', 'Started', { nativeType: 'task_started', sourceForm: 'event_msg', turnTrigger: 'composer', status: 'running' }),
     event('request', 'input', 'Read the current log only', { nativeType: 'item_completed/UserMessage', messageId: 'user', inputOrigin: 'user-entry', inputPhase: 'consumed' }),
-    ...Array.from({ length: 110 }, (_, index) => event('output-' + index, 'output', 'Read current log ' + index, {})),
+    ...Array.from({ length: 510 }, (_, index) => event('output-' + index, 'output', 'Read current log ' + index, {})),
   ], hierarchyContext: { schemaVersion: 1, revision: 1, sessions: [{ sessionId: taskId }], relations: [], activations: [{ taskId, lifecycleId, sessionId: taskId, runId: lifecycleId, state: 'running', stateRefs: [ref('start')] }], instructionBindings: [{ taskId, lifecycleId, inputRef: ref('request'), origin: 'user-entry', phase: 'consumed', originRefs: [ref('start'), ref('request')], ancestorLimitRefs: [] }], coverage: { complete: true, branchGaps: [] } } })
   let task
   for (let attempt = 0; attempt < 100; attempt++) { task = (await f.core.snapshot()).tasks[0]; if (task.analysis.completedAt) break; await delay(5) }
-  assert.equal(task.events.length, 100)
+  assert.equal(task.events.length, 500)
   assert.equal(task.currentRequest, 'Read the current log only')
-  assert.ok(task.events.some(event => event.id === 'output-109'))
+  assert.ok(task.events.some(event => event.id === 'output-509'))
   assert.ok(task.analysis.completedAt, JSON.stringify(task.analysis.error))
   assert.equal(task.analysis.error, null)
   assert.equal(task.analysis.coverage.complete, false, 'retirement stays an explicit observation gap')

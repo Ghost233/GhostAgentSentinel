@@ -70,9 +70,13 @@ test('a successful generated summary remains reachable only as history after the
   const failed = (await f.task(source)).analysis;
   assert.equal(failed.resultDisposition, 'invalid');
   assert.deepEqual(failed.lastSuccessfulSummary, expected);
+  assert.deepEqual(failed.availableSummary, failed.lastUnjudgedSummary);
+  assert.equal(failed.availableSummary.generated.text, summaryText('本轮总结尚未通过判断。'));
   assert.deepEqual(f.calls.map(call => call.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
   await f.restart();
-  assert.deepEqual((await f.task(source)).analysis.lastSuccessfulSummary, expected, 'the single historical success is durable');
+  const restored = (await f.task(source)).analysis;
+  assert.deepEqual(restored.lastSuccessfulSummary, expected, 'the single historical success is durable');
+  assert.deepEqual(restored.lastUnjudgedSummary, failed.lastUnjudgedSummary, 'the later summary also survives without a successful judgment');
 });
 
 for (const actualGap of [false, true]) test(`a cited partial observation survives Core restart without replacing complete history (${actualGap ? 'summary only retains judgment failure' : 'actual JEV response recovers judgment failure'})`, async t => {

@@ -1,8 +1,9 @@
 import { createServer } from 'node:http'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js'
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
 import { z } from 'zod'
 
@@ -17,7 +18,14 @@ export async function createPanelMCPServer({ read, control, modelSettings, insta
   // The host can retain HTML by resource URI across plugin upgrades.
   const digest = createHash('sha256').update(html).digest('hex')
   const uri = `ui://ghost-sentinel/current-chat-${digest}.html`
-  registerAppResource(mcp, 'sentinel-current-chat', uri, {}, async () => ({ contents: [{ uri, mimeType: RESOURCE_MIME_TYPE, text: html }] }))
+  const readPanel = async url => ({ contents: [{ uri: url.href, mimeType: RESOURCE_MIME_TYPE, text: html }] })
+  registerAppResource(mcp, 'sentinel-current-chat', uri, {}, readPanel)
+  // Restored tabs can request a panel address advertised by an older version.
+  const restoredPanel = new ResourceTemplate('ui://ghost-sentinel/current-{page}.html', { list: undefined })
+  mcp.registerResource('sentinel-restored-chat', restoredPanel, { mimeType: RESOURCE_MIME_TYPE }, async (url, { page }) => {
+    if (!/^chat(?:-[0-9a-f]{64})?$/.test(page)) throw new McpError(ErrorCode.InvalidParams, `Resource ${url} not found`)
+    return readPanel(url)
+  })
   registerTool(mcp, 'sentinel_current_chat', {
     title, description: '只读查看当前本机主会话及24小时内已监控执行的检查结果。',
     inputSchema: { executionKey: z.string().min(1).max(256).optional(), historyCursor: z.string().min(1).max(256).optional(), expectedThreadId: z.string().min(1).max(128).optional() },

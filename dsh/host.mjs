@@ -1,6 +1,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import descriptors from './remote.cjs'
 import { createObservation, hostIdentity } from './observation.mjs'
 import { connectCore } from '../src/core-client.mjs'
@@ -10,6 +11,7 @@ import { DSH_EXECUTION_SUMMARIES_FEATURE, GS_SUMMARY_FEATURE, INSTALLATION_NOTIF
 import { createHierarchyReader } from './hierarchy-reader.mjs'
 import { readModelDirectory } from '../src/model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
+import { projectDSHSessionPanel } from './session-panel.mjs'
 
 export const name = 'ghost-agent-sentinel'
 export const inject = ['agents']
@@ -264,6 +266,13 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       if (!gsSummarySupported) return Promise.resolve({ protocol: 1, generatedAt: null, sourceKey, sessionId, sourceStatus: 'unknown', scopeKnown: false,
         counts: { green: 0, yellow: 0, red: 0, gray: 0 }, coverage: { complete: false, gaps: ['共享核心未支持 GS 计数摘要；当前计数不可判断'] }, gsStatus: { supported: false } })
       return invoke('gsSummary', sourceKey, sessionId, signal)
+    },
+    panelDocument() { return readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8') },
+    async sessionPanel(sessionId, selection, signal) {
+      const owner = sourceKey
+      const snapshot = await invoke('snapshot', signal)
+      if (closed || owner !== sourceKey) throw new Error('会话观察来源已变化')
+      return projectDSHSessionPanel(snapshot, owner, sessionId, selection)
     },
     pause(signal) { return setInstallationPaused(true, signal) }, resume(signal) { return setInstallationPaused(false, signal) },
     modelDirectory({ baseUrl }, requested) {

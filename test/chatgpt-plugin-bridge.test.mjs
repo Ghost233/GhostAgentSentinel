@@ -19,6 +19,7 @@ import { Client } from '../chatgpt/node_modules/@modelcontextprotocol/sdk/dist/e
 import { StdioClientTransport } from '../chatgpt/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js'
 
 const chatResourceUri = tools => tools.find(tool => tool.name === 'sentinel_current_chat')._meta.ui.resourceUri
+const legacyChatResourceUri = 'ui://ghost-sentinel/current-chat.html'
 
 async function bounded(promise, label, timeoutMs = 5000) {
   const controller = new AbortController()
@@ -87,6 +88,8 @@ test('cold observation data does not block the MCP UI and later reads recover wi
     const tools = await request('tools/list')
     const resource = await request('resources/read', { uri: chatResourceUri(tools.result.tools) })
     assert.match(resource.result.contents[0].text, /id="refresh"/)
+    const restored = await request('resources/read', { uri: legacyChatResourceUri })
+    assert.deepEqual(restored.result.contents, [{ ...resource.result.contents[0], uri: legacyChatResourceUri }])
     const waiting = await request('tools/call', { name: 'sentinel_current_chat', arguments: {} })
     assert.equal(waiting.result.structuredContent.signal, 'gray')
     assert.equal(waiting.result.structuredContent.observation.gap, 'observer-unavailable')
@@ -424,6 +427,8 @@ test('real stdio MCP initialization, app tools, resource and current-chat metada
   assert.deepEqual(resources.result.resources.map(resource => resource.uri).sort(), [current._meta.ui.resourceUri, 'ui://ghost-sentinel/settings.html'])
   const resource = await bridge.request('resources/read', { uri: current._meta.ui.resourceUri })
   assert.match(resource.result.contents[0].text, /Sentinel/)
+  const restored = await bridge.request('resources/read', { uri: legacyChatResourceUri })
+  assert.deepEqual(restored.result.contents, [{ ...resource.result.contents[0], uri: legacyChatResourceUri }])
   const settingsResource = await bridge.request('resources/read', { uri: settings._meta.ui.resourceUri })
   assert.equal(settingsResource.result.contents[0].mimeType, 'text/html;profile=mcp-app')
   const before = await bridge.request('tools/call', { name: settings.name, arguments: {} })

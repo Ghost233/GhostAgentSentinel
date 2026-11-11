@@ -14,13 +14,14 @@ const paths = bundlePatchPaths(root, manifest.dsh.bundle)
 assert.equal(paths.length, 1)
 const entries = composeEntries([paths.flatMap(path => loadOverlayPatches('dsh', path))])
 assert.deepEqual(entries.map(({ id, name, config }) => ({ id, name, config })), [{ id: manifest.name, name: manifest.name, config: {} }])
-const runtimeFiles = ['dsh/host.mjs', 'dsh/remote.cjs', 'dsh/observation.mjs', 'dsh/hierarchy-reader.mjs', 'dsh/verification-evidence.mjs',
+const runtimeFiles = ['dsh/host.mjs', 'dsh/remote.cjs', 'dsh/observation.mjs', 'dsh/hierarchy-reader.mjs', 'dsh/verification-evidence.mjs', 'dsh/session-panel.mjs', 'src/panel-view.mjs', 'chatgpt/panel.html',
   'src/hierarchy.mjs', 'src/hierarchy-projection.mjs', 'src/core-client.mjs', 'src/daemon.mjs', 'src/server.mjs', 'src/protocol.mjs', 'src/privacy.mjs', 'src/enrollment-config.mjs',
   'src/core/index.mjs', 'src/analysis/index.mjs', 'src/analysis/http.mjs']
 for (const path of [...runtimeFiles, manifest.main, manifest.exports['.'], manifest.exports['./client'], manifest.dsh.bundle.patch, manifest.bin['ghost-agent-sentinel']]) {
   assert.ok((await stat(join(root, path))).isFile(), `Required package runtime file is not a regular file: ${path}`)
 }
 assert.equal(resolve(root, manifest.main), resolve(root, manifest.exports['.']), 'main and root export must load the same DSH plugin')
+assert.ok(manifest.files.includes('chatgpt/panel.html'), 'DSH installation includes the shared panel document')
 const host = await import(pathToFileURL(join(root, manifest.exports['.'])))
 assert.equal(host.default.name, manifest.name, 'DSH package, patch, and native plugin namespace must agree')
 assert.deepEqual(host.default.inject, ['agents'])

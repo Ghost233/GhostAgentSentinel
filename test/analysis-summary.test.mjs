@@ -84,6 +84,31 @@ test('three LLM requests reuse identical evidence and supply one merged summary 
   assert.equal(result.checks.find(check => check.id === 'request_drift').judgmentState, 'insufficient');
 });
 
+test('JEV can see 500 scoped records independently of the three cached summary requests', async t => {
+  const { analyzer, requests } = await models(t);
+  const events = [observation.events[0], ...Array.from({ length: 520 }, (_, i) => ({
+    ...observation.events[1], id: `action-${i}`, text: `Observed tool activity ${i}.`, capturedAt: now - 520 + i,
+  }))];
+  const previews = [];
+  await analyzer.analyze({ ...observation, events }, { onSummary: preview => {
+    assert.deepEqual(requests.map(request => request.path), llmPaths);
+    previews.push(preview);
+  } });
+  assert.equal(previews.length, 1);
+  assert.equal((previews[0].summary.generated ?? previews[0].summary.partial).text, summaryText);
+  assert.deepEqual(requests.map(request => request.path), analysisPaths);
+  const summaryRequests = requests.slice(0, 3).map(request => request.body.messages.slice(0, -1));
+  assert.deepEqual(summaryRequests[1], summaryRequests[0]);
+  assert.deepEqual(summaryRequests[2], summaryRequests[0]);
+  const summaryInput = JSON.parse(summaryRequests[0][1].content).evidence;
+  assert.ok(summaryInput.length <= 200);
+  const judgment = decodeJevRequest(requests.at(-1).body);
+  assert.equal(judgment.state.events.length, 500);
+  assert.equal(judgment.state.events[0].id, 'request');
+  assert.equal(judgment.state.events.at(-1).id, 'action-519');
+  assert.equal(judgment.state.executionSummary.text, summaryText);
+});
+
 test('one JEV request decides whether work is blocked and selects its original evidence', async t => {
   for (const [choice, status] of [['blocked_1', 'blocked'], ['unblocked_1', 'unblocked'], ['unknown', 'unknown']]) await t.test(status, async t => {
     const action = status === 'blocked' ? { ...observation.events[1], kind: 'tool-result', text: '读取日志失败：权限被拒绝，无法继续核对。', data: { exitCode: 1 } }
@@ -127,6 +152,19 @@ test('an incomplete observation publishes only a cited partial summary and prese
   assert.ok(result.coverage.gaps.includes('missing interval'));
   assert.ok(result.checks.every(check => check.status === 'unknown'));
   assert.deepEqual(requests.map(request => request.path), llmPaths);
+});
+
+test('a located earlier capture gap lets JEV judge later observed progress without reopening the other checks', async t => {
+  const { analyzer, requests } = await models(t, { judgment: wire => {
+    assert.deepEqual(Object.keys(wire.questions), ['execution_blocking']);
+    assert.deepEqual(wire.state.candidates.execution_blocking.evidenceIds, ['action']);
+    return { answers: { execution_blocking: { type: 'choice', choice: 'unblocked_1' } } };
+  } });
+  const gap = { ...observation.events[1], id: 'gap', kind: 'gap', capturedAt: now - 500, text: 'Unknown native record', data: { sourceKind: 'chatgpt-native' } };
+  const result = await analyzer.analyze({ ...observation, events: [observation.events[0], gap, observation.events[1]], coverage: { complete: false, gaps: [gap.text] } });
+  assert.deepEqual(requests.map(request => request.path), analysisPaths);
+  assert.equal(result.summary.partial.blocking.status, 'unblocked');
+  assert.ok(result.checks.every(check => check.status === 'unknown'));
 });
 
 test('normal excerpt limits still execute evidence-supported checks through JEV instead of stopping at a partial summary', async t => {
@@ -182,17 +220,17 @@ test('retained additional_tools diagnostics from an older observer do not poison
   });
 });
 
-test('long observations select recent evidence within the unchanged budget while retaining the request and all inherited limits', async t => {
+test('long observations retain the request and inherited limits under independent summary and JEV budgets', async t => {
   const { analyzer, requests } = await models(t);
   const events = [observation.events[0], ...Array.from({ length: 180 }, (_, index) => ({ ...observation.events[1], id: 'action-' + index, text: ('Observed action ' + index + ': ').padEnd(230, 'x'), capturedAt: now - 180 + index }))];
   const inherited = { id: 'limit', taskId: 'parent', taskLifecycleId: 'parent-run', kind: 'input', text: 'Keep the inherited user restriction.', capturedAt: now - 2000, contextRole: 'ancestor-limit', authorizationEligible: true, sourceRef: { taskId: 'parent', lifecycleId: 'parent-run', eventId: 'limit' } };
   const result = await analyzer.analyze({ ...observation, events, instructionContext: { inheritedEvents: [inherited], binding: { origin: 'delegated' }, gaps: [] } });
   assert.equal(requests.length, 4, 'budgeted evidence reaches all three summaries and per-check judgment');
-  assert.ok(JSON.stringify(requests.at(-1).body).length <= 24000);
+  assert.ok(JSON.stringify(requests.at(-1).body).length <= 256000);
   const judged = decodeJevRequest(requests.at(-1).body);
   assert.ok(judged.state.events.some(event => event.id === events.at(-1).id));
   assert.ok(judged.state.events.some(event => event.id === 'limit'));
-  assert.ok(judged.state.events.length < events.length);
+  assert.equal(judged.state.events.length, events.length + 1);
   assert.ok(JSON.stringify(requests[0].body).length <= 24000);
   const payload = JSON.parse(requests[0].body.messages[1].content);
   assert.ok(payload.evidence.some(group => group.isCurrentInput && group.text === observation.events[0].text));
@@ -237,7 +275,7 @@ test('the previous evidence-only model response is an explicit protocol failure'
   assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions']);
 });
 
-test('a pending or invalid judgment cannot publish the summary produced by the first model', async t => {
+test('the settled analysis still rejects an invalid JEV judgment after summary generation', async t => {
   let release, entered;
   const pending = new Promise(resolve => { release = resolve; });
   const received = new Promise(resolve => { entered = resolve; });

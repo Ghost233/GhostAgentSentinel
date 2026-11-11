@@ -52,6 +52,10 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
       && plugin.diagnostics().visibleViewers === (nextVisible && document.visibilityState !== 'hidden' ? count : 0), 'Actual sidebar viewer effects did not commit')
     await commit(async () => { for (const tab of document.querySelectorAll('[data-gs-tab=details]')) tab.click(); await settle(); for (const tree of document.querySelectorAll('[data-gs-scope-tree]:not([open])')) tree.querySelector('summary').click(); await settle() })
   }
+  const mountSession = async sessionId => {
+    if (!viewRoot) viewRoot = createRoot(document.getElementById('view'))
+    await commit(async () => { viewRoot.render(h(Panel, { useTabInfo, sessionId })); await settle() })
+  }
   const unmount = async () => {
     await commit(async () => { viewRoot?.unmount(); viewRoot = undefined })
     if (plugin) await waitUntil(() => plugin.diagnostics().viewInstances === 0 && plugin.diagnostics().pendingSnapshot === 0, 'Actual sidebar unmount did not release its viewers and snapshot')
@@ -169,7 +173,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   await waitUntil(() => plugin.diagnostics().backgroundTimer === 1, 'Actual Remote connection did not start background monitoring')
   if (mountPane) { await mount(); await dataReady() }
   else if (!overrides.claimNotifications) await waitUntil(() => plugin.diagnostics().pendingNotification === 0, 'Initial notification claim did not finish')
-  return { ctx, Panel, mounted, registered, delivered, acknowledged, invoked, Notification, plugin, intervals, dom, mount, unmount, mountSettings, unmountSettings, settle, waitUntil, dataReady, interact: commit,
+  return { ctx, Panel, mounted, registered, delivered, acknowledged, invoked, Notification, plugin, intervals, dom, mount, mountSession, unmount, mountSettings, unmountSettings, settle, waitUntil, dataReady, interact: commit,
     async tick() { await commit(async () => { for (const callback of [...intervals.values()]) callback(); await settle() }) },
     async visibility(value) { await commit(async () => { Object.defineProperty(dom.window.document, 'visibilityState', { value, configurable: true }); dom.window.document.dispatchEvent(new dom.window.Event('visibilitychange')); await settle() }) },
     async abortView() { await commit(async () => { tabController.abort(); await settle() }) },
@@ -178,6 +182,37 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     async reinstall(ready = true) { await commit(async () => { await clientFiber.dispose() }); clientFiber = ctx.plugin({ inject: plugin.inject, apply: plugin.apply }); await clientFiber.await(); await waitUntil(() => plugin.diagnostics().backgroundTimer === 1, 'Replacement Remote connection did not start'); if (ready) await dataReady(); else await settle() },
   }
 }
+
+test('DSH session sidebar uses the Codex panel document and binds reads to the owning session', async t => {
+  const html = await readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8'), reads = []
+  const f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true,
+    async panelDocument() { return { ok: true, value: html } },
+    async sessionPanel(id, selection) { reads.push({ id, selection }); return { ok: true, value: { identity: { threadId: id } } } },
+  })
+  await f.mountSession('dsh-owned-session')
+  const document = f.dom.window.document
+  await f.waitUntil(() => document.querySelector('iframe'), 'shared panel did not load')
+  const frame = document.querySelector('iframe'), replies = [], target = frame.contentWindow
+  assert.equal(frame.getAttribute('srcdoc'), html)
+  assert.equal(frame.getAttribute('sandbox'), 'allow-scripts')
+  target.postMessage = data => replies.push(data)
+  const message = (source, data) => f.dom.window.dispatchEvent(new f.dom.window.MessageEvent('message', { source, data: { jsonrpc: '2.0', ...data } }))
+  const request = { id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {} } }
+  message(f.dom.window, request)
+  assert.equal(reads.length, 0)
+  message(target, request)
+  await f.waitUntil(() => replies.length === 1, 'shared panel did not receive its session response')
+  assert.deepEqual(reads, [{ id: 'dsh-owned-session', selection: {} }])
+  assert.equal(replies[0].result.structuredContent.identity.threadId, 'dsh-owned-session')
+  await f.mountSession('dsh-next-session')
+  message(target, { ...request, id: 2 })
+  await f.settle()
+  assert.equal(reads.length, 1, 'retired iframe cannot request another session')
+  await f.interact(async () => { document.querySelector('.sentinel-panel-switch').click(); await f.settle() })
+  assert.equal(document.querySelector('iframe'), null)
+  assert.ok(document.querySelector('[aria-label="Sentinel 执行监控总览"]'))
+  await f.unmount()
+})
 
 async function waitForDisplayedTask(fixture, title) {
   const deadline = Date.now() + 1000
@@ -1803,13 +1838,15 @@ test('the actual DSH detail shows the current model short summary with direct ow
   const summary = () => f.dom.window.document.querySelector('[data-sentinel-model-summary]')
   assert.ok(summary(), 'the current model-generated summary is visible in the actual task detail')
   assert.ok(summary().textContent.includes('已观察到当前执行结果。'))
+  assert.equal(f.dom.window.getComputedStyle(summary().querySelector('[data-sentinel-summary-text]')).fontSize, '15px')
   assert.equal(summary().querySelectorAll('[data-sentinel-summary-text] > p').length, 3)
+  assert.deepEqual([...summary().querySelectorAll('[data-sentinel-summary-text] > p > strong')].map(label => label.textContent), ['在做什么：', '有什么进展：', '卡在哪里：'])
   assert.deepEqual([...summary().querySelectorAll('[data-sentinel-summary-text] > p')].map(row => row.textContent.trim()), summaryText.split('\n'))
   const citation = summary().querySelector('small[data-sentinel-citation="basis"]')
   assert.ok(citation.textContent.includes('本轮实际执行依据'))
   assert.equal(citation.dataset.sourceKey, 'summary-source')
   const decision = summary().querySelector('[data-sentinel-blocking]')
-  assert.equal(decision.querySelector('p').textContent, '未阻塞 · 本轮实际执行依据')
+  assert.equal(decision.querySelector('p').textContent, 'JEV · 未阻塞 · 本轮实际执行依据')
   const basis = decision.querySelector('details')
   assert.equal(basis.open, false)
   basis.open = true
@@ -1822,11 +1859,19 @@ test('the actual DSH detail shows the current model short summary with direct ow
   assert.ok(summary().textContent.includes('模型总结：' + summaryText))
   assert.equal(summary().textContent.includes('复用有效总结'), false)
   task.analysis.state = 'paused'; await f.tick()
-  assert.match(summary().querySelector('[data-sentinel-blocking] p').textContent, /^上次判断 · 未阻塞/)
+  assert.match(summary().querySelector('[data-sentinel-blocking] p').textContent, /^JEV · 上次判断 · 未阻塞/)
   task.analysis.state = 'analyzing'; task.analysis.resultDisposition = 'pending'; task.activity.summary = '已采集新材料，等待本轮模型结果'
   await f.tick()
   assert.equal(summary(), null, 'a prior generated summary does not cover pending material')
   assert.ok(f.dom.window.document.querySelector('[data-gs-detail]').textContent.includes(task.activity.summary))
+  task.analysis.availableSummary = { generated: { ...task.analysis.summary.generated, blocking: { status: 'pending', reason: '正在核对摘要和原始依据', evidenceRefs: [] } } }
+  await f.tick()
+  assert.match(summary().textContent, /已观察到当前执行结果。.*JEV · 判断中/s)
+  task.analysis.state = 'failed'
+  task.analysis.availableSummary.generated.blocking = { status: 'unknown', reason: 'JEV 判断超时', evidenceRefs: [] }
+  await f.tick()
+  assert.match(summary().textContent, /已观察到当前执行结果。.*JEV · 待确认 · JEV 判断超时/s)
+  delete task.analysis.availableSummary
   for (const state of ['failed', 'stale', 'unavailable', 'interrupted']) {
     task.analysis.state = state; task.analysis.resultDisposition = 'current'; await f.tick()
     assert.equal(summary(), null, state + ' never publishes a complete model summary')

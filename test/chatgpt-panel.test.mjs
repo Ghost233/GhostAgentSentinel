@@ -153,6 +153,7 @@ test('the recent and current summaries display three separate literal levels whi
     assert.equal(page.element(id).children.length, 3)
     assert.deepEqual(page.element(id).children.map(child => child.textContent.trim()), lines)
     assert.ok(page.element(id).children.every(child => child.tagName === 'P'))
+    assert.deepEqual(page.element(id).children.map(child => [child.children[0].tagName, child.children[0].textContent]), [['STRONG', '在做什么：'], ['STRONG', '有什么进展：'], ['STRONG', '卡在哪里：']])
   }
   assert.match(page.element('#recent-summary-gaps').textContent, /当前请求证据/)
   assert.equal(page.element('#recent-blocking').hidden, false)

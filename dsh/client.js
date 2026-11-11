@@ -49,6 +49,10 @@
             return value
           }
           if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('观察操作参数必须是对象')
+          if (name === 'panelSelection') {
+            if (Object.keys(value).some(key => !['executionKey', 'historyCursor', 'expectedThreadId'].includes(key) || typeof value[key] !== 'string' || !value[key] || value[key].length > 2000)) throw new Error('会话面板选择无效')
+            return value
+          }
           if (name === 'notificationRecordsSelection') {
             if (Object.keys(value).some(key => key !== 'cursor') || value.cursor !== undefined && (typeof value.cursor !== 'string' || !value.cursor || value.cursor.length > 2000)) throw new Error('通知记录分页参数无效')
             return value
@@ -70,7 +74,7 @@
           return value
         } }) }
       }
-      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], configureAnalysisScheduling: ['scheduling'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'], installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'] }
+      const methods = { snapshot: [], gsSummary: ['sessionId'], panelDocument: [], sessionPanel: ['sessionId', 'panelSelection'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], configureAnalysisScheduling: ['scheduling'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'], installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'] }
       const descriptors = Object.entries(methods).map(([method, parameters]) => ({
         id: `${id}#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,
         invocation: { kind: 'direct' }, cancellation: { parameter: 'signal' }, parameters: parameters.map(name => ({ name, wire: name, source: 'json', codec: parameterCodec(name) })), result: { mode: 'src-json' },
@@ -732,6 +736,7 @@
         'Some observed content was omitted for privacy': '敏感内容已省略',
         capture_coverage_unconfirmed: '采集覆盖未完整确认',
         analysis_evidence_budget: '本轮仅使用预算内的部分记录',
+        judgment_evidence_budget: 'JEV 使用预算内的部分记录',
         analysis_input_budget: '判断材料超过预算',
         extraction_evidence_gap: '模型提取的证据存在缺口',
         judgment_evidence_insufficient: '判断执行活动的证据不足',
@@ -804,40 +809,47 @@
             : notification.status === 'failed' ? '通知投递失败' : notification.status === 'claimed' ? '通知待确认' : '通知尚未确认'))
       }
       function SummaryText({ value }) {
-        const lines = text(value).split(/\r?\n/)
-        return h('div', { 'data-sentinel-summary-text': true }, lines.map((line, index) => h('p', { key: index }, line + (index < lines.length - 1 ? '\n' : ''))))
+        const body = text(value)
+        const folded = body.match(/^(在做什么：[\s\S]+?)\s*(有什么进展：[\s\S]+?)\s*(卡在哪里：[\s\S]+)$/)
+        const lines = folded ? folded.slice(1).map(line => line.trim()) : body.split(/\r?\n/)
+        return h('div', { 'data-sentinel-summary-text': true }, lines.map((line, index) => {
+          const ending = index < lines.length - 1 ? '\n' : ''
+          const parts = line.match(/^(在做什么：|有什么进展：|卡在哪里：)(.+)$/)
+          return parts ? h('p', { key: index, className: 'sentinel-summary-row' }, h('strong', null, parts[1]), h('span', null, parts[2] + ending)) : h('p', { key: index }, line + ending)
+        }))
       }
-      const blockingLabels = { blocked: '已阻塞', unblocked: '未阻塞', unknown: '待确认' }
+      const blockingLabels = { blocked: '已阻塞', unblocked: '未阻塞', unknown: '待确认', pending: '判断中' }
       function BlockingDecision({ decision, task, snapshot, historical = false }) {
         if (!Object.hasOwn(blockingLabels, decision?.status) || !text(decision.reason)) return null
         return h('div', { 'data-sentinel-blocking': true },
-          h('p', null, historical ? '上次判断 · ' : '', blockingLabels[decision.status], ' · ', decision.reason),
+          h('p', null, 'JEV · ', historical ? '上次判断 · ' : '', h('strong', null, blockingLabels[decision.status]), ' · ', decision.reason),
           decision.evidenceRefs?.length > 0 && h('details', null, h('summary', null, '查看判断依据'), h(EvidenceCitations, { record: decision, task, snapshot })))
       }
       function SummaryContent({ record, gaps, task, snapshot, historical = false }) {
         const scope = gaps && [...new Set(gaps.filter(gap => text(gap)).map(gapText))].slice(0, 24)
         return h(React.Fragment, null,
           h(SummaryText, { value: record.text }),
-          scope && h('p', null, '观察范围：', scope.join('；') || '本轮仅覆盖已采集的部分材料'),
           h(BlockingDecision, { decision: record.blocking, task, snapshot, historical }),
+          scope && h('p', null, '观察范围：', scope.join('；') || '本轮仅覆盖已采集的部分材料'),
           h(EvidenceCitations, { record, task, snapshot, compact: true }))
       }
       function ObservationDetail({ task, snapshot, current, gs = task.gs }) {
         const analysis = task.analysis || {}, source = snapshot.sources.find(item => item.key === task.sourceKey)
         const observed = connectionScope?.active && !current.error && !snapshot.adapter?.error
-        const generated = analysis.summary?.generated, partial = analysis.summary?.partial
+        const available = observed && source?.status === 'connected' && snapshot.monitoring?.state !== 'paused' ? analysis.availableSummary : null
+        const generated = available ? available.generated : analysis.summary?.generated, partial = available ? available.partial : analysis.summary?.partial
         const currentSummary = observed && source?.status === 'connected' && ['current', 'reused'].includes(analysis.resultDisposition) && !['failed', 'stale', 'unavailable', 'interrupted', 'unknown'].includes(analysis.state)
-        const publishableSummary = currentSummary && text(generated?.text)
-        const publishablePartial = currentSummary && !publishableSummary && analysis.coverage?.complete === false && text(partial?.text)
-        const currentGaps = ['gaps', 'verificationGaps', 'contextGaps', 'extractionGaps'].flatMap(key => Array.isArray(analysis.coverage?.[key]) ? analysis.coverage[key] : [])
-        const previous = analysis.lastSuccessfulSummary, previousPartial = analysis.lastPartialSummary, now = Date.now()
+        const publishableSummary = (available || currentSummary) && text(generated?.text)
+        const publishablePartial = (available || currentSummary && analysis.coverage?.complete === false) && !publishableSummary && text(partial?.text)
+        const currentGaps = available ? available.gaps : ['gaps', 'verificationGaps', 'contextGaps', 'extractionGaps'].flatMap(key => Array.isArray(analysis.coverage?.[key]) ? analysis.coverage[key] : [])
+        const previous = analysis.lastSuccessfulSummary, previousPartial = analysis.lastPartialSummary, unjudged = analysis.lastUnjudgedSummary, now = Date.now()
         const observedThrough = Number.isFinite(snapshot.generatedAt) ? Math.min(now, snapshot.generatedAt) : now
         const completedThrough = Number.isFinite(analysis.completedAt) ? Math.min(observedThrough, analysis.completedAt) : observedThrough
         const retained = (entry, record) => source?.descriptor?.registrationId && entry?.configScope?.registrationId === source.descriptor.registrationId
           && Number.isSafeInteger(entry.completedAt) && entry.completedAt <= completedThrough
           && Number.isSafeInteger(entry.expiresAt) && entry.expiresAt > now && entry.expiresAt <= entry.completedAt + 86400000 && text(record?.text)
         const completed = retained(previous, previous?.generated), incomplete = retained(previousPartial, previousPartial?.partial)
-        const final = ['idle', 'disposed'].includes(task.status) && [completed && previous, incomplete && previousPartial]
+        const final = ['idle', 'disposed'].includes(task.status) && [completed && previous, incomplete && previousPartial, retained(unjudged, unjudged?.generated ?? unjudged?.partial) && unjudged]
           .find(entry => entry?.final === true && entry.completedAt === analysis.finalSummaryCompletedAt)
         const historicalDecision = analysis.state === 'paused' || snapshot.monitoring?.state === 'paused'
         const analyzing = observed && snapshot.monitoring?.state !== 'paused' && task.status === 'running' && source?.status === 'connected'
@@ -852,18 +864,18 @@
           h('p', null, '当前状态：', observed ? taskStatus[task.status] || '状态未知' : '当前无法确认', ' · ',
             observed ? '' : '历史活动：', text(task.activity?.summary) || '活动摘要未提供'),
           publishableSummary && h('div', { 'data-sentinel-model-summary': true },
-            h('small', null, analysis.resultDisposition === 'reused' ? '复用有效总结：' : '模型总结：'),
+            h('small', null, available?.final ? '收尾摘要' : analysis.resultDisposition === 'reused' ? '复用有效总结：' : '模型总结：'),
             h(SummaryContent, { record: generated, task, snapshot, historical: historicalDecision })),
           publishablePartial && h('div', { 'data-sentinel-model-summary': true },
-            h('small', null, analysis.resultDisposition === 'reused' ? '复用部分观察摘要' : '部分观察摘要'),
+            h('small', null, available?.final ? '部分收尾摘要' : analysis.resultDisposition === 'reused' ? '复用部分观察摘要' : '部分观察摘要'),
             h(SummaryContent, { record: partial, gaps: currentGaps, task, snapshot, historical: historicalDecision })),
           final && h('div', { 'data-sentinel-final-summary': true },
             h('small', null, final.partial ? '部分收尾摘要' : '收尾摘要', ' · ', timeText(final.completedAt)),
             h(SummaryContent, { record: final.partial ?? final.generated, gaps: final.partial ? final.gaps ?? [] : null, task, snapshot, historical: true })),
-          completed && !publishableSummary && final !== previous && h('details', { 'data-sentinel-summary-history': true }, h('summary', null, '上次成功总结'),
+          completed && (!publishableSummary || available) && final !== previous && h('details', { 'data-sentinel-summary-history': true }, h('summary', null, '上次成功总结'),
             h('small', null, '历史总结 · 原完成时间：', timeText(previous.completedAt)),
             h(SummaryContent, { record: previous.generated, task, snapshot, historical: true })),
-          incomplete && !publishablePartial && final !== previousPartial && h('details', { 'data-sentinel-partial-history': true }, h('summary', null, previousPartial.final ? '上次部分收尾摘要' : '上次部分观察摘要'),
+          incomplete && (!publishablePartial || available) && final !== previousPartial && h('details', { 'data-sentinel-partial-history': true }, h('summary', null, previousPartial.final ? '上次部分收尾摘要' : '上次部分观察摘要'),
             h('small', null, '原完成时间：', timeText(previousPartial.completedAt)),
             h(SummaryContent, { record: previousPartial.partial, gaps: previousPartial.gaps ?? [], task, snapshot, historical: true })),
           task.instructionContext?.gaps?.length > 0 && h('p', null, '当前指令上下文缺口：', task.instructionContext.gaps.join('；')),
@@ -1049,7 +1061,63 @@
         useEffect(() => { const changed = () => update(value => value + 1); footerListeners.add(changed); return () => footerListeners.delete(changed) }, [])
         return sessionId && !visibleFooters.has(sessionId) ? h(GSView, { key: sessionId, sessionId, placement: 'below', visible, signal, useTabInfo }) : null
       }
-      function Panel({ useTabInfo } = {}) {
+      function SessionPanel({ sessionId, visible, signal }) {
+        const frame = useRef(null), [html, setHTML] = useState(null), [error, setError] = useState('')
+        useLayoutEffect(() => {
+          if (!visible || signal?.aborted) return
+          const viewport = document.defaultView, pending = new Map()
+          let connection, lifetime
+          const disconnect = () => { lifetime?.abort(); for (const request of pending.values()) request.abort(); pending.clear() }
+          const stop = () => { disconnect(); setHTML(null) }
+          const load = () => {
+            if (signal?.aborted || connection === connectionScope) return
+            disconnect(); connection = connectionScope; setHTML(null); setError('')
+            if (!connection?.active) return
+            lifetime = new AbortController()
+            const { signal: requestSignal } = lifetime
+            void scopedCall(connection, 'panelDocument', [], requestSignal).then(value => {
+              if (!requestSignal.aborted) setHTML(value)
+            }, error => { if (!requestSignal.aborted) setError(errorText(error)) })
+          }
+          const message = async event => {
+            const target = frame.current?.contentWindow, request = event.data
+            if (!target || event.source !== target || request?.jsonrpc !== '2.0' || !connection?.active || lifetime?.signal.aborted || signal?.aborted) return
+            if (request.method === 'notifications/cancelled') { pending.get(request.params?.requestId)?.abort(); return }
+            if (!Number.isSafeInteger(request.id) || pending.has(request.id)) return
+            const respond = payload => target.postMessage({ jsonrpc: '2.0', id: request.id, ...payload }, '*')
+            if (request.method === 'ui/initialize') { respond({ result: {} }); return }
+            if (request.method !== 'tools/call' || request.params?.name !== 'sentinel_current_chat' || pending.size >= 4) {
+              respond({ error: { code: -32601, message: 'DSH 当前会话面板不支持此操作' } }); return
+            }
+            const abort = new AbortController()
+            pending.set(request.id, abort)
+            try {
+              const view = await scopedCall(connection, 'sessionPanel', [sessionId, request.params.arguments ?? {}], abort.signal)
+              if (!abort.signal.aborted && frame.current?.contentWindow === target) respond({ result: { structuredContent: view } })
+            } catch (error) {
+              if (!abort.signal.aborted && frame.current?.contentWindow === target) respond({ error: { code: -32000, message: errorText(error) } })
+            } finally { if (pending.get(request.id) === abort) pending.delete(request.id) }
+          }
+          viewport.addEventListener('message', message); subscribers.add(load); signal?.addEventListener('abort', stop, { once: true })
+          load()
+          return () => { disconnect(); viewport.removeEventListener('message', message); subscribers.delete(load); signal?.removeEventListener('abort', stop) }
+        }, [sessionId, visible, signal])
+        if (!visible || signal?.aborted) return null
+        if (!html) return h('p', { role: 'status' }, error || '正在加载会话检查')
+        return h('iframe', { ref: frame, srcDoc: html, sandbox: 'allow-scripts', title: 'Sentinel 会话检查', className: 'sentinel-session-panel' })
+      }
+      function Panel({ sessionId, useTabInfo } = {}) {
+        if (!sessionId) return h(OverviewPanel, { useTabInfo })
+        return h(SessionSidebar, { key: sessionId, sessionId, useTabInfo })
+      }
+      function SessionSidebar({ sessionId, useTabInfo }) {
+        const [overview, showOverview] = useState(false)
+        const tab = useTabInfo ? useTabInfo().tab : { visible: false }
+        return h('section', { className: 'sentinel-session-sidebar' },
+          h('button', { type: 'button', className: 'sentinel-panel-switch', onClick: () => showOverview(value => !value) }, overview ? '返回当前会话' : '全部会话'),
+          overview ? h(OverviewPanel, { useTabInfo }) : h(SessionPanel, { sessionId, visible: tab.visible, signal: tab.signal }))
+      }
+      function OverviewPanel({ useTabInfo } = {}) {
         const tab = useTabInfo ? useTabInfo().tab : { visible: false }
         const current = useMonitor(tab.visible, tab.signal), snapshot = current.snapshot
         const [selected, select] = useState(null), [operation, setOperation] = useState(''), [hideNormal, setHideNormal] = useState(false), [monitorTab, setMonitorTab] = useState('issues')
@@ -1153,6 +1221,8 @@
         style.textContent += '.sentinel-gs{position:relative;display:inline-flex;font:12px/1.4 system-ui;color:var(--dsw-alias-label-primary)}.sentinel-gs button{font:inherit;color:inherit;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:4px 6px;cursor:pointer}.sentinel-gs-counts{display:inline-flex;gap:6px}.sentinel-gs-counts>span{display:inline-flex;align-items:center;gap:3px}.sentinel-gs-counts i{width:6px;height:6px;border-radius:50%;background:currentColor}.sentinel-gs-green{color:#378458}.sentinel-gs-yellow{color:#b97925}.sentinel-gs-red{color:#c44b4b}.sentinel-gs-gray{color:#7a8190}.sentinel-gs-popup{box-sizing:border-box;overflow-wrap:anywhere;position:absolute;bottom:calc(100% + 6px);right:0;z-index:1000;width:min(360px,85vw);max-height:60vh;overflow:auto;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);box-shadow:0 6px 24px #0003}.sentinel-gs-popup.sentinel-gs-below{bottom:auto;top:calc(100% + 6px)}.sentinel-gs-popup header{display:flex;justify-content:space-between;gap:8px}.sentinel-gs-popup nav{display:flex;flex-direction:column;gap:4px;margin:8px 0}.sentinel-gs-popup small{display:block;font-size:12px}.sentinel-gs-popup p{font-size:12px;margin:6px 0}.sentinel-gs-popup article{border-top:1px solid var(--dsw-alias-border-l2);padding-top:8px}'
         style.textContent += '.sentinel-tree,.sentinel-tree-node,[data-gs-row]{min-width:0;max-width:100%;box-sizing:border-box}.sentinel-tree button{width:100%;min-width:0;text-align:left;overflow-wrap:anywhere;box-sizing:border-box}.sentinel-node-name{font-size:13px;line-height:1.5}.sentinel-overview .sentinel-node-basis,.sentinel-gs-popup .sentinel-node-basis{font-size:12px;line-height:1.5;opacity:1;color:var(--dsw-alias-label-primary)}.sentinel-gs-counts{flex-wrap:wrap}.sentinel-hide-normal{display:flex;align-items:center;gap:6px;font-size:12px;margin:8px 0}.sentinel-overview .sentinel-hide-normal input{width:auto}.sentinel-tree details{margin:4px 0}.sentinel-tree summary{font-size:12px;cursor:pointer}.sentinel-tree article{font-size:12px;overflow-wrap:anywhere}.sentinel-gs-popup button:focus-visible,.sentinel-overview button:focus-visible{outline:2px solid currentColor;outline-offset:2px}.sentinel-gs-popup header>*{min-width:0}'
         style.textContent += '.sentinel-monitor-header{position:sticky;top:0;z-index:2;background:var(--dsw-alias-bg-layer-2);padding:8px 0;margin:0 0 12px;min-width:0}.sentinel-monitor-title,.sentinel-monitor-lamps{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sentinel-monitor-title{justify-content:space-between}.sentinel-monitor-header .sentinel-monitor-tabs{display:flex;flex-direction:row;gap:6px;margin:8px 0 0}.sentinel-monitor-tabs button{flex:1;text-align:center}.sentinel-monitor-tabs [aria-selected=true]{font-weight:600;border-color:currentColor}.sentinel-gs-popup .sentinel-monitor-header{display:block}.sentinel-issue-evidence small{font-size:11px;line-height:1.45;margin:3px 0;overflow-wrap:anywhere}.sentinel-issue-evidence [data-sentinel-citation]{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.sentinel-focus-summary{border-left:3px solid var(--dsw-alias-border-l2);padding-left:10px}.sentinel-focus-summary>strong{font-size:15px}.sentinel-monitor-header .sentinel-gs-counts{flex-wrap:nowrap}.sentinel-gs-popup [role=tabpanel],.sentinel-overview [role=tabpanel]{min-width:0}[data-gs-issues]:empty{min-height:40px}'
+        style.textContent += '[data-sentinel-summary-text]{font-size:15px;line-height:1.65}[data-sentinel-summary-text] .sentinel-summary-row{display:flex;flex-wrap:wrap;gap:2px 10px;margin:8px 0}.sentinel-summary-row strong{font-weight:650;flex:0 0 6em}.sentinel-summary-row span{flex:1 1 17em;min-width:0}[data-sentinel-blocking]{margin-top:10px}'
+        style.textContent += '.sentinel-session-sidebar{display:flex;flex-direction:column;height:100%;min-height:0}.sentinel-panel-switch{align-self:flex-end;margin:6px 12px 0;font:inherit}.sentinel-session-panel{flex:1 1 auto;width:100%;min-height:0;border:0}'
         document.head.appendChild(style)
         ctx.effect(() => () => { style.remove() })
         ctx.inject(['remote', 'typert'], child => {
@@ -1190,7 +1260,7 @@
         ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({ name: 'conversation.session.header.utilities', id: `${id}.gs`, order: 100, label: 'GS' }, GSHeader))
         ctx.inject(['sidebarRightTabs'], child => {
           const dispose = child.get('sidebarRightTabs').register({ id, kind: 'ghost-agent-sentinel', title: () => 'Sentinel',
-            guide: [{ id, order: 85, title: () => 'Sentinel', description: () => '已接入后台的执行监控总览' }] })
+            guide: [{ id, order: 85, title: () => 'Sentinel', description: () => '查看当前会话的摘要和检查结果' }] })
           child.effect(() => () => dispose())
           child.slots.inject('sidebar.right.pane.tab', () => child.slots.register({ name: 'sidebar.right.pane.tab', key: id, inject: () => ({}) }, Panel))
         })

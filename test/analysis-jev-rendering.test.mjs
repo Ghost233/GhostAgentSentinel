@@ -150,25 +150,25 @@ test('a rendered JEV batch retains the caller deadline and fails as a JEV deadli
   assert.deepEqual(http.captures.map(item => item.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
 });
 
-test('the unchanged input budget preserves existing checks when the additional blocking question does not fit', async t => {
+test('the independent JEV budget keeps blocking judgment when trimming extra evidence', async t => {
   const http = await inference(t), { recovery } = multilevel();
   await http.analyzer().analyze(recovery);
   const limit = JSON.stringify(http.captures.at(-1).body).length;
   assert.ok(JSON.stringify(decodeJevRequest(http.captures.at(-1).body)).length > limit, 'repeated identities exceed this valid rendered budget');
   assert.ok(JSON.stringify(http.captures[0].body).length < limit, 'the extractor fits the same unchanged budget');
   let before = http.captures.length;
-  const accepted = await http.analyzer({ inputBudgetChars: limit }).analyze(recovery);
+  const accepted = await http.analyzer({ jevInputBudgetChars: limit }).analyze(recovery);
   assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
   assert.equal(accepted.coverage.complete, true);
   assert.ok(http.captures.at(-1).body.questions.execution_blocking);
   before = http.captures.length;
-  const fallback = await http.analyzer({ inputBudgetChars: limit - 1 }).analyze(recovery);
+  const fallback = await http.analyzer({ jevInputBudgetChars: limit - 1 }).analyze(recovery);
   assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
-  assert.equal(http.captures.at(-1).body.questions.execution_blocking, undefined);
-  assert.equal(fallback.summary.generated.blocking.status, 'unknown');
-  const checksOnlyLimit = JSON.stringify(http.captures.at(-1).body).length;
+  assert.ok(http.captures.at(-1).body.questions.execution_blocking);
+  assert.ok(JSON.stringify(http.captures.at(-1).body).length < limit);
+  assert.ok(fallback.summary.partial ?? fallback.summary.generated);
   before = http.captures.length;
-  const rejected = await http.analyzer({ inputBudgetChars: checksOnlyLimit - 1 }).analyze(recovery);
+  const rejected = await http.analyzer({ jevInputBudgetChars: 100 }).analyze(recovery);
   assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions']);
   assert.ok(rejected.coverage.gaps.includes('analysis_input_budget'));
 });

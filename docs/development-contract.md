@@ -1,6 +1,6 @@
 # 开发接缝与验收
 
-当前源码按仓库的版本规则从 0.4.1 递增到 0.4.2。本次变更和既有验证的覆盖范围见[发布验证范围](release-status.md)。
+当前源码按仓库的版本规则从 0.4.2 递增到 0.4.3。本次变更和既有验证的覆盖范围见[发布验证范围](release-status.md)。
 
 ## 范围和分工
 
@@ -50,11 +50,11 @@
 
 用户已确认首版沿用聊天和工具现有的版本、验证范围与退出结果。缺失时显示不可判断，六项检测全部保留。额外读取工作区的版本指纹采集后置；适配器不主动读取工作区来补全证据。
 
-分析模块导出 `createAnalyzer(config)`，对象提供 `analyze({task,source,events,coverage},options)`、`prefill(input,options)` 与 `timeConditions(input,now)`。options 支持业务取消、传输停止和观察实例生命周期信号，以及模型状态回调。analyze 返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`；summary 保留 currentTask/currentState/recentProgress/attention 字符串。执行短总结使用可选的 `summary.generated = {text,evidenceIds,evidenceRefs}`，只在本轮总结模型和 JEV 实际调用成功且输出、引用合法后赋值。text 固定三行，依次为“在做什么：”“有什么进展：”“卡在哪里：”，合计最多 600 字符单元；任一环节失败或未完成均不发布完整总结。材料覆盖不足或 JEV 输入超预算时，总结模型已成功且引用合法的短总结可单独保存为 `summary.partial`，结构与 generated 相同，两者互斥；partial 要求 coverage.complete 为 false，不更新完整成功历史；它只表示观察材料范围有限。六项检查按各自证据独立执行，有充分依据的项目继续请求 JEV，缺当前请求、操作、验证或来源等关键证据的项目单独保留未知。仅成功生成总结不能结算分析故障恢复；本轮 JEV 实际返回有效判断后，可结算该轮已恢复的分析故障。Codex 显示“本次观察总结”和观察范围，绿色表示已检查项未见异常，并单列仍缺证据的项目，不代表完整历史均已核实。
+分析模块导出 `createAnalyzer(config)`，提供 `analyze({task,source,events,coverage},options)`、`prefill(input,options)` 和 `timeConditions(input,now)`。options 支持业务取消、传输停止、观察实例生命周期信号和模型状态回调。analyze 返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`。
 
-执行摘要优先概括近期实际工作、新结果和具体阻碍。“有什么进展”可包括新增事实和诊断；只有动作时如实说明尚未观察到新增结果。“卡在哪里”只描述已观察到且尚未解决的执行阻碍，没有明确阻碍时写“未观察到明确阻碍”。这不表示六项检查全部正常。正常调查、测试运行、任务未完成和 TDD 初次红灯不自动构成阻碍；观察缺口与检查说明各自保留。模型响应缺段、顺序错误或空段按 `invalid_summary` 拒绝，不补写内容。两端当前及历史总结按原文字面分段展示，已有单段总结继续按原文保留。正式观察器要求 `execution-summary-levels/1`，旧私有 Core 自然退出后接入新版。
+普通模型共享证据前缀，分三次回答“在做什么”“有什么进展”和“卡在哪里”。“有什么进展”可包括实际结果、新事实和诊断。“卡在哪里”描述已观察到的未解决事项，由 JEV 判断是否妨碍继续。摘要合计最多 600 字符单元，缺段、顺序错误和空段按 `invalid_summary` 拒绝。待 JEV 返回时，`onSummary` 把已核对的摘要交给 Core，面板可先显示。完整摘要使用 `summary.generated`，材料有缺口时使用 `summary.partial`。两者均携带 `text`、`evidenceIds` 和 `evidenceRefs`，且互斥。
 
-运行中的执行可以随摘要返回 `blocking`，含状态、简短原因和原始事件引用。JEV 在同一次判断请求中根据摘要及当前执行材料选择已阻塞、未阻塞或待确认。每个明确结论绑定一条原始摘录。只有阻塞问题适用时，这次请求只包含该问题。采集缺口、无执行依据、无效选择或超出输入预算时显示待确认。面板将已过时的结论标为上次判断，并提供可展开的引用。正式观察器要求 `execution-blocking/1`，旧私有 Core 自然退出后接入新版。
+运行中的执行可随摘要显示 `blocking`。JEV 根据合并摘要及最多 500 条相关记录，在同一次请求中判断阻塞和适用检查。明确结论绑定一条原始摘录，面板显示原因并提供可展开的依据。缺少决定性证据时显示待确认。JEV 失败后，Core 保留已生成的摘要，检查仍记为失败。只有有效判断才能确认分析故障恢复。正式观察器核对 `execution-summary-levels/1` 和 `execution-blocking/2`。
 
 Codex 的分析资格按有效来源、执行状态和已有执行记录核对，不依赖新用户消息或当前请求绑定。没有可引用请求时，仍总结活动并检查同类返工和完整验证重复成本；推进不足、偏离请求和当前版本验证缺口单独保持未知。没有任何当前执行材料时继续采集，取得材料后再调度模型。请求与授权证明规则分别核对，不因持续监控而提升未知来源文字的权限。无请求时的模型缓存按安装、任务、执行和角色隔离，不借用旧请求正文或未绑定的继承限制。正式观察器要求 `chatgpt-execution-monitoring/1`，缺少能力的旧私有 Core 自然退出后自动接续。
 

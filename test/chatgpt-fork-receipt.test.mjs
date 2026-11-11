@@ -99,16 +99,16 @@ test('native fork retains twenty user constraints across ten observed executions
 
 test('a fork beyond the per-chat capture bound retires old inheritance while keeping its new current request usable', async t => {
   const f = await fixture(t, 50)
-  for (let index = 0; index < 20; index++) await f.next('bounded-' + index)
+  for (let index = 0; index < 155; index++) await f.next('bounded-' + index)
   let snapshot = await f.core.snapshot()
   const own = snapshot.tasks.filter(task => task.id === 'f'), events = own.flatMap(task => task.events)
-  assert.equal(new Set(events.map(event => event.data?.nativeRecordId).filter(Boolean)).size, 100)
-  assert.equal(own.find(task => task.lifecycleId === 'bounded-19').currentRequest, 'Read only bounded-19')
+  assert.equal(new Set(events.map(event => event.data?.nativeRecordId).filter(Boolean)).size, 500)
+  assert.equal(own.find(task => task.lifecycleId === 'bounded-154').currentRequest, 'Read only bounded-154')
   assert.ok(own.some(task => task.gaps.some(gap => gap.includes('capture limit'))))
   const captures = new Map(events.filter(event => event.data?.nativeRecordId).map(event => [event.key, event.capturedAt]))
   await f.restartCore()
   snapshot = await f.core.snapshot()
-  assert.equal(snapshot.tasks.find(task => task.lifecycleId === 'bounded-19').currentRequest, 'Read only bounded-19')
+  assert.equal(snapshot.tasks.find(task => task.lifecycleId === 'bounded-154').currentRequest, 'Read only bounded-154')
   for (const event of snapshot.tasks.flatMap(task => task.events)) if (captures.has(event.key)) assert.ok(event.capturedAt <= captures.get(event.key), 'restart cannot refresh an existing native capture clock')
 })
 

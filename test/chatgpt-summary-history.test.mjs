@@ -15,9 +15,11 @@ import { withModelSummary } from './helpers/model-summary.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
 import { panelHarness } from './helpers/chatgpt-panel.mjs'
 
-test('real native material and model HTTP keep a reused summary visible and a later failure readable only as history through MCP', async t => {
+test('real native material and model HTTP publish before JEV and retain the new summary after JEV fails', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-summary-history-')), path = join(dir, 'resource-main.jsonl'), token = 'c'.repeat(64), calls = []
   let clock = Date.now() - 10000, failJudgment = false, adapter, core, server, models
+  let releaseJudgment
+  const firstJudgment = new Promise(resolve => { releaseJudgment = resolve })
   t.after(async () => {
     const failures = []
     for (const close of [() => adapter?.close(), () => core?.close(), () => server?.close(), async () => { if (models) { models.closeAllConnections(); await new Promise(resolve => models.close(resolve)) } }, () => rm(dir, { recursive: true, force: true })]) {
@@ -34,6 +36,7 @@ test('real native material and model HTTP keep a reused summary visible and a la
     if (request.url === '/v1/chat/completions') response.end(JSON.stringify({ model: wire.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(wire, { selectedOptionIds: [], gaps: [] })) } }] }))
     else if (failJudgment) response.writeHead(503).end('{"error":{"code":"controlled-judge-failure"}}')
     else {
+      await firstJudgment
       const body = decodeJevRequest(wire)
       response.end(JSON.stringify({ model: wire.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'execution_blocking' ? 'unblocked_1' : 'unknown' }])) }))
     }
@@ -62,6 +65,13 @@ test('real native material and model HTTP keep a reused summary visible and a la
     return packet.result.structuredContent
   }
   const until = async predicate => { const deadline = performance.now() + 3000; let view; while (!(await predicate(view = await read()))) { assert.ok(performance.now() < deadline, JSON.stringify(view.analysis)); await delay(2) }; return view }
+  const pending = await until(view => view.recentModelActivity?.summary?.blocking?.status === 'pending')
+  assert.match(pending.recentModelActivity.summary.text, /在做什么：/)
+  assert.equal(pending.analysis.lastSuccessfulSummary, null)
+  const page = await panelHarness(t)
+  await page.deliver(pending)
+  assert.match(page.element('#recent-blocking-status').textContent, /判断中/)
+  releaseJudgment()
   const first = await until(view => Boolean(view.analysis.generated)), original = first.analysis.lastSuccessfulSummary
   assert.match(first.analysis.generated.evidence[0].text, /synthetic log/)
   assert.equal(original.configScope.registrationId, 'chatgpt:summary-history')
@@ -72,7 +82,7 @@ test('real native material and model HTTP keep a reused summary visible and a la
   const reused = await until(view => view.analysis.resultDisposition === 'reused')
   assert.deepEqual(reused.analysis.lastSuccessfulSummary, original)
   assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone'])
-  const page = await panelHarness(t)
+  await page.refresh()
   await page.deliver(reused)
   assert.equal(page.element('#model-summary').hidden, false)
   assert.match(page.element('#model-status').textContent, /复用/)
@@ -80,15 +90,18 @@ test('real native material and model HTTP keep a reused summary visible and a la
   await configureInstallationModels(core, 'chatgpt:summary-history', { ...config, llm: { ...config.llm, model: 'summary-second' } })
   const failed = await until(view => view.analysis.state === 'failed')
   assert.equal(failed.analysis.generated, null)
-  assert.deepEqual(failed.analysis.lastSuccessfulSummary, original)
-  assert.deepEqual(failed.recentModelActivity.summary, { ...first.recentModelActivity.summary, blocking: { ...first.recentModelActivity.summary.blocking, historical: true } })
+  assert.equal(failed.recentModelActivity.summary.text, first.recentModelActivity.summary.text)
+  assert.equal(failed.recentModelActivity.summary.blocking.status, 'unknown')
+  assert.match(failed.recentModelActivity.summary.blocking.reason, /JEV.*失败/)
+  assert.ok(failed.recentModelActivity.summary.completedAt > original.completedAt)
   assert.notEqual(failed.analysis.currentConfigScope.revision, original.configScope.revision)
   await page.refresh(); await page.deliver(failed)
-  assert.equal(page.element('#model-summary').hidden, true)
+  assert.equal(page.element('#model-summary').hidden, false)
+  assert.match(page.element('#model-summary-evidence').textContent, /synthetic log/)
   assert.equal(page.element('#last-summary').hidden, false)
-  assert.equal(page.element('#last-summary').tagName, 'SECTION', 'a prior summary remains historical but is directly readable in Details')
-  assert.match(page.element('#last-summary-evidence').textContent, /synthetic log/)
+  assert.equal(page.element('#last-summary-text').textContent, original.generated.text)
+  assert.match(page.element('#last-blocking-status').textContent, /上次判断 · 未阻塞/)
   assert.equal(page.element('#recent-summary-text').textContent, original.generated.text)
-  assert.match(page.element('#recent-blocking-status').textContent, /^上次判断 · 未阻塞/)
+  assert.match(page.element('#recent-blocking-status').textContent, /^待确认 · JEV.*失败/)
   assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone'])
 })

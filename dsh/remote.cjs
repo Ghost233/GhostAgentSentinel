@@ -50,6 +50,10 @@ function parameterCodec(name) {
       return value
     }
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('观察操作参数必须是对象')
+    if (name === 'panelSelection') {
+      if (Object.keys(value).some(key => !['executionKey', 'historyCursor', 'expectedThreadId'].includes(key) || typeof value[key] !== 'string' || !value[key] || value[key].length > 2000)) throw new Error('会话面板选择无效')
+      return value
+    }
     if (name === 'result') {
       if (!['submitted', 'failed', 'invalidated'].includes(value.status) || Object.keys(value).some(key => !['status', 'error', 'attemptToken'].includes(key))
         || (value.attemptToken !== undefined && (typeof value.attemptToken !== 'string' || !value.attemptToken || value.attemptToken.length > 2000)) || (value.error !== undefined && (typeof value.error !== 'string' || value.error.length > 500))) throw new Error('通知投递结果无效')
@@ -66,7 +70,7 @@ function parameterCodec(name) {
 
 module.exports = function descriptors() {
   const methods = {
-    snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'],
+    snapshot: [], gsSummary: ['sessionId'], panelDocument: [], sessionPanel: ['sessionId', 'panelSelection'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'],
     configureAnalysisIfCurrent: ['config', 'revision'], configureAnalysisScheduling: ['scheduling'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'],
     installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'],
     installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'],

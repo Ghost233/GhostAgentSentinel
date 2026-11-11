@@ -5,6 +5,7 @@ const limits = new Set([
   'Some observed excerpts are truncated',
   'Some observed content was omitted for privacy',
   'analysis_evidence_budget',
+  'judgment_evidence_budget',
   'no_applicable_semantic_checks',
   '未识别原生响应材料类型：additional_tools',
   // A missing request limits goal checks, not observations of the execution.

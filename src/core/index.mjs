@@ -10,7 +10,7 @@ import { normalizeEnrollment } from '../enrollment-config.mjs';
 import { validateHierarchy, projectHierarchy } from '../hierarchy.mjs';
 import { createInstructionLookup, instructionContext, eventRef, referenceKey } from '../instruction-context.mjs';
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
-import { analysisTimeConditions } from '../analysis/index.mjs';
+import { analysisTimeConditions, JEV_EVIDENCE_LIMIT } from '../analysis/index.mjs';
 import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
 import { normalizeAnalysisConfig, normalizeAnalysisScheduling, CHECK_EVIDENCE_FEATURE, DSH_EXECUTION_SUMMARIES_FEATURE, EXECUTION_BLOCKING_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
@@ -21,6 +21,7 @@ const DAY = 24 * 60 * 60 * 1000;
 const CLAIM_MS = 60_000;
 const GROUP_MS = 3_000;
 const HIERARCHY_CAPTURE_LIMIT = 10_000;
+const NATIVE_CAPTURE_CHAT_LIMIT = JEV_EVIDENCE_LIMIT;
 const NATIVE_CAPACITY_GAP = 'Older native records were removed at the capture limit';
 const CONVERSATION_MONITORING_LIMIT = 1_000;
 const SUBMISSION_LIMIT = 1_000;
@@ -600,6 +601,7 @@ export async function createCore({
       const controller = round.controller;
       // Keep the lane until the provider settles, but release sealed input material now.
       round.input = null;
+      delete round.summaryRecord;
       round.controller = null;
       controller.abort(error);
       const task = tasks.get(round.taskKey);
@@ -745,7 +747,7 @@ export async function createCore({
     for (const records of chats.values()) {
       const live = [...records.values()].filter(record => record.copies.some(event => !removed.has(event.key)));
       live.sort((a, b) => Number(a.context) - Number(b.context) || a.at - b.at || a.sequence - b.sequence);
-      for (const record of live.slice(0, Math.max(0, live.length - 100))) for (const event of record.copies) removed.add(event.key);
+      for (const record of live.slice(0, Math.max(0, live.length - NATIVE_CAPTURE_CHAT_LIMIT))) for (const event of record.copies) removed.add(event.key);
     }
     const evicted = new Map(), removedRefs = new Map();
     for (const key of removed) {
@@ -776,8 +778,9 @@ export async function createCore({
     }
     for (const task of tasks.values()) {
       let changed = evicted.has(task.key);
-      for (const [field, result] of [['lastSuccessfulSummary', 'generated'], ['lastPartialSummary', 'partial']]) {
-        const summary = task.analysis[field]?.[result];
+      for (const field of ['lastSuccessfulSummary', 'lastPartialSummary', 'lastUnjudgedSummary']) {
+        const record = task.analysis[field];
+        const summary = record?.generated ?? record?.partial;
         const missing = ref => !events.has(identity(task.sourceKey, ref.taskId, ref.lifecycleId, ref.eventId));
         if (summary?.evidenceRefs?.some(missing)) { delete task.analysis[field]; changed = true; }
         else if (summary?.blocking?.evidenceRefs?.some(missing)) { delete summary.blocking; changed = true; }
@@ -807,6 +810,7 @@ export async function createCore({
       let changed = pendingPrunedTasks.has(task.key);
       if (task.analysis.lastSuccessfulSummary?.expiresAt <= current) { delete task.analysis.lastSuccessfulSummary; changed = true; }
       if (task.analysis.lastPartialSummary?.expiresAt <= current) { delete task.analysis.lastPartialSummary; changed = true; }
+      if (task.analysis.lastUnjudgedSummary?.expiresAt <= current) { delete task.analysis.lastUnjudgedSummary; changed = true; }
       if (task.analysis.lastPrefill?.submittedAt <= cutoff) { delete task.analysis.lastPrefill; changed = true; }
       const expired = new Set(expiredByTask.get(task.key) ?? []);
       const references = [task.requestId, ...(task.analysis.inputEventIds ?? []),
@@ -1162,9 +1166,32 @@ export async function createCore({
 
   function retainPartialSummary(task, expiresAt) {
     const { summary, summaryAt, coverage, configScope } = task.analysis;
+    task.analysis.lastPartialSummary = { partial: copy(summary.partial), completedAt: summaryAt, configScope: copy(configScope), expiresAt, gaps: summaryGaps(coverage) };
+  }
+
+  function summaryGaps(coverage) {
     const gaps = ['gaps', 'verificationGaps', 'contextGaps', 'extractionGaps'].flatMap(key => Array.isArray(coverage?.[key]) ? coverage[key] : []);
-    task.analysis.lastPartialSummary = { partial: copy(summary.partial), completedAt: summaryAt, configScope: copy(configScope), expiresAt,
-      gaps: [...new Set(gaps.filter(gap => typeof gap === 'string' && gap).map(gap => gap.slice(0, 160)))].slice(0, 24) };
+    return [...new Set(gaps.filter(gap => typeof gap === 'string' && gap).map(gap => gap.slice(0, 160)))].slice(0, 24);
+  }
+
+  function summaryRecordLive(task, record, readAt) {
+    return record?.expiresAt > readAt && (record.generated ?? record.partial).evidenceRefs.every(ref =>
+      events.has(identity(task.sourceKey, ref.taskId, ref.lifecycleId, ref.eventId)));
+  }
+
+  function availableSummary(task, readAt, read) {
+    const round = activeRound(task.key);
+    if (round?.summaryRecord && round.revision === task.revision && round.resultScope === resultScopeFor(task, read)
+      && !taskPaused(task) && analyzable(task) && summaryRecordLive(task, round.summaryRecord, readAt)) {
+      const record = round.summaryRecord;
+      const { judgmentPending, ...value } = copy(record);
+      if (judgmentPending) (value.generated ?? value.partial).blocking = { status: 'pending', reason: '正在核对摘要和原始依据', evidenceRefs: [] };
+      return value;
+    }
+    if (task.analysis.state !== 'failed' || task.analysis.throughRevision !== task.revision || taskPaused(task) || !analyzable(task)) return null;
+    const scope = configScopeFor(task);
+    const record = task.analysis.lastUnjudgedSummary;
+    return record?.settledAt === task.analysis.completedAt && record.configScope?.revision === scope?.revision && summaryRecordLive(task, record, readAt) ? copy(record) : null;
   }
 
   function completeRound(round, result, error) {
@@ -1199,6 +1226,16 @@ export async function createCore({
         if (details) task.analysis.error.details = details;
       }
       task.analysis.checks = unknownChecks('The current analysis failed; prior conclusions are not current', 'failed');
+      if (error.stage === 'jev' && summaryRecordLive(task, round.summaryRecord, completedAt)) {
+        const { judgmentPending, ...record } = round.summaryRecord;
+        const summary = record.generated ?? record.partial;
+        if (judgmentPending) summary.blocking = { status: 'unknown', reason: error.code === 'deadline' ? 'JEV 判断超时' : 'JEV 判断失败', evidenceRefs: [] };
+        task.analysis.lastUnjudgedSummary = { ...record, settledAt: completedAt };
+        if (record.final) {
+          task.analysis.finalSummaryCompletedAt = record.completedAt;
+          task.analysis.finalSummaryPending = false;
+        }
+      }
     } else {
       task.resultKey = round.resultKey;
       task.resultScope = round.resultScope;
@@ -1218,6 +1255,7 @@ export async function createCore({
     const settledError = error ?? failedCheck?.error ?? (failedCheck ? { code: 'analysis_failed' } : null);
     const partial = !settledError && result.summary.partial;
     if (!settledError && (result.summary.generated || partial) && !result.coverage?.dependencies?.length) {
+      delete task.analysis.lastUnjudgedSummary;
       let expiresAt = completedAt + DAY;
       for (const material of [round.input.events, round.input.instructionContext?.inheritedEvents ?? []]) for (const event of material) expiresAt = Math.min(expiresAt, event.capturedAt + DAY);
       if (partial) retainPartialSummary(task, expiresAt);
@@ -1321,7 +1359,17 @@ export async function createCore({
         currentTask.analysis.modelState = state;
         save('tasks', currentTask);
       };
-      Promise.resolve().then(() => round.cancelled ? null : currentAnalyzer.analyze(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal, lifetimeSignal: inferenceLifetime.signal, onState }))
+      const onSummary = (preview, judgmentPending) => {
+        if (closed || round.cancelled || rounds.get(round.taskKey) !== round) return;
+        const { summary, coverage } = validateResult(preview, round);
+        const field = summary.generated ? 'generated' : 'partial';
+        if (!summary[field]) return;
+        const completedAt = now();
+        let expiresAt = completedAt + DAY;
+        for (const event of [...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])]) expiresAt = Math.min(expiresAt, event.capturedAt + DAY);
+        round.summaryRecord = { [field]: summary[field], completedAt, expiresAt, configScope: copy(round.configScope), ...(summary.partial ? { gaps: summaryGaps(coverage) } : {}), ...(round.finalSummary ? { final: true } : {}), judgmentPending };
+      };
+      Promise.resolve().then(() => round.cancelled ? null : currentAnalyzer.analyze(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal, lifetimeSignal: inferenceLifetime.signal, onState, onSummary }))
         .then(result => round.cancelled ? null : validateResult(result, round))
         .then(result => completeRound(round, result, null), error => completeRound(round, null, error));
     }
@@ -1943,6 +1991,8 @@ export async function createCore({
         value.analysis.lagMs = task.lastActivity === null ? null : Math.max(0, task.lastActivity - (task.analysis.through ?? task.lastActivity));
         value.analysis.waitMs = task.analysis.queuedAt === null ? 0 : Math.max(0, current - task.analysis.queuedAt);
         value.analysis.resultDisposition = resultDispositionFor(task, instruction, read);
+        const summary = availableSummary(task, current, read);
+        if (summary) value.analysis.availableSummary = summary;
         if (analyzerFactory) value.analysis.currentConfigScope = configScopeFor(task);
         const conversation = conversationFor(task);
         if (conversation) value.conversationMonitoring = conversation;
@@ -2011,6 +2061,7 @@ export async function createCore({
         if (task.analysis.summary) captured(task.analysis.summaryAt ?? task.analysis.completedAt);
         if (task.analysis.lastSuccessfulSummary) deadline(task.analysis.lastSuccessfulSummary.expiresAt);
         if (task.analysis.lastPartialSummary) deadline(task.analysis.lastPartialSummary.expiresAt);
+        if (task.analysis.lastUnjudgedSummary) deadline(task.analysis.lastUnjudgedSummary.expiresAt);
         if (task.analysis.lastPrefill) captured(task.analysis.lastPrefill.submittedAt);
         if (!liveIdentity(task) && task.updatedAt + DAY > diagnostics.generatedAt) captured(task.updatedAt);
         for (const alert of task.alerts) captured(alert.firstAt);

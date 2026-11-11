@@ -50,7 +50,7 @@ test('an upgraded chat panel bypasses a cached inline summary and shows three ro
       assert.equal(resource.uri, uri)
       cache.set(uri, resource.text)
     }
-    return { uri, html: cache.get(uri) }
+    return { uri, html: cache.get(uri), client }
   }
   const at = Date.now(), lines = ['在做什么：核对本地构建。', '有什么进展：定向验证通过。', '卡在哪里：等待最终校验。']
   const view = { signal: 'gray', summary: '当前记录重验中', identity: { threadId: 'cached-panel' },
@@ -69,6 +69,14 @@ test('an upgraded chat panel bypasses a cached inline summary and shows three ro
   assert.match(page.element('#recent-blocking-evidence').textContent, /验证通过/)
   assert.notEqual(current.uri, previous.uri)
   assert.equal((await open(currentHtml)).uri, current.uri, 'unchanged HTML reuses the same resource address')
+
+  const [currentResource] = (await current.client.readResource({ uri: current.uri })).contents
+  for (const uri of ['ui://ghost-sentinel/current-chat.html', previous.uri]) {
+    const reopened = await current.client.readResource({ uri })
+    assert.deepEqual(reopened.contents, [{ ...currentResource, uri }])
+  }
+  assert.deepEqual((await current.client.listResources()).resources.map(resource => resource.uri), [current.uri])
+  await assert.rejects(current.client.readResource({ uri: 'ui://ghost-sentinel/current-chat-unknown.html' }), { code: -32602 })
 })
 
 test('GitHub normal and test panels have separate names through the public MCP resource and tool list', async t => {

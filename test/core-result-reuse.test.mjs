@@ -31,7 +31,7 @@ async function fixture(t) {
     const finish = () => res.end(JSON.stringify(req.url === '/v1/chat/completions'
       ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }
       : { model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: decision }])) }))
-    if (holding && startsRound) held.push(finish)
+    if (holding && startsRound || decision === 'timeout' && req.url === '/v1/systemone') held.push(finish)
     else finish()
   })
   await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve))
@@ -44,6 +44,24 @@ async function fixture(t) {
     async actor() { return (await core.snapshot()).tasks[0] },
   }
 }
+
+test('a JEV deadline retains the current summary while checks still record a failed round', async t => {
+  const f = await fixture(t), at = f.now();
+  await f.core.setAnalyzer(f.analyzer({ jevTimeoutMs: 100 }));
+  f.decision('timeout');
+  await f.core.ingest(f.source, { tasks: [{ id: 'actor', lifecycleId: 'life', status: 'running', title: 'Own actor' }], events: [f.event('request', 'input', at), f.event('output', 'output', at)] });
+  let pending;
+  await until(async () => (pending = (await f.actor()).analysis.availableSummary)?.generated.blocking.status === 'pending', 'summary precedes the held JEV decision');
+  await until(async () => (await f.actor()).analysis.error?.code === 'deadline', 'the local judge exceeded its deadline');
+  const analysis = (await f.actor()).analysis;
+  assert.equal(analysis.state, 'failed');
+  assert.equal(analysis.availableSummary.generated.text, pending.generated.text);
+  assert.equal(analysis.availableSummary.generated.blocking.status, 'unknown');
+  assert.equal(analysis.availableSummary.generated.blocking.reason, 'JEV 判断超时');
+  assert.deepEqual(analysis.lastUnjudgedSummary, analysis.availableSummary);
+  assert.equal(analysis.lastSuccessfulSummary, undefined);
+  assert.deepEqual(f.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+});
 
 test('an unchanged successful result is reused after cooldown inside the same time-condition interval without another model call', async t => {
   const f = await fixture(t)
