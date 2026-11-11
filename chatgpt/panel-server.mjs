@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { timingSafeEqual } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -14,7 +14,9 @@ export async function createPanelMCPServer({ read, control, modelSettings, insta
   const settingsHtml = modelSettings || forwardTool ? (resources?.settingsHtml ?? await readFile(new URL('./settings.html', import.meta.url), 'utf8')).replace('<title>Sentinel 安装设置</title>', '<title>' + settingsTitle + '</title>').replace('<h1>Sentinel · 安装设置</h1>', '<h1>' + settingsTitle + '</h1>') : null
   const mcp = new McpServer({ name: 'ghost-sentinel-chatgpt', version: '0.1.0-dev.1' })
   const registerTool = (server, name, options, handler) => registerAppTool(server, name, options, forwardTool ? (selection, extra) => forwardTool(name, selection, extra) : handler)
-  const uri = 'ui://ghost-sentinel/current-chat.html'
+  // The host can retain HTML by resource URI across plugin upgrades.
+  const digest = createHash('sha256').update(html).digest('hex')
+  const uri = `ui://ghost-sentinel/current-chat-${digest}.html`
   registerAppResource(mcp, 'sentinel-current-chat', uri, {}, async () => ({ contents: [{ uri, mimeType: RESOURCE_MIME_TYPE, text: html }] }))
   registerTool(mcp, 'sentinel_current_chat', {
     title, description: '只读查看当前本机主会话及24小时内已监控执行的检查结果。',

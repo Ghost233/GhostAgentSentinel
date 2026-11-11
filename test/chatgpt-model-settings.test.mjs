@@ -1019,7 +1019,7 @@ test('production adapter settings bind the installation independently from colle
   assert.deepEqual(settings._meta['openai/ui'].entrypoints, [{ type: 'global' }])
   assert.notEqual(monitor._meta.ui.resourceUri, settings._meta.ui.resourceUri)
   const resources = (await request('resources/list')).resources
-  assert.deepEqual(resources.map(resource => resource.uri).sort(), ['ui://ghost-sentinel/current-chat.html', 'ui://ghost-sentinel/settings.html'])
+  assert.deepEqual(resources.map(resource => resource.uri).sort(), [monitor._meta.ui.resourceUri, 'ui://ghost-sentinel/settings.html'])
   const resource = await request('resources/read', { uri: settings._meta.ui.resourceUri })
   assert.equal(resource.contents[0].mimeType, 'text/html;profile=mcp-app')
   const first = await rpc('sentinel_model_settings')

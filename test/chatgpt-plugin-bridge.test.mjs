@@ -18,6 +18,8 @@ import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { Client } from '../chatgpt/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js'
 import { StdioClientTransport } from '../chatgpt/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js'
 
+const chatResourceUri = tools => tools.find(tool => tool.name === 'sentinel_current_chat')._meta.ui.resourceUri
+
 async function bounded(promise, label, timeoutMs = 5000) {
   const controller = new AbortController()
   try { return await Promise.race([promise, delay(timeoutMs, null, { signal: controller.signal }).then(() => assert.fail(label))]) }
@@ -82,7 +84,8 @@ test('cold observation data does not block the MCP UI and later reads recover wi
     const initialized = await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'pending-data-regression', version: '1' } })
     assert.equal(initialized.result.protocolVersion, '2025-06-18')
     input.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n')
-    const resource = await request('resources/read', { uri: 'ui://ghost-sentinel/current-chat.html' })
+    const tools = await request('tools/list')
+    const resource = await request('resources/read', { uri: chatResourceUri(tools.result.tools) })
     assert.match(resource.result.contents[0].text, /id="refresh"/)
     const waiting = await request('tools/call', { name: 'sentinel_current_chat', arguments: {} })
     assert.equal(waiting.result.structuredContent.signal, 'gray')
@@ -134,7 +137,7 @@ test('normal metadata stderr cannot close a live MCP panel or its unique observe
       identities.push(view.structuredContent.identity.threadId)
     }
     assert.deepEqual(identities, Array(8).fill('resource-main'))
-    assert.ok((await client.readResource({ uri: 'ui://ghost-sentinel/current-chat.html' })).contents.length, 'switching back can still load the page resource on the same connection')
+    assert.ok((await client.readResource({ uri: chatResourceUri((await client.listTools()).tools) })).contents.length, 'switching back can still load the page resource on the same connection')
     assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, runtime.runId)
     assert.equal(metadataChildren.length, 1)
     await writeFile(env.statePath, 'false'); await runtime.refresh()
@@ -210,7 +213,7 @@ for (const fault of [{ kind: 'persistent-health-network' }, { kind: 'persistent-
     if (fault.startup) await assert.rejects(connecting, /Connection closed/)
     else {
       await connecting
-      assert.ok((await client.readResource({ uri: 'ui://ghost-sentinel/current-chat.html' })).contents.length)
+      assert.ok((await client.readResource({ uri: chatResourceUri((await client.listTools()).tools) })).contents.length)
       assert.equal((await client.callTool({ name: 'sentinel_current_chat', arguments: {} })).structuredContent.signal, 'gray')
     }
     const facts = (await readFile(env.auditPath, 'utf8')).trim().split('\n').map(JSON.parse)
@@ -418,7 +421,7 @@ test('real stdio MCP initialization, app tools, resource and current-chat metada
   assert.deepEqual(current._meta['openai/ui'].entrypoints, [{ type: 'thread' }])
   assert.deepEqual(settings._meta['openai/ui'].entrypoints, [{ type: 'global' }])
   const resources = await bridge.request('resources/list')
-  assert.deepEqual(resources.result.resources.map(resource => resource.uri).sort(), ['ui://ghost-sentinel/current-chat.html', 'ui://ghost-sentinel/settings.html'])
+  assert.deepEqual(resources.result.resources.map(resource => resource.uri).sort(), [current._meta.ui.resourceUri, 'ui://ghost-sentinel/settings.html'])
   const resource = await bridge.request('resources/read', { uri: current._meta.ui.resourceUri })
   assert.match(resource.result.contents[0].text, /Sentinel/)
   const settingsResource = await bridge.request('resources/read', { uri: settings._meta.ui.resourceUri })

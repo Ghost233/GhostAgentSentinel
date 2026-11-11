@@ -1,14 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { startPanelServer } from '../chatgpt/panel-server.mjs'
+import { createPanelMCPServer, startPanelServer } from '../chatgpt/panel-server.mjs'
 import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { createNativeNotificationIO, notificationPrefix } from '../chatgpt/native-notifications.mjs'
+import { Client } from '../chatgpt/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js'
+import { InMemoryTransport } from '../chatgpt/node_modules/@modelcontextprotocol/sdk/dist/esm/inMemory.js'
+import { panelHarness } from './helpers/chatgpt-panel.mjs'
 
 const token = 'a'.repeat(64)
 const identity = { installationId: 'presentation-installation', runId: 'presentation-run', pid: 123, version: '0.1.0-preview', ownership: 'plugin' }
@@ -25,12 +28,56 @@ async function panel(t, options = {}) {
   }
 }
 
+test('an upgraded chat panel bypasses a cached inline summary and shows three rows and its JEV state', async t => {
+  const currentHtml = await readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8')
+  const oldHtml = currentHtml
+    .replace("writeSummary('recent-summary-text',", "write('recent-summary-text',")
+    .replace("renderBlocking('recent',decision,", "renderBlocking('recent',null,")
+  assert.notEqual(oldHtml, currentHtml)
+  const cache = new Map()
+  async function open(html) {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    const server = await createPanelMCPServer({ resources: { html }, displayName: 'GhostSentinel', read: async () => ({ summary: '只读观察' }) })
+    const client = new Client({ name: 'panel-cache-regression', version: '1' })
+    t.after(async () => { await client.close(); await server.close() })
+    await server.connect(serverTransport)
+    await client.connect(clientTransport)
+    const tools = await client.listTools()
+    const uri = tools.tools.find(tool => tool.name === 'sentinel_current_chat')._meta.ui.resourceUri
+    assert.ok((await client.listResources()).resources.some(resource => resource.uri === uri))
+    if (!cache.has(uri)) {
+      const resource = (await client.readResource({ uri })).contents[0]
+      assert.equal(resource.uri, uri)
+      cache.set(uri, resource.text)
+    }
+    return { uri, html: cache.get(uri) }
+  }
+  const at = Date.now(), lines = ['在做什么：核对本地构建。', '有什么进展：定向验证通过。', '卡在哪里：等待最终校验。']
+  const view = { signal: 'gray', summary: '当前记录重验中', identity: { threadId: 'cached-panel' },
+    analysis: { state: 'unknown', checks: [] }, observation: { coverage: 'caught-up', recordRevalidating: true },
+    recentModelActivity: { summary: { text: lines.join(' '), completedAt: at - 1000, expiresAt: at + 60000,
+      blocking: { status: 'unblocked', reason: '定向验证通过', evidence: [{ text: '验证通过', reference: 'native:check' }] } } } }
+  const previous = await open(oldHtml), previousPage = await panelHarness(t, { html: previous.html })
+  await previousPage.deliver(view)
+  assert.equal(previousPage.element('#recent-summary-text').children.length, 0)
+  assert.equal(previousPage.element('#recent-blocking').hidden, true)
+
+  const current = await open(currentHtml), page = await panelHarness(t, { html: current.html })
+  await page.deliver(view)
+  assert.deepEqual(page.element('#recent-summary-text').children.map(row => row.textContent.trim()), lines)
+  assert.match(page.element('#recent-blocking-status').textContent, /^上次判断 · 未阻塞/)
+  assert.match(page.element('#recent-blocking-evidence').textContent, /验证通过/)
+  assert.notEqual(current.uri, previous.uri)
+  assert.equal((await open(currentHtml)).uri, current.uri, 'unchanged HTML reuses the same resource address')
+})
+
 test('GitHub normal and test panels have separate names through the public MCP resource and tool list', async t => {
   for (const displayName of ['GhostSentinel', 'GhostSentinel test']) {
     const page = await panel(t, { displayName })
     const tools = await page.rpc('tools/list')
-    assert.equal(tools.tools.find(tool => tool.name === 'sentinel_current_chat').title, displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查')
-    const resource = await page.rpc('resources/read', { uri: 'ui://ghost-sentinel/current-chat.html' })
+    const monitor = tools.tools.find(tool => tool.name === 'sentinel_current_chat')
+    assert.equal(monitor.title, displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查')
+    const resource = await page.rpc('resources/read', { uri: monitor._meta.ui.resourceUri })
     assert.ok(resource.contents[0].text.includes('<title>' + (displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查') + '</title>'))
     assert.ok(resource.contents[0].text.includes('<h1>' + displayName + ' · 当前会话</h1>'))
   }
@@ -39,8 +86,9 @@ test('GitHub normal and test panels have separate names through the public MCP r
 test('legacy panel presentation remains unchanged and channel labels cannot inject arbitrary HTML', async t => {
   const page = await panel(t)
   const tools = await page.rpc('tools/list')
-  assert.equal(tools.tools.find(tool => tool.name === 'sentinel_current_chat').title, 'Sentinel 会话检查')
-  const resource = await page.rpc('resources/read', { uri: 'ui://ghost-sentinel/current-chat.html' })
+  const monitor = tools.tools.find(tool => tool.name === 'sentinel_current_chat')
+  assert.equal(monitor.title, 'Sentinel 会话检查')
+  const resource = await page.rpc('resources/read', { uri: monitor._meta.ui.resourceUri })
   assert.ok(resource.contents[0].text.includes('<h1>Sentinel · 当前会话</h1>'))
   for (const displayName of ['<script>alert(1)</script>', 'GhostSentinel TEST', '', null]) await assert.rejects(startPanelServer({ token, read: async () => ({ summary: '' }), displayName }), /display name/)
 })
