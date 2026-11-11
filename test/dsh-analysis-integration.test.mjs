@@ -93,7 +93,7 @@ async function fixture(t, faults = {}) {
       response.end(JSON.stringify({ model: 'select', choices: [{ finish_reason: 'stop', message: { content: mode === 'invalid' ? '{"selectedOptionIds":["invalid"],"gaps":[]}' : JSON.stringify(withModelSummary(wire, { selectedOptionIds: [], gaps: [] })) } }] }))
     } else {
       const decision = faults.unknownB && body.state.request.includes('request B') ? 'unknown' : mode === 'unknown' ? 'unknown' : body.state.events.some(event => event.text.includes('unrelated-storage')) ? 'attention' : 'clear'
-      response.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? decision : 'unknown', probabilities: { attention: decision === 'attention' ? 1 : 0, clear: decision === 'clear' ? 1 : 0, unknown: decision === 'unknown' ? 1 : 0 } }])) }))
+      response.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? decision : id === 'execution_blocking' ? faults.blockingChoice ?? 'unknown' : 'unknown', probabilities: { attention: decision === 'attention' ? 1 : 0, clear: decision === 'clear' ? 1 : 0, unknown: decision === 'unknown' ? 1 : 0 } }])) }))
     }
   })
   await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
@@ -192,6 +192,20 @@ test('native observation, real HTTP analysis and native Remote deliver isolated 
   await view.tick(); await until(() => view.notices.length === 2, 'notification after pane destruction')
   assert.equal(view.snapshotCalls, reads)
   host.finish('task-a'); host.finish('task-b'); await until(() => a.agent.status === 'idle' && b.agent.status === 'idle', 'natural completion')
+})
+
+test('DSH session summaries keep raw output in the JEV evidence rather than the judgment reason', async t => {
+  const host = await fixture(t, { blockingChoice: 'unblocked_1' }), id = 'task-blocking-reason'
+  const output = "Script completed: /synthetic/DSH Workflow ['cache', 'launcher.lock']"
+  await host.create(id, 'Check the results of the directory inspection')
+  host.send(id, output)
+  await until(async () => (await host.control.snapshot()).tasks.find(task => task.id === id)?.events.some(event => event.text.includes(output)), 'native output captured')
+  await host.control.resume()
+  let decision
+  await until(async () => (decision = (await host.adapter.sessionPanel(id, {})).recentModelActivity.summary?.blocking)?.status === 'unblocked', 'DSH publishes the JEV decision')
+  assert.equal(decision.reason, '会话回复记录了可继续推进的进展')
+  assert.match(decision.evidence[0].text, /\/synthetic\/DSH Workflow/)
+  assert.equal(host.modelCalls.filter(call => call.path === '/v1/systemone').length, 1)
 })
 
 test('DSH retains partial observations and summarizes each observed execution once after it ends', async t => {

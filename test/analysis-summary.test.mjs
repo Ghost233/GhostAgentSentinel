@@ -115,7 +115,7 @@ test('JEV can see 500 scoped records independently of the three cached summary r
 test('one JEV request decides whether work is blocked and selects its original evidence', async t => {
   for (const [choice, status] of [['blocked_1', 'blocked'], ['unblocked_1', 'unblocked'], ['unknown', 'unknown']]) await t.test(status, async t => {
     const action = status === 'blocked' ? { ...observation.events[1], kind: 'tool-result', text: '读取日志失败：权限被拒绝，无法继续核对。', data: { exitCode: 1 } }
-      : { ...observation.events[1], kind: 'tool-start', text: '定向检查通过，正在运行完整测试。' };
+      : { ...observation.events[1], kind: 'tool-result', text: "Script completed\nOutput:\n/synthetic/DSH Workflow ['cache', 'global', 'launcher.lock']", data: { exitCode: 0 } };
     const { analyzer, requests } = await models(t, { judgment: wire => {
       assert.equal(wire.state.executionSummary.text, summaryText);
       assert.ok(wire.state.events.some(event => event.id === 'action' && event.text === action.text));
@@ -127,7 +127,7 @@ test('one JEV request decides whether work is blocked and selects its original e
     assert.deepEqual(requests.map(request => request.path), analysisPaths);
     assert.equal(result.summary.generated.blocking.status, status);
     if (status !== 'unknown') {
-      assert.equal(result.summary.generated.blocking.reason, action.text);
+      assert.equal(result.summary.generated.blocking.reason, status === 'blocked' ? '命令执行失败（退出码 1），仍影响后续工作' : '已取得可用于继续工作的工具结果');
       assert.deepEqual(result.summary.generated.blocking.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
     }
     assert.equal(result.checks.length, 6);

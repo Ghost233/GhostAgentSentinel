@@ -501,6 +501,23 @@ function mergeSummary(sections, catalog, events) {
   return { text: paragraphs.join('\n'), sections: paragraphs, evidenceIds: uniqueIds(facts), evidenceRefs: [...new Map(references.map(reference => [referenceKey(reference), reference])).values()] };
 }
 
+export function executionBlockingReason(status, event) {
+  if (status === 'blocked') {
+    if (event?.kind === 'tool-result') {
+      const code = event.data?.exitCode;
+      if (failure(event) && Number.isSafeInteger(code) && code !== 0) return `命令执行失败（退出码 ${code}），仍影响后续工作`;
+      if (failure(event)) return '工具执行失败，仍影响后续工作';
+      return '工具结果显示继续执行所需的条件尚未满足';
+    }
+    if (event?.kind === 'output') return '会话回复指出了仍妨碍后续工作的事项';
+    return '执行记录显示后续工作仍有阻碍';
+  }
+  if (event?.kind === 'tool-result') return '已取得可用于继续工作的工具结果';
+  if (event?.kind === 'tool-start') return '下一步工具操作已启动，可以等待结果';
+  if (event?.kind === 'output') return '会话回复记录了可继续推进的进展';
+  return '执行记录显示工作可以继续';
+}
+
 function executionBlockingQuestion(events, summary, coverage, lastGap) {
   let activity = events.filter(event => !event.contextRole && !event.data?.history && !event.data?.redacted
     && ['output', 'tool-start', 'tool-result'].includes(event.kind) && event.text?.trim());
@@ -519,11 +536,10 @@ function executionBlockingQuestion(events, summary, coverage, lastGap) {
   const criteria = { unknown: '无法确认当前任务能否继续，或候选引用无法支持一个具体原因。' };
   for (const [index, event] of basis.entries()) {
     const position = index + 1;
-    const reason = event.text.replace(/\s+/g, ' ').trim().slice(0, 180);
     for (const [status, meaning] of [['blocked', '已阻塞'], ['unblocked', '未阻塞']]) {
       const id = `${status}_${position}`;
       criteria[id] = `${meaning}，主要依据为 candidates.execution_blocking.evidenceRefs 第 ${position} 条。`;
-      outcomes.set(id, { status, reason, evidenceRefs: [eventRef(event)] });
+      outcomes.set(id, { status, reason: executionBlockingReason(status, event), evidenceRefs: [eventRef(event)] });
     }
   }
   return {

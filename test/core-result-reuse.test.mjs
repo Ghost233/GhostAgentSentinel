@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createCore } from '../src/core/index.mjs'
 import { createAnalyzer } from '../src/analysis/index.mjs'
+import { recentModelActivity } from '../src/panel-view.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
 
 const until = async (predicate, label) => { const deadline = Date.now() + 3000; while (!await predicate()) { assert.ok(Date.now() < deadline, label); await new Promise(resolve => setTimeout(resolve, 5)) } }
@@ -61,6 +62,29 @@ test('a JEV deadline retains the current summary while checks still record a fai
   assert.deepEqual(analysis.lastUnjudgedSummary, analysis.availableSummary);
   assert.equal(analysis.lastSuccessfulSummary, undefined);
   assert.deepEqual(f.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+});
+
+test('a historical blocking decision shows a readable reason and keeps the old tool output in its evidence', async t => {
+  const f = await fixture(t), at = f.now(), analyzer = f.analyzer();
+  const output = "Script completed\nOutput:\n/synthetic/DSH Workflow ['cache', 'global', 'launcher.lock']";
+  const action = { ...f.event('result', 'tool-result', at, { exitCode: 0 }), text: output };
+  const evidenceRefs = [{ taskId: 'actor', lifecycleId: 'life', eventId: 'result' }];
+  await f.core.setAnalyzer({ ...analyzer, async analyze(...args) {
+    const result = await analyzer.analyze(...args);
+    result.summary.generated.blocking = { status: 'unblocked', reason: output.replace(/\s+/g, ' '), evidenceRefs };
+    return result;
+  } });
+  await f.core.ingest(f.source, { tasks: [{ id: 'actor', lifecycleId: 'life', status: 'running', title: 'Own actor' }],
+    events: [f.event('request', 'input', at), action] });
+  await until(async () => (await f.actor()).analysis.lastSuccessfulSummary, 'legacy decision is retained with its summary');
+  const snapshot = await f.core.snapshot(), task = snapshot.tasks[0];
+  const stored = task.analysis.lastSuccessfulSummary.generated.blocking;
+  assert.equal(stored.reason, '已取得可用于继续工作的工具结果');
+  assert.deepEqual(stored.evidenceRefs, evidenceRefs);
+  const history = recentModelActivity([task], null, 'result-reuse', snapshot.generatedAt, false);
+  assert.equal(history.summary.blocking.historical, true);
+  assert.equal(history.summary.blocking.reason, stored.reason);
+  assert.equal(history.summary.blocking.evidence[0].text, output);
 });
 
 test('an unchanged successful result is reused after cooldown inside the same time-condition interval without another model call', async t => {

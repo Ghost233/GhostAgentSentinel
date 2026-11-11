@@ -10,7 +10,7 @@ import { normalizeEnrollment } from '../enrollment-config.mjs';
 import { validateHierarchy, projectHierarchy } from '../hierarchy.mjs';
 import { createInstructionLookup, instructionContext, eventRef, referenceKey } from '../instruction-context.mjs';
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
-import { analysisTimeConditions, JEV_EVIDENCE_LIMIT } from '../analysis/index.mjs';
+import { analysisTimeConditions, executionBlockingReason, JEV_EVIDENCE_LIMIT } from '../analysis/index.mjs';
 import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
 import { normalizeAnalysisConfig, normalizeAnalysisScheduling, CHECK_EVIDENCE_FEATURE, DSH_EXECUTION_SUMMARIES_FEATURE, EXECUTION_BLOCKING_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
@@ -1997,6 +1997,14 @@ export async function createCore({
         value.analysis.resultDisposition = resultDispositionFor(task, instruction, read);
         const summary = availableSummary(task, current, read);
         if (summary) value.analysis.availableSummary = summary;
+        // Older summaries stored the raw evidence excerpt as the reason.
+        for (const record of [value.analysis.summary, value.analysis.lastSuccessfulSummary, value.analysis.lastPartialSummary, value.analysis.lastUnjudgedSummary, summary]) {
+          const decision = (record?.generated ?? record?.partial)?.blocking;
+          if (decision?.status !== 'blocked' && decision?.status !== 'unblocked') continue;
+          const ref = decision.evidenceRefs?.[0];
+          const evidence = ref && events.get(identity(task.sourceKey, ref.taskId, ref.lifecycleId, ref.eventId));
+          decision.reason = executionBlockingReason(decision.status, evidence);
+        }
         if (analyzerFactory) value.analysis.currentConfigScope = configScopeFor(task);
         const conversation = conversationFor(task);
         if (conversation) value.conversationMonitoring = conversation;
