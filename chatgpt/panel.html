@@ -24,7 +24,7 @@
 <section id="recent-model-activity" aria-label="本聊天最近的预填和总结">
   <div class="recent-model-row"><strong>上次送预填</strong><div class="recent-model-value"><time id="recent-prefill-time" hidden></time><span id="recent-prefill-state" class="recent-model-badge">待核对</span></div></div>
   <div class="recent-model-row" id="recent-summary-row"><strong>上次总结</strong><div class="recent-model-value"><span id="recent-summary-state" class="recent-model-badge" hidden></span><time id="recent-summary-time" hidden></time></div></div>
-  <div id="recent-summary-text" class="muted">等待核对当前聊天</div><div id="recent-blocking" class="blocking" hidden><p id="recent-blocking-status"></p><details id="recent-blocking-details" hidden><summary>查看判断依据</summary><div id="recent-blocking-evidence"></div></details></div><p id="recent-summary-gaps" class="muted" hidden></p>
+  <div id="recent-summary-text" class="muted">等待核对当前聊天</div><div id="recent-blocking" class="blocking" hidden><p>JEV 阻塞判断 · <span id="recent-blocking-status"></span></p><details id="recent-blocking-details" hidden><summary>查看判断依据</summary><div id="recent-blocking-evidence"></div></details></div><p id="recent-summary-gaps" class="muted" hidden></p>
   <p id="recent-model-status" class="muted" role="status" hidden></p>
 </section>
 <p id="availability" class="muted" role="status" hidden></p>
@@ -58,6 +58,8 @@ const element=id=>document.querySelector('#'+id);
 function set(id,key,value){const target=element(id);if(target[key]!==value)target[key]=value;}
 const write=(id,value)=>set(id,'textContent',value);
 function writeSummary(id,value){
+  const folded=value.match(/^(在做什么：[\s\S]+?)\s*(有什么进展：[\s\S]+?)\s*(卡在哪里：[\s\S]+)$/);
+  if(folded)value=folded.slice(1).map(line=>line.trim()).join('\n');
   if(element(id).textContent===value)return;
   const lines=value.split(/\r?\n/);
   if(lines.length===1){write(id,value);return;}
@@ -103,7 +105,8 @@ function renderRecentModelActivity(activity,retained=false,revalidating=false){
   attribute('recent-summary-state','data-tone','ok');
   set('recent-summary-text','className',valid?'':'muted');
   writeSummary('recent-summary-text',valid?text(summary.text,600):activity?'暂无可显示的总结':'等待核对当前聊天');
-  renderBlocking('recent',valid?summary.blocking:null,retained||revalidating);
+  const decision=valid?(summary.blocking??{status:'unknown',reason:summary.final?'执行已收尾，未作运行中判断':'这份摘要没有可显示的 JEV 判断'}):null;
+  renderBlocking('recent',decision,retained||revalidating);
   time('recent-summary-time',valid?summary.completedAt:null);
   const missing=valid&&summary.partial?summaryGaps(list(summary.gaps)):[];
   show('recent-summary-gaps',missing.length>0);write('recent-summary-gaps',missing.length?'观察范围与说明 · '+missing.join('、'):'');

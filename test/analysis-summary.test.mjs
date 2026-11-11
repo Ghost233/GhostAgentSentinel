@@ -57,9 +57,13 @@ test('two successful model calls publish the generated short summary with verifi
 
 test('the three summary levels describe work, actual progress and blockers independently from unknown checks', async t => {
   const text = '在做什么：核对所请求日志。\n有什么进展：已找到最新记录。\n卡在哪里：未观察到明确阻碍。';
-  const { analyzer } = await models(t, { extraction: (_evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text, evidenceOptionIds: [option.optionId] } }) });
+  const { analyzer, requests } = await models(t, { extraction: (_evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text, evidenceOptionIds: [option.optionId] } }) });
   const result = await analyzer.analyze(observation);
   assert.equal(result.summary.generated.text, text);
+  assert.deepEqual(requests[0].body.messages.slice(2).map(message => message.role), ['user', 'user', 'user']);
+  for (const [index, label] of ['在做什么', '有什么进展', '卡在哪里'].entries()) {
+    assert.ok(requests[0].body.messages[index + 2].content.startsWith(label + '：'));
+  }
   assert.deepEqual(result.summary.generated.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
   assert.equal(result.checks.find(check => check.id === 'request_drift').judgmentState, 'insufficient');
 });

@@ -12,7 +12,7 @@ import { createInstructionLookup, instructionContext, eventRef, referenceKey } f
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
 import { analysisTimeConditions } from '../analysis/index.mjs';
 import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
-import { normalizeAnalysisConfig, normalizeAnalysisScheduling, CHECK_EVIDENCE_FEATURE, EXECUTION_BLOCKING_FEATURE, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
+import { normalizeAnalysisConfig, normalizeAnalysisScheduling, CHECK_EVIDENCE_FEATURE, DSH_EXECUTION_SUMMARIES_FEATURE, EXECUTION_BLOCKING_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
 import { createNativeNotificationStore } from './native-notifications.mjs';
 import { createNativeCaptureProgress } from './native-capture-progress.mjs';
@@ -190,10 +190,17 @@ export async function createCore({
   const liveIdentity = task => task.status === 'running' && task.baselineConfirmed && connected(sources.get(task.sourceKey));
   const usable = task => liveIdentity(task) && (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' ? taskEvents(task).some(event => !historical(event)) : !sources.get(task.sourceKey)?.hierarchyContext || task.requestId != null);
   const observationOnly = task => sources.get(task.sourceKey)?.descriptor.mode === 'observation-only';
+  const dshSummaries = source => source?.descriptor.policy !== 'chatgpt-main/1' && source?.descriptor.capabilities?.includes(DSH_EXECUTION_SUMMARIES_FEATURE);
+  const terminal = status => status === 'idle' || status === 'disposed';
   const finalProofs = new WeakMap();
   const finalSummaryEligible = task => {
     const source = sources.get(task.sourceKey);
-    if (!task.analysis.finalSummaryPending || task.analysis.finalSummaryCompletedAt || task.status !== 'idle' || !task.baselineConfirmed || !connected(source) || !source.descriptor.capabilities?.includes('main-final-summary/1')) return false;
+    if (!task.analysis.finalSummaryPending || task.analysis.finalSummaryCompletedAt || !task.baselineConfirmed || !connected(source)) return false;
+    if (dshSummaries(source)) {
+      const end = events.get(task.analysis.finalSummaryPending);
+      return terminal(task.status) && task.requestId != null && end?.taskKey === task.key && end.capturedAt > now() - DAY;
+    }
+    if (task.status !== 'idle' || !source.descriptor.capabilities?.includes('main-final-summary/1')) return false;
     let proof = finalProofs.get(task);
     if (!proof || proof.revision !== task.revision) {
       const end = taskEvents(task).findLast(event => !historical(event) && event.data?.sourceKind === 'chatgpt-native' && ['task_complete', 'turn_aborted'].includes(event.data.nativeType) && event.data.runId === task.lifecycleId);
@@ -202,12 +209,32 @@ export async function createCore({
     return proof.expiresAt > now();
   };
   const analyzable = task => usable(task) || finalSummaryEligible(task);
+  const queueFinalSummary = (task, proof) => {
+    task.analysis.finalSummaryPending = proof; task.analysis.nextEligibleAt = now(); task.resultKey = null; task.resultScope = null;
+  };
   const noteEnd = (task, previousStatus) => {
     const source = sources.get(task.sourceKey);
     if ((previousStatus === 'running' || previousStatus === 'unknown' && task.lastKnownStatus === 'running') && task.status === 'idle' && source.descriptor.policy === 'chatgpt-main/1' && source.descriptor.capabilities?.includes('main-final-summary/1') && !task.analysis.finalSummaryCompletedAt) {
-      task.analysis.finalSummaryPending = true; task.analysis.nextEligibleAt = now(); task.resultKey = null; task.resultScope = null;
+      queueFinalSummary(task, true);
     }
   };
+  function resumeDshExecution(task) {
+    if (!task.analysis.finalSummaryPending && task.analysis.finalSummaryCompletedAt == null) return;
+    cancelRound('A new native execution started', task);
+    task.analysis.finalSummaryPending = false;
+    task.analysis.finalSummaryCompletedAt = null;
+    task.analysis.nextEligibleAt = now();
+  }
+  function observeDshExecution(task, event) {
+    const { nativeType, status } = event.data;
+    if (nativeType === 'agent/status' && status === 'running') resumeDshExecution(task);
+    if (!(nativeType === 'agent/status' && status === 'idle' || nativeType === 'agent/disposed' && status === 'disposed')) return;
+    // A descriptor can already show the final state when both edges arrive in one batch.
+    const previous = taskEvents(task).findLast(candidate => candidate.sequence < event.sequence
+      && candidate.capturedAt <= event.capturedAt && candidate.capturedAt > now() - DAY && !historical(candidate)
+      && candidate.kind === 'status' && ['agent/status', 'agent/disposed', 'agent/created', 'native-baseline'].includes(candidate.data?.nativeType));
+    if (previous?.data.status === 'running') queueFinalSummary(task, event.key);
+  }
   const conversationFor = task => {
     const source = sources.get(task.sourceKey);
     if (source?.descriptor.policy !== 'chatgpt-main/1') return null;
@@ -434,7 +461,7 @@ export async function createCore({
   const resultScopeFor = (task, read, coverage) => {
     const source = sources.get(task.sourceKey), activation = source?.hierarchyContext?.activations.find(item => item.taskId === task.id && item.lifecycleId === task.lifecycleId);
     const parent = source?.hierarchyContext?.relations.find(item => item.kind === 'delegation' && (item.childSessionId === task.sessionId || item.childActivationRef?.taskId === task.id && item.childActivationRef?.lifecycleId === task.lifecycleId));
-    return fingerprint([CHECK_EVIDENCE_FEATURE, EXECUTION_BLOCKING_FEATURE, task.requestId, task.contextFingerprint, task.status, activation?.sessionId, activation?.runId, parent?.parentSessionId, source?.descriptor, coverage ?? coverageFor(task, read), configScopeFor(task)]);
+    return fingerprint([CHECK_EVIDENCE_FEATURE, EXECUTION_BLOCKING_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, task.requestId, task.contextFingerprint, task.status, activation?.sessionId, activation?.runId, parent?.parentSessionId, source?.descriptor, coverage ?? coverageFor(task, read), configScopeFor(task)]);
   };
   const resultDispositionFor = (task, context, read) => {
     if (!task.resultScope || !task.analysis.summary) return task.resultScope != null || task.analysis.completedAt != null || ['analysis_expired', 'evidence_expired'].includes(task.analysis.error?.code) ? 'invalid' : 'none';
@@ -619,7 +646,7 @@ export async function createCore({
   for (const source of sources.values()) initializeHierarchyCaptures(source);
   for (const task of tasks.values()) {
     const { summary, summaryAt, inputEventIds, contextEvidenceRefs, lastPartialSummary } = task.analysis;
-    if (lastPartialSummary || sources.get(task.sourceKey)?.descriptor.policy !== 'chatgpt-main/1' || !summary?.partial || !Number.isSafeInteger(summaryAt) || !inputEventIds?.length) continue;
+    if (lastPartialSummary || !summary?.partial || !Number.isSafeInteger(summaryAt) || !inputEventIds?.length) continue;
     const references = [...inputEventIds.map(eventId => ({ taskId: task.id, lifecycleId: task.lifecycleId, eventId })), ...(contextEvidenceRefs ?? []), ...summary.partial.evidenceRefs];
     let expiresAt = summaryAt + DAY;
     for (const ref of references) {
@@ -1189,7 +1216,7 @@ export async function createCore({
     }
     const failedCheck = !error && sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' ? result.checks.find(check => check.judgmentState === 'failed') : null;
     const settledError = error ?? failedCheck?.error ?? (failedCheck ? { code: 'analysis_failed' } : null);
-    const partial = !settledError && result.summary.partial && round.input.source.policy === 'chatgpt-main/1';
+    const partial = !settledError && result.summary.partial;
     if (!settledError && (result.summary.generated || partial) && !result.coverage?.dependencies?.length) {
       let expiresAt = completedAt + DAY;
       for (const material of [round.input.events, round.input.instructionContext?.inheritedEvents ?? []]) for (const event of material) expiresAt = Math.min(expiresAt, event.capturedAt + DAY);
@@ -1717,7 +1744,9 @@ export async function createCore({
           const previousStatus = task.status;
           task.title = descriptor.title;
           task.status = descriptor.status;
-          noteEnd(task, previousStatus);
+          if (dshSummaries(source)) {
+            if (task.status === 'running' && previousStatus !== 'running') resumeDshExecution(task);
+          } else noteEnd(task, previousStatus);
           if (task.status !== 'unknown') task.lastKnownStatus = task.status;
           task.sessionId = descriptor.sessionId ?? task.sessionId;
           task.parentId = descriptor.parentId ?? task.parentId;
@@ -1731,7 +1760,10 @@ export async function createCore({
           if (changed) {
             task.updatedAt = now();
             task.revision++;
-            if (task.status !== 'running') { cancelRound('Source task is no longer running', task); invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended'); }
+            if (task.status !== 'running') {
+              if (!(dshSummaries(source) && terminal(task.status) && activeRound(task.key)?.finalSummary)) cancelRound('Source task is no longer running', task);
+              invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended');
+            }
             save('tasks', task);
           }
         }
@@ -1771,9 +1803,13 @@ export async function createCore({
           if (!historical(event) && event.kind === 'status' && ['running', 'idle', 'disposed', 'unknown'].includes(event.data?.status) && (source.descriptor.policy !== 'chatgpt-main/1' || task.baselineConfirmed)) {
             const previousStatus = task.status;
             task.status = event.data.status;
-            noteEnd(task, previousStatus);
+            if (dshSummaries(source)) observeDshExecution(task, event);
+            else noteEnd(task, previousStatus);
             if (task.status !== 'unknown') task.lastKnownStatus = task.status;
-            if (task.status !== 'running') { cancelRound('Source task is no longer running', task); invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended'); }
+            if (task.status !== 'running') {
+              if (!(dshSummaries(source) && terminal(task.status) && activeRound(task.key)?.finalSummary)) cancelRound('Source task is no longer running', task);
+              invalidateAlerts(task, task.status === 'unknown' ? 'unknown' : 'ended');
+            }
           }
           save('tasks', task);
         }

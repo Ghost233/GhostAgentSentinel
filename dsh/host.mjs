@@ -6,7 +6,7 @@ import { createObservation, hostIdentity } from './observation.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { HIERARCHY_FEATURE } from '../src/hierarchy.mjs'
 import { GS_FEATURE } from '../src/gs-status.mjs'
-import { GS_SUMMARY_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE } from '../src/protocol.mjs'
+import { DSH_EXECUTION_SUMMARIES_FEATURE, GS_SUMMARY_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE } from '../src/protocol.mjs'
 import { createHierarchyReader } from './hierarchy-reader.mjs'
 import { readModelDirectory } from '../src/model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
@@ -35,7 +35,7 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
     registrationId: config.registrationId || (profile?.dir ? `dsh:${profile.dir}` : `dsh:unconfigured:${identity.hostRunId}`),
     hostRunId: identity.hostRunId,
     name: config.name || (profile?.name ? `DSH · ${profile.name}` : 'DSH Host'),
-    capabilities: ['native-agent-events', 'native-tool-results', 'native-baseline'],
+    capabilities: ['native-agent-events', 'native-tool-results', 'native-baseline', DSH_EXECUTION_SUMMARIES_FEATURE],
     enroll: !!(config.registrationId || profile?.dir),
     gaps: [],
   }

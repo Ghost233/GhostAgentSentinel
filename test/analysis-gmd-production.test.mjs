@@ -117,6 +117,8 @@ test('managed summary prefill and generation bound thinking before publishing a 
   const prefillPrompt = f.requests[0].body.messages[0].content;
   assert.match(prefillPrompt, /summary\.text 必须使用简体中文/);
   assert.equal(f.requests[1].body.messages[0].content, prefillPrompt);
+  assert.deepEqual(f.requests[1].body.messages.slice(2), f.requests[0].body.messages.slice(2));
+  assert.equal(f.requests[0].body.messages.slice(2).length, 3);
   assert.ok(JSON.stringify(f.requests[1].body).includes('Found the newer requested log entry.'));
   assert.equal(f.requests[0].body.cache_salt, f.requests[1].body.cache_salt);
   assert.deepEqual(f.requests.map(request => request.body.thinking_token_budget), [0, 0, undefined]);

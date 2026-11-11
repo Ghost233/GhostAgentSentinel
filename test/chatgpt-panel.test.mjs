@@ -145,7 +145,7 @@ test('verified summary cache contention shows automatic recovery beside the last
 test('the recent and current summaries display three separate literal levels while check gaps remain separate', async t => {
   const page = await harness(t), view = material('main-a', 'gray'), completedAt = Date.now() - 1000
   const lines = ['在做什么：核对 <日志>。', '有什么进展：已找到最新记录。', '卡在哪里：未观察到明确阻碍。'], body = lines.join('\n')
-  view.recentModelActivity = { summary: { text: body, completedAt, expiresAt: completedAt + 86400000, partial: true, gaps: ['current_request_evidence_missing'] } }
+  view.recentModelActivity = { summary: { text: lines.join(' '), completedAt, expiresAt: completedAt + 86400000, partial: true, gaps: ['current_request_evidence_missing'] } }
   view.analysis.partial = { text: body, evidence: [{ text: '已找到最新记录', reference: 'native:summary' }] }
   view.analysis.coverage = { complete: false, gaps: ['current_request_evidence_missing'] }
   await page.deliver(view)
@@ -155,9 +155,16 @@ test('the recent and current summaries display three separate literal levels whi
     assert.ok(page.element(id).children.every(child => child.tagName === 'P'))
   }
   assert.match(page.element('#recent-summary-gaps').textContent, /当前请求证据/)
+  assert.equal(page.element('#recent-blocking').hidden, false)
+  assert.match(page.element('#recent-blocking-status').textContent, /待确认.*没有可显示的 JEV 判断/)
   const first = page.element('#recent-summary-text').children[0]
   await page.refresh(); await page.deliver(view)
   assert.equal(page.element('#recent-summary-text').children[0], first, 'unchanged polling preserves the displayed summary rows')
+  view.recentModelActivity.summary.blocking = { status: 'unblocked', reason: '定向复测已通过', evidence: [{ text: '测试通过', reference: 'native:test' }] }
+  await page.refresh(); await page.deliver(view)
+  assert.match(page.element('#recent-blocking-status').textContent, /^未阻塞 · 定向复测已通过$/)
+  assert.equal(page.element('#recent-blocking-details').hidden, false)
+  assert.match(page.element('#recent-blocking-evidence').textContent, /测试通过/)
 })
 
 test('a partial summary lists observation gaps, stays gray and keeps the prior complete summary as history', async t => {

@@ -194,6 +194,43 @@ test('native observation, real HTTP analysis and native Remote deliver isolated 
   host.finish('task-a'); host.finish('task-b'); await until(() => a.agent.status === 'idle' && b.agent.status === 'idle', 'natural completion')
 })
 
+test('DSH retains partial observations and summarizes each observed execution once after it ends', async t => {
+  const host = await fixture(t), id = 'task-final'
+  const actor = await host.create(id, 'first execution request')
+  const readTask = async () => (await host.control.snapshot()).tasks.find(task => task.id === id)
+  const finalCalls = () => host.modelCalls.filter(call => call.path === '/v1/chat/completions'
+    && JSON.parse(call.body.messages.find(message => message.role === 'user').content).task.status === 'idle')
+  host.send(id, 'first execution result')
+  await until(async () => (await readTask())?.events.some(event => event.text.includes('first execution result')), 'first native result captured')
+  host.finish(id)
+  await until(() => actor.agent.status === 'idle', 'first execution ended')
+  await host.control.resume()
+  await until(async () => (await readTask())?.analysis.finalSummaryCompletedAt, 'first execution receives a final summary while idle')
+  const first = await readTask()
+  assert.ok([first.analysis.lastSuccessfulSummary, first.analysis.lastPartialSummary].some(record => record?.final))
+  assert.equal(first.alerts.filter(alert => alert.status === 'attention').length, 0)
+  assert.equal(finalCalls().length, 1)
+
+  actor.agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'second execution request' }] }))
+  await until(async () => (await readTask())?.currentRequest.includes('second execution request'), 'second request consumed')
+  host.send(id, 'second execution result '.repeat(80))
+  await until(async () => {
+    const task = await readTask()
+    return task.analysis.summary?.partial && task.analysis.lastPartialSummary?.gaps.includes('event_excerpt_or_capture_gap')
+  }, 'partial observation retained with coverage gaps while running')
+  const running = await readTask()
+  assert.equal(running.lifecycleId, first.lifecycleId)
+  assert.equal(running.analysis.lastPartialSummary.final, undefined)
+  assert.ok(!running.analysis.finalSummaryCompletedAt)
+  host.finish(id)
+  await until(async () => {
+    const task = await readTask()
+    return task.status === 'idle' && task.analysis.lastPartialSummary?.final && task.analysis.finalSummaryCompletedAt > first.analysis.finalSummaryCompletedAt
+  }, 'second execution receives a partial final summary')
+  await new Promise(resolve => setTimeout(resolve, 120))
+  assert.equal(finalCalls().length, 2)
+})
+
 test('unknown or failed native analysis does not notify and cancellation seals late results', async t => {
   const host = await fixture(t), view = await frontend(t, host), actor = await host.create('task-error', 'same-title request')
   host.send('task-error', 'unrelated-storage activity')

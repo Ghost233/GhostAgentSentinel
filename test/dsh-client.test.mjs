@@ -1835,7 +1835,7 @@ test('the actual DSH detail shows the current model short summary with direct ow
   assert.ok(summary().textContent.includes('已观察到当前执行结果。'))
 })
 
-test('a failed or pending DSH detail keeps only its last successful summary as folded owned history and rejects late expired or foreign records', async t => {
+test('DSH detail distinguishes partial and final summaries from scoped history', async t => {
   const at = Date.now(), completedAt = at - 2000
   const generated = { text: '上次已完成日志检查。', evidenceIds: ['basis'], evidenceRefs: [{ taskId: 'main', lifecycleId: 'run', eventId: 'basis' }] }
   const successful = { generated, completedAt, configScope: { registrationId: 'dsh:summary', revision: 'prior-settings' }, expiresAt: completedAt + 86400000 }
@@ -1875,6 +1875,34 @@ test('a failed or pending DSH detail keeps only its last successful summary as f
   task.analysis.lastSuccessfulSummary = { ...successful, generated: { ...generated, evidenceRefs: [{ taskId: 'foreign', lifecycleId: 'foreign-run', eventId: 'basis' }] } }; await f.tick()
   assert.ok(history().querySelector('[data-sentinel-citation-gap]'))
   assert.equal(history().textContent.includes('FOREIGN-SOURCE-PRIVATE-BASIS'), false, 'missing own references never resolve through another source')
+
+  task.analysis.lastSuccessfulSummary = successful
+  const partial = { ...generated, text: '已核对其中一段输出。' }
+  const gaps = ['event_excerpt_or_capture_gap']
+  Object.assign(task.analysis, { summary: { partial }, coverage: { complete: false, gaps }, resultDisposition: 'current', state: 'cooldown',
+    lastPartialSummary: { ...successful, generated: undefined, partial, gaps } })
+  await f.tick()
+  assert.match(current().textContent, /部分观察摘要.*已核对其中一段输出。/)
+  assert.match(current().textContent, /观察范围.*部分记录截断/)
+  assert.ok(history().textContent.includes(generated.text))
+  task.status = 'idle'
+  task.analysis.resultDisposition = 'invalid'
+  task.analysis.lastPartialSummary.final = true
+  task.analysis.finalSummaryCompletedAt = completedAt
+  await f.tick()
+  const final = () => f.dom.window.document.querySelector('[data-sentinel-final-summary]')
+  assert.equal(current(), null)
+  assert.match(final().textContent, /部分收尾摘要.*已核对其中一段输出。/)
+  assert.match(final().textContent, /观察范围.*部分记录截断/)
+  assert.ok(final().querySelector('[data-sentinel-citation="basis"]'))
+  assert.ok(history().textContent.includes(generated.text))
+  task.status = 'running'
+  task.analysis.finalSummaryCompletedAt = null
+  await f.tick()
+  assert.equal(final(), null)
+  const partialHistory = f.dom.window.document.querySelector('[data-sentinel-partial-history]')
+  assert.equal(partialHistory.open, false)
+  assert.match(partialHistory.textContent, /已核对其中一段输出。/)
 })
 
 test('current activity handles older snapshots without the field and preserves the core disconnected-source boundary', async t => {

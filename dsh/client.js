@@ -727,6 +727,15 @@
         'Task baseline is unconfirmed': '任务基线未确认',
         'Source is disconnected': '来源已断开',
         'Task baseline is not yet available': '任务基线尚未取得',
+        event_excerpt_or_capture_gap: '部分记录截断或存在采集缺口',
+        'Some observed excerpts are truncated': '部分记录截断',
+        'Some observed content was omitted for privacy': '敏感内容已省略',
+        capture_coverage_unconfirmed: '采集覆盖未完整确认',
+        analysis_evidence_budget: '本轮仅使用预算内的部分记录',
+        analysis_input_budget: '判断材料超过预算',
+        extraction_evidence_gap: '模型提取的证据存在缺口',
+        judgment_evidence_insufficient: '判断执行活动的证据不足',
+        no_applicable_semantic_checks: '本次观察未触发语义检查',
       }
       const gapText = value => historicalGaps[value] || value
       function EvidenceCitations({ record, task, snapshot, recovery = false, compact = false }) {
@@ -805,17 +814,32 @@
           h('p', null, historical ? '上次判断 · ' : '', blockingLabels[decision.status], ' · ', decision.reason),
           decision.evidenceRefs?.length > 0 && h('details', null, h('summary', null, '查看判断依据'), h(EvidenceCitations, { record: decision, task, snapshot })))
       }
+      function SummaryContent({ record, gaps, task, snapshot, historical = false }) {
+        const scope = gaps && [...new Set(gaps.filter(gap => text(gap)).map(gapText))].slice(0, 24)
+        return h(React.Fragment, null,
+          h(SummaryText, { value: record.text }),
+          scope && h('p', null, '观察范围：', scope.join('；') || '本轮仅覆盖已采集的部分材料'),
+          h(BlockingDecision, { decision: record.blocking, task, snapshot, historical }),
+          h(EvidenceCitations, { record, task, snapshot, compact: true }))
+      }
       function ObservationDetail({ task, snapshot, current, gs = task.gs }) {
         const analysis = task.analysis || {}, source = snapshot.sources.find(item => item.key === task.sourceKey)
         const observed = connectionScope?.active && !current.error && !snapshot.adapter?.error
-        const generated = analysis.summary?.generated
-        const publishableSummary = observed && source?.status === 'connected' && ['current', 'reused'].includes(analysis.resultDisposition) && !['failed', 'stale', 'unavailable', 'interrupted', 'unknown'].includes(analysis.state) && text(generated?.text)
-        const previous = analysis.lastSuccessfulSummary, now = Date.now()
+        const generated = analysis.summary?.generated, partial = analysis.summary?.partial
+        const currentSummary = observed && source?.status === 'connected' && ['current', 'reused'].includes(analysis.resultDisposition) && !['failed', 'stale', 'unavailable', 'interrupted', 'unknown'].includes(analysis.state)
+        const publishableSummary = currentSummary && text(generated?.text)
+        const publishablePartial = currentSummary && !publishableSummary && analysis.coverage?.complete === false && text(partial?.text)
+        const currentGaps = ['gaps', 'verificationGaps', 'contextGaps', 'extractionGaps'].flatMap(key => Array.isArray(analysis.coverage?.[key]) ? analysis.coverage[key] : [])
+        const previous = analysis.lastSuccessfulSummary, previousPartial = analysis.lastPartialSummary, now = Date.now()
         const observedThrough = Number.isFinite(snapshot.generatedAt) ? Math.min(now, snapshot.generatedAt) : now
         const completedThrough = Number.isFinite(analysis.completedAt) ? Math.min(observedThrough, analysis.completedAt) : observedThrough
-        const historicalSummary = !publishableSummary && source?.descriptor?.registrationId && previous?.configScope?.registrationId === source.descriptor.registrationId
-          && Number.isSafeInteger(previous.completedAt) && previous.completedAt <= completedThrough
-          && Number.isSafeInteger(previous.expiresAt) && previous.expiresAt > now && previous.expiresAt <= previous.completedAt + 86400000 && text(previous.generated?.text)
+        const retained = (entry, record) => source?.descriptor?.registrationId && entry?.configScope?.registrationId === source.descriptor.registrationId
+          && Number.isSafeInteger(entry.completedAt) && entry.completedAt <= completedThrough
+          && Number.isSafeInteger(entry.expiresAt) && entry.expiresAt > now && entry.expiresAt <= entry.completedAt + 86400000 && text(record?.text)
+        const completed = retained(previous, previous?.generated), incomplete = retained(previousPartial, previousPartial?.partial)
+        const final = ['idle', 'disposed'].includes(task.status) && [completed && previous, incomplete && previousPartial]
+          .find(entry => entry?.final === true && entry.completedAt === analysis.finalSummaryCompletedAt)
+        const historicalDecision = analysis.state === 'paused' || snapshot.monitoring?.state === 'paused'
         const analyzing = observed && snapshot.monitoring?.state !== 'paused' && task.status === 'running' && source?.status === 'connected'
           && !['unknown', 'interrupted', 'stale', 'failed', 'unavailable', 'paused'].includes(analysis.state)
         return h('article', { 'data-gs-detail': task.key, 'aria-live': 'polite' },
@@ -829,11 +853,19 @@
             observed ? '' : '历史活动：', text(task.activity?.summary) || '活动摘要未提供'),
           publishableSummary && h('div', { 'data-sentinel-model-summary': true },
             h('small', null, analysis.resultDisposition === 'reused' ? '复用有效总结：' : '模型总结：'),
-            h(SummaryText, { value: generated.text }),
-            h(BlockingDecision, { decision: generated.blocking, task, snapshot, historical: analysis.state === 'paused' || snapshot.monitoring?.state === 'paused' }),
-            h(EvidenceCitations, { record: generated, task, snapshot, compact: true })),
-          historicalSummary && h('details', { 'data-sentinel-summary-history': true }, h('summary', null, '上次成功总结'),
-            h('small', null, '历史总结 · 原完成时间：', timeText(previous.completedAt)), h(SummaryText, { value: previous.generated.text }), h(BlockingDecision, { decision: previous.generated.blocking, task, snapshot, historical: true }), h(EvidenceCitations, { record: previous.generated, task, snapshot, compact: true })),
+            h(SummaryContent, { record: generated, task, snapshot, historical: historicalDecision })),
+          publishablePartial && h('div', { 'data-sentinel-model-summary': true },
+            h('small', null, analysis.resultDisposition === 'reused' ? '复用部分观察摘要' : '部分观察摘要'),
+            h(SummaryContent, { record: partial, gaps: currentGaps, task, snapshot, historical: historicalDecision })),
+          final && h('div', { 'data-sentinel-final-summary': true },
+            h('small', null, final.partial ? '部分收尾摘要' : '收尾摘要', ' · ', timeText(final.completedAt)),
+            h(SummaryContent, { record: final.partial ?? final.generated, gaps: final.partial ? final.gaps ?? [] : null, task, snapshot, historical: true })),
+          completed && !publishableSummary && final !== previous && h('details', { 'data-sentinel-summary-history': true }, h('summary', null, '上次成功总结'),
+            h('small', null, '历史总结 · 原完成时间：', timeText(previous.completedAt)),
+            h(SummaryContent, { record: previous.generated, task, snapshot, historical: true })),
+          incomplete && !publishablePartial && final !== previousPartial && h('details', { 'data-sentinel-partial-history': true }, h('summary', null, previousPartial.final ? '上次部分收尾摘要' : '上次部分观察摘要'),
+            h('small', null, '原完成时间：', timeText(previousPartial.completedAt)),
+            h(SummaryContent, { record: previousPartial.partial, gaps: previousPartial.gaps ?? [], task, snapshot, historical: true })),
           task.instructionContext?.gaps?.length > 0 && h('p', null, '当前指令上下文缺口：', task.instructionContext.gaps.join('；')),
           h('details', { 'data-gs-checks': true }, h('summary', null, '完整检查与依据'),
             h('p', null, '最近推进：', text(analysis.summary?.recentProgress) || '尚未判断'),

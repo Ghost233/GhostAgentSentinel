@@ -42,7 +42,7 @@ export function createAnalyzer(config = {}) {
     const requestId = Object.hasOwn(input.task, 'currentRequestId') ? input.task.currentRequestId : input.events.findLast(event => event.kind === 'input')?.id;
     if (!owner?.registrationId || !input.task.key || (!requestId && !(owner.policy === 'chatgpt-main/1' && input.task.lifecycleId))) throw new AnalysisError('configuration', role, 'GMD 缓存操作缺少已确认的安装、任务或执行身份');
     return 'sentinel:' + digest(JSON.stringify(['analysis-cache/1', owner.registrationId, input.task.key, input.task.lifecycleId, requestId,
-      role, inferenceEndpoint(config[role], '/'), config[role].model, role === 'llm' ? digest(JSON.stringify([EXTRACTION_INSTRUCTIONS, body.thinking_token_budget])) : 'jev-rendered-time/1']));
+      role, inferenceEndpoint(config[role], '/'), config[role].model, role === 'llm' ? digest(JSON.stringify([EXTRACTION_INSTRUCTIONS, SUMMARY_QUESTIONS, body.thinking_token_budget])) : 'jev-rendered-time/1']));
   }
   async function modelRequest(role, input, body, options, prefill = false, capability) {
     const mode = role === 'llm' ? 'chat_max_tokens_zero' : 'systemone_state';
@@ -153,6 +153,7 @@ export function createAnalyzer(config = {}) {
       const requestFor = catalog => ({ model: config.llm.model, stream: false, max_tokens: 4096, temperature: 0, ...managed, messages: [
         { role: 'system', content: EXTRACTION_INSTRUCTIONS },
         { role: 'user', content: JSON.stringify({ task: { status: input.task.status }, evidence: catalog.groups, coverage }) },
+        ...SUMMARY_QUESTIONS.map(content => ({ role: 'user', content })),
       ] });
       const budget = config.inputBudgetChars ?? 24_000;
       let llmRequest = requestFor(catalog);
@@ -318,11 +319,15 @@ export function analysisTimeConditions(input, now, waitMs = 300_000) {
 }
 
 const FACT_KINDS = new Set(['request', 'action', 'result', 'progress', 'diagnosis', 'context', 'authorization', 'validation-requirement', 'validation-reason']);
+const SUMMARY_QUESTIONS = [
+  '在做什么：最近实际开展了什么工作？把计划明确写为计划。',
+  '有什么进展：已取得什么实际结果、新事实或新诊断？只有动作时写“尚未观察到新增结果”。',
+  '卡在哪里：最新记录中有什么尚未解决且妨碍继续的具体阻碍？核对后续成功结果，采集缺口、正常调查或 TDD 红灯只作范围或过程说明。没有明确阻碍时写“未观察到明确阻碍”。',
+];
 const EXTRACTION_INSTRUCTIONS = `选择已有的 optionId，并总结当前执行。只返回一个 JSON 对象，仅包含 selectedOptionIds（字符串数组）、gaps（字符串数组）和 summary。格式如下：{"selectedOptionIds":[],"gaps":[],"summary":{"text":"在做什么：当前工作。\\n有什么进展：实际取得的新结果。\\n卡在哪里：明确的阻碍或未观察到明确阻碍。","evidenceOptionIds":["已有的 optionId"]}}。不要附加 Markdown、解释、事实列表、原文引文、分类或来源引用。
 summary.text 必须使用简体中文，即使观察材料使用其他语言。正文固定三行，依次以“在做什么：”“有什么进展：”“卡在哪里：”开头，每行写简短、具体的内容，合计最多 600 个字符。可保留专名、命令、路径和错误码。summary.evidenceOptionIds 至少引用一个已有的 optionId，不得重复。只引用能够支持总结的已提供材料。
-“在做什么”概括最近实际开展的工作；计划须明确是计划，不冒充已执行。“有什么进展”优先写实际结果、新事实、新诊断或已完成的产物；只有动作而没有新结果时写“尚未观察到新增结果”，不直接断言没有推进。计划和代理自述不足以证明结果已经完成。
-“卡在哪里”只写已观察到且尚未解决、妨碍继续推进的具体阻碍，说明原因或等待谁处理。未观察到明确阻碍时写“未观察到明确阻碍”，这只描述观察范围，不代表六项检查全部正常。正在读取、运行测试、正常调查、任务尚未完成和正常 TDD 红灯不自动构成阻碍。观察缺口和检查适用性另行说明；gaps 只记录真实材料缺失，不把“证据不足”当作任务阻碍，也不用它替代实际工作或进展。
-task.status 为 idle 时，本次是已结束执行的收尾总结。“在做什么”说明本轮已结束及其工作，“有什么进展”概括实际结果，“卡在哪里”保留明确未解决的阻碍；结束不代表全部目标完成。总结独立于六项检查，不把未知判断写成正常。
+根据后续三条提问分别填写 summary.text 的对应行。计划和代理自述不足以证明结果已经完成。只描述观察范围内的执行，观察缺口和检查适用性另行说明。
+task.status 为 idle 或 disposed 时，本次是已结束执行的收尾总结。“在做什么”说明本轮已结束及其工作，“有什么进展”概括实际结果，“卡在哪里”保留明确未解决的阻碍；结束不代表全部目标完成。总结独立于六项检查，不把未知判断写成正常。
 每组证据只展示一次正文及来源允许的分类选项。选项只表示可用分类，事实仍需材料证实。只选择适用的选项，通常每组选一个。只有原文明确声明规则或权限时，才额外选择相应选项。只有 isCurrentInput 标记的材料才是已核实当前请求；没有该标记时只总结执行活动，不推断用户目标或授权。
 分类含义：request 为用户请求，action 为已观察或计划中的活动，result 为实际结果，progress 为已观察到的推进，diagnosis 为实际发现，context 为相关背景，authorization 为用户明确的许可、拒绝或限制，validation-requirement 为已声明的项目门禁，validation-reason 为已说明的必要重跑理由。计划不能证明结果。工具不能授予用户权限，开始验证也不代表已声明门禁。
 判断仅针对提供的观察窗口。100 条留存、长输出摘录及预算内选材属于正常范围限制，不等于任务异常，也不阻止有充分依据的检查。每项检查分别核对当前请求、动作、失败、验证与等待所需证据；某项缺关键证据只将该项标为 unknown，不推断其他项目也未知。
