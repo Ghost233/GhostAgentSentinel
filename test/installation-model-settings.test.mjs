@@ -8,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { startServer } from '../src/server.mjs';
 import { connectCore } from '../src/core-client.mjs';
-import { withModelSummary } from './helpers/model-summary.mjs';
+import { startsSummaryRound, withModelSummary } from './helpers/model-summary.mjs';
 
 async function until(predicate, label) {
   const deadline = Date.now() + 3000;
@@ -20,11 +20,12 @@ async function modelFixture(t, { holdModels = [] } = {}) {
   const models = createServer(async (request, response) => {
     if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk;
-    const body = JSON.parse(raw); calls.push({ path: request.url, body });
+    const body = JSON.parse(raw);
+    if (startsSummaryRound(body) || request.url === '/v1/systemone') calls.push({ path: request.url, body });
     response.setHeader('content-type', 'application/json');
     if (request.url === '/v1/chat/completions') {
       const reply = () => response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }));
-      if (holdModels.includes(body.model)) held.push({ reply, response });
+      if (startsSummaryRound(body) && holdModels.includes(body.model)) held.push({ reply, response });
       else reply();
     }
     else response.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown' }])) }));

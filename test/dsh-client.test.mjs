@@ -12,7 +12,7 @@ import { connectCore } from '../src/core-client.mjs'
 import { createAdapter } from '../dsh/host.mjs'
 import { createServer } from 'node:http'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
-import { withModelSummary } from './helpers/model-summary.mjs'
+import { summaryLineForRequest, withModelSummary } from './helpers/model-summary.mjs'
 
 const { Context } = req('@deepseek-ai/cordis')
 const { createElement: h, act } = clientRequire('react')
@@ -949,7 +949,7 @@ test('the actual DSH settings form autosaves groups through Native Remote and dr
       const evidence = JSON.parse(body.messages.find(message => message.role === 'user').content).evidence
       const option = evidence.find(entry => entry.origin === 'output')?.options.find(option => option.kind === 'action') ?? evidence[0].options[0]
       const selectedOptionIds = option.kind === 'action' ? [option.optionId] : []
-      response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [], summary: { text: '在做什么：处理当前请求。\n有什么进展：已观察到执行活动。\n卡在哪里：未观察到明确阻碍。', evidenceOptionIds: [option.optionId] } }) } }] }))
+      response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [], summary: { text: summaryLineForRequest(body, '在做什么：处理当前请求。\n有什么进展：已观察到执行活动。\n卡在哪里：未观察到明确阻碍。'), evidenceOptionIds: [option.optionId] } }) } }] }))
     } else {
       const input = decodeJevRequest(body)
       response.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(input.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'attention' : 'unknown' }])) }))

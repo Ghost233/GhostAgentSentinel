@@ -1,4 +1,4 @@
-import { withModelSummary } from './helpers/model-summary.mjs'
+import { startsSummaryRound, withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
@@ -35,7 +35,7 @@ async function fixture(t, { profile = candidateHostProfile, producer = candidate
     if (req.method === 'GET') return res.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let body = ''; for await (const chunk of req) body += chunk
     res.setHeader('content-type', 'application/json')
-    if (req.url === '/v1/chat/completions') { state.summaryCalls++; await state.modelGate; if (state.modelFailure) return res.writeHead(503).end('{"error":"controlled model unavailable"}'); res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] })) }
+    if (req.url === '/v1/chat/completions') { const wire = JSON.parse(body); if (startsSummaryRound(wire)) state.summaryCalls++; await state.modelGate; if (state.modelFailure) return res.writeHead(503).end('{"error":"controlled model unavailable"}'); res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(wire, { selectedOptionIds: [], gaps: [] })) } }] })) }
     else { state.jevCalls++; const request = decodeJevRequest(JSON.parse(body)); res.end(JSON.stringify({ model: 'fixed-judge', answers: Object.fromEntries(Object.keys(request.questions).map(id => [id, { type: 'choice', choice: id === 'execution_blocking' ? state.blockingChoice ?? 'unknown' : 'clear' }])) })) }
   })
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); wire.closeAllConnections(); await new Promise(resolve => wire.close(resolve)); await fs.rm(dir, { recursive: true, force: true }) })

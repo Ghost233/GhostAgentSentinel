@@ -88,13 +88,13 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
     releaseJudge, stopLifetime() { lifetime.abort(new Error('Observer lifetime closed')); } };
 }
 
-test('a bounded output allowance above the observed truncation ceiling can publish a cited partial summary in one managed generation', async t => {
+test('a bounded output allowance above the observed truncation ceiling can publish a cited partial summary in three managed generations', async t => {
   const f = await fixture(t, { minimumOutputTokens: 4096 });
   const result = await f.analyzer.analyze({ ...observation, coverage: { complete: false, gaps: ['image omitted'] } }, f.options);
   assert.ok(result.summary.partial.evidenceRefs.length);
   assert.equal(result.summary.generated, undefined);
   assert.equal(result.coverage.complete, false);
-  assert.equal(f.requests.length, 1, 'no untracked replacement after a released generation');
+  assert.equal(f.requests.length, 3, 'one generation per question with no extra replacement');
   assert.equal(f.requests[0].body.max_tokens, 4096);
   assert.ok(result.summary.partial.text.length <= 600);
   assert.ok(result.usage.gmd.llm.terminal && result.usage.gmd.llm.lease_released);
@@ -112,20 +112,24 @@ test('managed summary prefill and generation bound thinking before publishing a 
   assert.ok(result.summary.generated);
   assert.equal(result.checks.length, 6);
   assert.deepEqual(f.requests.map(request => [request.path, request.body.max_tokens ?? null]), [
-    ['/v1/chat/completions', 0], ['/v1/chat/completions', 4096], ['/v1/systemone', null],
+    ['/v1/chat/completions', 0], ...Array.from({ length: 3 }, () => ['/v1/chat/completions', 4096]), ['/v1/systemone', null],
   ], 'consume handles the new suffix without an extra zero-budget request');
   const prefillPrompt = f.requests[0].body.messages[0].content;
   assert.match(prefillPrompt, /summary\.text 必须使用简体中文/);
   assert.equal(f.requests[1].body.messages[0].content, prefillPrompt);
-  assert.deepEqual(f.requests[1].body.messages.slice(2), f.requests[0].body.messages.slice(2));
-  assert.equal(f.requests[0].body.messages.slice(2).length, 3);
+  const generations = f.requests.slice(1, 4);
+  assert.equal(f.requests[0].body.messages.length, 2, 'prefill sends only the shared prefix');
+  assert.ok(generations.every(request => request.body.messages.length === 3 && request.body.cache_salt === f.requests[0].body.cache_salt));
+  for (const request of generations) assert.deepEqual(request.body.messages.slice(0, 2), generations[0].body.messages.slice(0, 2));
+  assert.equal(new Set(generations.map(request => request.body.messages[2].content)).size, 3);
+  assert.equal(new Set(generations.map(request => request.id)).size, 3);
   assert.ok(JSON.stringify(f.requests[1].body).includes('Found the newer requested log entry.'));
   assert.equal(f.requests[0].body.cache_salt, f.requests[1].body.cache_salt);
-  assert.deepEqual(f.requests.map(request => request.body.thinking_token_budget), [0, 0, undefined]);
+  assert.deepEqual(f.requests.map(request => request.body.thinking_token_budget), [0, 0, 0, 0, undefined]);
   const legacySalt = 'sentinel:' + hash(JSON.stringify(['analysis-cache/1', observation.source.registrationId, observation.task.key, observation.task.lifecycleId, observation.task.currentRequestId,
     'llm', f.config.llm.baseUrl + '/', 'summary', hash(f.requests[0].body.messages[0].content)]));
   assert.notEqual(f.requests[0].body.cache_salt, legacySalt, 'new generation policy cannot reuse the unconstrained-thinking prefix');
-  assert.notEqual(f.requests[1].body.cache_salt, f.requests[2].body.cache_salt);
+  assert.notEqual(f.requests[1].body.cache_salt, f.requests.at(-1).body.cache_salt);
   assert.notEqual(f.requests[0].id, f.requests[1].id);
   assert.ok(result.usage.gmd.llm.lease_released);
 });
@@ -136,7 +140,7 @@ test('an undeclared prefill provider retains the existing two-model analysis wit
   assert.equal(f.requests.length, 0);
   const result = await f.analyzer.analyze(observation, f.options);
   assert.ok(result.summary.generated);
-  assert.deepEqual(f.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(f.requests.map(request => request.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
   assert.ok(f.requests.every(request => request.id === undefined && request.body.cache_salt === undefined && request.body.thinking_token_budget === undefined));
 });
 
@@ -145,17 +149,19 @@ test('verified summary cache contention generates in one isolated cache without 
   for (let round = 0; round < 2; round++) {
     const result = await f.analyzer.analyze(observation, f.options);
     assert.ok(result.summary.generated);
-    const [rejected, generated, judgment] = f.requests.slice(round * 3);
+    const [rejected, generated, progress, blocker, judgment] = f.requests.slice(round * 5);
     assert.equal(rejected.body.max_tokens, 4096);
     assert.equal(generated.body.max_tokens, rejected.body.max_tokens);
     assert.deepEqual(generated.body.messages, rejected.body.messages);
     assert.notEqual(generated.body.cache_salt, rejected.body.cache_salt);
     assert.notEqual(generated.id, rejected.id);
-    assert.equal(result.usage.gmd.llm.request_id, generated.id);
+    assert.equal(progress.body.cache_salt, generated.body.cache_salt);
+    assert.equal(blocker.body.cache_salt, generated.body.cache_salt);
+    assert.equal(result.usage.gmd.llm.request_id, blocker.id);
     assert.equal(judgment.path, '/v1/systemone');
   }
-  assert.equal(f.requests.length, 6);
-  assert.equal(f.requests[1].body.cache_salt, f.requests[4].body.cache_salt, 'recovery does not create a new cache every round');
+  assert.equal(f.requests.length, 10);
+  assert.equal(f.requests[1].body.cache_salt, f.requests[6].body.cache_salt, 'recovery does not create a new cache every round');
 });
 
 test('a busy isolated summary cache does not trigger another isolated attempt', async t => {
@@ -205,8 +211,8 @@ test('the complete managed summary envelope fits its input budget without droppi
   const result = await f.analyzer.analyze({ ...observation, events }, f.options);
   assert.ok(result.summary.partial.evidenceRefs.length);
   assert.ok(result.coverage.gaps.includes('analysis_evidence_budget'));
-  assert.equal(f.requests.length, 2, 'managed bounded observations still reach per-check judgment');
-  assert.ok(JSON.stringify(f.requests[1].body).length <= 24_000);
+  assert.equal(f.requests.length, 4, 'managed bounded observations still reach per-check judgment');
+  assert.ok(JSON.stringify(f.requests.at(-1).body).length <= 24_000);
   assert.ok(JSON.stringify(f.requests[0].body).length <= 24_000, 'budget includes the thinking policy and cache namespace actually sent');
   const evidence = JSON.parse(f.requests[0].body.messages[1].content).evidence;
   assert.ok(evidence.some(group => group.isCurrentInput));
@@ -267,7 +273,7 @@ test('ChatGPT activity without a request uses an execution-scoped managed cache 
   const next = { ...input, task: { ...input.task, lifecycleId: 'next-run' }, events: input.events.map(event => ({ ...event, taskLifecycleId: 'next-run' })) };
   await f.analyzer.prefill(next, f.options);
   const llmRequests = f.requests.filter(request => request.path === '/v1/chat/completions');
-  assert.notEqual(llmRequests[0].body.cache_salt, llmRequests[2].body.cache_salt);
+  assert.notEqual(llmRequests[0].body.cache_salt, llmRequests[4].body.cache_salt);
   assert.ok(llmRequests.every(request => JSON.parse(request.body.messages[1].content).evidence.every(group => !group.isCurrentInput)));
   assert.ok(f.requests.every(request => !JSON.stringify(request.body).includes('UNBOUND_HISTORICAL_LIMIT')));
 });
@@ -314,7 +320,7 @@ test('production cancellation keeps admission until release and resumes using th
   f.release();
   await until(async () => Boolean((await core.snapshot()).tasks[0].analysis.summary?.generated));
   const consumes = f.requests.filter(request => request.body.max_tokens > 0);
-  assert.equal(consumes.length, 2);
+  assert.equal(consumes.length, 4);
   assert.ok(JSON.stringify(consumes[1].body).includes('Material collected during pause.'));
   assert.notEqual(consumes[0].id, consumes[1].id);
 });
@@ -365,6 +371,6 @@ test('a verified no-admission rejection records failure and lets the next queued
   assert.equal(tasks.find(task => task.id === 'task').analysis.error.code, 'gmd_not_admitted');
   assert.equal(tasks.find(task => task.id === 'task').analysis.summary, null);
   assert.ok(tasks.find(task => task.id === 'peer').analysis.summary.generated);
-  assert.equal(f.requests.filter(request => request.body.max_tokens > 0).length, 2, 'each task receives one normal analysis; the rejection is not retried as a replacement');
+  assert.equal(f.requests.filter(request => request.body.max_tokens > 0).length, 4, 'the first task fails once and the peer completes its three questions');
   assert.equal((await core.diagnostics()).runtime.cancelledUnsettledRequests, 0);
 });

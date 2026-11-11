@@ -89,11 +89,11 @@ test('native material reaches the existing Chat/JEV IO and distinguishes normal,
     assert.equal(drift.judgmentState, mode === 'clear' ? 'clear' : 'insufficient')
     assert.equal(result.checks.find(check => check.id === 'long_wait').status, 'clear')
     for (const id of ['stalled_progress', 'failure_loop', 'validation_cost', 'validation_gap']) assert.equal(result.checks.find(check => check.id === id).applicability.state, 'not-triggered')
-    assert.deepEqual(io.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone'])
+    assert.deepEqual(io.requests.map(request => request.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone'])
     const evidence = JSON.parse(io.requests[0].body.messages[1].content).evidence
     assert.ok(evidence.some(item => item.text === 'Read only the requested log'))
     assert.ok(evidence.some(item => item.text === 'Read the requested log and found the failing assertion'))
-    assert.equal(io.requests[1].body.state.request, 'Read only the requested log')
+    assert.equal(io.requests.at(-1).body.state.request, 'Read only the requested log')
     assert.deepEqual(result.coverage.dependencies, [])
   })
 })
@@ -151,8 +151,8 @@ test('running ChatGPT executions analyze activity without a user request and res
     }
     assert.match(first.activity.summary, /failure-2/)
     assert.equal(first.gs.light, choice === 'attention' ? 'red' : 'green')
-    assert.deepEqual(io.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone'])
-    const judged = io.requests[1].body
+    assert.deepEqual(io.requests.map(request => request.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone'])
+    const judged = io.requests.at(-1).body
     assert.equal(judged.state.request, null)
     assert.deepEqual(Object.keys(judged.questions), ['execution_blocking', 'failure_loop', 'validation_cost'])
     if (choice === 'attention') { time += 3001; assert.ok((await core.claimNotifications(source)).length) }
@@ -161,7 +161,7 @@ test('running ChatGPT executions analyze activity without a user request and res
     time += 60_001
     await core.ingest(source, { events: [{ ...event('new-output', 'output', 0), capturedAt: time, occurredAt: time }] })
     const paused = (await core.snapshot()).tasks[0]
-    assert.equal(paused.analysis.state, 'paused'); assert.equal(io.requests.length, 2)
+    assert.equal(paused.analysis.state, 'paused'); assert.equal(io.requests.length, 4)
     await core.setConversationMonitoring({ registrationId: 'running-chat', taskId: 'main', paused: false, revision: paused.conversationMonitoring.revision })
     const resumed = await settled(core)
     assert.ok(resumed.analysis.completedAt > first.analysis.completedAt)
@@ -205,7 +205,7 @@ test('bounded native output reaches real model judgment and a scoped green Core 
   const start = { id: 'start', taskId: 'main', taskLifecycleId: 'turn', kind: 'status', occurredAt: at, capturedAt: at, text: 'task_started', data: { nativeType: 'task_started', runId: 'turn', sourceKind: 'chatgpt-native', sourceForm: 'event_msg', turnTrigger: 'composer', status: 'running' } }
   await core.ingest(source, { tasks: [{ id: 'main', lifecycleId: 'turn', sessionId: 'main', title: 'Main', status: 'running' }], events: [start, ...f.input.events, ...(choice === 'missing-verification' ? ['git push', 'npm verify'].map((command, i) => ({ id: 'tool-' + i, taskId: 'main', taskLifecycleId: 'turn', kind: 'tool-start', occurredAt: at, capturedAt: at, text: command, data: { callId: 'tool-' + i, command } })) : [])], hierarchyContext: { schemaVersion: 1, revision: 1, sessions: [{ sessionId: 'main' }], activations: [{ taskId: 'main', lifecycleId: 'turn', sessionId: 'main', runId: 'turn', state: 'running', stateRefs: [ref('start')] }], relations: [], instructionBindings: [{ taskId: 'main', lifecycleId: 'turn', inputRef: ref('material-0'), phase: 'consumed', origin: 'user-entry', originRefs: [ref('start'), ref('material-0')], ancestorLimitRefs: [] }], coverage: { complete: true, branchGaps: [] } } })
   const actor = await settled(core)
-  assert.deepEqual(io.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone'])
+  assert.deepEqual(io.requests.map(request => request.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone'])
   assert.equal(actor.analysis.checks.find(check => check.id === 'request_drift').status, choice === 'missing-verification' ? 'clear' : choice)
   assert.equal(actor.gs.light, { clear: 'green', attention: 'red', unknown: 'gray', 'missing-verification': 'green' }[choice])
   if (choice === 'missing-verification') for (const id of ['validation_cost', 'validation_gap']) {

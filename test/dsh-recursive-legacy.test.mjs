@@ -22,7 +22,7 @@ test('an actual legacy core preserves consumed root input while accepted, notice
     let body = ''; for await (const chunk of request) body += chunk
     const json = JSON.parse(body); modelRequests.push(json)
     response.setHeader('content-type', 'application/json')
-    if (request.url === '/v1/chat/completions') response.end(JSON.stringify({ model: 'extractor', choices: [{ message: { content: JSON.stringify(withModelSummary(json, { selectedOptionIds: [], gaps: [] })) }, finish_reason: 'stop' }] }))
+    if (request.url === '/v1/chat/completions') response.end(JSON.stringify({ model: 'extractor', choices: [{ message: { content: JSON.stringify(withModelSummary(json, { selectedOptionIds: [], gaps: [] }, { legacy: true })) }, finish_reason: 'stop' }] }))
     else response.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(json.questions).map(id => [id, { type: 'choice', choice: 'unknown', confidence: 1 }])) }))
   })
   t.after(async () => {

@@ -69,9 +69,9 @@ test('JEV renders one lossless provenance dictionary without rewriting evidence 
     const result = await http.analyzer().analyze(sample.input);
     assert.deepEqual(sample.input, before, 'observations, source references and active alerts remain immutable');
     const calls = http.captures.slice(count);
-    assert.deepEqual(calls.map(item => item.path), ['/v1/chat/completions', '/v1/systemone'], 'one batch serves the semantic and recovery questions');
+    assert.deepEqual(calls.map(item => item.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone'], 'one batch serves the semantic and recovery questions');
     assert.deepEqual(result.checks.map(check => check.id), CHECK_IDS);
-    const capture = calls[1];
+    const capture = calls.at(-1);
     if (process.env.SENTINEL_JEV_RENDER_RECEIPTS) await writeFile(join(process.env.SENTINEL_JEV_RENDER_RECEIPTS, sample.name + '-wire.json'), JSON.stringify(capture.body, null, 2));
     records.push({ ...sample, capture, result });
   }
@@ -147,7 +147,7 @@ test('dictionary rendering preserves the separate relevant-result recovery decis
 test('a rendered JEV batch retains the caller deadline and fails as a JEV deadline', async t => {
   const http = await inference(t, { holdJudge: true });
   await assert.rejects(http.analyzer({ jevTimeoutMs: 25 }).analyze(multilevel().input), error => error.code === 'deadline' && error.stage === 'jev');
-  assert.deepEqual(http.captures.map(item => item.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(http.captures.map(item => item.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
 });
 
 test('the unchanged input budget preserves existing checks when the additional blocking question does not fit', async t => {
@@ -158,18 +158,18 @@ test('the unchanged input budget preserves existing checks when the additional b
   assert.ok(JSON.stringify(http.captures[0].body).length < limit, 'the extractor fits the same unchanged budget');
   let before = http.captures.length;
   const accepted = await http.analyzer({ inputBudgetChars: limit }).analyze(recovery);
-  assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
   assert.equal(accepted.coverage.complete, true);
   assert.ok(http.captures.at(-1).body.questions.execution_blocking);
   before = http.captures.length;
   const fallback = await http.analyzer({ inputBudgetChars: limit - 1 }).analyze(recovery);
-  assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
   assert.equal(http.captures.at(-1).body.questions.execution_blocking, undefined);
   assert.equal(fallback.summary.generated.blocking.status, 'unknown');
   const checksOnlyLimit = JSON.stringify(http.captures.at(-1).body).length;
   before = http.captures.length;
   const rejected = await http.analyzer({ inputBudgetChars: checksOnlyLimit - 1 }).analyze(recovery);
-  assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions']);
+  assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions']);
   assert.ok(rejected.coverage.gaps.includes('analysis_input_budget'));
 });
 

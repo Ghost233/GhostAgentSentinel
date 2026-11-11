@@ -156,7 +156,7 @@ test('a nonempty current request with the same title still uses verified Chat an
   const models = await withModels(t, { facts: [{ kind: 'request', eventId: 'request', quote: 'Add a log' }, { kind: 'action', eventId: action.id, quote: action.text }], gaps: [] }, { request_drift: 'clear' });
   const result = await models.analyzer().analyze({ ...input, task: { ...task, currentRequestId: 'request' }, events: [...input.events, action] });
   assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'clear');
-  assert.deepEqual(models.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(models.requests.map(request => request.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
   assert.equal(result.coverage.complete, true);
 });
 
@@ -178,14 +178,14 @@ test('verified request and action quotes reach public JEV and can raise first-ro
   const drift = result.checks.find(check => check.id === 'request_drift');
   assert.equal(drift.status, 'attention');
   assert.deepEqual(drift.evidenceIds, ['request', 'action']);
-  assert.equal(models.requests.length, 2);
+  assert.equal(models.requests.length, 4);
   assert.equal(models.requests[0].path, '/v1/chat/completions');
   assert.equal(models.requests[0].body.stream, false);
-  assert.equal(models.requests[1].path, '/v1/systemone');
-  const state = models.requests[1].body.state;
+  assert.equal(models.requests.at(-1).path, '/v1/systemone');
+  const state = models.requests.at(-1).body.state;
   assert.equal(state.facts[1].quote, undefined);
   assert.equal(state.events.find(event => event.id === state.facts[1].eventId).text, 'I am redesigning the database');
-  assert.equal(result.usage.llm.prompt_tokens, 12);
+  assert.equal(result.usage.llm.prompt_tokens, 36);
   assert.equal(result.quality, 'unvalidated');
 });
 
@@ -235,7 +235,7 @@ test('out-of-order inputs and same-time backfill use the core request identity',
   const result = await models.analyzer().analyze({ ...input, task: { ...task, currentRequestId: current.id }, events: [current, action, backfill, old] });
   assert.equal(result.summary.currentTask, 'Current request');
   assert.equal(JSON.parse(models.requests[0].body.messages[1].content).evidence.find(entry => entry.isCurrentInput).text, current.text);
-  assert.equal(models.requests[1].body.state.request, 'Current request');
+  assert.equal(models.requests.at(-1).body.state.request, 'Current request');
   assert.deepEqual(result.checks.find(check => check.id === 'request_drift').evidenceIds, ['current-input', 'action', 'backfill-input']);
 });
 
@@ -273,7 +273,7 @@ test('old gaps and truncated history do not poison the new core-anchored request
   assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'attention');
   assert.equal(result.coverage.complete, true);
   assert.deepEqual(JSON.parse(models.requests[0].body.messages[1].content).evidence.map(entry => entry.text), [current.text, action.text]);
-  assert.deepEqual(models.requests[1].body.state.events.map(event => event.id), [current.id, action.id]);
+  assert.deepEqual(models.requests.at(-1).body.state.events.map(event => event.id), [current.id, action.id]);
   assert.equal(events.length, 6);
 });
 
@@ -373,7 +373,7 @@ test('known repeated failures are judged semantically rather than equating repea
   const models = await withModels(t, { facts, gaps: [] }, { failure_loop: 'clear', stalled_progress: 'clear', request_drift: 'clear' });
   const result = await models.analyzer().analyze({ ...input, events });
   assert.equal(result.checks.find(check => check.id === 'failure_loop').status, 'clear');
-  assert.ok(models.requests[1].body.state.events.some(event => event.id === 'failed-2'));
+  assert.ok(models.requests.at(-1).body.state.events.some(event => event.id === 'failed-2'));
 });
 
 test('real repeated failures reach JEV without action labels and preserve delegated loop decisions', async t => {
@@ -471,7 +471,7 @@ test('canonical failures count distinct calls while refinements and interrupted 
     const models = await withModels(t, { facts, gaps: [] }, { request_drift: 'clear', stalled_progress: 'clear', failure_loop: 'attention' });
     const result = await models.analyzer().analyze({ ...input, events: [...input.events, ...actions, ...results] });
     assert.equal(result.checks.find(check => check.id === 'failure_loop').status, expected, mode);
-    if (mode === 'refinement') assert.ok(!models.requests[1].body.state.events.some(item => item.id === 'fallback'));
+    if (mode === 'refinement') assert.ok(!models.requests.at(-1).body.state.events.some(item => item.id === 'fallback'));
     if (mode === 'interrupted') assert.match(result.checks.find(check => check.id === 'failure_loop').reason, /中断/);
   }
 });
@@ -551,7 +551,7 @@ test('full rerun only becomes a candidate with explicit scope, actual duration a
   const models = await withModels(t, { facts, gaps: [] }, { validation_cost: 'clear' });
   const result = await models.analyzer().analyze({ ...input, events });
   assert.equal(result.checks.find(check => check.id === 'validation_cost').status, 'clear');
-  assert.ok(models.requests[1].body.questions.validation_cost);
+  assert.ok(models.requests.at(-1).body.questions.validation_cost);
   const noScope = await withModels(t, { facts, gaps: [] });
   const unknown = await noScope.analyzer().analyze({ ...input, events: events.map(event => ({ ...event, data: event.data && { ...event.data, validationScope: undefined } })) });
   assert.equal(unknown.checks.find(check => check.id === 'validation_cost').status, 'unknown');
@@ -821,7 +821,7 @@ test('coverage gaps block unsupported semantic alarms and retained expired snipp
   const models = await withModels(t, { facts: [{ kind: 'request', eventId: 'request', quote: 'Add a log' }, { kind: 'action', eventId: 'action', quote: 'different work' }], gaps: [] }, { request_drift: 'attention' });
   const result = await models.analyzer().analyze({ ...input, coverage: { complete: false, gaps: ['baseline_gap'] }, events: [...input.events, event('action', 'output', 'different work')] });
   assert.ok(result.checks.every(check => check.status === 'unknown'));
-  assert.equal(models.requests.length, 1);
+  assert.equal(models.requests.length, 3);
   assert.equal(result.coverage.complete, false);
 });
 
@@ -831,7 +831,7 @@ test('model-declared missing authorization accompanies a separate JEV scope judg
   assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'unknown');
   assert.equal(result.coverage.complete, false);
   assert.deepEqual(result.coverage.extractionGaps, ['Latest authorization was not present']);
-  assert.equal(models.requests.length, 2);
+  assert.equal(models.requests.length, 4);
 });
 
 test('a malformed JEV answer fails the round, while a valid unknown decision stays unknown', async t => {

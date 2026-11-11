@@ -56,5 +56,5 @@ test('offline analysis backs off per object and resumes the same models without 
   assert.equal(recovered.retryAttempt, 0);
   assert.equal(recovered.nextEligibleAt, clock + 10);
   assert.equal((await task('b')).analysis.nextEligibleAt, b.nextEligibleAt);
-  assert.deepEqual(calls.filter(call => call.model.startsWith('a-')).map(call => call.model), ['a-summary', 'a-summary', 'a-summary', 'a-judge']);
+  assert.deepEqual(calls.filter(call => call.model.startsWith('a-')).map(call => call.model), ['a-summary', 'a-summary', 'a-summary', 'a-summary', 'a-summary', 'a-judge']);
 });

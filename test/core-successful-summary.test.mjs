@@ -8,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { startServer } from '../src/server.mjs';
 import { connectCore } from '../src/core-client.mjs';
 import { configureInstallationModels } from './helpers/installation-model-settings.mjs';
-import { withModelSummary } from './helpers/model-summary.mjs';
+import { summaryLineForRequest, withModelSummary } from './helpers/model-summary.mjs';
 
 const DAY = 86_400_000;
 const summaryText = progress => `在做什么：核对当前日志。\n有什么进展：${progress}\n卡在哪里：未观察到明确阻碍。`;
@@ -23,7 +23,7 @@ async function fixture(t) {
     const body = JSON.parse(raw); calls.push({ path: request.url, model: body.model });
     response.setHeader('content-type', 'application/json');
     if (request.url === '/v1/chat/completions') {
-      const extraction = withModelSummary(body, { selectedOptionIds: [], gaps: [] }); extraction.summary.text = text;
+      const extraction = withModelSummary(body, { selectedOptionIds: [], gaps: [] }); extraction.summary.text = summaryLineForRequest(body, text);
       const reply = () => response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(extraction) } }] }));
       if (mode === 'hold') held.push(reply); else reply();
     } else if (mode === 'fail-jev') response.writeHead(503).end('{"error":{"code":"controlled_failure"}}');
@@ -70,7 +70,7 @@ test('a successful generated summary remains reachable only as history after the
   const failed = (await f.task(source)).analysis;
   assert.equal(failed.resultDisposition, 'invalid');
   assert.deepEqual(failed.lastSuccessfulSummary, expected);
-  assert.deepEqual(f.calls.map(call => call.path), ['/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(f.calls.map(call => call.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
   await f.restart();
   assert.deepEqual((await f.task(source)).analysis.lastSuccessfulSummary, expected, 'the single historical success is durable');
 });
@@ -131,7 +131,7 @@ test('reuse and unconfigured local checks preserve the old history until a new r
   const reused = (await f.task(source)).analysis;
   assert.equal(reused.resultDisposition, 'reused');
   assert.deepEqual(reused.lastSuccessfulSummary, first);
-  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls.length, 4);
   const empty = await f.save('chatgpt:history', {});
   await until(async () => (await f.task(source)).analysis.coverage?.dependencies?.length === 2, 'local fact checks finish with both models unconfigured');
   const local = (await f.task(source)).analysis;
@@ -139,7 +139,7 @@ test('reuse and unconfigured local checks preserve the old history until a new r
   assert.deepEqual(local.lastSuccessfulSummary, first);
   assert.notEqual(local.currentConfigScope.revision, first.configScope.revision);
   assert.equal(local.currentConfigScope.revision, empty.revision);
-  assert.equal(f.calls.length, 2, 'unconfigured local checks do not call either model');
+  assert.equal(f.calls.length, 4, 'unconfigured local checks do not call either model');
   f.text('已核对新的本轮总结。');
   const next = await f.save('chatgpt:history'); f.advance(10);
   await until(async () => (await f.task(source)).analysis.lastSuccessfulSummary?.generated.text === summaryText('已核对新的本轮总结。'), 'a new actual two-model success replaces the single historical success');
@@ -147,7 +147,7 @@ test('reuse and unconfigured local checks preserve the old history until a new r
   assert.equal(replaced.completedAt, f.now());
   assert.equal(replaced.configScope.revision, next.revision);
   assert.equal(replaced.expiresAt, first.expiresAt, 'new completion cannot extend the retained input material deadline');
-  assert.deepEqual(f.calls.map(call => call.path), ['/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(f.calls.map(call => call.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
 });
 
 test('cancelling a later actual model request cannot replace or retime the successful historical summary', async t => {

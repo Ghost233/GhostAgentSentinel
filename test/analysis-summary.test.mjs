@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createAnalyzer } from '../src/analysis/index.mjs';
+import { summaryLineForRequest } from './helpers/model-summary.mjs';
 import { decodeJevRequest } from './helpers/jev-wire.mjs';
 
 const now = 1_800_000_000_000;
@@ -14,6 +15,8 @@ const observation = {
   ],
   coverage: { complete: true, gaps: [] },
 };
+const llmPaths = Array(3).fill('/v1/chat/completions');
+const analysisPaths = [...llmPaths, '/v1/systemone'];
 const summaryText = '在做什么：核对所请求日志。\n有什么进展：已找到最新记录。\n卡在哪里：未观察到明确阻碍。';
 
 async function models(t, { extraction, judgment } = {}) {
@@ -27,7 +30,7 @@ async function models(t, { extraction, judgment } = {}) {
     if (request.url === '/v1/chat/completions') {
       const evidence = JSON.parse(body.messages[1].content).evidence;
       const option = evidence.find(group => group.origin === 'output')?.options.find(option => option.kind === 'action') ?? evidence[0].options[0];
-      const content = extraction ? await extraction(evidence, option) : { selectedOptionIds: [option.optionId], gaps: [], summary: { text: summaryText, evidenceOptionIds: [option.optionId] } };
+      const content = extraction ? await extraction(evidence, option, body) : { selectedOptionIds: [option.optionId], gaps: [], summary: { text: summaryLineForRequest(body, summaryText), evidenceOptionIds: [option.optionId] } };
       response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(content) } }] }));
     } else {
       const wire = decodeJevRequest(body);
@@ -48,21 +51,34 @@ test('two successful model calls publish the generated short summary with verifi
   assert.equal(result.summary.generated.text, summaryText);
   assert.deepEqual(result.summary.generated.evidenceIds, ['action']);
   assert.deepEqual(result.summary.generated.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
-  assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(requests.map(request => request.path), analysisPaths);
   assert.equal(result.checks.length, 6);
   assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'unknown');
   assert.equal(result.checks.find(check => check.id === 'request_drift').judgmentState, 'insufficient');
   assert.ok(['currentTask', 'currentState', 'recentProgress', 'attention'].every(key => typeof result.summary[key] === 'string'));
 });
 
-test('the three summary levels describe work, actual progress and blockers independently from unknown checks', async t => {
-  const text = '在做什么：核对所请求日志。\n有什么进展：已找到最新记录。\n卡在哪里：未观察到明确阻碍。';
-  const { analyzer, requests } = await models(t, { extraction: (_evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text, evidenceOptionIds: [option.optionId] } }) });
+test('three LLM requests reuse identical evidence and supply one merged summary to JEV', async t => {
+  const labels = ['在做什么', '有什么进展', '卡在哪里'];
+  const lines = summaryText.split('\n');
+  const { analyzer, requests } = await models(t, { extraction: (_evidence, option, body) => {
+    const question = body.messages.at(-1).content;
+    const index = labels.findIndex(label => question.startsWith(label + '：'));
+    return { selectedOptionIds: [option.optionId], gaps: [], summary: { text: lines[index], evidenceOptionIds: [option.optionId] } };
+  }, judgment: wire => {
+    assert.equal(wire.state.executionSummary.text, summaryText);
+    assert.ok(wire.state.events.some(event => event.id === 'action' && event.text === observation.events[1].text));
+    return { answers: { request_drift: { type: 'choice', choice: 'unknown' }, execution_blocking: { type: 'choice', choice: 'unblocked_1' } } };
+  } });
   const result = await analyzer.analyze(observation);
-  assert.equal(result.summary.generated.text, text);
-  assert.deepEqual(requests[0].body.messages.slice(2).map(message => message.role), ['user', 'user', 'user']);
-  for (const [index, label] of ['在做什么', '有什么进展', '卡在哪里'].entries()) {
-    assert.ok(requests[0].body.messages[index + 2].content.startsWith(label + '：'));
+  assert.equal(result.summary.generated.text, summaryText);
+  assert.equal(result.summary.generated.blocking.status, 'unblocked');
+  assert.deepEqual(requests.map(request => request.path), analysisPaths);
+  for (const [index, label] of labels.entries()) {
+    const messages = requests[index].body.messages;
+    assert.equal(messages.length, 3);
+    assert.deepEqual(messages.slice(0, 2), requests[0].body.messages.slice(0, 2));
+    assert.ok(messages[2].content.startsWith(label + '：'));
   }
   assert.deepEqual(result.summary.generated.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
   assert.equal(result.checks.find(check => check.id === 'request_drift').judgmentState, 'insufficient');
@@ -80,7 +96,7 @@ test('one JEV request decides whether work is blocked and selects its original e
       return { answers: { request_drift: { type: 'choice', choice: 'unknown' }, execution_blocking: { type: 'choice', choice } } };
     } });
     const result = await analyzer.analyze({ ...observation, events: [observation.events[0], action] });
-    assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+    assert.deepEqual(requests.map(request => request.path), analysisPaths);
     assert.equal(result.summary.generated.blocking.status, status);
     if (status !== 'unknown') {
       assert.equal(result.summary.generated.blocking.reason, action.text);
@@ -88,6 +104,15 @@ test('one JEV request decides whether work is blocked and selects its original e
     }
     assert.equal(result.checks.length, 6);
   });
+});
+
+test('an invalid second answer stops the round before a third request or JEV', async t => {
+  const { analyzer, requests } = await models(t, { extraction: (_evidence, option, body) => ({
+    selectedOptionIds: [option.optionId], gaps: [],
+    summary: { text: summaryLineForRequest(body, summaryText), evidenceOptionIds: body.messages[2].content.startsWith('有什么进展：') ? ['foreign-option'] : [option.optionId] },
+  }) });
+  await assert.rejects(analyzer.analyze(observation), error => error.code === 'invalid_evidence' && error.stage === 'llm');
+  assert.deepEqual(requests.map(request => request.path), llmPaths.slice(0, 2));
 });
 
 test('an incomplete observation publishes only a cited partial summary and preserves its gaps without a normal judgment', async t => {
@@ -101,7 +126,7 @@ test('an incomplete observation publishes only a cited partial summary and prese
   assert.equal(result.coverage.complete, false);
   assert.ok(result.coverage.gaps.includes('missing interval'));
   assert.ok(result.checks.every(check => check.status === 'unknown'));
-  assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions']);
+  assert.deepEqual(requests.map(request => request.path), llmPaths);
 });
 
 test('normal excerpt limits still execute evidence-supported checks through JEV instead of stopping at a partial summary', async t => {
@@ -110,7 +135,7 @@ test('normal excerpt limits still execute evidence-supported checks through JEV 
     events: [observation.events[0], { ...observation.events[1], data: { truncated: true } }],
     coverage: { complete: false, gaps: ['Some observed excerpts are truncated'] },
   });
-  assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(requests.map(request => request.path), analysisPaths);
   assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'clear');
   assert.equal(result.coverage.complete, false, 'a supported check does not pretend the original material was exhaustive');
   assert.ok(result.summary.partial, 'the bounded summary keeps its observation scope');
@@ -162,9 +187,9 @@ test('long observations select recent evidence within the unchanged budget while
   const events = [observation.events[0], ...Array.from({ length: 180 }, (_, index) => ({ ...observation.events[1], id: 'action-' + index, text: ('Observed action ' + index + ': ').padEnd(230, 'x'), capturedAt: now - 180 + index }))];
   const inherited = { id: 'limit', taskId: 'parent', taskLifecycleId: 'parent-run', kind: 'input', text: 'Keep the inherited user restriction.', capturedAt: now - 2000, contextRole: 'ancestor-limit', authorizationEligible: true, sourceRef: { taskId: 'parent', lifecycleId: 'parent-run', eventId: 'limit' } };
   const result = await analyzer.analyze({ ...observation, events, instructionContext: { inheritedEvents: [inherited], binding: { origin: 'delegated' }, gaps: [] } });
-  assert.equal(requests.length, 2, 'budgeted evidence reaches both summary and per-check judgment');
-  assert.ok(JSON.stringify(requests[1].body).length <= 24000);
-  const judged = decodeJevRequest(requests[1].body);
+  assert.equal(requests.length, 4, 'budgeted evidence reaches all three summaries and per-check judgment');
+  assert.ok(JSON.stringify(requests.at(-1).body).length <= 24000);
+  const judged = decodeJevRequest(requests.at(-1).body);
   assert.ok(judged.state.events.some(event => event.id === events.at(-1).id));
   assert.ok(judged.state.events.some(event => event.id === 'limit'));
   assert.ok(judged.state.events.length < events.length);
@@ -198,7 +223,7 @@ test('missing, reordered or empty summary levels fail the model round before jud
 
 test('a generated summary requires nonempty unique references from this round catalog', async t => {
   for (const mode of ['empty', 'duplicate', 'unknown', 'event-id', 'wrong-type']) {
-    const { analyzer, requests } = await models(t, { extraction: (_evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text: summaryText,
+    const { analyzer, requests } = await models(t, { extraction: (_evidence, option, body) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text: summaryLineForRequest(body, summaryText),
       evidenceOptionIds: mode === 'empty' ? [] : mode === 'duplicate' ? [option.optionId, option.optionId] : mode === 'event-id' ? ['action'] : mode === 'wrong-type' ? [4] : ['foreign-event-option'],
     } }) });
     await assert.rejects(analyzer.analyze(observation), error => error.code === 'invalid_evidence' && error.stage === 'llm');
@@ -263,7 +288,7 @@ test('summary option references resolve only to the current request even when pr
 
 test('summary references retain distinct inherited owners when their local evidence ids collide', async t => {
   const inheritedEvents = ['parent', 'ancestor'].map(owner => ({ id: 'shared-limit', taskId: owner, taskLifecycleId: `${owner}-run`, kind: 'input', text: `${owner} user limit.`, capturedAt: now - 2000, contextRole: 'ancestor-limit', authorizationEligible: true, sourceRef: { taskId: owner, lifecycleId: `${owner}-run`, eventId: 'shared-limit' } }));
-  const { analyzer } = await models(t, { extraction: (evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text: summaryText, evidenceOptionIds: [option.optionId, ...evidence.filter(group => group.contextRole === 'ancestor-limit').map(group => group.options[0].optionId)] } }) });
+  const { analyzer } = await models(t, { extraction: (evidence, option, body) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text: summaryLineForRequest(body, summaryText), evidenceOptionIds: [option.optionId, ...evidence.filter(group => group.contextRole === 'ancestor-limit').map(group => group.options[0].optionId)] } }) });
   const result = await analyzer.analyze({ ...observation, instructionContext: { inheritedEvents, binding: { origin: 'delegated' }, gaps: [] } });
   assert.deepEqual(result.summary.generated.evidenceIds, ['action', 'shared-limit']);
   assert.deepEqual(result.summary.generated.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }, ...inheritedEvents.map(event => event.sourceRef)]);
@@ -272,7 +297,7 @@ test('summary references retain distinct inherited owners when their local evide
 test('a failed second model stays an attributed failure after the first model produced a valid summary', async t => {
   const { analyzer, requests } = await models(t, { judgment: () => ({ error: { code: 'controlled-judge-failure' } }) });
   await assert.rejects(analyzer.analyze(observation), error => error.code === 'http_error' && error.stage === 'jev');
-  assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.deepEqual(requests.map(request => request.path), analysisPaths);
 });
 
 test('cancelling during judgment seals the generated text and a later round remains independent', async t => {

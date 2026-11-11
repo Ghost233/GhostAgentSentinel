@@ -103,7 +103,7 @@ test('graph and grouped notification replay stays bounded, then expired proof an
   assert.equal(before.retained.taskContextFingerprints, 100)
   assert.equal(before.retained.notificationMemberships, 96)
   assert.equal(before.temporary.pendingNotificationWindows, 4)
-  assert.equal(llmCalls, 96)
+  assert.equal(llmCalls, 288)
   assert.ok(largestRequest <= 24_000)
   await sample(0)
   for (let index = 1; index <= 100; index++) {
@@ -113,7 +113,7 @@ test('graph and grouped notification replay stays bounded, then expired proof an
     await core.gsSummary({ sourceKey: source, sessionId: roots[index % 4] })
     if (index % 20 === 0) await sample(index)
   }
-  assert.equal(llmCalls, 96, 'replay and state reads never re-run unchanged successful HTTP judgments')
+  assert.equal(llmCalls, 288, 'replay and state reads never re-run unchanged successful HTTP judgments')
   assert.equal((await core.snapshot()).sources[0].hierarchyMaterialAt, materialAt, 'revision-only replays do not renew metadata capture time')
   assert.deepEqual((await core.diagnostics()).retained, before.retained)
   clock += 3000

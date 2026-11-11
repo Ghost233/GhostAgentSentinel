@@ -1,4 +1,4 @@
-import { withModelSummary } from './helpers/model-summary.mjs'
+import { startsSummaryRound, withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -23,13 +23,15 @@ async function fixture(t) {
   modelServer = createServer(async (req, res) => {
     if (req.method === 'GET') { res.writeHead(404, { 'content-type': 'application/json' }); res.end('{"error":{"code":"not_found"}}'); return; }
     let raw = ''; for await (const chunk of req) raw += chunk
-    const wire = JSON.parse(raw), body = req.url === '/v1/systemone' ? decodeJevRequest(wire) : wire; requests.push({ path: req.url, body })
+    const wire = JSON.parse(raw), body = req.url === '/v1/systemone' ? decodeJevRequest(wire) : wire
+    const startsRound = req.url === '/v1/chat/completions' && startsSummaryRound(wire)
+    if (startsRound || req.url === '/v1/systemone') requests.push({ path: req.url, body })
     res.setHeader('content-type', 'application/json')
     if (decision === 'fail') { res.statusCode = 500; res.end(JSON.stringify({ error: { message: 'Controlled inference failure' } })); return }
     const finish = () => res.end(JSON.stringify(req.url === '/v1/chat/completions'
       ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }
       : { model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: decision }])) }))
-    if (holding && req.url === '/v1/chat/completions') held.push(finish)
+    if (holding && startsRound) held.push(finish)
     else finish()
   })
   await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve))

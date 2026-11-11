@@ -1,4 +1,4 @@
-import { withModelSummary } from './helpers/model-summary.mjs'
+import { startsSummaryRound, withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
@@ -199,7 +199,8 @@ test('DSH retains partial observations and summarizes each observed execution on
   const actor = await host.create(id, 'first execution request')
   const readTask = async () => (await host.control.snapshot()).tasks.find(task => task.id === id)
   const finalCalls = () => host.modelCalls.filter(call => call.path === '/v1/chat/completions'
-    && JSON.parse(call.body.messages.find(message => message.role === 'user').content).task.status === 'idle')
+    && JSON.parse(call.body.messages[1].content).task.status === 'idle'
+    && startsSummaryRound(call.body))
   host.send(id, 'first execution result')
   await until(async () => (await readTask())?.events.some(event => event.text.includes('first execution result')), 'first native result captured')
   host.finish(id)

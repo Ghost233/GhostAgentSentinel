@@ -1,4 +1,4 @@
-import { withModelSummary } from './helpers/model-summary.mjs'
+import { startsSummaryRound, withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -25,7 +25,7 @@ async function fixture(t, { models = false, hold = false, drift = 'attention' } 
       const finish = () => res.end(JSON.stringify(req.url === '/v1/chat/completions'
         ? { model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }
         : { model: body.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? drift : 'unknown' }])) }))
-      if (hold && req.url === '/v1/chat/completions') held.push(finish)
+      if (hold && startsSummaryRound(body)) held.push(finish)
       else finish()
     })
     await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve))
@@ -154,7 +154,7 @@ test('F3 a held model result cannot exempt a tool timeout already established be
   const notices = await f.request('notifications/claim', { sourceKey: f.sourceKey })
   assert.equal(notices.length, 1)
   assert.ok(notices[0].checkIds.includes('long_wait'), 'the first sufficiently grounded round remains eligible to notify')
-  assert.equal(f.requests.filter(request => request.path === '/v1/chat/completions').length, 1, 'no second vote is needed')
+  assert.equal(f.requests.filter(request => request.path === '/v1/chat/completions').length, 3, 'no second vote is needed')
 })
 
 test('F3 actual pre-wait overdue facts stay red while time caused by the current user wait stays exempt', async t => {
@@ -180,6 +180,6 @@ test('F3 actual pre-wait overdue facts stay red while time caused by the current
       assert.equal(actor.gs.light, 'green')
       assert.deepEqual(notices, [])
     }
-    assert.equal(f.requests.filter(request => request.path === '/v1/chat/completions').length, 1)
+    assert.equal(f.requests.filter(request => request.path === '/v1/chat/completions').length, 3)
   }
 })

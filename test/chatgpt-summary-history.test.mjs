@@ -71,7 +71,7 @@ test('real native material and model HTTP keep a reused summary visible and a la
   clock += 10
   const reused = await until(view => view.analysis.resultDisposition === 'reused')
   assert.deepEqual(reused.analysis.lastSuccessfulSummary, original)
-  assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/systemone'])
+  assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone'])
   const page = await panelHarness(t)
   await page.deliver(reused)
   assert.equal(page.element('#model-summary').hidden, false)
@@ -90,5 +90,5 @@ test('real native material and model HTTP keep a reused summary visible and a la
   assert.match(page.element('#last-summary-evidence').textContent, /synthetic log/)
   assert.equal(page.element('#recent-summary-text').textContent, original.generated.text)
   assert.match(page.element('#recent-blocking-status').textContent, /^上次判断 · 未阻塞/)
-  assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/systemone'])
+  assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone'])
 })

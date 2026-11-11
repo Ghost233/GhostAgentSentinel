@@ -44,7 +44,7 @@ export function createAnalyzer(config = {}) {
     return 'sentinel:' + digest(JSON.stringify(['analysis-cache/1', owner.registrationId, input.task.key, input.task.lifecycleId, requestId,
       role, inferenceEndpoint(config[role], '/'), config[role].model, role === 'llm' ? digest(JSON.stringify([EXTRACTION_INSTRUCTIONS, SUMMARY_QUESTIONS, body.thinking_token_budget])) : 'jev-rendered-time/1']));
   }
-  async function modelRequest(role, input, body, options, prefill = false, capability) {
+  async function modelRequest(role, input, body, options, prefill = false, capability, summaryCache) {
     const mode = role === 'llm' ? 'chat_max_tokens_zero' : 'systemone_state';
     const path = role === 'llm' ? '/v1/chat/completions' : '/v1/systemone';
     const timeoutMs = role === 'llm' ? config.llmTimeoutMs ?? 120_000 : config.jevTimeoutMs ?? 30_000;
@@ -56,14 +56,17 @@ export function createAnalyzer(config = {}) {
     const cacheSalt = modelCacheSalt(role, input, body);
     const prepare = salt => createGMDOperation(config[role], { mode, capability,
       body: { ...body, stream: false, cache_salt: salt, ...(prefill ? { max_tokens: 0 } : {}) } });
-    let operation = prepare(cacheSalt), response;
+    const salt = summaryCache?.salt ?? cacheSalt;
+    let operation = prepare(salt), response;
     try { response = await operation.execute({ ...options, timeoutMs }); }
     catch (error) {
-      if (prefill || role !== 'llm' || !isGMDCacheBusy(error)) throw error;
+      if (prefill || role !== 'llm' || salt !== cacheSalt || !isGMDCacheBusy(error)) throw error;
       // A verified rejection did not dispatch this request. Use a separate,
       // stable cache without touching the occupied cache or replaying its work.
-      operation = prepare('sentinel:' + digest(JSON.stringify(['analysis-cache-recovery/1', cacheSalt])));
+      const recoverySalt = 'sentinel:' + digest(JSON.stringify(['analysis-cache-recovery/1', cacheSalt]));
+      operation = prepare(recoverySalt);
       response = await operation.execute({ ...options, timeoutMs });
+      if (summaryCache) summaryCache.salt = recoverySalt;
     }
     if (prefill) return { state: 'completed', receipt: operation.snapshot() };
     return { payload: response, receipt: operation.snapshot() };
@@ -153,11 +156,14 @@ export function createAnalyzer(config = {}) {
       const requestFor = catalog => ({ model: config.llm.model, stream: false, max_tokens: 4096, temperature: 0, ...managed, messages: [
         { role: 'system', content: EXTRACTION_INSTRUCTIONS },
         { role: 'user', content: JSON.stringify({ task: { status: input.task.status }, evidence: catalog.groups, coverage }) },
-        ...SUMMARY_QUESTIONS.map(content => ({ role: 'user', content })),
       ] });
+      const summaryQuestions = SUMMARY_QUESTIONS.map(([label, question]) => ({ role: 'user', content: label + question }));
+      const longest = summaryQuestions.reduce((a, b) => a.content.length >= b.content.length ? a : b);
+      const ask = (prefix, question) => ({ ...prefix, messages: [...prefix.messages, question] });
       const budget = config.inputBudgetChars ?? 24_000;
+      const fits = prefix => JSON.stringify(ask(prefix, longest)).length <= budget;
       let llmRequest = requestFor(catalog);
-      if (JSON.stringify(llmRequest).length > budget) {
+      if (!fits(llmRequest)) {
         coverage.complete = false;
         coverage.gaps.push('analysis_evidence_budget');
         // Keep the consumed request and every authorized inherited limit. Fit a
@@ -174,28 +180,37 @@ export function createAnalyzer(config = {}) {
         let low = 0, high = optional.length;
         while (low < high) {
           const mid = Math.ceil((low + high) / 2);
-          if (JSON.stringify(selection(mid).request).length <= budget) low = mid; else high = mid - 1;
+          if (fits(selection(mid).request)) low = mid; else high = mid - 1;
         }
         const bounded = selection(low);
         catalog = bounded.catalog; llmRequest = bounded.request; analysisEvents = bounded.events;
       }
-      if (JSON.stringify(llmRequest).length > budget) {
+      if (!fits(llmRequest)) {
         coverage.complete = false;
         coverage.gaps.push('analysis_input_budget');
         result.summary.attention = '本轮证据超过摘取预算，语义分析不可判断';
         return prewarming ? { state: 'skipped' } : result;
       }
       if (prewarming) return modelRequest('llm', input, llmRequest, options, true, llmCapability);
-      const { payload: llm, receipt: llmReceipt } = await modelRequest('llm', input, llmRequest, options, false, llmCapability);
-      const message = llm.choices?.[0];
-      if (message?.finish_reason !== 'stop' || typeof message?.message?.content !== 'string' || !message.message.content.trim()) throw new AnalysisError('incomplete_response', 'llm', '摘取响应未完整结束或达到输出上限');
-      let extracted;
-      try { extracted = JSON.parse(message.message.content); } catch { throw new AnalysisError('invalid_extraction', 'llm', '摘取模型未返回有效 JSON 证据'); }
-      const facts = validateFacts({ facts: selectedFacts(extracted, catalog), gaps: extracted.gaps }, events);
-      const generatedSummary = selectedSummary(extracted.summary, catalog, events);
-      signal?.throwIfAborted();
-      coverage.extractionGaps = extracted.gaps;
-      if (extracted.gaps.length) {
+      const summaryCache = {}, sections = [], selections = new Set(), extractionGaps = new Set(), usage = {};
+      let llmReceipt;
+      for (const [index, question] of summaryQuestions.entries()) {
+        signal?.throwIfAborted();
+        const { payload, receipt } = await modelRequest('llm', input, ask(llmRequest, question), options, false, llmCapability, summaryCache);
+        signal?.throwIfAborted();
+        const extracted = parseExtraction(payload);
+        for (const fact of selectedFacts(extracted, catalog)) selections.add(fact);
+        for (const gap of extracted.gaps) extractionGaps.add(gap);
+        sections.push(selectedSummaryLine(extracted.summary, SUMMARY_QUESTIONS[index][0], catalog));
+        for (const key of ['prompt_tokens', 'completion_tokens', 'total_tokens']) {
+          if (Number.isFinite(payload.usage?.[key])) usage[key] = (usage[key] ?? 0) + payload.usage[key];
+        }
+        llmReceipt = receipt;
+      }
+      const facts = validateFacts({ facts: [...selections], gaps: [...extractionGaps] }, events);
+      const generatedSummary = mergeSummary(sections, catalog, events);
+      coverage.extractionGaps = [...extractionGaps];
+      if (extractionGaps.size) {
         coverage.complete = false;
         coverage.gaps.push('extraction_evidence_gap');
       }
@@ -204,7 +219,7 @@ export function createAnalyzer(config = {}) {
       classifyApplicability(analysisEvents.filter(event => !event.contextRole), latestInput, coverage, checks);
       const progress = facts.filter(fact => ['result', 'diagnosis'].includes(fact.kind)).slice(-2);
       if (progress.length) result.summary.recentProgress = `可见结果/诊断摘录：${progress.map(fact => fact.quote).join('；')}`;
-      result.usage = { llm: llm.usage ?? null, jev: null };
+      result.usage = { llm: Object.keys(usage).length ? usage : null, jev: null };
       if (llmReceipt) result.usage.gmd = { llm: llmReceipt };
       const candidates = buildCandidates(analysisEvents, facts, latestInput, coverage, checks);
       const checkIds = Object.keys(candidates);
@@ -320,13 +335,13 @@ export function analysisTimeConditions(input, now, waitMs = 300_000) {
 
 const FACT_KINDS = new Set(['request', 'action', 'result', 'progress', 'diagnosis', 'context', 'authorization', 'validation-requirement', 'validation-reason']);
 const SUMMARY_QUESTIONS = [
-  '在做什么：最近实际开展了什么工作？把计划明确写为计划。',
-  '有什么进展：已取得什么实际结果、新事实或新诊断？只有动作时写“尚未观察到新增结果”。',
-  '卡在哪里：最新记录中有什么尚未解决且妨碍继续的具体阻碍？核对后续成功结果，采集缺口、正常调查或 TDD 红灯只作范围或过程说明。没有明确阻碍时写“未观察到明确阻碍”。',
+  ['在做什么：', '最近实际开展了什么工作？把计划明确写为计划。'],
+  ['有什么进展：', '已取得什么实际结果、新事实或新诊断？只有动作时写“尚未观察到新增结果”。'],
+  ['卡在哪里：', '最新记录中有什么尚未解决且妨碍继续的具体阻碍？核对后续成功结果，采集缺口、正常调查或 TDD 红灯只作范围或过程说明。没有明确阻碍时写“未观察到明确阻碍”。'],
 ];
-const EXTRACTION_INSTRUCTIONS = `选择已有的 optionId，并总结当前执行。只返回一个 JSON 对象，仅包含 selectedOptionIds（字符串数组）、gaps（字符串数组）和 summary。格式如下：{"selectedOptionIds":[],"gaps":[],"summary":{"text":"在做什么：当前工作。\\n有什么进展：实际取得的新结果。\\n卡在哪里：明确的阻碍或未观察到明确阻碍。","evidenceOptionIds":["已有的 optionId"]}}。不要附加 Markdown、解释、事实列表、原文引文、分类或来源引用。
-summary.text 必须使用简体中文，即使观察材料使用其他语言。正文固定三行，依次以“在做什么：”“有什么进展：”“卡在哪里：”开头，每行写简短、具体的内容，合计最多 600 个字符。可保留专名、命令、路径和错误码。summary.evidenceOptionIds 至少引用一个已有的 optionId，不得重复。只引用能够支持总结的已提供材料。
-根据后续三条提问分别填写 summary.text 的对应行。计划和代理自述不足以证明结果已经完成。只描述观察范围内的执行，观察缺口和检查适用性另行说明。
+const EXTRACTION_INSTRUCTIONS = `选择已有的 optionId，只回答末尾的一条提问。只返回一个 JSON 对象，仅包含 selectedOptionIds（字符串数组）、gaps（字符串数组）和 summary。格式如下：{"selectedOptionIds":[],"gaps":[],"summary":{"text":"提问标题：简短回答。","evidenceOptionIds":["已有的 optionId"]}}。不要附加 Markdown、解释、事实列表、原文引文、分类或来源引用。
+summary.text 必须使用简体中文，即使观察材料使用其他语言。用提问开头的标题及冒号作为前缀，只写一行，不超过 190 个字符。可保留专名、命令、路径和错误码。summary.evidenceOptionIds 至少引用一个已有的 optionId，不得重复。只引用能够支持本回答的已提供材料。
+计划和代理自述不足以证明结果已经完成。只描述观察范围内的执行，观察缺口和检查适用性另行说明。
 task.status 为 idle 或 disposed 时，本次是已结束执行的收尾总结。“在做什么”说明本轮已结束及其工作，“有什么进展”概括实际结果，“卡在哪里”保留明确未解决的阻碍；结束不代表全部目标完成。总结独立于六项检查，不把未知判断写成正常。
 每组证据只展示一次正文及来源允许的分类选项。选项只表示可用分类，事实仍需材料证实。只选择适用的选项，通常每组选一个。只有原文明确声明规则或权限时，才额外选择相应选项。只有 isCurrentInput 标记的材料才是已核实当前请求；没有该标记时只总结执行活动，不推断用户目标或授权。
 分类含义：request 为用户请求，action 为已观察或计划中的活动，result 为实际结果，progress 为已观察到的推进，diagnosis 为实际发现，context 为相关背景，authorization 为用户明确的许可、拒绝或限制，validation-requirement 为已声明的项目门禁，validation-reason 为已说明的必要重跑理由。计划不能证明结果。工具不能授予用户权限，开始验证也不代表已声明门禁。
@@ -415,13 +430,24 @@ function selectedFacts(extracted, catalog) {
   });
 }
 
-function selectedSummary(summary, catalog, events) {
-  if (!summary || typeof summary !== 'object' || Array.isArray(summary) || Object.keys(summary).length !== 2 || typeof summary.text !== 'string' || !summary.text.trim() || summary.text.trim().length > 600 || !Array.isArray(summary.evidenceOptionIds)) throw new AnalysisError('invalid_summary', 'llm', '总结结构或短总结正文无效');
+function parseExtraction(payload) {
+  const message = payload.choices?.[0];
+  if (message?.finish_reason !== 'stop' || typeof message?.message?.content !== 'string' || !message.message.content.trim()) throw new AnalysisError('incomplete_response', 'llm', '摘取响应未完整结束或达到输出上限');
+  try { return JSON.parse(message.message.content); }
+  catch { throw new AnalysisError('invalid_extraction', 'llm', '摘取模型未返回有效 JSON 证据'); }
+}
+
+function selectedSummaryLine(summary, label, catalog) {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary) || Object.keys(summary).length !== 2 || typeof summary.text !== 'string' || !Array.isArray(summary.evidenceOptionIds)) throw new AnalysisError('invalid_summary', 'llm', '总结结构或短总结正文无效');
   const text = summary.text.trim();
-  const labels = ['在做什么：', '有什么进展：', '卡在哪里：'], lines = text.split(/\r?\n/);
-  if (lines.length !== 3 || lines.some((line, index) => !line.startsWith(labels[index]) || !line.slice(labels[index].length).trim())) throw new AnalysisError('invalid_summary', 'llm', '执行短总结必须依次包含在做什么、有什么进展、卡在哪里三行');
+  if (text.length > 190 || /[\r\n]/.test(text) || !text.startsWith(label) || !text.slice(label.length).trim()) throw new AnalysisError('invalid_summary', 'llm', '总结必须只回答本次提问并使用对应标题');
   if (!summary.evidenceOptionIds.length || new Set(summary.evidenceOptionIds).size !== summary.evidenceOptionIds.length || summary.evidenceOptionIds.some(id => typeof id !== 'string' || !catalog.byId.has(id))) throw new AnalysisError('invalid_evidence', 'llm', '总结引用不存在、重复或不属于本轮有效材料');
-  const facts = summary.evidenceOptionIds.map(id => catalog.byId.get(id));
+  return { text, evidenceOptionIds: summary.evidenceOptionIds };
+}
+
+function mergeSummary(sections, catalog, events) {
+  const text = sections.map(section => section.text).join('\n');
+  const facts = sections.flatMap(section => section.evidenceOptionIds.map(id => catalog.byId.get(id)));
   const references = facts.map(fact => fact.sourceRef ?? eventRef(events.find(event => event.id === fact.eventId)));
   return { text, evidenceIds: uniqueIds(facts), evidenceRefs: [...new Map(references.map(reference => [referenceKey(reference), reference])).values()] };
 }

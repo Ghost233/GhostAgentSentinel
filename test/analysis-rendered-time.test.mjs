@@ -89,7 +89,7 @@ test('rendered chronology losslessly preserves raw times, negative offsets, UTC 
   assert.deepEqual(request.state.instruction, input.instructionContext.binding)
   assert.ok(request.state.facts.some(fact => fact.eventId === policy.id && JSON.stringify(fact.sourceRef) === JSON.stringify(policy.sourceRef)))
   assert.equal(result.coverage.complete, true)
-  assert.equal(http.requests.length, 2)
+  assert.equal(http.requests.length, 4)
 })
 
 test('the same relative process renders identically after clock translation while original absolute records remain recoverable', async t => {
@@ -104,5 +104,5 @@ test('the same relative process renders identically after clock translation whil
   assert.equal(Date.parse(b.request.state.timeBasis.originUtc) - Date.parse(a.request.state.timeBasis.originUtc), shift)
   assert.equal(b.result.coverage.through - a.result.coverage.through, shift)
   assert.deepEqual(a.result.checks, b.result.checks)
-  assert.equal(http.requests.length, 4)
+  assert.equal(http.requests.length, 8)
 })
