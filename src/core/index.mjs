@@ -1118,7 +1118,11 @@ export async function createCore({
       const generated = result.summary[field];
       const invalid = () => { throw Object.assign(new Error('Analyzer returned invalid or unverified generated summary evidence'), { code: 'invalid_summary', stage: 'llm' }); };
       if (field === 'partial' && (result.summary.generated !== undefined || result.coverage?.complete !== false)) invalid();
-      if (!generated || typeof generated !== 'object' || Array.isArray(generated) || Object.keys(generated).some(key => !['text', 'evidenceIds', 'evidenceRefs', 'blocking'].includes(key)) || typeof generated.text !== 'string' || !generated.text.trim() || generated.text.length > 600 || !Array.isArray(generated.evidenceIds) || !generated.evidenceIds.length || new Set(generated.evidenceIds).size !== generated.evidenceIds.length || generated.evidenceIds.some(id => typeof id !== 'string' || !id) || !Array.isArray(generated.evidenceRefs) || !generated.evidenceRefs.length) invalid();
+      if (!generated || typeof generated !== 'object' || Array.isArray(generated) || Object.keys(generated).some(key => !['text', 'sections', 'evidenceIds', 'evidenceRefs', 'blocking'].includes(key)) || typeof generated.text !== 'string' || !generated.text.trim() || !Array.isArray(generated.evidenceIds) || !generated.evidenceIds.length || new Set(generated.evidenceIds).size !== generated.evidenceIds.length || generated.evidenceIds.some(id => typeof id !== 'string' || !id) || !Array.isArray(generated.evidenceRefs) || !generated.evidenceRefs.length) invalid();
+      const { sections } = generated;
+      if (sections !== undefined && (!Array.isArray(sections) || sections.length !== 3
+        || sections.some(section => typeof section !== 'string' || !section.trim())
+        || sections.join('\n') !== generated.text)) invalid();
       const retained = new Set([...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])].filter(event => event.capturedAt > now() - DAY).map(event => referenceKey(eventRef(event))));
       const seen = new Set(), citedIds = new Set();
       for (const reference of generated.evidenceRefs) {

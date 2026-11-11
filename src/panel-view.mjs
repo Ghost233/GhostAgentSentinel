@@ -51,7 +51,7 @@ export function materialView(view, task, { historical = false, snapshot } = {}) 
       const event = summaryEvent(task, reference, ownerTasks)
       return { text: event?.text?.slice(0, 240) ?? '引用材料当前不可读取', reference: event?.evidence ?? JSON.stringify(reference) }
     })
-    return { text: value.text, evidence, ...(blocking ? { blocking } : {}) }
+    return { text: value.text, ...(value.sections ? { sections: value.sections } : {}), evidence, ...(blocking ? { blocking } : {}) }
   }
   const lastSuccessfulSummary = prior && prior.completedAt <= readAt && prior.expiresAt > readAt && (!prior.configScope || prior.configScope.registrationId === task.analysis.currentConfigScope?.registrationId)
     ? { ...prior, generated: generatedView(prior.generated, true) } : null
@@ -85,7 +85,7 @@ export function recentModelActivity(chatTasks, currentTask, registrationId, read
         && ['current', 'reused'].includes(task.analysis.resultDisposition) && ['cooldown', 'idle'].includes(task.analysis.state)
         && !task.conversationMonitoring?.paused && task.monitoringHealth?.state !== 'failed'
       const blocking = blockingView(result.blocking, task, ownerTasks, readAt, !current)
-      summary = { text: result.text, completedAt: record.completedAt, expiresAt: record.expiresAt, partial: Boolean(record.partial), gaps: record.gaps ?? [], ...(record.final ? { final: true } : {}), ...(blocking ? { blocking } : {}) }
+      summary = { text: result.text, ...(result.sections ? { sections: result.sections } : {}), completedAt: record.completedAt, expiresAt: record.expiresAt, partial: Boolean(record.partial), gaps: record.gaps ?? [], ...(record.final ? { final: true } : {}), ...(blocking ? { blocking } : {}) }
     }
   }
   const attempt = currentTask?.analysis.prefill

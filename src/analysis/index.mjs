@@ -215,7 +215,7 @@ export function createAnalyzer(config = {}) {
         const extracted = parseExtraction(payload);
         for (const fact of selectedFacts(extracted, catalog)) selections.add(fact);
         for (const gap of extracted.gaps) extractionGaps.add(gap);
-        sections.push(selectedSummaryLine(extracted.summary, SUMMARY_QUESTIONS[index][0], catalog));
+        sections.push(selectedSummarySection(extracted.summary, SUMMARY_QUESTIONS[index][0], catalog));
         for (const key of ['prompt_tokens', 'completion_tokens', 'total_tokens']) {
           if (Number.isFinite(payload.usage?.[key])) usage[key] = (usage[key] ?? 0) + payload.usage[key];
         }
@@ -385,10 +385,10 @@ const FACT_KINDS = new Set(['request', 'action', 'result', 'progress', 'diagnosi
 const SUMMARY_QUESTIONS = [
   ['在做什么：', '最近实际开展了什么工作？把计划明确写为计划。'],
   ['有什么进展：', '已取得什么实际结果、新事实或新诊断？只有动作时写“尚未观察到新增结果”。'],
-  ['卡在哪里：', '最新记录中有哪些已观察到、尚未解决的失败、依赖或等待事项？核对后续结果，用一句话写具体事实。由 JEV 判断是否妨碍继续。没有明确事项时写“未观察到明确阻碍”。'],
+  ['卡在哪里：', '最新记录中有哪些已观察到、尚未解决的失败、依赖或等待事项？核对后续结果并写明具体事实。由 JEV 判断是否妨碍继续。没有明确事项时写“未观察到明确阻碍”。'],
 ];
-const EXTRACTION_INSTRUCTIONS = `选择已有的 optionId，只回答末尾的一条提问。只返回一个 JSON 对象，仅包含 selectedOptionIds（字符串数组）、gaps（字符串数组）和 summary。格式如下：{"selectedOptionIds":[],"gaps":[],"summary":{"text":"提问标题：简短回答。","evidenceOptionIds":["已有的 optionId"]}}。不要附加 Markdown、解释、事实列表、原文引文、分类或来源引用。
-summary.text 必须使用简体中文，即使观察材料使用其他语言。用提问开头的标题及冒号作为前缀，只写一行，优先用一句短句，尽量控制在 70 个字以内，最多 190 个字符。使用简短专名，完整命令、路径和日志留在引用材料中。summary.evidenceOptionIds 至少引用一个已有的 optionId，不得重复。只引用能够支持本回答的已提供材料。
+const EXTRACTION_INSTRUCTIONS = `选择已有的 optionId，只回答末尾的一条提问。只返回一个 JSON 对象，仅包含 selectedOptionIds（字符串数组）、gaps（字符串数组）和 summary。格式如下：{"selectedOptionIds":[],"gaps":[],"summary":{"text":"摘要正文","evidenceOptionIds":["已有的 optionId"]}}。
+summary.text 必须使用简体中文，可以分行，显示标题由 Sentinel 添加。使用简短专名，完整命令、路径和日志留在引用材料中。summary.evidenceOptionIds 至少引用一个已有的 optionId，不得重复。只引用能够支持本回答的已提供材料。
 计划和代理自述不足以证明结果已经完成。只描述观察范围内的执行，观察缺口和检查适用性另行说明。
 task.status 为 idle 或 disposed 时，本次是已结束执行的收尾总结。“在做什么”说明本轮已结束及其工作，“有什么进展”概括实际结果，“卡在哪里”保留明确未解决的阻碍；结束不代表全部目标完成。总结独立于六项检查，不把未知判断写成正常。
 每组证据只展示一次正文及来源允许的分类选项。选项只表示可用分类，事实仍需材料证实。只选择适用的选项，通常每组选一个。只有原文明确声明规则或权限时，才额外选择相应选项。只有 isCurrentInput 标记的材料才是已核实当前请求；没有该标记时只总结执行活动，不推断用户目标或授权。
@@ -485,19 +485,20 @@ function parseExtraction(payload) {
   catch { throw new AnalysisError('invalid_extraction', 'llm', '摘取模型未返回有效 JSON 证据'); }
 }
 
-function selectedSummaryLine(summary, label, catalog) {
+function selectedSummarySection(summary, label, catalog) {
   if (!summary || typeof summary !== 'object' || Array.isArray(summary) || Object.keys(summary).length !== 2 || typeof summary.text !== 'string' || !Array.isArray(summary.evidenceOptionIds)) throw new AnalysisError('invalid_summary', 'llm', '总结结构或短总结正文无效');
-  const text = summary.text.trim();
-  if (text.length > 190 || /[\r\n]/.test(text) || !text.startsWith(label) || !text.slice(label.length).trim()) throw new AnalysisError('invalid_summary', 'llm', '总结必须只回答本次提问并使用对应标题');
+  const answer = summary.text.trim();
+  const text = answer.startsWith(label) ? answer.slice(label.length).trimStart() : answer;
+  if (!text) throw new AnalysisError('invalid_summary', 'llm', '总结正文为空');
   if (!summary.evidenceOptionIds.length || new Set(summary.evidenceOptionIds).size !== summary.evidenceOptionIds.length || summary.evidenceOptionIds.some(id => typeof id !== 'string' || !catalog.byId.has(id))) throw new AnalysisError('invalid_evidence', 'llm', '总结引用不存在、重复或不属于本轮有效材料');
-  return { text, evidenceOptionIds: summary.evidenceOptionIds };
+  return { text: label + text, evidenceOptionIds: summary.evidenceOptionIds };
 }
 
 function mergeSummary(sections, catalog, events) {
-  const text = sections.map(section => section.text).join('\n');
+  const paragraphs = sections.map(section => section.text);
   const facts = sections.flatMap(section => section.evidenceOptionIds.map(id => catalog.byId.get(id)));
   const references = facts.map(fact => fact.sourceRef ?? eventRef(events.find(event => event.id === fact.eventId)));
-  return { text, evidenceIds: uniqueIds(facts), evidenceRefs: [...new Map(references.map(reference => [referenceKey(reference), reference])).values()] };
+  return { text: paragraphs.join('\n'), sections: paragraphs, evidenceIds: uniqueIds(facts), evidenceRefs: [...new Map(references.map(reference => [referenceKey(reference), reference])).values()] };
 }
 
 function executionBlockingQuestion(events, summary, coverage, lastGap) {

@@ -60,18 +60,21 @@ test('two successful model calls publish the generated short summary with verifi
 
 test('three LLM requests reuse identical evidence and supply one merged summary to JEV', async t => {
   const labels = ['在做什么', '有什么进展', '卡在哪里'];
-  const lines = summaryText.split('\n');
+  const answers = ['核对所请求日志。\n\n已读取最新记录。', '已找到最新记录。\n' + '进展说明。'.repeat(130), '等待下一次工具结果。'];
+  const sections = answers.map((answer, index) => labels[index] + '：' + answer);
+  const merged = sections.join('\n');
   const { analyzer, requests } = await models(t, { extraction: (_evidence, option, body) => {
     const question = body.messages.at(-1).content;
     const index = labels.findIndex(label => question.startsWith(label + '：'));
-    return { selectedOptionIds: [option.optionId], gaps: [], summary: { text: lines[index], evidenceOptionIds: [option.optionId] } };
+    return { selectedOptionIds: [option.optionId], gaps: [], summary: { text: answers[index], evidenceOptionIds: [option.optionId] } };
   }, judgment: wire => {
-    assert.equal(wire.state.executionSummary.text, summaryText);
+    assert.equal(wire.state.executionSummary.text, merged);
     assert.ok(wire.state.events.some(event => event.id === 'action' && event.text === observation.events[1].text));
     return { answers: { request_drift: { type: 'choice', choice: 'unknown' }, execution_blocking: { type: 'choice', choice: 'unblocked_1' } } };
   } });
   const result = await analyzer.analyze(observation);
-  assert.equal(result.summary.generated.text, summaryText);
+  assert.equal(result.summary.generated.text, merged);
+  assert.deepEqual(result.summary.generated.sections, sections);
   assert.equal(result.summary.generated.blocking.status, 'unblocked');
   assert.deepEqual(requests.map(request => request.path), analysisPaths);
   for (const [index, label] of labels.entries()) {
@@ -245,12 +248,8 @@ test('long observations retain the request and inherited limits under independen
   assert.equal(events.length, 181, 'input observations are not pruned or rewritten');
 });
 
-test('missing, reordered or empty summary levels fail the model round before judgment', async t => {
+test('missing or empty summary content fails the model round before judgment', async t => {
   const summaries = [null, [], {}, { text: '', evidenceOptionIds: ['placeholder'] }, { text: '   ', evidenceOptionIds: ['placeholder'] },
-    { text: '第一句。第二句。第三句。', evidenceOptionIds: ['placeholder'] }, { text: '材'.repeat(601), evidenceOptionIds: ['placeholder'] },
-    { text: '在做什么：核对日志。\n有什么进展：找到记录。', evidenceOptionIds: ['placeholder'] },
-    { text: '有什么进展：找到记录。\n在做什么：核对日志。\n卡在哪里：未观察到明确阻碍。', evidenceOptionIds: ['placeholder'] },
-    { text: '在做什么：核对日志。\n有什么进展：  \n卡在哪里：未观察到明确阻碍。', evidenceOptionIds: ['placeholder'] },
     { text: summaryText, evidenceOptionIds: ['placeholder'], extra: 'unexpected' }];
   for (const summary of summaries) {
     const { analyzer, requests } = await models(t, { extraction: (_evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: summary?.evidenceOptionIds ? { ...summary, evidenceOptionIds: [option.optionId] } : summary }) });

@@ -1827,11 +1827,12 @@ test('current observed activity remains visible while analysis is paused, unavai
 })
 
 test('the actual DSH detail shows the current model short summary with direct owned citations and hides it while new material waits or fails', async t => {
-  const summaryText = '在做什么：核对当前执行。\n有什么进展：已观察到当前执行结果。\n卡在哪里：未观察到明确阻碍。'
+  const sections = ['在做什么：核对当前执行。\n有什么进展：这是原始材料中的标题。', '有什么进展：已观察到当前执行结果。', '卡在哪里：未观察到明确阻碍。']
+  const summaryText = sections.join('\n')
   const at = Date.now(), task = { key: 'summary-task', sourceKey: 'summary-source', id: 'main', lifecycleId: 'run', title: '总结观察', status: 'running',
     currentRequest: 'Inspect the current execution', activity: { summary: '工具已返回一个结果', observedAt: at },
     events: [{ id: 'basis', taskId: 'main', taskLifecycleId: 'run', kind: 'output', capturedAt: at, text: '本轮实际执行依据' }],
-    analysis: { state: 'cooldown', resultDisposition: 'current', completedAt: at, summary: { generated: { text: summaryText, evidenceIds: ['basis'], evidenceRefs: [{ taskId: 'main', lifecycleId: 'run', eventId: 'basis' }] } }, checks: [] } }
+    analysis: { state: 'cooldown', resultDisposition: 'current', completedAt: at, summary: { generated: { text: summaryText, sections, evidenceIds: ['basis'], evidenceRefs: [{ taskId: 'main', lifecycleId: 'run', eventId: 'basis' }] } }, checks: [] } }
   const snapshot = { protocol: 1, generatedAt: at, monitoring: { state: 'active' }, overview: {}, sources: [{ key: 'summary-source', status: 'connected', descriptor: { name: '本安装' } }], tasks: [task] }
   task.analysis.summary.generated.blocking = { status: 'unblocked', reason: '本轮实际执行依据', evidenceRefs: task.analysis.summary.generated.evidenceRefs }
   const f = await client(t, snapshot, 'denied', null, true)
@@ -1841,7 +1842,7 @@ test('the actual DSH detail shows the current model short summary with direct ow
   assert.equal(f.dom.window.getComputedStyle(summary().querySelector('[data-sentinel-summary-text]')).fontSize, '15px')
   assert.equal(summary().querySelectorAll('[data-sentinel-summary-text] > p').length, 3)
   assert.deepEqual([...summary().querySelectorAll('[data-sentinel-summary-text] > p > strong')].map(label => label.textContent), ['在做什么：', '有什么进展：', '卡在哪里：'])
-  assert.deepEqual([...summary().querySelectorAll('[data-sentinel-summary-text] > p')].map(row => row.textContent.trim()), summaryText.split('\n'))
+  assert.deepEqual([...summary().querySelectorAll('[data-sentinel-summary-text] > p')].map(row => row.textContent.trim()), sections)
   const citation = summary().querySelector('small[data-sentinel-citation="basis"]')
   assert.ok(citation.textContent.includes('本轮实际执行依据'))
   assert.equal(citation.dataset.sourceKey, 'summary-source')

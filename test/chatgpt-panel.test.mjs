@@ -166,6 +166,16 @@ test('the recent and current summaries display three separate literal levels whi
   assert.match(page.element('#recent-blocking-status').textContent, /^未阻塞 · 定向复测已通过$/)
   assert.equal(page.element('#recent-blocking-details').hidden, false)
   assert.match(page.element('#recent-blocking-evidence').textContent, /测试通过/)
+
+  const sections = [lines[0] + '\n\n补充核对。\n有什么进展：这是日志中的文字。', lines[1] + '\n' + '后续记录。'.repeat(130), lines[2]]
+  const multiline = { text: sections.join('\n'), sections }
+  Object.assign(view.recentModelActivity.summary, multiline)
+  Object.assign(view.analysis.partial, multiline)
+  await page.refresh(); await page.deliver(view)
+  for (const id of ['#recent-summary-text', '#model-summary-text']) {
+    assert.deepEqual(page.element(id).children.map(child => child.textContent.trim()), sections)
+    assert.equal(page.element(id).children[0].children[1].textContent.trim(), sections[0].slice('在做什么：'.length))
+  }
 })
 
 test('a partial summary lists observation gaps, stays gray and keeps the prior complete summary as history', async t => {

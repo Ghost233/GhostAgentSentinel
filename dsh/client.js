@@ -808,13 +808,13 @@
           notification && h('small', { 'data-gs-notification': true }, notification.status === 'submitted' ? '系统已受理 · 是否看见未知'
             : notification.status === 'failed' ? '通知投递失败' : notification.status === 'claimed' ? '通知待确认' : '通知尚未确认'))
       }
-      function SummaryText({ value }) {
+      function SummaryText({ value, sections }) {
         const body = text(value)
-        const folded = body.match(/^(在做什么：[\s\S]+?)\s*(有什么进展：[\s\S]+?)\s*(卡在哪里：[\s\S]+)$/)
-        const lines = folded ? folded.slice(1).map(line => line.trim()) : body.split(/\r?\n/)
+        const folded = sections ? null : body.match(/^(在做什么：[\s\S]+?)\s*(有什么进展：[\s\S]+?)\s*(卡在哪里：[\s\S]+)$/)
+        const lines = sections ?? (folded ? folded.slice(1).map(line => line.trim()) : body.split(/\r?\n/))
         return h('div', { 'data-sentinel-summary-text': true }, lines.map((line, index) => {
           const ending = index < lines.length - 1 ? '\n' : ''
-          const parts = line.match(/^(在做什么：|有什么进展：|卡在哪里：)(.+)$/)
+          const parts = line.match(/^(在做什么：|有什么进展：|卡在哪里：)([\s\S]+)$/)
           return parts ? h('p', { key: index, className: 'sentinel-summary-row' }, h('strong', null, parts[1]), h('span', null, parts[2] + ending)) : h('p', { key: index }, line + ending)
         }))
       }
@@ -828,7 +828,7 @@
       function SummaryContent({ record, gaps, task, snapshot, historical = false }) {
         const scope = gaps && [...new Set(gaps.filter(gap => text(gap)).map(gapText))].slice(0, 24)
         return h(React.Fragment, null,
-          h(SummaryText, { value: record.text }),
+          h(SummaryText, { value: record.text, sections: record.sections }),
           h(BlockingDecision, { decision: record.blocking, task, snapshot, historical }),
           scope && h('p', null, '观察范围：', scope.join('；') || '本轮仅覆盖已采集的部分材料'),
           h(EvidenceCitations, { record, task, snapshot, compact: true }))
@@ -1221,7 +1221,7 @@
         style.textContent += '.sentinel-gs{position:relative;display:inline-flex;font:12px/1.4 system-ui;color:var(--dsw-alias-label-primary)}.sentinel-gs button{font:inherit;color:inherit;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:4px 6px;cursor:pointer}.sentinel-gs-counts{display:inline-flex;gap:6px}.sentinel-gs-counts>span{display:inline-flex;align-items:center;gap:3px}.sentinel-gs-counts i{width:6px;height:6px;border-radius:50%;background:currentColor}.sentinel-gs-green{color:#378458}.sentinel-gs-yellow{color:#b97925}.sentinel-gs-red{color:#c44b4b}.sentinel-gs-gray{color:#7a8190}.sentinel-gs-popup{box-sizing:border-box;overflow-wrap:anywhere;position:absolute;bottom:calc(100% + 6px);right:0;z-index:1000;width:min(360px,85vw);max-height:60vh;overflow:auto;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);box-shadow:0 6px 24px #0003}.sentinel-gs-popup.sentinel-gs-below{bottom:auto;top:calc(100% + 6px)}.sentinel-gs-popup header{display:flex;justify-content:space-between;gap:8px}.sentinel-gs-popup nav{display:flex;flex-direction:column;gap:4px;margin:8px 0}.sentinel-gs-popup small{display:block;font-size:12px}.sentinel-gs-popup p{font-size:12px;margin:6px 0}.sentinel-gs-popup article{border-top:1px solid var(--dsw-alias-border-l2);padding-top:8px}'
         style.textContent += '.sentinel-tree,.sentinel-tree-node,[data-gs-row]{min-width:0;max-width:100%;box-sizing:border-box}.sentinel-tree button{width:100%;min-width:0;text-align:left;overflow-wrap:anywhere;box-sizing:border-box}.sentinel-node-name{font-size:13px;line-height:1.5}.sentinel-overview .sentinel-node-basis,.sentinel-gs-popup .sentinel-node-basis{font-size:12px;line-height:1.5;opacity:1;color:var(--dsw-alias-label-primary)}.sentinel-gs-counts{flex-wrap:wrap}.sentinel-hide-normal{display:flex;align-items:center;gap:6px;font-size:12px;margin:8px 0}.sentinel-overview .sentinel-hide-normal input{width:auto}.sentinel-tree details{margin:4px 0}.sentinel-tree summary{font-size:12px;cursor:pointer}.sentinel-tree article{font-size:12px;overflow-wrap:anywhere}.sentinel-gs-popup button:focus-visible,.sentinel-overview button:focus-visible{outline:2px solid currentColor;outline-offset:2px}.sentinel-gs-popup header>*{min-width:0}'
         style.textContent += '.sentinel-monitor-header{position:sticky;top:0;z-index:2;background:var(--dsw-alias-bg-layer-2);padding:8px 0;margin:0 0 12px;min-width:0}.sentinel-monitor-title,.sentinel-monitor-lamps{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sentinel-monitor-title{justify-content:space-between}.sentinel-monitor-header .sentinel-monitor-tabs{display:flex;flex-direction:row;gap:6px;margin:8px 0 0}.sentinel-monitor-tabs button{flex:1;text-align:center}.sentinel-monitor-tabs [aria-selected=true]{font-weight:600;border-color:currentColor}.sentinel-gs-popup .sentinel-monitor-header{display:block}.sentinel-issue-evidence small{font-size:11px;line-height:1.45;margin:3px 0;overflow-wrap:anywhere}.sentinel-issue-evidence [data-sentinel-citation]{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.sentinel-focus-summary{border-left:3px solid var(--dsw-alias-border-l2);padding-left:10px}.sentinel-focus-summary>strong{font-size:15px}.sentinel-monitor-header .sentinel-gs-counts{flex-wrap:nowrap}.sentinel-gs-popup [role=tabpanel],.sentinel-overview [role=tabpanel]{min-width:0}[data-gs-issues]:empty{min-height:40px}'
-        style.textContent += '[data-sentinel-summary-text]{font-size:15px;line-height:1.65}[data-sentinel-summary-text] .sentinel-summary-row{display:flex;flex-wrap:wrap;gap:2px 10px;margin:8px 0}.sentinel-summary-row strong{font-weight:650;flex:0 0 6em}.sentinel-summary-row span{flex:1 1 17em;min-width:0}[data-sentinel-blocking]{margin-top:10px}'
+        style.textContent += '[data-sentinel-summary-text]{font-size:15px;line-height:1.65}[data-sentinel-summary-text] .sentinel-summary-row{display:flex;flex-wrap:wrap;gap:2px 10px;margin:8px 0}.sentinel-summary-row strong{font-weight:650;flex:0 0 6em}.sentinel-summary-row span{flex:1 1 17em;min-width:0;white-space:pre-wrap}[data-sentinel-blocking]{margin-top:10px}'
         style.textContent += '.sentinel-session-sidebar{display:flex;flex-direction:column;height:100%;min-height:0}.sentinel-panel-switch{align-self:flex-end;margin:6px 12px 0;font:inherit}.sentinel-session-panel{flex:1 1 auto;width:100%;min-height:0;border:0}'
         document.head.appendChild(style)
         ctx.effect(() => () => { style.remove() })

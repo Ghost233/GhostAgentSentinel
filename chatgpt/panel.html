@@ -16,7 +16,7 @@
 .recent-model-badge[data-tone=failed]{background:light-dark(#f8e4e2,#3a2628);color:light-dark(#7b302e,#f0aaa6)}
 #recent-summary-row{border-top:1px solid color-mix(in srgb,GrayText 15%,transparent);margin-top:5px;padding-top:5px}
 #recent-summary-gaps{margin:6px 0 0;font-size:11px}
-.summary-body:not(.muted){font-size:15px;line-height:1.65}.summary-body p{margin:8px 0}.summary-body .summary-row{display:grid;grid-template-columns:6em minmax(0,1fr);column-gap:10px}.summary-row strong{font-weight:650}
+.summary-body:not(.muted){font-size:15px;line-height:1.65}.summary-body p{margin:8px 0}.summary-body .summary-row{display:grid;grid-template-columns:6em minmax(0,1fr);column-gap:10px}.summary-row strong{font-weight:650}.summary-row span{white-space:pre-wrap}
 @media(max-width:420px){.summary-body .summary-row{grid-template-columns:1fr;row-gap:2px}}
 .blocking{margin-top:10px}.blocking p{margin:4px 0}.blocking details{font-size:12px}
 .blocking [data-status="blocked"]{color:light-dark(#a32323,#ffabab)}
@@ -58,15 +58,16 @@ const executions={running:'运行中',idle:'已结束',ended:'已结束',aborted
 const element=id=>document.querySelector('#'+id);
 function set(id,key,value){const target=element(id);if(target[key]!==value)target[key]=value;}
 const write=(id,value)=>set(id,'textContent',value);
-function writeSummary(id,value){
-  const folded=value.match(/^(在做什么：[\s\S]+?)\s*(有什么进展：[\s\S]+?)\s*(卡在哪里：[\s\S]+)$/);
-  if(folded)value=folded.slice(1).map(line=>line.trim()).join('\n');
+function writeSummary(id,value,sections){
+  const folded=sections?null:value.match(/^(在做什么：[\s\S]+?)\s*(有什么进展：[\s\S]+?)\s*(卡在哪里：[\s\S]+)$/);
+  if(folded)sections=folded.slice(1).map(line=>line.trim());
+  if(sections)value=sections.join('\n');
   if(element(id).textContent===value)return;
-  const lines=value.split(/\r?\n/);
+  const lines=sections??value.split(/\r?\n/);
   if(lines.length===1){write(id,value);return;}
   element(id).replaceChildren(...lines.map((line,index)=>{
     const ending=index<lines.length-1?'\n':'';
-    const parts=line.match(/^(在做什么：|有什么进展：|卡在哪里：)(.+)$/);
+    const parts=line.match(/^(在做什么：|有什么进展：|卡在哪里：)([\s\S]+)$/);
     if(!parts)return node('p',line+ending);
     const row=node('p','','summary-row');
     row.append(node('strong',parts[1]),node('span',parts[2]+ending));
@@ -108,11 +109,11 @@ function renderRecentModelActivity(activity,retained=false,revalidating=false){
   write('recent-prefill-state',label);
   attribute('recent-prefill-state','data-tone',tone);
   time('recent-prefill-time',prefill?.submittedAt);
-  const valid=recent(summary?.completedAt)&&summary.expiresAt>now&&Boolean(text(summary.text,600));
+  const valid=recent(summary?.completedAt)&&summary.expiresAt>now&&Boolean(text(summary.text,Infinity));
   show('recent-summary-state',valid);write('recent-summary-state',valid?(summary.final?'已收尾':'已总结'):'');
   attribute('recent-summary-state','data-tone','ok');
   set('recent-summary-text','className',valid?'summary-body':'summary-body muted');
-  writeSummary('recent-summary-text',valid?text(summary.text,600):activity?'暂无可显示的总结':'等待核对当前聊天');
+  writeSummary('recent-summary-text',valid?text(summary.text,Infinity):activity?'暂无可显示的总结':'等待核对当前聊天',valid?summary.sections:null);
   const decision=valid?(summary.blocking??{status:'unknown',reason:summary.final?'执行已收尾，未作运行中判断':'这份摘要没有可显示的 JEV 判断'}):null;
   renderBlocking('recent',decision,retained||revalidating);
   time('recent-summary-time',valid?summary.completedAt:null);
@@ -264,9 +265,9 @@ function render(view){
   write('inheritance',inheritanceGap?(view.inheritance.state==='pending'?'继承要求待补齐 · 相关检查不可判断':'继承要求存在缺口 · 相关检查不可判断'):'');
   const available=analysis.availableSummary;
   const partial=available?available.partial:!analysis.generated&&analysis.coverage?.complete===false&&analysis.partial;
-  const generated=available?.result||analysis.generated||partial,publishable=generated&&text(generated.text,600)&&Array.isArray(generated.evidence)&&generated.evidence.length&&(available||!['failed','unavailable','interrupted','stale','unknown'].includes(analysis.state)&&(view.execution?.historical||['current','reused'].includes(analysis.resultDisposition)));
+  const generated=available?.result||analysis.generated||partial,publishable=generated&&text(generated.text,Infinity)&&Array.isArray(generated.evidence)&&generated.evidence.length&&(available||!['failed','unavailable','interrupted','stale','unknown'].includes(analysis.state)&&(view.execution?.historical||['current','reused'].includes(analysis.resultDisposition)));
   show('model-summary',Boolean(publishable));
-  writeSummary('model-summary-text',publishable?text(generated.text,600):'');
+  writeSummary('model-summary-text',publishable?text(generated.text,Infinity):'',publishable?generated.sections:null);
   renderBlocking('model',publishable?generated.blocking:null,view.execution?.historical||recordRevalidating||analysis.state==='paused'||view.health?.state==='failed');
   updateRows('model-summary-evidence',publishable?summaryEvidence(generated):[]);
   write('model-summary-title',publishable&&partial?(scoped?'本次观察总结':'部分观察总结'):'模型总结');
@@ -288,10 +289,10 @@ function render(view){
   renderHealth(view.health);
   renderHistory(view);
   const prior=analysis.lastSuccessfulSummary,old=prior?.generated,readAt=Date.now();
-  const priorVisible=Boolean((!publishable||partial||available)&&Number.isFinite(prior?.completedAt)&&prior.completedAt<=readAt&&Number.isFinite(prior.expiresAt)&&prior.expiresAt>readAt&&text(old?.text,600)&&Array.isArray(old.evidence)&&old.evidence.length);
+  const priorVisible=Boolean((!publishable||partial||available)&&Number.isFinite(prior?.completedAt)&&prior.completedAt<=readAt&&Number.isFinite(prior.expiresAt)&&prior.expiresAt>readAt&&text(old?.text,Infinity)&&Array.isArray(old.evidence)&&old.evidence.length);
   show('history',Boolean(view.history)||priorVisible);show('last-summary',priorVisible);
   write('last-summary-time',priorVisible?'历史记录 · 不代表当前结果 · '+new Date(prior.completedAt).toLocaleString():'');
-  writeSummary('last-summary-text',priorVisible?text(old.text,600):'');
+  writeSummary('last-summary-text',priorVisible?text(old.text,Infinity):'',priorVisible?old.sections:null);
   renderBlocking('last',priorVisible?old.blocking:null,true);
   updateRows('last-summary-evidence',priorVisible?summaryEvidence(old):[]);
   const monitoring=view.monitoring;

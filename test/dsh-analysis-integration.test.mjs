@@ -214,6 +214,8 @@ test('DSH retains partial observations and summarizes each observed execution on
   assert.equal(view.recentModelActivity.summary.final, true)
   assert.equal(view.execution.historical, true)
   assert.match(view.recentModelActivity.summary.text, /在做什么：/)
+  assert.equal(view.recentModelActivity.summary.sections?.length, 3)
+  assert.equal(view.recentModelActivity.summary.sections.join('\n'), view.recentModelActivity.summary.text)
   const wrongSession = await host.adapter.sessionPanel('other-session', { executionKey: view.execution.key, expectedThreadId: 'other-session' })
   assert.equal(wrongSession.execution, undefined)
   assert.equal(wrongSession.recentModelActivity.summary, null)
