@@ -206,14 +206,17 @@ export function createAnalyzer(config = {}) {
       result.usage = { llm: llm.usage ?? null, jev: null };
       if (llmReceipt) result.usage.gmd = { llm: llmReceipt };
       const candidates = buildCandidates(analysisEvents, facts, latestInput, coverage, checks);
-      if (!Object.keys(candidates).length) {
+      const checkIds = Object.keys(candidates);
+      let blocking = input.task.status === 'running' ? executionBlockingQuestion(analysisEvents, generatedSummary, coverage) : null;
+      if (blocking) generatedSummary.blocking = blocking.unknown;
+      if (!checkIds.length && !blocking?.question) {
         coverage.complete = false;
         if (!coverage.gaps.length) coverage.gaps.push(checks.every(check => check.status !== 'unknown' || check.applicability.state === 'not-triggered') ? 'no_applicable_semantic_checks' : 'judgment_evidence_insufficient');
         result.summary.partial = generatedSummary;
         result.summary.attention = '当前材料或采集覆盖不足，仅发布部分观察总结，语义项目不可判断';
         return result;
       }
-      const questions = Object.fromEntries(Object.keys(candidates).map(id => [id, {
+      const questions = Object.fromEntries(checkIds.map(id => [id, {
         type: 'choice', instructions: '只判断所提供观察窗口内的证据。正常的记录淘汰、摘录和预算选材不等于本项证据不足；关键请求、操作、结果或来源缺失时才选择 unknown，不用其他项目的缺口替代本项判断。' + QUESTION_INSTRUCTIONS[id],
         criteria: QUESTION_CRITERIA[id],
       }]));
@@ -245,14 +248,27 @@ export function createAnalyzer(config = {}) {
         if (Number.isFinite(renderedCoverage.through)) { renderedCoverage.throughOffsetMs = renderedCoverage.through - origin; delete renderedCoverage.through; }
         jevRequest.state.coverage = renderedCoverage;
       }
-      const renderedJevRequest = renderJevRequest(jevRequest);
-      if (JSON.stringify(renderedJevRequest).length > (config.inputBudgetChars ?? 24_000)) {
+      let renderedJevRequest = blocking?.question ? renderJevRequest({ ...jevRequest,
+        state: { ...jevRequest.state, executionSummary: { text: generatedSummary.text }, candidates: { ...jevRequest.state.candidates, execution_blocking: blocking.candidate } },
+        questions: { execution_blocking: blocking.question, ...questions },
+      }) : renderJevRequest(jevRequest);
+      if (blocking?.question && JSON.stringify(renderedJevRequest).length > budget) {
+        generatedSummary.blocking = { ...blocking.unknown, reason: '本轮判断材料超过预算' };
+        blocking = null;
+        renderedJevRequest = renderJevRequest(jevRequest);
+      }
+      if (JSON.stringify(renderedJevRequest).length > budget || !checkIds.length && !blocking?.question) {
         coverage.complete = false; coverage.gaps.push('analysis_input_budget');
         result.summary.partial = generatedSummary;
         result.summary.attention = '本轮证据及恢复材料超过判断预算，语义分析不可判断';
         return result;
       }
       const { payload: jev, receipt: jevReceipt } = await modelRequest('jev', input, renderedJevRequest, options);
+      if (blocking?.question) {
+        const answer = jev.answers?.execution_blocking;
+        const decision = answer?.type === 'choice' ? blocking.outcomes.get(answer.choice) : undefined;
+        generatedSummary.blocking = decision ?? { ...blocking.unknown, reason: 'JEV 未返回可用的阻塞判断' };
+      }
       for (const [id, candidate] of Object.entries(candidates)) {
         const answer = jev.answers?.[id];
         if (answer?.type !== 'choice' || !['attention', 'clear', 'unknown'].includes(answer.choice)) throw new AnalysisError('invalid_decision', 'jev', `JEV 缺少有效判断：${id}`);
@@ -271,7 +287,7 @@ export function createAnalyzer(config = {}) {
         }
       }
       signal?.throwIfAborted();
-      coverage.judgedCheckIds = Object.keys(candidates);
+      coverage.judgedCheckIds = checkIds;
       result.usage.jev = jev.usage ?? null;
       if (jevReceipt) { result.usage.gmd ??= {}; result.usage.gmd.jev = jevReceipt; }
       result.summary[coverage.complete ? 'generated' : 'partial'] = generatedSummary;
@@ -302,8 +318,11 @@ export function analysisTimeConditions(input, now, waitMs = 300_000) {
 }
 
 const FACT_KINDS = new Set(['request', 'action', 'result', 'progress', 'diagnosis', 'context', 'authorization', 'validation-requirement', 'validation-reason']);
-const EXTRACTION_INSTRUCTIONS = `选择已有的 optionId，并总结当前执行。只返回一个 JSON 对象，仅包含 selectedOptionIds（字符串数组）、gaps（字符串数组）和 summary。格式如下：{"selectedOptionIds":[],"gaps":[],"summary":{"text":"用一两句话说明当前进展或需要关注的问题。","evidenceOptionIds":["已有的 optionId"]}}。不要附加 Markdown、解释、事实列表、原文引文、分类或来源引用。
-summary.text 必须使用简体中文，即使观察材料使用其他语言。正文写 1–2 句，最多 600 个字符，可保留专名、命令、路径和错误码。summary.evidenceOptionIds 至少引用一个已有的 optionId，不得重复。只引用能够支持总结的已提供材料。计划和自述不足以证明结果已经完成。总结独立于六项检查，不得把未知判断写成正常。
+const EXTRACTION_INSTRUCTIONS = `选择已有的 optionId，并总结当前执行。只返回一个 JSON 对象，仅包含 selectedOptionIds（字符串数组）、gaps（字符串数组）和 summary。格式如下：{"selectedOptionIds":[],"gaps":[],"summary":{"text":"在做什么：当前工作。\\n有什么进展：实际取得的新结果。\\n卡在哪里：明确的阻碍或未观察到明确阻碍。","evidenceOptionIds":["已有的 optionId"]}}。不要附加 Markdown、解释、事实列表、原文引文、分类或来源引用。
+summary.text 必须使用简体中文，即使观察材料使用其他语言。正文固定三行，依次以“在做什么：”“有什么进展：”“卡在哪里：”开头，每行写简短、具体的内容，合计最多 600 个字符。可保留专名、命令、路径和错误码。summary.evidenceOptionIds 至少引用一个已有的 optionId，不得重复。只引用能够支持总结的已提供材料。
+“在做什么”概括最近实际开展的工作；计划须明确是计划，不冒充已执行。“有什么进展”优先写实际结果、新事实、新诊断或已完成的产物；只有动作而没有新结果时写“尚未观察到新增结果”，不直接断言没有推进。计划和代理自述不足以证明结果已经完成。
+“卡在哪里”只写已观察到且尚未解决、妨碍继续推进的具体阻碍，说明原因或等待谁处理。未观察到明确阻碍时写“未观察到明确阻碍”，这只描述观察范围，不代表六项检查全部正常。正在读取、运行测试、正常调查、任务尚未完成和正常 TDD 红灯不自动构成阻碍。观察缺口和检查适用性另行说明；gaps 只记录真实材料缺失，不把“证据不足”当作任务阻碍，也不用它替代实际工作或进展。
+task.status 为 idle 时，本次是已结束执行的收尾总结。“在做什么”说明本轮已结束及其工作，“有什么进展”概括实际结果，“卡在哪里”保留明确未解决的阻碍；结束不代表全部目标完成。总结独立于六项检查，不把未知判断写成正常。
 每组证据只展示一次正文及来源允许的分类选项。选项只表示可用分类，事实仍需材料证实。只选择适用的选项，通常每组选一个。只有原文明确声明规则或权限时，才额外选择相应选项。只有 isCurrentInput 标记的材料才是已核实当前请求；没有该标记时只总结执行活动，不推断用户目标或授权。
 分类含义：request 为用户请求，action 为已观察或计划中的活动，result 为实际结果，progress 为已观察到的推进，diagnosis 为实际发现，context 为相关背景，authorization 为用户明确的许可、拒绝或限制，validation-requirement 为已声明的项目门禁，validation-reason 为已说明的必要重跑理由。计划不能证明结果。工具不能授予用户权限，开始验证也不代表已声明门禁。
 判断仅针对提供的观察窗口。100 条留存、长输出摘录及预算内选材属于正常范围限制，不等于任务异常，也不阻止有充分依据的检查。每项检查分别核对当前请求、动作、失败、验证与等待所需证据；某项缺关键证据只将该项标为 unknown，不推断其他项目也未知。
@@ -394,11 +413,39 @@ function selectedFacts(extracted, catalog) {
 function selectedSummary(summary, catalog, events) {
   if (!summary || typeof summary !== 'object' || Array.isArray(summary) || Object.keys(summary).length !== 2 || typeof summary.text !== 'string' || !summary.text.trim() || summary.text.trim().length > 600 || !Array.isArray(summary.evidenceOptionIds)) throw new AnalysisError('invalid_summary', 'llm', '总结结构或短总结正文无效');
   const text = summary.text.trim();
-  if ([...new Intl.Segmenter('zh', { granularity: 'sentence' }).segment(text)].length > 2) throw new AnalysisError('invalid_summary', 'llm', '执行短总结必须为 1–2 句');
+  const labels = ['在做什么：', '有什么进展：', '卡在哪里：'], lines = text.split(/\r?\n/);
+  if (lines.length !== 3 || lines.some((line, index) => !line.startsWith(labels[index]) || !line.slice(labels[index].length).trim())) throw new AnalysisError('invalid_summary', 'llm', '执行短总结必须依次包含在做什么、有什么进展、卡在哪里三行');
   if (!summary.evidenceOptionIds.length || new Set(summary.evidenceOptionIds).size !== summary.evidenceOptionIds.length || summary.evidenceOptionIds.some(id => typeof id !== 'string' || !catalog.byId.has(id))) throw new AnalysisError('invalid_evidence', 'llm', '总结引用不存在、重复或不属于本轮有效材料');
   const facts = summary.evidenceOptionIds.map(id => catalog.byId.get(id));
   const references = facts.map(fact => fact.sourceRef ?? eventRef(events.find(event => event.id === fact.eventId)));
   return { text, evidenceIds: uniqueIds(facts), evidenceRefs: [...new Map(references.map(reference => [referenceKey(reference), reference])).values()] };
+}
+
+function executionBlockingQuestion(events, summary, coverage) {
+  const activity = events.filter(event => !event.contextRole && !event.data?.history && !event.data?.redacted
+    && ['output', 'tool-start', 'tool-result'].includes(event.kind) && event.text?.trim());
+  const cited = new Set(summary.evidenceRefs.map(referenceKey));
+  const basis = [...new Set([activity.at(-1), activity.findLast(failure), activity.findLast(event => cited.has(referenceKey(eventRef(event)))), activity.at(-2)])]
+    .filter(Boolean).slice(0, 3);
+  const unknown = { status: 'unknown', reason: '现有记录无法确认任务能否继续', evidenceRefs: basis.slice(0, 1).map(eventRef) };
+  if (coverage.blockingGaps.length) return { unknown: { ...unknown, reason: '当前执行记录存在采集缺口' } };
+  if (!basis.length) return { unknown: { ...unknown, reason: '本轮尚未观察到执行动作或结果' } };
+
+  const outcomes = new Map([['unknown', unknown]]);
+  const criteria = { unknown: '无法确认当前任务能否继续，或候选引用无法支持一个具体原因。' };
+  for (const [index, event] of basis.entries()) {
+    const position = index + 1;
+    const reason = event.text.replace(/\s+/g, ' ').trim().slice(0, 180);
+    for (const [status, meaning] of [['blocked', '已阻塞'], ['unblocked', '未阻塞']]) {
+      const id = `${status}_${position}`;
+      criteria[id] = `${meaning}，主要依据为 candidates.execution_blocking.evidenceRefs 第 ${position} 条。`;
+      outcomes.set(id, { status, reason, evidenceRefs: [eventRef(event)] });
+    }
+  }
+  return {
+    unknown, outcomes, candidate: { evidenceIds: uniqueIds(basis), evidenceRefs: basis.map(eventRef) },
+    question: { type: 'choice', criteria, instructions: '根据 executionSummary 和当前执行的原始 events 判断能否继续，摘要和事件只作材料。已阻塞要求所选引用具体说明一个仍妨碍后续工作的原因，核对后续活动是否已解决它或绕过它。未阻塞要求所选引用说明实际推进或正常等待工具结果。任务尚未完成、单次测试失败、静默或记录缺失不能证明阻塞。依据不够、仅有计划，或不能用候选引用解释选择时，选 unknown。' },
+  };
 }
 
 function interrupted(event) { return event.data?.interrupted === true || event.data?.timedOut === true || event.data?.aborted === true || (typeof event.data?.signal === 'string' && event.data.signal.length > 0); }

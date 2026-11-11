@@ -154,7 +154,7 @@ test('running ChatGPT executions analyze activity without a user request and res
     assert.deepEqual(io.requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone'])
     const judged = io.requests[1].body
     assert.equal(judged.state.request, null)
-    assert.deepEqual(Object.keys(judged.questions), ['failure_loop', 'validation_cost'])
+    assert.deepEqual(Object.keys(judged.questions), ['execution_blocking', 'failure_loop', 'validation_cost'])
     if (choice === 'attention') { time += 3001; assert.ok((await core.claimNotifications(source)).length) }
 
     await core.setConversationMonitoring({ registrationId: 'running-chat', taskId: 'main', paused: true, revision: first.conversationMonitoring.revision })

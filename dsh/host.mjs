@@ -289,6 +289,17 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       })())
     },
     analysisConfigState(signal) { return installationCall('installationAnalysisConfig', [], signal) },
+    async configureAnalysisScheduling(scheduling, signal) {
+      try { return await installationCall('configureInstallationScheduling', [scheduling], signal) }
+      catch (error) {
+        const requestFailure = error?.coreRequestFailure
+        const rejected = error?.code === 'core_feature_unsupported' || requestFailure?.operation === '/v1/analysis/installations/scheduling' && requestFailure.kind === 'http' && requestFailure.status >= 400 && requestFailure.status <= 599
+        const failure = error && typeof error === 'object' ? error : new Error(String(error))
+        failure.code ??= 'gateway/internal'; failure.isDSHRemoteError = true
+        failure.details = { ...failure.details, saveOutcome: rejected ? 'rejected' : 'unknown' }
+        throw failure
+      }
+    },
     async configureAnalysisIfCurrent(value, revision, signal) {
       try { return await installationCall('configureInstallationAnalysis', [value, revision], signal) }
       catch (error) {

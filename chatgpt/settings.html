@@ -12,7 +12,7 @@
 </style>
 <main>
 <h1>Sentinel · 安装设置</h1>
-<p class="muted page-description">配置本安装的模型与通知。关闭设置后，监控继续运行。</p>
+<p class="muted page-description">配置本安装的模型、分析并行数与通知。关闭设置后，监控继续运行。</p>
 <nav role="tablist" aria-label="安装设置"><button id="settings-tab-settings" type="button" role="tab" aria-controls="settings-pane-settings">设置</button><button id="settings-tab-notifications" type="button" role="tab" aria-controls="settings-pane-notifications">通知记录</button><button id="settings-tab-diagnostics" type="button" role="tab" aria-controls="settings-pane-diagnostics">连接诊断</button></nav>
 <section id="settings-pane-settings" role="tabpanel" aria-labelledby="settings-tab-settings">
 <form id="settings-form">
@@ -28,6 +28,16 @@
 <div class="model-actions"><button id="settings-jev-list" type="button">读取列表</button><button id="settings-jev-check" type="button">检查连接</button></div><div class="model-status"><p id="settings-jev-list-status" class="muted"></p><p id="settings-jev-check-status" class="muted"></p><p id="settings-jev-status" class="muted"></p></div></fieldset>
 </div>
 <p class="muted save-hint">选定模型或完成编辑后自动保存，未完成的输入保留为草稿。</p>
+<fieldset><legend>会话查询队列</legend>
+<label>最大查询并发数<input id="settings-query-concurrency" type="number" min="1" max="16" step="1" value="2" aria-describedby="settings-query-concurrency-status"></label>
+<p id="settings-query-concurrency-status" class="muted" role="status">尚未读取</p>
+<label>每轮查询间隔（秒）<input id="settings-query-interval" type="number" min="0.25" max="3600" step="0.25" value="1.5" aria-describedby="settings-query-interval-status"></label>
+<p id="settings-query-interval-status" class="muted" role="status">尚未读取</p>
+<p class="muted">默认 2 路、每轮结束后等待 1.5 秒。发现活动或结束状态变化后交给摘要队列，已排队的会话只更新材料。</p></fieldset>
+<fieldset><legend>会话摘要队列</legend>
+<label>最大并行会话数<input id="settings-concurrency" type="number" min="1" max="16" step="1" value="1" aria-describedby="settings-concurrency-help settings-concurrency-status"></label>
+<p id="settings-concurrency-help" class="muted">1–16 路，默认 1 路。本安装所有会话共用，不受查询间隔限制。预填与正式分析共用名额，调低后等待已有分析完成。</p>
+<p id="settings-concurrency-status" class="muted" role="status">尚未读取</p></fieldset>
 </form>
 <fieldset class="notification-settings"><legend>桌面通知</legend>
 <p class="muted notification-description">关闭只停止桌面提醒，监控照常运行。重新开启不补发历史通知。</p>
@@ -54,12 +64,15 @@ const element=id=>document.querySelector('#'+id),text=(value,max=2000)=>typeof v
 let id=0,ready=false,stopped=false,settingsBusy=false,settingsState=null,settingsVersion=0,savingGroups=null,settingsTab='settings',diagnosticsBusy=false,diagnosticsVersion=0,diagnosticsRetryTimer=null,diagnosticsRetries=0,installationRegistrationId=null,notificationReadBusy=false,notificationReadVersion=0,permissionBusy=false,permissionVersion=0,notificationRecordsBusy=false,notificationRecordsVersion=0,notificationRecordsCursor=null;
 const pending=new Map(),directoryVersions={llm:0,jev:0},directoryRequests={llm:{list:0,check:0},jev:{list:0,check:0}},editVersions={llm:0,jev:0},completedVersions={llm:0,jev:0},dirtyRoles=new Set(),queuedGroups=new Map();
 const notificationKinds=['task-alert','monitoring-failure'],notificationEdits=Object.fromEntries(notificationKinds.map(kind=>[kind,{version:0,dirty:false,saving:false,queued:null}]));
+const schedulingFields={queryConcurrency:{id:'settings-query-concurrency',fallback:2,scale:1,suffix:'路'},queryIntervalMs:{id:'settings-query-interval',fallback:1500,scale:1000,suffix:'秒'},concurrency:{id:'settings-concurrency',fallback:1,scale:1,suffix:'路'}};
+const schedulingEdits=Object.fromEntries(Object.keys(schedulingFields).map(key=>[key,{version:0,dirty:false}])),queuedScheduling=new Map();
 function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);if(entry.method==='tools/call')parent.postMessage({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id,reason}},'*');entry.reject(new Error(reason));}
 function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,name:params?.name,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
 function applyHostTheme(context){if(['light','dark'].includes(context?.theme))document.documentElement.style.colorScheme=context.theme;}
 function onMessage(event){if(event.source!==parent||event.data?.jsonrpc!=='2.0')return;const message=event.data;if(message.method){if(message.method==='ui/resource-teardown'){teardown();parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');}else if(message.method==='ui/notifications/host-context-changed')applyHostTheme(message.params);return;}const entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timeout);message.error?entry.reject(new Error(message.error.message)):entry.resolve(message.result);}
 function validateModelSettings(value){
   if(!value||!text(value.registrationId)||!text(value.revision)||!value.config||typeof value.config!=='object'||Array.isArray(value.config)||installationRegistrationId&&installationRegistrationId!==value.registrationId)throw new Error('模型配置归属未确认');
+  for(const key of Object.keys(schedulingFields))if(value[key]!==undefined&&(!Number.isInteger(value[key])||value[key]<(key==='queryIntervalMs'?250:1)||value[key]>(key==='queryIntervalMs'?3600000:16)))throw new Error('队列设置内容未确认');
   installationRegistrationId=value.registrationId;
 }
 function validateNotificationPreferences(value){
@@ -108,6 +121,7 @@ async function requestInstallationNotificationPermission(){
 }
 function renderModelSettings(value){
   validateModelSettings(value);settingsState=value;
+  for(const [key,field] of Object.entries(schedulingFields))if(!schedulingEdits[key].dirty){const current=(value[key]??field.fallback)/field.scale;element(field.id).value=String(current);element(field.id+'-status').textContent='当前为 '+current+' '+field.suffix;}
   for(const role of ['llm','jev']){
     if(dirtyRoles.has(role))continue;
     directoryVersions[role]++;element('settings-'+role+'-options').replaceChildren();
@@ -142,7 +156,9 @@ function completeModelGroup(role){
   queuedGroups.set(role,{group,version:editVersions[role]});return saveModelSettings();
 }
 async function saveModelSettings(){
-  if(stopped||document.hidden||!ready||settingsBusy||!settingsState||!queuedGroups.size)return;
+  if(stopped||document.hidden||!ready||settingsBusy||!settingsState)return;
+  if(queuedScheduling.size)return saveScheduling();
+  if(!queuedGroups.size)return;
   const config={...settingsState.config};savingGroups=new Map(queuedGroups);queuedGroups.clear();
   for(const [role,{group}] of savingGroups){if(group)config[role]=group;else delete config[role];}
   settingsBusy=true;const version=++settingsVersion;element('settings-reload').disabled=true;element('settings-status').textContent='正在保存';
@@ -157,6 +173,30 @@ async function saveModelSettings(){
     element('settings-status').textContent='已保存 · 等待重新分析'+(dirtyRoles.size?' · 仍有未保存草稿':'');
   }catch(error){if(!stopped&&version===settingsVersion)element('settings-status').textContent='保存结果未确认 · 输入已保留，可重新读取核对；'+text(error.message);}
   finally{if(!stopped&&version===settingsVersion){savingGroups=null;settingsBusy=false;element('settings-reload').disabled=false;void saveModelSettings();}}
+}
+function completeScheduling(key){
+  if(stopped)return;
+  const field=schedulingFields[key],edit=schedulingEdits[key],value=Number(element(field.id).value)*field.scale;
+  edit.dirty=true;edit.version++;
+  if(!Number.isInteger(value)||value<(key==='queryIntervalMs'?250:1)||value>(key==='queryIntervalMs'?3600000:16)){queuedScheduling.delete(key);element(field.id+'-status').textContent=key==='queryIntervalMs'?'未保存 · 请输入 0.25–3600 秒':'未保存 · 请输入 1–16 的整数';return;}
+  queuedScheduling.set(key,{value,version:edit.version});element(field.id+'-status').textContent='等待保存';return saveModelSettings();
+}
+async function saveScheduling(){
+  const changes=new Map(queuedScheduling);queuedScheduling.clear();
+  const scheduling=Object.fromEntries([...changes].map(([key,entry])=>[key,entry.value]));
+  settingsBusy=true;const version=++settingsVersion;element('settings-reload').disabled=true;
+  for(const key of changes.keys())element(schedulingFields[key].id+'-status').textContent='正在保存';
+  const report=message=>{for(const [key,change] of changes)if(change.version===schedulingEdits[key].version)element(schedulingFields[key].id+'-status').textContent=message;};
+  try{
+    const response=await request('tools/call',{name:'sentinel_save_analysis_scheduling',arguments:scheduling});
+    if(stopped||version!==settingsVersion)return;
+    if(response.isError){if(response.structuredContent?.saveOutcome!=='rejected')throw new Error('保存响应未确认');report('保存失败 · 输入已保留');return;}
+    const value=response.structuredContent;validateModelSettings(value);
+    if(![...changes].every(([key,entry])=>value[key]===entry.value))throw new Error('队列设置保存内容未确认');
+    settingsState=value;
+    for(const [key,entry] of changes)if(entry.version===schedulingEdits[key].version){schedulingEdits[key].dirty=false;const field=schedulingFields[key];element(field.id+'-status').textContent='已保存 · '+(entry.value/field.scale)+' '+field.suffix;}
+  }catch(error){if(!stopped&&version===settingsVersion)report('保存结果未确认 · 输入已保留，可重新读取核对；'+text(error.message));}
+  finally{if(!stopped&&version===settingsVersion){settingsBusy=false;element('settings-reload').disabled=false;void saveModelSettings();}}
 }
 async function readDirectory(role,action){
   if(stopped||document.hidden||!ready||element('settings-'+role+'-'+action).disabled)return;
@@ -265,6 +305,11 @@ element('settings-notification-reload').onclick=readNotificationPreferences;elem
 for(const kind of notificationKinds){const checkbox=element('settings-notification-'+kind);checkbox.disabled=true;checkbox.onchange=()=>{if(stopped||document.hidden||checkbox.disabled)return;const edit=notificationEdits[kind];edit.version++;edit.dirty=true;edit.queued={enabled:checkbox.checked,version:edit.version};element('settings-notification-'+kind+'-status').textContent='正在保存';return saveNotificationPreference(kind);};}
 for(const tab of ['settings','notifications','diagnostics'])element('settings-tab-'+tab).onclick=()=>selectSettingsTab(tab);
 element('diagnostics-refresh').onclick=()=>readDiagnostics();element('settings-notifications-refresh').onclick=()=>readInstallationNotificationRecords();element('settings-notifications-older').onclick=()=>notificationRecordsCursor?readInstallationNotificationRecords(notificationRecordsCursor):undefined;element('settings-notifications-older').hidden=true;element('settings-notifications-status').textContent='尚未读取本安装通知记录';element('diagnostics-status').textContent='尚未读取连接诊断';selectSettingsTab('settings');
+for(const [key,field] of Object.entries(schedulingFields)){
+  element(field.id).onchange=()=>completeScheduling(key);
+  element(field.id).oninput=()=>{const edit=schedulingEdits[key];edit.dirty=true;edit.version++;queuedScheduling.delete(key);element(field.id+'-status').textContent='输入完成后自动保存';};
+  element(field.id).onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();return completeScheduling(key);}};
+}
 for(const role of ['llm','jev']){
   for(const action of ['list','check'])element('settings-'+role+'-'+action).onclick=()=>readDirectory(role,action);
   element('settings-'+role+'-options').onchange=()=>{const selected=element('settings-'+role+'-options').value;if(!selected)return;element('settings-'+role+'-model').value=selected;markModelDraft(role,'selection');return completeModelGroup(role);};

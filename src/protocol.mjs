@@ -18,9 +18,12 @@ export const NATIVE_CAPTURE_PRIORITY_FEATURE = 'native-capture-priority/1'
 export const CHECK_EVIDENCE_FEATURE = 'per-check-evidence/1'
 export const CHATGPT_EXECUTION_MONITORING_FEATURE = 'chatgpt-execution-monitoring/1'
 export const STALLED_PROGRESS_REVIEW_FEATURE = 'stalled-progress-review/1'
+export const INSTALLATION_ANALYSIS_SCHEDULING_FEATURE = 'installation-analysis-scheduling/1'
 export const NATIVE_CAPTURE_CHAT_LIMIT_FEATURE = 'native-capture-chat-limit/1'
 export const CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE = 'chatgpt-recent-model-activity/1'
 export const CHINESE_SUMMARY_PROMPT_FEATURE = 'chinese-summary-prompt/1'
+export const EXECUTION_SUMMARY_LEVELS_FEATURE = 'execution-summary-levels/1'
+export const EXECUTION_BLOCKING_FEATURE = 'execution-blocking/1'
 export const GMD_SUMMARY_CACHE_RECOVERY_FEATURE = 'gmd-summary-cache-recovery/1'
 export const CHATGPT_INSTALLATION_PURGE_FEATURE = 'chatgpt-installation-purge/1'
 export const CHATGPT_RETENTION_MAINTENANCE_FEATURE = 'chatgpt-retention-maintenance/1'
@@ -289,6 +292,23 @@ export function normalizeAnalysisConfig(value) {
     config[key] = result
   }
   return config
+}
+export function normalizeAnalysisConcurrency(value) {
+  if (!Number.isInteger(value) || value < 1 || value > 16) throw new Error('analysis concurrency must be an integer from 1 to 16')
+  return value
+}
+export function normalizeAnalysisScheduling(value) {
+  object(value, 'scheduling')
+  const keys = Object.keys(value)
+  if (!keys.length || keys.some(key => !['concurrency', 'queryConcurrency', 'queryIntervalMs'].includes(key))) throw new Error('unsupported scheduling field')
+  const normalized = {}
+  for (const key of keys) {
+    if (key === 'queryIntervalMs') {
+      if (!Number.isInteger(value[key]) || value[key] < 250 || value[key] > 3600000) throw new Error('query interval must be an integer from 250 to 3600000 milliseconds')
+      normalized[key] = value[key]
+    } else normalized[key] = normalizeAnalysisConcurrency(value[key])
+  }
+  return normalized
 }
 import { sanitizeObservation } from './privacy.mjs'
 import { normalizeHierarchy } from './hierarchy.mjs'

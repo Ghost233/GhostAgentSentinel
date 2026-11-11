@@ -7,6 +7,10 @@
       const id = 'ghost-agent-sentinel'
       function parameterCodec(name) {
         return { mode: 'strict', typeSymbol: `Sentinel.${name}`, create: () => ({ parse(value) {
+          if (name === 'scheduling') {
+            if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length || Object.keys(value).some(key => !['concurrency', 'queryConcurrency', 'queryIntervalMs'].includes(key) || !Number.isInteger(value[key]) || value[key] < (key === 'queryIntervalMs' ? 250 : 1) || value[key] > (key === 'queryIntervalMs' ? 3600000 : 16))) throw new Error('队列设置无效')
+            return value
+          }
           if (name === 'entries') {
             if (!Array.isArray(value) || value.length > 100) throw new Error('后台清单最多 100 项')
             const seen = new Set()
@@ -66,7 +70,7 @@
           return value
         } }) }
       }
-      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'], installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'] }
+      const methods = { snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], configureAnalysisScheduling: ['scheduling'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'], installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'] }
       const descriptors = Object.entries(methods).map(([method, parameters]) => ({
         id: `${id}#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,
         invocation: { kind: 'direct' }, cancellation: { parameter: 'signal' }, parameters: parameters.map(name => ({ name, wire: name, source: 'json', codec: parameterCodec(name) })), result: { mode: 'src-json' },
@@ -330,6 +334,7 @@
           baseUrl: config.config?.[role]?.baseUrl || '', model: config.config?.[role]?.model || '',
         }])))
         const [results, setResults] = useState({})
+        const [concurrency, setConcurrency] = useState(config.concurrency ?? 1)
         const [directories, setDirectories] = useState({}), [checks, setChecks] = useState({}), actions = useRef({})
         const edits = useRef({ llm: 0, jev: 0 }), values = useRef(draft), confirmed = useRef(config)
         const savedEdits = useRef({ llm: 0, jev: 0 }), resultScopes = useRef({}), confirmedScope = useRef(connectionScope)
@@ -390,6 +395,13 @@
                   if (latest?.registrationId !== config.registrationId) throw new Error('安装响应不匹配')
                   confirmed.current = latest; confirmedScope.current = scope; uncertain.current = false
                 }
+                if (role === 'scheduling') {
+                  const saved = await request('configureAnalysisScheduling', edit.scheduling)
+                  if (!valid()) break
+                  if (saved?.registrationId !== config.registrationId || saved.concurrency !== edit.scheduling.concurrency) throw new Error('安装或并行数响应不匹配')
+                  confirmed.current = saved; uncertain.current = false; onConfig(saved); report(`已保存 · ${saved.concurrency} 路`)
+                  continue
+                }
                 if (!uncertain.current && savedEdits.current[role] === edit.version && JSON.stringify(confirmed.current.config?.[role]) === JSON.stringify(edit.model)) { report('已保存；下一轮采用新配置'); continue }
                 const next = { ...confirmed.current.config }
                 if (edit.model) next[role] = edit.model; else delete next[role]
@@ -444,7 +456,15 @@
             h('p', { 'data-sentinel-model-list': true }, directory ? directory.scope === connectionScope && connectionScope?.active ? directory.message : '列表已过期，请重新读取' : '尚未读取列表'),
             h('p', { 'data-sentinel-model-check': true }, check ? check.scope === connectionScope && connectionScope?.active ? check.message : '检查已过期，请重新检查连接' : '尚未检查连接；实际分析未验证'),
             results[role] && h('p', { role: 'status' }, results[role] === '正在保存' && (resultScopes.current[role] !== connectionScope || !connectionScope?.active) ? '保存结果未知：观察连接已关闭' : results[role]))
-          })))
+          }), h('div', { 'data-sentinel-concurrency-settings': true },
+            h('label', null, '最大 LLM 并行会话数', h('select', { 'data-sentinel-analysis-concurrency': true, value: concurrency, onChange: event => {
+              const value = Number(event.target.value), scope = connectionScope
+              setConcurrency(value); edits.current.scheduling = (edits.current.scheduling ?? 0) + 1
+              if (!scope?.active) { setResults(previous => ({ ...previous, scheduling: '保存结果未知：观察连接已关闭' })); return }
+              pending.current.set('scheduling', { scheduling: { concurrency: value }, version: edits.current.scheduling, scope }); void flush()
+            } }, Array.from({ length: 16 }, (_, index) => h('option', { key: index + 1, value: index + 1 }, `${index + 1} 路`)))),
+            h('p', null, '默认 1 路，本安装独立保存。DSH 直接接收原生事件，无需轮询会话；此上限用于摘要分析。'),
+            results.scheduling && h('p', { role: 'status', 'data-sentinel-concurrency-status': true }, results.scheduling === '正在保存' && (resultScopes.current.scheduling !== connectionScope || !connectionScope?.active) ? '保存结果未知：观察连接已关闭' : results.scheduling))))
       }
       function InstallationDiagnostics({ config, visible, signal, checks }) {
         const [result, setResult] = useState({}), pending = useRef(null), active = useRef(true)
@@ -774,6 +794,17 @@
           notification && h('small', { 'data-gs-notification': true }, notification.status === 'submitted' ? '系统已受理 · 是否看见未知'
             : notification.status === 'failed' ? '通知投递失败' : notification.status === 'claimed' ? '通知待确认' : '通知尚未确认'))
       }
+      function SummaryText({ value }) {
+        const lines = text(value).split(/\r?\n/)
+        return h('div', { 'data-sentinel-summary-text': true }, lines.map((line, index) => h('p', { key: index }, line + (index < lines.length - 1 ? '\n' : ''))))
+      }
+      const blockingLabels = { blocked: '已阻塞', unblocked: '未阻塞', unknown: '待确认' }
+      function BlockingDecision({ decision, task, snapshot, historical = false }) {
+        if (!Object.hasOwn(blockingLabels, decision?.status) || !text(decision.reason)) return null
+        return h('div', { 'data-sentinel-blocking': true },
+          h('p', null, historical ? '上次判断 · ' : '', blockingLabels[decision.status], ' · ', decision.reason),
+          decision.evidenceRefs?.length > 0 && h('details', null, h('summary', null, '查看判断依据'), h(EvidenceCitations, { record: decision, task, snapshot })))
+      }
       function ObservationDetail({ task, snapshot, current, gs = task.gs }) {
         const analysis = task.analysis || {}, source = snapshot.sources.find(item => item.key === task.sourceKey)
         const observed = connectionScope?.active && !current.error && !snapshot.adapter?.error
@@ -796,9 +827,13 @@
           h('p', null, '当前任务：', text(analysis.summary?.currentTask) || text(task.currentRequest) || '未采集当前请求'),
           h('p', null, '当前状态：', observed ? taskStatus[task.status] || '状态未知' : '当前无法确认', ' · ',
             observed ? '' : '历史活动：', text(task.activity?.summary) || '活动摘要未提供'),
-          publishableSummary && h('div', { 'data-sentinel-model-summary': true }, h('p', null, analysis.resultDisposition === 'reused' ? '复用有效总结：' : '模型总结：', generated.text), h(EvidenceCitations, { record: generated, task, snapshot, compact: true })),
+          publishableSummary && h('div', { 'data-sentinel-model-summary': true },
+            h('small', null, analysis.resultDisposition === 'reused' ? '复用有效总结：' : '模型总结：'),
+            h(SummaryText, { value: generated.text }),
+            h(BlockingDecision, { decision: generated.blocking, task, snapshot, historical: analysis.state === 'paused' || snapshot.monitoring?.state === 'paused' }),
+            h(EvidenceCitations, { record: generated, task, snapshot, compact: true })),
           historicalSummary && h('details', { 'data-sentinel-summary-history': true }, h('summary', null, '上次成功总结'),
-            h('small', null, '历史总结 · 原完成时间：', timeText(previous.completedAt)), h('p', null, previous.generated.text), h(EvidenceCitations, { record: previous.generated, task, snapshot, compact: true })),
+            h('small', null, '历史总结 · 原完成时间：', timeText(previous.completedAt)), h(SummaryText, { value: previous.generated.text }), h(BlockingDecision, { decision: previous.generated.blocking, task, snapshot, historical: true }), h(EvidenceCitations, { record: previous.generated, task, snapshot, compact: true })),
           task.instructionContext?.gaps?.length > 0 && h('p', null, '当前指令上下文缺口：', task.instructionContext.gaps.join('；')),
           h('details', { 'data-gs-checks': true }, h('summary', null, '完整检查与依据'),
             h('p', null, '最近推进：', text(analysis.summary?.recentProgress) || '尚未判断'),

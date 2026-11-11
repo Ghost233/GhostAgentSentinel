@@ -36,7 +36,7 @@ async function fixture(t, { profile = candidateHostProfile, producer = candidate
     let body = ''; for await (const chunk of req) body += chunk
     res.setHeader('content-type', 'application/json')
     if (req.url === '/v1/chat/completions') { state.summaryCalls++; await state.modelGate; if (state.modelFailure) return res.writeHead(503).end('{"error":"controlled model unavailable"}'); res.end(JSON.stringify({ model: 'fixed-extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(JSON.parse(body), { selectedOptionIds: [], gaps: [] })) } }] })) }
-    else { state.jevCalls++; const request = decodeJevRequest(JSON.parse(body)); res.end(JSON.stringify({ model: 'fixed-judge', answers: Object.fromEntries(Object.keys(request.questions).map(id => [id, { type: 'choice', choice: 'clear' }])) })) }
+    else { state.jevCalls++; const request = decodeJevRequest(JSON.parse(body)); res.end(JSON.stringify({ model: 'fixed-judge', answers: Object.fromEntries(Object.keys(request.questions).map(id => [id, { type: 'choice', choice: id === 'execution_blocking' ? state.blockingChoice ?? 'unknown' : 'clear' }])) })) }
   })
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); wire.closeAllConnections(); await new Promise(resolve => wire.close(resolve)); await fs.rm(dir, { recursive: true, force: true }) })
   await new Promise(resolve => wire.listen(0, '127.0.0.1', resolve))
@@ -86,6 +86,108 @@ test('installation diagnostics report bounded backfill positions without pumping
   await f.caughtUp()
   const later = await fetch(f.adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'c'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sentinel_installation_diagnostics', arguments: {} } }) })
   assert.equal((await later.json()).result.structuredContent.collection.backfill, undefined)
+})
+
+test('a JEV blocking decision reaches the summary with expandable original evidence and becomes historical when new material arrives', async t => {
+  const f = await fixture(t)
+  f.state.blockingChoice = 'unblocked_1'
+  let view = await f.caughtUp()
+  for (let i = 0; i < 100 && !view.recentModelActivity?.summary?.blocking; i++) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+    view = await f.read()
+  }
+  const decision = view.recentModelActivity?.summary?.blocking
+  assert.equal(decision?.status, 'unblocked')
+  assert.equal(decision.historical, false)
+  assert.equal(decision.reason, 'The synthetic log has been inspected')
+  assert.equal(decision.evidence[0].text, decision.reason)
+  assert.equal(f.state.jevCalls, 1)
+  const page = await panelHarness(t)
+  await page.deliver(view)
+  assert.match(page.element('#recent-blocking-status').textContent, /^未阻塞 · /)
+  assert.equal(page.element('#recent-blocking-details').hidden, false)
+  assert.equal(page.element('#recent-blocking-details').open, false)
+  assert.match(page.element('#recent-blocking-evidence').textContent, /The synthetic log has been inspected/)
+
+  let release
+  f.state.modelGate = new Promise(resolve => { release = resolve })
+  try {
+    f.advance()
+    const later = agent(owner, 'turn', 'A later action now needs review'); later.item.id = 'later-blocking-review'
+    await fs.appendFile(f.path, row(4, 'event_msg', later))
+    view = await f.caughtUp()
+    assert.equal(view.recentModelActivity.summary.blocking.historical, true)
+    await page.refresh(); await page.deliver(view)
+    assert.match(page.element('#recent-blocking-status').textContent, /^上次判断 · 未阻塞/)
+    assert.equal(f.state.jevCalls, 1)
+  } finally { release() }
+})
+
+test('querying and coalescing continue while LLM work is held and the next analysis ignores the query interval', async t => {
+  const f = await fixture(t)
+  await f.core.configureInstallationScheduling('chatgpt:current-app-material', { concurrency: 1, queryConcurrency: 2, queryIntervalMs: 5000 })
+  let release; f.state.modelGate = new Promise(resolve => { release = resolve })
+  try {
+    await f.caughtUp()
+    for (let i = 0; i < 100 && f.state.summaryCalls !== 1; i++) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.equal(f.state.summaryCalls, 1)
+    const reads = f.state.threadReads; f.advance()
+    const later = agent(owner, 'turn', 'A second diagnostic fact was found'); later.item.id = 'second-agent'
+    await fs.appendFile(f.path, row(4, 'event_msg', later))
+    for (let i = 0; i < 4; i++) await f.caughtUp()
+    assert.ok(f.state.threadReads > reads)
+    assert.equal(f.state.summaryCalls, 1, 'polling never duplicates an already active conversation')
+    release()
+    for (let i = 0; i < 150; i++) {
+      const task = (await f.core.snapshot()).tasks.find(task => task.id === owner)
+      if (f.state.summaryCalls === 2 && task.analysis.throughRevision === task.revision) break
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    assert.equal(f.state.summaryCalls, 2, 'the coalesced version starts without waiting five seconds or another query')
+  } finally { release() }
+})
+
+test('a verified active execution gets one final summary after ending and never re-enters the analysis queue', async t => {
+  const f = await fixture(t, { cooldownMs: 60000 })
+  await f.caughtUp()
+  let task
+  for (let i = 0; i < 100; i++) { task = (await f.core.snapshot()).tasks.find(task => task.id === owner); if (task?.analysis.summary?.generated || task?.analysis.summary?.partial) break; await new Promise(resolve => setTimeout(resolve, 5)) }
+  assert.equal(f.state.summaryCalls, 1)
+  f.advance()
+  await fs.appendFile(f.path, row(4, 'event_msg', { type: 'task_complete', turn_id: 'turn' }))
+  await f.caughtUp()
+  for (let i = 0; i < 150; i++) { task = (await f.core.snapshot()).tasks.find(task => task.id === owner); if (task?.analysis.finalSummaryCompletedAt) break; await new Promise(resolve => setTimeout(resolve, 5)) }
+  assert.equal(f.state.summaryCalls, 2, 'an active-to-ended transition schedules the final summary without waiting for the query interval or cooldown')
+  assert.ok(task.analysis.finalSummaryCompletedAt)
+  assert.equal(task.status, 'idle')
+  assert.equal(task.gs.light, null)
+  assert.equal((await f.core.snapshot()).overview.runningTasks, 0)
+  const view = await f.caughtUp(), page = await panelHarness(t)
+  assert.equal(view.recentModelActivity.summary.final, true)
+  await page.deliver(view)
+  assert.equal(page.element('#recent-summary-state').textContent, '已收尾')
+  for (let i = 0; i < 120; i++) { f.advance(); await f.core.heartbeat(task.sourceKey) }
+  for (let i = 0; i < 3; i++) await f.caughtUp()
+  assert.equal(f.state.summaryCalls, 2)
+})
+
+test('an idle metadata transition keeps draining until its native end record can produce the final summary', async t => {
+  const f = await fixture(t, { cooldownMs: 60000 })
+  await f.caughtUp()
+  for (let i = 0; i < 100 && !(await f.core.snapshot()).tasks[0]?.analysis.completedAt; i++) await new Promise(resolve => setTimeout(resolve, 5))
+  const read = f.native.readThread.bind(f.native)
+  f.native.readThread = async id => ({ ...await read(id), activity: 'idle' })
+  const waiting = await f.caughtUp(), page = await panelHarness(t)
+  await page.deliver(waiting)
+  assert.match(page.element('#availability').textContent, /已静止.*收尾摘要/)
+  assert.ok(f.adapter.diagnostics().openReaders > 0, 'idle metadata cannot discard an end record that has not been read yet')
+  assert.equal((await f.core.snapshot()).overview.runningTasks, 0)
+  f.advance(); await fs.appendFile(f.path, row(4, 'event_msg', { type: 'task_complete', turn_id: 'turn' }))
+  await f.caughtUp()
+  for (let i = 0; i < 150 && !(await f.core.snapshot()).tasks[0]?.analysis.finalSummaryCompletedAt; i++) await new Promise(resolve => setTimeout(resolve, 5))
+  assert.ok((await f.core.snapshot()).tasks[0].analysis.finalSummaryCompletedAt)
+  assert.equal(f.state.summaryCalls, 2)
+  assert.equal(f.adapter.diagnostics().openReaders, 0)
 })
 
 test('native additional_tools and normal excerpts reach per-check judgment and the real MCP panel for plain and compressed main/fork records', async t => {

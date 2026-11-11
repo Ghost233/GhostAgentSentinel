@@ -47,6 +47,18 @@ export async function createPanelMCPServer({ read, control, modelSettings, insta
         return { isError: true, content: [{ type: 'text', text: String(error?.message ?? error) }], structuredContent: { saveOutcome: rejected ? 'rejected' : 'unknown' } }
       }
     })
+    if (forwardTool || typeof modelSettings?.saveScheduling === 'function') registerTool(mcp, 'sentinel_save_analysis_scheduling', {
+      title: '保存查询与摘要队列设置', description: '设置本安装的会话查询并发数、查询间隔和 LLM 并发数，不更改模型配置。',
+      inputSchema: z.object({ concurrency: z.number().int().min(1).max(16).optional(), queryConcurrency: z.number().int().min(1).max(16).optional(), queryIntervalMs: z.number().int().min(250).max(3600000).optional() }).strict().refine(value => Object.keys(value).length > 0),
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },
+    }, async change => {
+      try { return { content: [{ type: 'text', text: '分析并行数已保存' }], structuredContent: await modelSettings.saveScheduling(change) } }
+      catch (error) {
+        const failure = error?.coreRequestFailure;
+        const rejected = error?.code === 'core_feature_unsupported' || failure?.operation === '/v1/analysis/installations/scheduling' && failure.kind === 'http' && failure.status >= 400 && failure.status <= 599;
+        return { isError: true, content: [{ type: 'text', text: String(error?.message ?? error) }], structuredContent: { saveOutcome: rejected ? 'rejected' : 'unknown' } }
+      }
+    })
     if (forwardTool || typeof modelSettings?.directory === 'function') registerTool(mcp, 'sentinel_model_directory', {
       title: '读取本机模型列表', description: '仅检查服务在线及模型名称，不调用生成或 JEV 推理。', inputSchema: { baseUrl: z.string().min(1).max(2000) },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, _meta: { ui: { visibility: ['app'] } },

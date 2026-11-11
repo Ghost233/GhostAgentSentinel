@@ -122,10 +122,10 @@ test('production HTTP scope cancellation retains admission until the submitted r
   t.diagnostic(`server-work: ${JSON.stringify({ enteredHeldRequests: f.held.length, finishedHeldRequests: f.held.filter(job => job.finished).length, peakUnfinishedRequests: f.peakHttp })}`)
 })
 
-test('a waiting different source retains FIFO ahead of repeated replacements once old submitted work finishes', async t => {
+test('a waiting source in the same installation retains FIFO ahead of repeated replacements once old submitted work finishes', async t => {
   const f = await fixture(t, { honorAbort: true })
   await f.observe(0); await until(() => f.held.length === 1, 'first source extraction entered')
-  const other = await f.core.registerSource({ registrationId: 'other-admission', hostRunId: 'host', name: 'Other private source' })
+  const other = await f.core.registerSource({ registrationId: 'admission', hostRunId: 'other-host', name: 'Other source in the installation' })
   await f.observe(99, other)
   for (let index = 1; index <= 12; index++) await f.observe(index)
   assert.equal((await f.core.diagnostics()).temporary.queueKeys, 2)

@@ -12,6 +12,13 @@ import { renderJevRequest, JEV_PROVENANCE_INSTRUCTIONS } from '../src/analysis/j
 const now = 1_800_000_000_000;
 const bytes = body => Buffer.byteLength(JSON.stringify(body));
 const ref = event => ({ taskId: event.taskId, lifecycleId: event.taskLifecycleId, eventId: event.id });
+function existingChecksRequest(body) {
+  const logical = decodeJevRequest(body);
+  delete logical.questions.execution_blocking;
+  delete logical.state.executionSummary;
+  delete logical.state.candidates.execution_blocking;
+  return logical;
+}
 function multilevel() {
   const taskId = 'synthetic-density-grandchild', lifecycleId = taskId + '-life';
   const own = (id, kind, text, age, data = {}) => ({ id: taskId + '-' + id, taskId, taskLifecycleId: lifecycleId, kind, text, capturedAt: now - age, occurredAt: now - age, data });
@@ -76,13 +83,13 @@ test('JEV renders one lossless provenance dictionary without rewriting evidence 
     assert.match(body.state.referenceRenderingInstructions, /\$ref/);
     assert.match(body.state.referenceRenderingInstructions, /Apply sharedQuestionInstructions before each semantic question/);
     const baseline = JSON.parse(await readFile(new URL('./fixtures/jev-rendering/' + name + '.json', import.meta.url), 'utf8'));
-    assert.deepEqual(decodeJevRequest(body), baseline, 'entire original logical request survives the public HTTP rendering seam');
-    assert.deepEqual(Object.keys(body.questions), Object.keys(baseline.questions));
+    assert.deepEqual(existingChecksRequest(body), baseline, 'the existing check evidence and questions survive rendering');
     const semantic = Object.entries(body.questions).filter(([id]) => !id.startsWith('recover_'));
     assert.ok(semantic.every(([, question]) => !question.instructions.includes('state.requestId 是核心确认')));
     assert.equal(JSON.stringify(body).split('state.requestId 是核心确认').length - 1, 1, 'fixed shared provenance paragraph appears exactly once');
-    assert.ok(capture.rawBytes < bytes(baseline), 'dictionary removes measured wire repetition');
-    metrics.push({ name, originalBytes: bytes(baseline), wireBytes: capture.rawBytes, reduction: 1 - capture.rawBytes / bytes(baseline), entries: body.state.referenceTable.length, questionIds: Object.keys(body.questions) });
+    const logicalBytes = bytes(decodeJevRequest(body));
+    assert.ok(capture.rawBytes < logicalBytes, 'dictionary removes measured wire repetition');
+    metrics.push({ name, originalBytes: logicalBytes, wireBytes: capture.rawBytes, reduction: 1 - capture.rawBytes / logicalBytes, entries: body.state.referenceTable.length, questionIds: Object.keys(body.questions) });
     if (!input.instructionContext) continue;
     const originals = input.instructionContext.inheritedEvents;
     for (const event of originals) assert.ok(body.state.referenceTable.some(entry => JSON.stringify(entry) === JSON.stringify(ref(event))), 'foreign duplicate local ids remain separate full identities');
@@ -117,10 +124,9 @@ test('literal markers at declared source slots or on an event preserve the compl
     const body = http.captures.filter(item => item.path === '/v1/systemone').at(-1).body;
     assert.ok(!Object.hasOwn(body.state, 'referenceTable'), 'colliding source markers keep original identities for this request');
     assert.match(body.state.referenceRenderingInstructions, /Apply sharedQuestionInstructions before each semantic question/);
-    assert.deepEqual(decodeJevRequest(body), expected);
+    assert.deepEqual(existingChecksRequest(body), expected);
     assert.deepEqual(recovery, before);
     assert.deepEqual(result.checks.map(check => check.id), CHECK_IDS);
-    assert.deepEqual(Object.keys(body.questions), Object.keys(baseline.questions));
   }
 });
 
@@ -144,19 +150,25 @@ test('a rendered JEV batch retains the caller deadline and fails as a JEV deadli
   assert.deepEqual(http.captures.map(item => item.path), ['/v1/chat/completions', '/v1/systemone']);
 });
 
-test('the unchanged input budget admits the final rendered body and rejects one character less', async t => {
+test('the unchanged input budget preserves existing checks when the additional blocking question does not fit', async t => {
   const http = await inference(t), { recovery } = multilevel();
   await http.analyzer().analyze(recovery);
   const limit = JSON.stringify(http.captures.at(-1).body).length;
-  const baseline = JSON.parse(await readFile(new URL('./fixtures/jev-rendering/multilevel-stage-two.json', import.meta.url), 'utf8'));
-  assert.ok(JSON.stringify(baseline).length > limit, 'the old repeated body exceeds this valid rendered budget');
+  assert.ok(JSON.stringify(decodeJevRequest(http.captures.at(-1).body)).length > limit, 'repeated identities exceed this valid rendered budget');
   assert.ok(JSON.stringify(http.captures[0].body).length < limit, 'the extractor fits the same unchanged budget');
   let before = http.captures.length;
   const accepted = await http.analyzer({ inputBudgetChars: limit }).analyze(recovery);
   assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/systemone']);
   assert.equal(accepted.coverage.complete, true);
+  assert.ok(http.captures.at(-1).body.questions.execution_blocking);
   before = http.captures.length;
-  const rejected = await http.analyzer({ inputBudgetChars: limit - 1 }).analyze(recovery);
+  const fallback = await http.analyzer({ inputBudgetChars: limit - 1 }).analyze(recovery);
+  assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions', '/v1/systemone']);
+  assert.equal(http.captures.at(-1).body.questions.execution_blocking, undefined);
+  assert.equal(fallback.summary.generated.blocking.status, 'unknown');
+  const checksOnlyLimit = JSON.stringify(http.captures.at(-1).body).length;
+  before = http.captures.length;
+  const rejected = await http.analyzer({ inputBudgetChars: checksOnlyLimit - 1 }).analyze(recovery);
   assert.deepEqual(http.captures.slice(before).map(item => item.path), ['/v1/chat/completions']);
   assert.ok(rejected.coverage.gaps.includes('analysis_input_budget'));
 });
@@ -175,7 +187,7 @@ test('repeated original IDs in a public recovery batch use the existing full-ide
   assert.ok(body.state.previousAlerts.every(alert => alert.evidenceIds.every(id => Number.isInteger(id?.$id))));
   assert.match(body.state.idReferenceRenderingInstructions, /equals only referenceTable\[n\]\.eventId/);
   assert.match(body.state.idReferenceRenderingInstructions, /no owner\/lifecycle meaning/);
-  assert.deepEqual(decodeJevRequest(body), baseline);
+  assert.deepEqual(existingChecksRequest(body), baseline);
   assert.deepEqual(recovery, before);
   assert.deepEqual(result.checks.map(check => check.id), CHECK_IDS);
   for (const check of result.checks) assert.ok(check.evidenceIds.every(id => typeof id === 'string'), 'result and audit IDs stay original strings');

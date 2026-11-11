@@ -44,6 +44,26 @@ async function observe(client, registrationId, taskId, hostRunId = 'host') {
   return sourceKey;
 }
 
+test('the installation HTTP setting opens four real model requests and preserves the selected models', async t => {
+  const models = await modelFixture(t, { holdModels: ['four-summary'] }), dataDir = await mkdtemp(join(tmpdir(), 'sentinel-installation-concurrency-'));
+  const server = await startServer({ dataDir }), client = await connectCore({ dataDir });
+  t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const original = await client.configureInstallationAnalysis('four', models.config('four'), (await client.installationAnalysisConfig('four')).revision);
+  const saved = await client.configureInstallationScheduling('four', { concurrency: 4 });
+  assert.equal(saved.concurrency, 4);
+  assert.equal(saved.revision, original.revision);
+  assert.deepEqual(saved.config, original.config);
+  for (const id of ['a', 'b', 'c', 'd', 'e']) await observe(client, 'four', id, id);
+  await until(() => models.held.length === 4, 'four separate production HTTP requests are in flight');
+  assert.equal((await client.diagnostics()).runtime.activeAnalyses, 4);
+  assert.equal((await client.snapshot()).tasks.find(task => task.id === 'e').analysis.state, 'queued');
+  models.held[1].reply();
+  await until(() => models.held.length === 5, 'the fifth request starts after a real model completion');
+  assert.equal((await client.installationAnalysisConfig('four')).concurrency, 4);
+  await assert.rejects(client.configureInstallationScheduling('four', { concurrency: 17 }), error => error.status === 400);
+  assert.equal((await client.installationAnalysisConfig('four')).concurrency, 4);
+});
+
 test('two settings windows save valid offline installation configuration with the last save winning across reopening', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-installation-models-'));
   let server, client, peer;
@@ -82,17 +102,20 @@ test('two settings windows save valid offline installation configuration with th
   assert.deepEqual(await client.installationAnalysisConfig('chatgpt:formal'), saved);
 });
 
-test('saving one installation seals only its round and preserves another installation queue and cooldown', async t => {
-  const models = await modelFixture(t, { holdModels: ['old-a-summary'] }), dataDir = await mkdtemp(join(tmpdir(), 'sentinel-installation-switch-'));
+test('saving one installation seals only its round and preserves another installation in-flight work and cooldown', async t => {
+  const holdModels = ['old-a-summary'];
+  const models = await modelFixture(t, { holdModels }), dataDir = await mkdtemp(join(tmpdir(), 'sentinel-installation-switch-'));
   const server = await startServer({ dataDir }), client = await connectCore({ dataDir });
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   const save = async (id, config) => client.configureInstallationAnalysis(id, config, (await client.installationAnalysisConfig(id)).revision);
   const oldA = await save('a', models.config('old-a')), originalB = await save('b', models.config('b'));
   await observe(client, 'b', 'b-cooling');
   await until(async () => (await client.snapshot()).tasks.find(task => task.id === 'b-cooling').analysis.completedAt !== null, 'the other installation has an existing completed result');
+  holdModels.push('b-summary');
   await observe(client, 'a', 'a-active');
   await until(() => models.held.length === 1, 'the old actual model request is held');
   await observe(client, 'b', 'b-queued');
+  await until(() => models.held.length === 2, 'the other installation uses its independent lane');
   const before = await client.snapshot(), beforeB = before.tasks.filter(task => task.id.startsWith('b-'));
   await client.configureInstallationAnalysis('a', models.config('superseded-a'), oldA.revision);
   const newA = await client.configureInstallationAnalysis('a', models.config('new-a'), oldA.revision);
@@ -103,8 +126,8 @@ test('saving one installation seals only its round and preserves another install
   assert.equal(switched.tasks.find(task => task.id === 'a-active').analysis.resultDisposition, 'none');
   assert.deepEqual(switched.tasks.filter(task => task.id.startsWith('b-')).map(task => task.analysis), beforeB.map(task => ({ ...task.analysis, waitMs: switched.tasks.find(current => current.id === task.id).analysis.waitMs })));
   assert.equal(models.held[0].response.destroyed, false);
-  assert.equal(models.calls.filter(call => call.path === '/v1/chat/completions').length, 2);
-  models.held[0].reply();
+  assert.equal(models.calls.filter(call => call.path === '/v1/chat/completions').length, 3);
+  models.held[0].reply(); models.held[1].reply();
   await until(async () => (await client.snapshot()).tasks.filter(task => task.id !== 'b-cooling').every(task => task.analysis.completedAt !== null), 'the remaining FIFO work uses the new installation configuration');
   const final = await client.snapshot();
   assert.deepEqual(final.tasks.find(task => task.id === 'a-active').analysis.configScope, { registrationId: 'a', revision: newA.revision });

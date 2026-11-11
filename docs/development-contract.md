@@ -1,6 +1,6 @@
 # 开发接缝与验收
 
-当前源码按仓库的版本规则从 0.3.7 递增到 0.3.8。本次变更和既有验证的覆盖范围见[发布验证范围](release-status.md)。
+当前源码按仓库的版本规则从 0.3.8 递增到 0.3.9。本次变更和既有验证的覆盖范围见[发布验证范围](release-status.md)。
 
 ## 范围和分工
 
@@ -50,7 +50,11 @@
 
 用户已确认首版沿用聊天和工具现有的版本、验证范围与退出结果。缺失时显示不可判断，六项检测全部保留。额外读取工作区的版本指纹采集后置；适配器不主动读取工作区来补全证据。
 
-分析模块导出 `createAnalyzer(config)`，对象提供 `analyze({task,source,events,coverage},options)`、`prefill(input,options)` 与 `timeConditions(input,now)`。options 支持业务取消、传输停止和观察实例生命周期信号，以及模型状态回调。analyze 返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`；summary 保留 currentTask/currentState/recentProgress/attention 字符串。执行短总结使用可选的 `summary.generated = {text,evidenceIds,evidenceRefs}`，只在本轮总结模型和 JEV 实际调用成功且输出、引用合法后赋值。text 为附依据的 1～2 句，最多 600 字符单元；任一环节失败或未完成均不发布完整总结。材料覆盖不足或 JEV 输入超预算时，总结模型已成功且引用合法的短总结可单独保存为 `summary.partial`，结构与 generated 相同，两者互斥；partial 要求 coverage.complete 为 false，不更新完整成功历史；它只表示观察材料范围有限。六项检查按各自证据独立执行，有充分依据的项目继续请求 JEV，缺当前请求、操作、验证或来源等关键证据的项目单独保留未知。仅成功生成总结不能结算分析故障恢复；本轮 JEV 实际返回有效判断后，可结算该轮已恢复的分析故障。Codex 显示“本次观察总结”和观察范围，绿色表示已检查项未见异常，并单列仍缺证据的项目，不代表完整历史均已核实。
+分析模块导出 `createAnalyzer(config)`，对象提供 `analyze({task,source,events,coverage},options)`、`prefill(input,options)` 与 `timeConditions(input,now)`。options 支持业务取消、传输停止和观察实例生命周期信号，以及模型状态回调。analyze 返回 `{summary,checks,coverage,usage?,quality:'unvalidated'}`；summary 保留 currentTask/currentState/recentProgress/attention 字符串。执行短总结使用可选的 `summary.generated = {text,evidenceIds,evidenceRefs}`，只在本轮总结模型和 JEV 实际调用成功且输出、引用合法后赋值。text 固定三行，依次为“在做什么：”“有什么进展：”“卡在哪里：”，合计最多 600 字符单元；任一环节失败或未完成均不发布完整总结。材料覆盖不足或 JEV 输入超预算时，总结模型已成功且引用合法的短总结可单独保存为 `summary.partial`，结构与 generated 相同，两者互斥；partial 要求 coverage.complete 为 false，不更新完整成功历史；它只表示观察材料范围有限。六项检查按各自证据独立执行，有充分依据的项目继续请求 JEV，缺当前请求、操作、验证或来源等关键证据的项目单独保留未知。仅成功生成总结不能结算分析故障恢复；本轮 JEV 实际返回有效判断后，可结算该轮已恢复的分析故障。Codex 显示“本次观察总结”和观察范围，绿色表示已检查项未见异常，并单列仍缺证据的项目，不代表完整历史均已核实。
+
+执行摘要优先概括近期实际工作、新结果和具体阻碍。“有什么进展”可包括新增事实和诊断；只有动作时如实说明尚未观察到新增结果。“卡在哪里”只描述已观察到且尚未解决的执行阻碍，没有明确阻碍时写“未观察到明确阻碍”。这不表示六项检查全部正常。正常调查、测试运行、任务未完成和 TDD 初次红灯不自动构成阻碍；观察缺口与检查说明各自保留。模型响应缺段、顺序错误或空段按 `invalid_summary` 拒绝，不补写内容。两端当前及历史总结按原文字面分段展示，已有单段总结继续按原文保留。正式观察器要求 `execution-summary-levels/1`，旧私有 Core 自然退出后接入新版。
+
+运行中的执行可以随摘要返回 `blocking`，含状态、简短原因和原始事件引用。JEV 在同一次判断请求中根据摘要及当前执行材料选择已阻塞、未阻塞或待确认。每个明确结论绑定一条原始摘录。只有阻塞问题适用时，这次请求只包含该问题。采集缺口、无执行依据、无效选择或超出输入预算时显示待确认。面板将已过时的结论标为上次判断，并提供可展开的引用。正式观察器要求 `execution-blocking/1`，旧私有 Core 自然退出后接入新版。
 
 Codex 的分析资格按有效来源、执行状态和已有执行记录核对，不依赖新用户消息或当前请求绑定。没有可引用请求时，仍总结活动并检查同类返工和完整验证重复成本；推进不足、偏离请求和当前版本验证缺口单独保持未知。没有任何当前执行材料时继续采集，取得材料后再调度模型。请求与授权证明规则分别核对，不因持续监控而提升未知来源文字的权限。无请求时的模型缓存按安装、任务、执行和角色隔离，不借用旧请求正文或未绑定的继承限制。正式观察器要求 `chatgpt-execution-monitoring/1`，缺少能力的旧私有 Core 自然退出后自动接续。
 
@@ -64,7 +68,7 @@ checks 固定六项 ID：stalled_progress/request_drift/failure_loop/validation_
 
 分析模块的私有 LLM 接缝使用有限证据目录，每组原文只提供一次，可选项使用 `optionId`。模型必须严格返回 `{selectedOptionIds,gaps,summary:{text,evidenceOptionIds}}`；总结依据也使用目录选项，代码再映射为公开的事件引用。模型载荷不展示结构化的来源事件 ID 或当前请求 ID，以 `isCurrentInput` 标明已确认锚点；真实事件定位、原文和来源允许的事实分类仍由代码绑定。
 
-目录项仅表示可选择资格，实际门禁、授权等语义仍需选择与判断。未知或重复选项、额外字段、旧键、无效总结或引用均报错，不自动修复，也不接受事件 ID 作为选项。还原后继续校验原文引用与来源权限。当前请求从保留范围内已确认的真实非空 input 确定，空、缺失或过期时保留未知，不以任务标题或元数据补造。完整 LLM 请求 JSON 受原 24,000 字符预算约束；超限时保留当前请求和全部授权继承限制，并选择预算内最近观察，标 analysis_evidence_budget 及省略数量，原始留存记录不裁剪。JEV 使用同一份预算内材料核对可支持的检查，不因正常选材而整轮跳过；当前请求和授权继承限制仍必须保留。必需材料仍超限则明确返回 analysis_input_budget，不静默丢弃约束。生成输出上限为 4,096 token，预填仍为零输出；声明受管预填能力的 GMD 总结请求显式设置 thinking_token_budget 为 0，预填与生成使用同一策略，缓存命名空间绑定该策略。完整请求预算包含实际发送的思考参数和缓存命名空间。普通提供方和 JEV 不增加该参数，GMD 全局配置不改写。Codex 观察器要求 bounded-summary-generation/1 能力，旧私有 Core 在旧来源退出后自然结束，再由观察器连接新版；独立 DSH Core 不受替换。可发布短总结仍限 600 字符、1～2 句，截断或无效结果继续拒绝。JEV 的判断职责和既有适配器输入协议保持。
+目录项仅表示可选择资格，实际门禁、授权等语义仍需选择与判断。未知或重复选项、额外字段、旧键、无效总结或引用均报错，不自动修复，也不接受事件 ID 作为选项。还原后继续校验原文引用与来源权限。当前请求从保留范围内已确认的真实非空 input 确定，空、缺失或过期时保留未知，不以任务标题或元数据补造。完整 LLM 请求 JSON 受原 24,000 字符预算约束；超限时保留当前请求和全部授权继承限制，并选择预算内最近观察，标 analysis_evidence_budget 及省略数量，原始留存记录不裁剪。JEV 使用同一份预算内材料核对可支持的检查，不因正常选材而整轮跳过；当前请求和授权继承限制仍必须保留。必需材料仍超限则明确返回 analysis_input_budget，不静默丢弃约束。生成输出上限为 4,096 token，预填仍为零输出；声明受管预填能力的 GMD 总结请求显式设置 thinking_token_budget 为 0，预填与生成使用同一策略，缓存命名空间绑定该策略。完整请求预算包含实际发送的思考参数和缓存命名空间。普通提供方和 JEV 不增加该参数，GMD 全局配置不改写。Codex 观察器要求 bounded-summary-generation/1 能力，旧私有 Core 在旧来源退出后自然结束，再由观察器连接新版；独立 DSH Core 不受替换。可发布短总结仍限 600 字符，固定三行，截断或无效结果继续拒绝。JEV 的判断职责和既有适配器输入协议保持。
 
 偏离检查的询问资格依据真实当前请求、与该项有关的关键证据以及本轮非空输出或工具开始活动，不要求模型再选出 action 分类。活动只说明有材料可问，偏离、合理调查或必要前置仍由 JEV 核对；不直接设置判断，也不补造分类。仅有工具结果、缺少请求或活动、相关关键证据不足时保持未知。引用保留本轮相关原文，便于展开核对权限和调查理由。
 
@@ -84,7 +88,15 @@ Codex 原生弹窗采用聊天优先：标题使用本次资格核验取得的�
 
 适配器接缝：`src/core-client.mjs` 导出 `connectCore({dataDir})`，提供上述业务方法对应的 HTTP 方法及 `close()`。close 只关闭客户端；适配器须先 unregisterSource。连接断开后适配器重试 connectCore 和登记／基线，不能依赖旧连接 token 或旧 sourceKey。公开事件验证由主线程完成，业务语义与去重由核心完成。核心默认租约 15 秒，适配器心跳 3 秒；开发默认长等待阈值 5 分钟明确标为待质量验收，不作为任务失败结论。
 
-安装配置使用 `installationAnalysisConfig(registrationId)` 读取 `{registrationId,config,revision}`，使用 `configureInstallationAnalysis(registrationId,config,revision)` 保存。HTTP 为 `GET /v1/analysis/installations/config?registrationId=…` 与同路径 POST，写入正文为 `{registrationId,config,revision}`。配置为 `{llm:{baseUrl,model},jev:{baseUrl,model}}`，未设置的项可以省略，只允许回环 HTTP(S)，不包含密钥。同安装的聊天共用配置，不同 registrationId 各自持久保存；未配置安装返回空配置，不回落到旧全局设置。
+安装配置使用 `installationAnalysisConfig(registrationId)` 读取 `{registrationId,config,revision,concurrency,queryConcurrency,queryIntervalMs}`，使用 `configureInstallationAnalysis(registrationId,config,revision)` 保存模型配置。HTTP 为 `GET /v1/analysis/installations/config?registrationId=…` 与同路径 POST，写入正文为 `{registrationId,config,revision}`。配置为 `{llm:{baseUrl,model},jev:{baseUrl,model}}`，未设置的项可以省略，只允许回环 HTTP(S)，不包含密钥。同安装的聊天共用配置，不同 registrationId 各自持久保存；未配置安装返回空配置，不回落到旧全局设置。
+
+会话查询与模型分析使用独立队列。`queryConcurrency` 默认 2，`concurrency` 默认 1，两者均为 1～16 的整数。`queryIntervalMs` 默认 1500，范围为 250～3,600,000 的整数毫秒。设置保存在同一安装配置中，重启后保留。`configureInstallationScheduling(registrationId,scheduling)` 接受这三个字段的非空部分更新，返回完整安装配置。HTTP 使用 `POST /v1/analysis/installations/scheduling`，正文为 `{registrationId,scheduling}`。修改调度设置保留模型配置与修订号，不取消在途分析。
+
+Codex 设置页通过 app-only `sentinel_save_analysis_scheduling` 自动保存有效数值，安装身份由宿主固定。查询间隔控制后台发现周期，查询并发限制原生会话元数据读取；材料读取继续遵守原物理和解码预算。来源心跳每 3 秒独立核对宿主资格，不等待下一轮查询。DSH 直接接收原生事件，设置页只提供 LLM 并发。
+
+分析队列不等待查询间隔。同一执行最多保留一个排队键，出队时固定最新材料；在途期间的新材料继续合并。每安装独立限制调用数，完整分析优先于尚未开始的预填，已开始的预填自然结束。取消请求仍占用名额，直到其 Promise 真实结算；同一任务在此之前不能重入。提高并发后立即补足空位，降低并发后等待现有调用结束。快照保留 `monitoring.activeTaskKey`，另用 `activeTaskKeys` 表达全部在途任务。正式观察器要求 `installation-analysis-scheduling/1`，旧私有 Core 自然退出后再接入新能力。
+
+正式 v2 来源声明 `main-final-summary/1`。已观察到运行的执行变为静止后，继续补读并核实同一执行的原生完成或中断记录，再补一次收尾摘要。该轮可越过正常成功冷却，失败仍按原规则退避；附依据的完整或部分摘要成功保存后，不再重复收尾。只有元数据静止、结束记录尚未落盘时，状态保持待核实并继续补读。收尾结果标为 `final`，面板显示“已收尾”，不产生新的活动任务告警。首次发现即已结束的历史执行、手动暂停和来源失联继续遵守原边界。
 
 同一安装以最后一次有效保存为准，不因另一窗口先保存而拒绝旧修订号；仍校验安装身份、修订号格式和整份配置。每次成功写入更换该安装的修订号，并将该安装受影响的配置、任务和通知变化一起持久提交。无效配置不部分生效。分析轮次和结果绑定 registrationId、配置修订号及执行材料；保存后取消旧轮次、封存晚到结果，按新配置公平排队。采集、原任务、其它安装与手动暂停保持。响应丢失时保留结果未知，调用方重新读取，不能仅凭值相同推定写入归属。安装暂停、会话暂停和旧全局配置各自的修订冲突规则保持。
 

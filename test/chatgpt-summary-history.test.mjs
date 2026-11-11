@@ -35,7 +35,7 @@ test('real native material and model HTTP keep a reused summary visible and a la
     else if (failJudgment) response.writeHead(503).end('{"error":{"code":"controlled-judge-failure"}}')
     else {
       const body = decodeJevRequest(wire)
-      response.end(JSON.stringify({ model: wire.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: 'unknown' }])) }))
+      response.end(JSON.stringify({ model: wire.model, answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'choice', choice: id === 'execution_blocking' ? 'unblocked_1' : 'unknown' }])) }))
     }
   })
   await new Promise(resolve => models.listen(0, '127.0.0.1', resolve))
@@ -67,6 +67,7 @@ test('real native material and model HTTP keep a reused summary visible and a la
   assert.equal(original.configScope.registrationId, 'chatgpt:summary-history')
   assert.equal(first.recentModelActivity.summary.text, original.generated.text)
   assert.equal(first.recentModelActivity.summary.completedAt, original.completedAt)
+  assert.equal(first.recentModelActivity.summary.blocking.historical, false)
   clock += 10
   const reused = await until(view => view.analysis.resultDisposition === 'reused')
   assert.deepEqual(reused.analysis.lastSuccessfulSummary, original)
@@ -80,7 +81,7 @@ test('real native material and model HTTP keep a reused summary visible and a la
   const failed = await until(view => view.analysis.state === 'failed')
   assert.equal(failed.analysis.generated, null)
   assert.deepEqual(failed.analysis.lastSuccessfulSummary, original)
-  assert.deepEqual(failed.recentModelActivity.summary, first.recentModelActivity.summary)
+  assert.deepEqual(failed.recentModelActivity.summary, { ...first.recentModelActivity.summary, blocking: { ...first.recentModelActivity.summary.blocking, historical: true } })
   assert.notEqual(failed.analysis.currentConfigScope.revision, original.configScope.revision)
   await page.refresh(); await page.deliver(failed)
   assert.equal(page.element('#model-summary').hidden, true)
@@ -88,5 +89,6 @@ test('real native material and model HTTP keep a reused summary visible and a la
   assert.equal(page.element('#last-summary').tagName, 'SECTION', 'a prior summary remains historical but is directly readable in Details')
   assert.match(page.element('#last-summary-evidence').textContent, /synthetic log/)
   assert.equal(page.element('#recent-summary-text').textContent, original.generated.text)
+  assert.match(page.element('#recent-blocking-status').textContent, /^上次判断 · 未阻塞/)
   assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/systemone'])
 })

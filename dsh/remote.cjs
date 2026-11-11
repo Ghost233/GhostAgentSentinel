@@ -1,5 +1,9 @@
 function parameterCodec(name) {
   return { mode: 'strict', typeSymbol: `Sentinel.${name}`, create: () => ({ parse(value) {
+    if (name === 'scheduling') {
+      if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length || Object.keys(value).some(key => !['concurrency', 'queryConcurrency', 'queryIntervalMs'].includes(key) || !Number.isInteger(value[key]) || value[key] < (key === 'queryIntervalMs' ? 250 : 1) || value[key] > (key === 'queryIntervalMs' ? 3600000 : 16))) throw new Error('队列设置无效')
+      return value
+    }
     if (name === 'entries') {
       if (!Array.isArray(value) || value.length > 100) throw new Error('后台清单最多 100 项')
       const seen = new Set()
@@ -63,7 +67,7 @@ function parameterCodec(name) {
 module.exports = function descriptors() {
   const methods = {
     snapshot: [], gsSummary: ['sessionId'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'],
-    configureAnalysisIfCurrent: ['config', 'revision'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'],
+    configureAnalysisIfCurrent: ['config', 'revision'], configureAnalysisScheduling: ['scheduling'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'],
     installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'],
     installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'],
   }

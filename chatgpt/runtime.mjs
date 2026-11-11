@@ -133,7 +133,7 @@ export async function resolvePluginOwner({ configPath, includeStarting = false }
   return runtime && !runtime.dead ? { ...runtime, token: config.token } : null
 }
 
-export async function startFromInstallation({ configPath, pollMs = 1500, native, notificationIO, ownership = 'helper', displayName, expectedReleaseId } = {}) {
+export async function startFromInstallation({ configPath, pollMs, native, notificationIO, ownership = 'helper', displayName, expectedReleaseId } = {}) {
   if (typeof configPath !== 'string' || !isAbsolute(configPath)) throw new Error('explicit private configuration path required')
   if (!['helper', 'plugin'].includes(ownership)) throw new Error('invalid observation ownership')
   const config = await readPrivateConfig(configPath), pluginDir = join(config.dataDir, 'plugin')

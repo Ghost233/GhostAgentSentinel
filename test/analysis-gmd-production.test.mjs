@@ -264,8 +264,9 @@ test('ChatGPT activity without a request uses an execution-scoped managed cache 
   assert.equal(f.requests[0].body.cache_salt, f.requests[1].body.cache_salt);
   const next = { ...input, task: { ...input.task, lifecycleId: 'next-run' }, events: input.events.map(event => ({ ...event, taskLifecycleId: 'next-run' })) };
   await f.analyzer.prefill(next, f.options);
-  assert.notEqual(f.requests[0].body.cache_salt, f.requests[2].body.cache_salt);
-  assert.ok(f.requests.every(request => JSON.parse(request.body.messages[1].content).evidence.every(group => !group.isCurrentInput)));
+  const llmRequests = f.requests.filter(request => request.path === '/v1/chat/completions');
+  assert.notEqual(llmRequests[0].body.cache_salt, llmRequests[2].body.cache_salt);
+  assert.ok(llmRequests.every(request => JSON.parse(request.body.messages[1].content).evidence.every(group => !group.isCurrentInput)));
   assert.ok(f.requests.every(request => !JSON.stringify(request.body).includes('UNBOUND_HISTORICAL_LIMIT')));
 });
 

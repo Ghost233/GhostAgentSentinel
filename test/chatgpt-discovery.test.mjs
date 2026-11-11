@@ -11,7 +11,7 @@ import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 const profile = { appVersion: '26.1007.71326', appBuild: '20398', cliVersion: '0.162.0-alpha.17.2' }
 const record = (type, payload, at) => JSON.stringify({ type, payload, timestamp: new Date(at).toISOString() }) + '\n'
 
-async function fixture(t, { pollMs = 0, nativeOriginVersion = 1, fixedStorageRoots = false } = {}) {
+async function fixture(t, { pollMs = 0, nativeOriginVersion = 1, fixedStorageRoots = false, savedPolling = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-discovery-')), born = Date.now() - 10000
   const sessionsRoot = fixedStorageRoots ? join(dir, 'sessions') : dir, archiveRoot = join(dir, 'archived_sessions')
   if (fixedStorageRoots) { await mkdir(sessionsRoot); await mkdir(archiveRoot) }
@@ -30,7 +30,7 @@ async function fixture(t, { pollMs = 0, nativeOriginVersion = 1, fixedStorageRoo
     async close() {},
   }
   const server = await startServer({ dataDir: join(dir, 'core') }), core = await connectCore({ dataDir: join(dir, 'core') })
-  const adapter = await startChatGPTAdapter({ core, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'discovery-installation', token: 'a'.repeat(64), pollMs, nativeOriginVersion })
+  const adapter = await startChatGPTAdapter({ core, native, sessionsRoot, dataDir: join(dir, 'adapter'), installationId: 'discovery-installation', token: 'a'.repeat(64), pollMs: savedPolling ? undefined : pollMs, nativeOriginVersion })
   t.after(async () => { await adapter.close(); await core.close(); await server.close(); await rm(dir, { recursive: true, force: true }) })
   const read = async id => (await fetch(adapter.url + '/mcp', { method: 'POST', headers: { authorization: 'Bearer ' + 'a'.repeat(64), 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: id } } }) }).then(value => value.json())).result.structuredContent
   return { dir, sessionsRoot, archiveRoot, rows, facts, native, core, adapter, add, read }
@@ -54,6 +54,70 @@ test('background directory pagination discovers existing and new independent loc
   assert.equal(view.discovery.counts.main, 3)
   assert.equal(view.discovery.directoryComplete, true)
   assert.equal(view.discovery.complete, false, 'cached directory completion does not prove all execution domains are discovered')
+})
+
+test('the lightweight query queue uses its saved concurrency before handing the batch to material collection', async t => {
+  const f = await fixture(t)
+  for (const id of ['a', 'b', 'c', 'd']) await f.add(id)
+  const read = f.native.readThread.bind(f.native), held = []
+  let holding = true, running = 0, peak = 0
+  f.native.readThread = async id => {
+    running++; peak = Math.max(peak, running)
+    try { if (holding) await new Promise(resolve => held.push({ id, resolve })); return await read(id) }
+    finally { running-- }
+  }
+  const refresh = f.adapter.refresh()
+  try {
+    for (let attempt = 0; attempt < 100 && held.length < 2; attempt++) await new Promise(resolve => setTimeout(resolve, 3))
+    assert.equal(held.length, 2, 'the default query queue has two lanes')
+    assert.equal(f.adapter.diagnostics().openReaders, 0, 'querying activity precedes material extraction')
+  } finally { holding = false; for (const call of held) call.resolve(); await refresh }
+  assert.equal(peak, 2)
+  assert.equal((await f.core.snapshot()).tasks.length, 4)
+  await f.core.configureInstallationScheduling('chatgpt:discovery-installation', { queryConcurrency: 3, queryIntervalMs: 5000 })
+  held.length = 0; holding = true; peak = 0
+  const next = f.adapter.refresh()
+  try {
+    for (let attempt = 0; attempt < 100 && held.length < 3; attempt++) await new Promise(resolve => setTimeout(resolve, 3))
+    assert.equal(held.length, 3)
+  } finally { holding = false; for (const call of held) call.resolve(); await next }
+  assert.equal(peak, 3)
+})
+
+test('background query scheduling uses the persisted interval and rearms its timer after an edit', async t => {
+  const intervals = [], original = globalThis.setTimeout
+  t.mock.method(globalThis, 'setTimeout', (callback, milliseconds, ...args) => { intervals.push(milliseconds); return original(callback, milliseconds, ...args) })
+  const f = await fixture(t, { savedPolling: true })
+  await f.adapter.refresh()
+  await f.add('main')
+  await f.core.configureInstallationScheduling('chatgpt:discovery-installation', { queryIntervalMs: 4321 })
+  await f.adapter.refresh()
+  assert.ok(intervals.includes(4321), 'the actual background timer uses the saved interval')
+  await f.core.configureInstallationScheduling('chatgpt:discovery-installation', { queryIntervalMs: 9876 })
+  await f.adapter.refresh()
+  assert.ok(intervals.includes(9876), 'a changed interval replaces the pending background timer')
+})
+
+test('the source heartbeat runs independently while the query queue waits for its long interval', async t => {
+  const timers = [], original = globalThis.setTimeout
+  t.mock.method(globalThis, 'setTimeout', (callback, milliseconds, ...args) => {
+    const caller = new Error().stack.split('\n').slice(1).find(frame => !frame.includes('/test/chatgpt-discovery.test.mjs') && !frame.includes('node:internal/test_runner/mock'))
+    const handle = original(callback, milliseconds, ...args); timers.push({ callback, milliseconds, handle, adapter: caller?.includes('/chatgpt/adapter.mjs') }); return handle
+  })
+  const f = await fixture(t, { savedPolling: true })
+  await f.adapter.refresh(); await f.add('main')
+  await f.core.configureInstallationScheduling('chatgpt:discovery-installation', { queryIntervalMs: 60000 })
+  await f.adapter.refresh()
+  let heartbeats = 0; const heartbeat = f.core.heartbeat.bind(f.core)
+  t.mock.method(f.core, 'heartbeat', async (...args) => { heartbeats++; return heartbeat(...args) })
+  const pages = f.facts.pages, reads = f.facts.reads.length, timer = timers.findLast(value => value.milliseconds === 3000 && value.adapter)
+  assert.ok(timer, 'a separate heartbeat timer is independent from the sixty-second query timer')
+  clearTimeout(timer.handle); timer.callback()
+  for (let i = 0; i < 100 && !heartbeats; i++) await new Promise(resolve => original(resolve, 3))
+  assert.equal(heartbeats, 1)
+  assert.equal(f.facts.pages, pages)
+  assert.equal(f.facts.reads.length, reads)
+  assert.equal((await f.core.snapshot()).sources[0].status, 'connected')
 })
 
 test('archived chats are excluded from directory collection and direct panel visits', async t => {

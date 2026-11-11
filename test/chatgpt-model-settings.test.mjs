@@ -27,6 +27,43 @@ async function settingsPage(t, initial = state) {
 
 function leaveModelGroup(page, role) { return page.element('#settings-' + role + '-group').onfocusout({ relatedTarget: null }) }
 
+test('the installation page saves four analysis lanes without saving an unfinished model draft', async t => {
+  const page = await settingsPage(t, { ...state, concurrency: 1 })
+  page.element('#settings-llm-model').value = 'unfinished-model'
+  page.element('#settings-llm-model').oninput()
+  const field = page.element('#settings-concurrency')
+  assert.equal(field.value, '1')
+  field.value = '4'
+  const saving = field.onchange(); await page.flush()
+  const call = page.sent.findLast(row => row.params?.name === 'sentinel_save_analysis_scheduling')
+  assert.ok(call)
+  assert.deepEqual(JSON.parse(JSON.stringify(call.params.arguments)), { concurrency: 4 })
+  assert.equal(page.sent.some(row => row.params?.name === 'sentinel_save_model_settings'), false)
+  page.reply(call.id, { structuredContent: { ...state, concurrency: 4 } }); await saving; await page.flush()
+  assert.equal(field.value, '4')
+  assert.match(page.element('#settings-concurrency-status').textContent, /已保存.*4.*路/)
+  assert.equal(page.element('#settings-llm-model').value, 'unfinished-model')
+})
+
+test('query settings save independently, serialize with LLM settings and preserve an invalid interval draft', async t => {
+  const page = await settingsPage(t, { ...state, concurrency: 1, queryConcurrency: 2, queryIntervalMs: 1500 })
+  const interval = page.element('#settings-query-interval'), query = page.element('#settings-query-concurrency'), llm = page.element('#settings-concurrency')
+  assert.equal(interval.value, '1.5'); assert.equal(query.value, '2')
+  interval.value = '0'; interval.oninput(); await interval.onchange()
+  assert.match(page.element('#settings-query-interval-status').textContent, /未保存/)
+  llm.value = '4'; const firstSave = llm.onchange(); await page.flush()
+  const first = page.sent.findLast(row => row.params?.name === 'sentinel_save_analysis_scheduling')
+  query.value = '3'; query.oninput(); query.onchange(); await page.flush()
+  assert.equal(page.sent.filter(row => row.params?.name === first.params.name).length, 1)
+  page.reply(first.id, { structuredContent: { ...state, concurrency: 4, queryConcurrency: 2, queryIntervalMs: 1500 } }); await firstSave; await page.flush()
+  const second = page.sent.findLast(row => row.params?.name === first.params.name)
+  assert.deepEqual(JSON.parse(JSON.stringify(second.params.arguments)), { queryConcurrency: 3 })
+  page.reply(second.id, { structuredContent: { ...state, concurrency: 4, queryConcurrency: 3, queryIntervalMs: 1500 } }); await page.flush()
+  assert.equal(interval.value, '0')
+  assert.equal(query.value, '3')
+  assert.match(page.element('#settings-query-concurrency-status').textContent, /已保存.*3.*路/)
+})
+
 test('host theme changes update settings controls without reloading configuration or losing a draft', async t => {
   const page = await settingsPage(t), style = {}
   page.document.documentElement = { style }
@@ -1005,8 +1042,29 @@ test('production adapter settings bind the installation independently from colle
   assert.match(page.element('#settings-status').textContent, /已保存/)
   assert.deepEqual((await core.installationAnalysisConfig('chatgpt:another-installation')).config, {})
   assert.deepEqual((await rpc('sentinel_model_settings')).config, state.config)
+  const concurrencyTool = tools.find(tool => tool.name === 'sentinel_save_analysis_scheduling')
+  assert.deepEqual(concurrencyTool?._meta.ui.visibility, ['app'])
+  assert.equal(concurrencyTool.annotations.readOnlyHint, false)
+  page.element('#settings-concurrency').value = '4'
+  const savingConcurrency = page.element('#settings-concurrency').onchange(); await page.flush()
+  const concurrencyChange = page.sent.findLast(row => row.params?.name === 'sentinel_save_analysis_scheduling')
+  page.reply(concurrencyChange.id, await request('tools/call', concurrencyChange.params)); await savingConcurrency
+  assert.equal((await rpc('sentinel_model_settings')).concurrency, 4)
+  assert.equal((await core.installationAnalysisConfig('chatgpt:another-installation')).concurrency, 1)
+  assert.match(page.element('#settings-concurrency-status').textContent, /已保存.*4.*路/)
+  for (const [id, value, key, expected] of [['settings-query-concurrency', '3', 'queryConcurrency', 3], ['settings-query-interval', '5', 'queryIntervalMs', 5000]]) {
+    const input = page.element('#' + id); input.value = value
+    const saving = input.onchange(); await page.flush()
+    const change = page.sent.findLast(row => row.params?.name === 'sentinel_save_analysis_scheduling')
+    assert.deepEqual(JSON.parse(JSON.stringify(change.params.arguments)), { [key]: expected })
+    page.reply(change.id, await request('tools/call', change.params)); await saving
+  }
+  assert.equal((await rpc('sentinel_model_settings')).queryIntervalMs, 5000)
   const peer = await panelHarness(t, { html: resource.contents[0].text }), peerState = await rpc('sentinel_model_settings')
   peer.reply(peer.sent.findLast(row => row.params?.name === 'sentinel_model_settings').id, { structuredContent: peerState }); await peer.flush()
+  assert.equal(peer.element('#settings-query-concurrency').value, '3')
+  assert.equal(peer.element('#settings-query-interval').value, '5')
+  assert.equal(peer.element('#settings-concurrency').value, '4')
   for (const [window, model] of [[page, 'earlier-window-summary'], [peer, 'last-window-summary']]) {
     const input = window.element('#settings-llm-model')
     input.value = model; input.oninput(); const saving = leaveModelGroup(window, 'llm'); await window.flush()

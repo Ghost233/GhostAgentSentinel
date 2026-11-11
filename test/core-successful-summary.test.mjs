@@ -11,11 +11,12 @@ import { configureInstallationModels } from './helpers/installation-model-settin
 import { withModelSummary } from './helpers/model-summary.mjs';
 
 const DAY = 86_400_000;
+const summaryText = progress => `在做什么：核对当前日志。\n有什么进展：${progress}\n卡在哪里：未观察到明确阻碍。`;
 async function until(predicate, label) { const deadline = performance.now() + 3000; while (!await predicate()) { assert.ok(performance.now() < deadline, label); await delay(2); } }
 
 async function fixture(t) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-successful-summary-')), calls = [], held = [];
-  let clock = Date.now(), mode = 'success', text = '已核对本轮观察材料。', server, client;
+  let clock = Date.now(), mode = 'success', text = summaryText('已核对本轮观察材料。'), server, client;
   const models = createServer(async (request, response) => {
     if (request.method === 'GET') return response.writeHead(404, { 'content-type': 'application/json' }).end('{}');
     let raw = ''; for await (const chunk of request) raw += chunk;
@@ -34,7 +35,7 @@ async function fixture(t) {
   t.after(async () => { for (const reply of held.splice(0)) reply(); await client?.close(); await server?.close(); models.closeAllConnections(); await new Promise(resolve => models.close(resolve)); await rm(dataDir, { recursive: true, force: true }); });
   const baseUrl = 'http://127.0.0.1:' + models.address().port;
   const config = { llm: { baseUrl, model: 'history-summary' }, jev: { baseUrl, model: 'history-judge' } };
-  return { config, calls, held, now: () => clock, advance: ms => { clock += ms; }, mode: value => { mode = value; }, text: value => { text = value; },
+  return { config, calls, held, now: () => clock, advance: ms => { clock += ms; }, mode: value => { mode = value; }, text: value => { text = summaryText(value); },
     get client() { return client; }, async save(registrationId, value = config) { return configureInstallationModels(client, registrationId, value); },
     async task(sourceKey, id = 'main') { return (await client.snapshot()).tasks.find(task => task.sourceKey === sourceKey && task.id === id); },
     async restart() { await client.close(); await server.close(); await start(); },
@@ -141,7 +142,7 @@ test('reuse and unconfigured local checks preserve the old history until a new r
   assert.equal(f.calls.length, 2, 'unconfigured local checks do not call either model');
   f.text('已核对新的本轮总结。');
   const next = await f.save('chatgpt:history'); f.advance(10);
-  await until(async () => (await f.task(source)).analysis.lastSuccessfulSummary?.generated.text === '已核对新的本轮总结。', 'a new actual two-model success replaces the single historical success');
+  await until(async () => (await f.task(source)).analysis.lastSuccessfulSummary?.generated.text === summaryText('已核对新的本轮总结。'), 'a new actual two-model success replaces the single historical success');
   const replaced = (await f.task(source)).analysis.lastSuccessfulSummary;
   assert.equal(replaced.completedAt, f.now());
   assert.equal(replaced.configScope.revision, next.revision);

@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
-import { PROTOCOL, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
+import { PROTOCOL, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, NOTIFICATION_REVOCATION_FEATURE, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
 
 export const defaultDataDir = join(homedir(), '.ghost-agent-sentinel')
 
@@ -106,6 +106,9 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
   const active = new Map(), tracking = { deadlineTimers: 0 }
   const call = (path, body, requestSignal) => {
     if (closed) return Promise.reject(new Error('core client closed'))
+    if (path === '/v1/analysis/installations/scheduling' && !runtime.features.includes(INSTALLATION_ANALYSIS_SCHEDULING_FEATURE)) return Promise.reject(requestSignal?.aborted ? requestSignal.reason : Object.assign(new Error('共享核心尚不支持并行分析设置，请先更新共享核心。'), {
+      code: 'core_feature_unsupported', coreCapabilityFailure: Object.freeze({ operation: path, feature: INSTALLATION_ANALYSIS_SCHEDULING_FEATURE }),
+    }))
     if (path.startsWith('/v1/notifications/installations/')) {
       const required = [INSTALLATION_NOTIFICATION_RECORDS_FEATURE, ...(body === undefined ? [] : [NOTIFICATION_REVOCATION_FEATURE])]
       const missing = required.find(feature => !runtime.features.includes(feature))
@@ -155,6 +158,7 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
     configureAnalysisIfCurrent: (config, revision, requestSignal) => call('/v1/analysis/config/compare', { config, revision }, requestSignal),
     installationAnalysisConfig: (registrationId, requestSignal) => call('/v1/analysis/installations/config?' + new URLSearchParams({ registrationId }), undefined, requestSignal),
     configureInstallationAnalysis: (registrationId, config, revision, requestSignal) => call('/v1/analysis/installations/config', { registrationId, config, revision }, requestSignal),
+    configureInstallationScheduling: (registrationId, scheduling, requestSignal) => call('/v1/analysis/installations/scheduling', { registrationId, scheduling }, requestSignal),
     installationNotificationPreferences: (registrationId, requestSignal) => call('/v1/notifications/installations/preferences?' + new URLSearchParams({ registrationId }), undefined, requestSignal),
     installationNotificationRecords: async (registrationId, selection = {}, requestSignal) => call('/v1/notifications/installations/records?' + new URLSearchParams({ registrationId, ...normalizeInstallationNotificationRecordsQuery(selection) }), undefined, requestSignal),
     setInstallationNotificationPreference: (registrationId, kind, enabled, requestSignal) => call('/v1/notifications/installations/preferences', { registrationId, kind, enabled }, requestSignal),

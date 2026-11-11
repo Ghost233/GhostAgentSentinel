@@ -14,7 +14,7 @@ const observation = {
   ],
   coverage: { complete: true, gaps: [] },
 };
-const summaryText = '已核对所请求日志并找到最新记录。';
+const summaryText = '在做什么：核对所请求日志。\n有什么进展：已找到最新记录。\n卡在哪里：未观察到明确阻碍。';
 
 async function models(t, { extraction, judgment } = {}) {
   const requests = [];
@@ -45,7 +45,9 @@ async function models(t, { extraction, judgment } = {}) {
 test('two successful model calls publish the generated short summary with verified observation references', async t => {
   const { analyzer, requests } = await models(t);
   const result = await analyzer.analyze(observation);
-  assert.deepEqual(result.summary.generated, { text: summaryText, evidenceIds: ['action'], evidenceRefs: [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }] });
+  assert.equal(result.summary.generated.text, summaryText);
+  assert.deepEqual(result.summary.generated.evidenceIds, ['action']);
+  assert.deepEqual(result.summary.generated.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
   assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
   assert.equal(result.checks.length, 6);
   assert.equal(result.checks.find(check => check.id === 'request_drift').status, 'unknown');
@@ -53,11 +55,44 @@ test('two successful model calls publish the generated short summary with verifi
   assert.ok(['currentTask', 'currentState', 'recentProgress', 'attention'].every(key => typeof result.summary[key] === 'string'));
 });
 
+test('the three summary levels describe work, actual progress and blockers independently from unknown checks', async t => {
+  const text = '在做什么：核对所请求日志。\n有什么进展：已找到最新记录。\n卡在哪里：未观察到明确阻碍。';
+  const { analyzer } = await models(t, { extraction: (_evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text, evidenceOptionIds: [option.optionId] } }) });
+  const result = await analyzer.analyze(observation);
+  assert.equal(result.summary.generated.text, text);
+  assert.deepEqual(result.summary.generated.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
+  assert.equal(result.checks.find(check => check.id === 'request_drift').judgmentState, 'insufficient');
+});
+
+test('one JEV request decides whether work is blocked and selects its original evidence', async t => {
+  for (const [choice, status] of [['blocked_1', 'blocked'], ['unblocked_1', 'unblocked'], ['unknown', 'unknown']]) await t.test(status, async t => {
+    const action = status === 'blocked' ? { ...observation.events[1], kind: 'tool-result', text: '读取日志失败：权限被拒绝，无法继续核对。', data: { exitCode: 1 } }
+      : { ...observation.events[1], kind: 'tool-start', text: '定向检查通过，正在运行完整测试。' };
+    const { analyzer, requests } = await models(t, { judgment: wire => {
+      assert.equal(wire.state.executionSummary.text, summaryText);
+      assert.ok(wire.state.events.some(event => event.id === 'action' && event.text === action.text));
+      assert.deepEqual(wire.state.candidates.execution_blocking.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
+      assert.ok(wire.questions.execution_blocking.criteria[choice]);
+      return { answers: { request_drift: { type: 'choice', choice: 'unknown' }, execution_blocking: { type: 'choice', choice } } };
+    } });
+    const result = await analyzer.analyze({ ...observation, events: [observation.events[0], action] });
+    assert.deepEqual(requests.map(request => request.path), ['/v1/chat/completions', '/v1/systemone']);
+    assert.equal(result.summary.generated.blocking.status, status);
+    if (status !== 'unknown') {
+      assert.equal(result.summary.generated.blocking.reason, action.text);
+      assert.deepEqual(result.summary.generated.blocking.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
+    }
+    assert.equal(result.checks.length, 6);
+  });
+});
+
 test('an incomplete observation publishes only a cited partial summary and preserves its gaps without a normal judgment', async t => {
   const { analyzer, requests } = await models(t);
   const result = await analyzer.analyze({ ...observation, coverage: { complete: false, gaps: ['missing interval'] } });
   assert.equal(result.summary.generated, undefined);
   assert.equal(result.summary.partial.text, summaryText);
+  assert.equal(result.summary.partial.blocking.status, 'unknown');
+  assert.equal(result.summary.partial.blocking.reason, '当前执行记录存在采集缺口');
   assert.deepEqual(result.summary.partial.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }]);
   assert.equal(result.coverage.complete, false);
   assert.ok(result.coverage.gaps.includes('missing interval'));
@@ -143,9 +178,12 @@ test('long observations select recent evidence within the unchanged budget while
   assert.equal(events.length, 181, 'input observations are not pruned or rewritten');
 });
 
-test('invalid short-summary structure or sentence count fails the model round before judgment', async t => {
+test('missing, reordered or empty summary levels fail the model round before judgment', async t => {
   const summaries = [null, [], {}, { text: '', evidenceOptionIds: ['placeholder'] }, { text: '   ', evidenceOptionIds: ['placeholder'] },
     { text: '第一句。第二句。第三句。', evidenceOptionIds: ['placeholder'] }, { text: '材'.repeat(601), evidenceOptionIds: ['placeholder'] },
+    { text: '在做什么：核对日志。\n有什么进展：找到记录。', evidenceOptionIds: ['placeholder'] },
+    { text: '有什么进展：找到记录。\n在做什么：核对日志。\n卡在哪里：未观察到明确阻碍。', evidenceOptionIds: ['placeholder'] },
+    { text: '在做什么：核对日志。\n有什么进展：  \n卡在哪里：未观察到明确阻碍。', evidenceOptionIds: ['placeholder'] },
     { text: summaryText, evidenceOptionIds: ['placeholder'], extra: 'unexpected' }];
   for (const summary of summaries) {
     const { analyzer, requests } = await models(t, { extraction: (_evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: summary?.evidenceOptionIds ? { ...summary, evidenceOptionIds: [option.optionId] } : summary }) });
@@ -221,7 +259,7 @@ test('summary option references resolve only to the current request even when pr
 
 test('summary references retain distinct inherited owners when their local evidence ids collide', async t => {
   const inheritedEvents = ['parent', 'ancestor'].map(owner => ({ id: 'shared-limit', taskId: owner, taskLifecycleId: `${owner}-run`, kind: 'input', text: `${owner} user limit.`, capturedAt: now - 2000, contextRole: 'ancestor-limit', authorizationEligible: true, sourceRef: { taskId: owner, lifecycleId: `${owner}-run`, eventId: 'shared-limit' } }));
-  const { analyzer } = await models(t, { extraction: (evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text: '已观察到当前操作及两项祖先用户限制。', evidenceOptionIds: [option.optionId, ...evidence.filter(group => group.contextRole === 'ancestor-limit').map(group => group.options[0].optionId)] } }) });
+  const { analyzer } = await models(t, { extraction: (evidence, option) => ({ selectedOptionIds: [option.optionId], gaps: [], summary: { text: summaryText, evidenceOptionIds: [option.optionId, ...evidence.filter(group => group.contextRole === 'ancestor-limit').map(group => group.options[0].optionId)] } }) });
   const result = await analyzer.analyze({ ...observation, instructionContext: { inheritedEvents, binding: { origin: 'delegated' }, gaps: [] } });
   assert.deepEqual(result.summary.generated.evidenceIds, ['action', 'shared-limit']);
   assert.deepEqual(result.summary.generated.evidenceRefs, [{ taskId: 'task', lifecycleId: 'run', eventId: 'action' }, ...inheritedEvents.map(event => event.sourceRef)]);

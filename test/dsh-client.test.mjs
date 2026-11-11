@@ -694,6 +694,12 @@ test('native system settings edits only its stable installation through producti
   assert.equal(f.plugin.diagnostics().viewInstances, 0, 'Permission does not mount another monitor')
   const inputs = [...settings().querySelectorAll('input')], { Simulate } = clientRequire('react-dom/test-utils')
   assert.deepEqual(inputs.map(input => input.value), ['http://127.0.0.1:1', 'dsh-summary', 'http://127.0.0.1:1', 'dsh-judge'])
+  const concurrency = settings().querySelector('[data-sentinel-analysis-concurrency]')
+  assert.ok(concurrency, 'the native settings expose this installation LLM concurrency')
+  await f.interact(async () => { concurrency.value = '4'; Simulate.change(concurrency); await f.settle() })
+  await f.waitUntil(() => settings().querySelector('[data-sentinel-concurrency-status]')?.textContent.includes('4 路'), 'the native setting confirms the persisted lane count')
+  assert.equal((await core.installationAnalysisConfig('dsh:system-settings')).concurrency, 4)
+  assert.equal((await core.installationAnalysisConfig('chatgpt:formal')).concurrency, 1)
   const original = await core.installationAnalysisConfig('dsh:system-settings')
   await f.interact(async () => {
     inputs[3].value = ''; Simulate.change(inputs[3]); Simulate.blur(inputs[3], { relatedTarget: null })
@@ -943,7 +949,7 @@ test('the actual DSH settings form autosaves groups through Native Remote and dr
       const evidence = JSON.parse(body.messages.find(message => message.role === 'user').content).evidence
       const option = evidence.find(entry => entry.origin === 'output')?.options.find(option => option.kind === 'action') ?? evidence[0].options[0]
       const selectedOptionIds = option.kind === 'action' ? [option.optionId] : []
-      response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [], summary: { text: 'The current request has observed execution activity.', evidenceOptionIds: [option.optionId] } }) } }] }))
+      response.end(JSON.stringify({ model: body.model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ selectedOptionIds, gaps: [], summary: { text: '在做什么：处理当前请求。\n有什么进展：已观察到执行活动。\n卡在哪里：未观察到明确阻碍。', evidenceOptionIds: [option.optionId] } }) } }] }))
     } else {
       const input = decodeJevRequest(body)
       response.end(JSON.stringify({ model: body.model, answers: Object.fromEntries(Object.keys(input.questions).map(id => [id, { type: 'choice', choice: id === 'request_drift' ? 'attention' : 'unknown' }])) }))
@@ -1786,25 +1792,37 @@ test('current observed activity remains visible while analysis is paused, unavai
 })
 
 test('the actual DSH detail shows the current model short summary with direct owned citations and hides it while new material waits or fails', async t => {
+  const summaryText = '在做什么：核对当前执行。\n有什么进展：已观察到当前执行结果。\n卡在哪里：未观察到明确阻碍。'
   const at = Date.now(), task = { key: 'summary-task', sourceKey: 'summary-source', id: 'main', lifecycleId: 'run', title: '总结观察', status: 'running',
     currentRequest: 'Inspect the current execution', activity: { summary: '工具已返回一个结果', observedAt: at },
     events: [{ id: 'basis', taskId: 'main', taskLifecycleId: 'run', kind: 'output', capturedAt: at, text: '本轮实际执行依据' }],
-    analysis: { state: 'cooldown', resultDisposition: 'current', completedAt: at, summary: { generated: { text: '已观察到当前执行结果。', evidenceIds: ['basis'], evidenceRefs: [{ taskId: 'main', lifecycleId: 'run', eventId: 'basis' }] } }, checks: [] } }
+    analysis: { state: 'cooldown', resultDisposition: 'current', completedAt: at, summary: { generated: { text: summaryText, evidenceIds: ['basis'], evidenceRefs: [{ taskId: 'main', lifecycleId: 'run', eventId: 'basis' }] } }, checks: [] } }
   const snapshot = { protocol: 1, generatedAt: at, monitoring: { state: 'active' }, overview: {}, sources: [{ key: 'summary-source', status: 'connected', descriptor: { name: '本安装' } }], tasks: [task] }
+  task.analysis.summary.generated.blocking = { status: 'unblocked', reason: '本轮实际执行依据', evidenceRefs: task.analysis.summary.generated.evidenceRefs }
   const f = await client(t, snapshot, 'denied', null, true)
   const summary = () => f.dom.window.document.querySelector('[data-sentinel-model-summary]')
   assert.ok(summary(), 'the current model-generated summary is visible in the actual task detail')
   assert.ok(summary().textContent.includes('已观察到当前执行结果。'))
+  assert.equal(summary().querySelectorAll('[data-sentinel-summary-text] > p').length, 3)
+  assert.deepEqual([...summary().querySelectorAll('[data-sentinel-summary-text] > p')].map(row => row.textContent.trim()), summaryText.split('\n'))
   const citation = summary().querySelector('small[data-sentinel-citation="basis"]')
   assert.ok(citation.textContent.includes('本轮实际执行依据'))
   assert.equal(citation.dataset.sourceKey, 'summary-source')
+  const decision = summary().querySelector('[data-sentinel-blocking]')
+  assert.equal(decision.querySelector('p').textContent, '未阻塞 · 本轮实际执行依据')
+  const basis = decision.querySelector('details')
+  assert.equal(basis.open, false)
+  basis.open = true
+  assert.match(basis.querySelector('[data-sentinel-citation="basis"]').textContent, /本轮实际执行依据/)
   assert.equal(summary().closest('[data-gs-checks]'), null, 'summary and citations are directly visible without opening full checks')
   task.analysis.resultDisposition = 'reused'; await f.tick()
   assert.ok(summary(), 'a valid reused result stays visible')
-  assert.ok(summary().textContent.includes('复用有效总结：已观察到当前执行结果。'), 'a valid reused result stays visible without claiming a new model call')
+  assert.ok(summary().textContent.includes('复用有效总结：' + summaryText), 'a valid reused result stays visible without claiming a new model call')
   task.analysis.resultDisposition = 'current'; await f.tick()
-  assert.ok(summary().textContent.includes('模型总结：已观察到当前执行结果。'))
+  assert.ok(summary().textContent.includes('模型总结：' + summaryText))
   assert.equal(summary().textContent.includes('复用有效总结'), false)
+  task.analysis.state = 'paused'; await f.tick()
+  assert.match(summary().querySelector('[data-sentinel-blocking] p').textContent, /^上次判断 · 未阻塞/)
   task.analysis.state = 'analyzing'; task.analysis.resultDisposition = 'pending'; task.activity.summary = '已采集新材料，等待本轮模型结果'
   await f.tick()
   assert.equal(summary(), null, 'a prior generated summary does not cover pending material')

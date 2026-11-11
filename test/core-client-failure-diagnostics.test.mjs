@@ -55,6 +55,12 @@ async function fixture(t, features = []) {
   return { adapter, faults, hits, held, token, async client() { const value = await connectCore({ dataDir }); clients.push(value); return value } }
 }
 
+test('an older Core cannot accept a concurrency setting without declaring lane scheduling support', async t => {
+  const f = await fixture(t, ['installation-model-settings/1']), client = await f.client()
+  await assert.rejects(client.configureInstallationScheduling('owned-installation', { concurrency: 4 }), error => error.code === 'core_feature_unsupported' && error.coreCapabilityFailure.feature === 'installation-analysis-scheduling/1')
+  assert.equal(f.hits.get('/v1/analysis/installations/scheduling') ?? 0, 0)
+})
+
 test('an existing older Core rejects unsupported notification settings before sending unknown endpoints', async t => {
   const f = await fixture(t, ['installation-model-settings/1']), client = await f.client()
   const before = f.adapter.diagnostics().adapter.communicationFailure
