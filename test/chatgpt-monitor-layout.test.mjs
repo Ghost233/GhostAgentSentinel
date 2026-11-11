@@ -4,23 +4,36 @@ import { panelHarness } from './helpers/chatgpt-panel.mjs'
 
 const view = () => ({ identity: { threadId: 'main-a' }, signal: 'gray', summary: '尚未分析', observation: { status: 'running' }, execution: { key: 'turn-a', status: 'running', historical: false }, analysis: { state: 'unknown', issues: [] } })
 
-test('the monitor keeps four GS counts above two tabs and leaves the problem pane empty when analysis is unknown', async t => {
+test('the monitor puts the current light and JEV judgment beside the update time above the tabs', async t => {
   const page = await panelHarness(t)
-  await page.deliver(view())
+  const completedAt = Date.now() - 1000
+  const current = { ...view(), recentModelActivity: { summary: { text: '已核对日志', completedAt, expiresAt: completedAt + 60000,
+    blocking: { status: 'unblocked', reason: '已取得工具结果', evidence: [{ text: '日志原文', reference: 'native:log' }] } } } }
+  await page.deliver(current)
   assert.equal(page.element('#monitor-tab-issues').getAttribute('aria-selected'), 'true')
   assert.equal(page.element('#monitor-details').hidden, true)
   assert.equal(page.element('#issues').hidden, false)
   assert.equal(page.element('#issues').textContent, '')
-  assert.equal(page.element('#gs-gray').textContent, '⚪ 1')
-  for (const [name, expected] of [['green', '🟢 0'], ['yellow', '🟡 0'], ['red', '🔴 0']]) assert.equal(page.element('#gs-' + name).textContent, expected)
+  assert.equal(page.element('#session-light').textContent, '⚪')
+  assert.match(page.element('#session-light').getAttribute('aria-label'), /不可判断/)
+  assert.equal(page.element('#recent-blocking-status').textContent, '未阻塞')
+  assert.equal(page.element('#recent-blocking-reason').textContent, '已取得工具结果')
+  assert.equal(page.element('#recent-summary-time').dateTime, new Date(completedAt).toISOString())
+  assert.equal(page.element('#recent-blocking-details').hidden, false)
+  assert.equal(page.element('#recent-blocking-details').open, false)
+  assert.match(page.element('#recent-blocking-evidence').textContent, /日志原文/)
   page.element('#monitor-tab-details').onclick()
   assert.equal(page.element('#monitor-details').hidden, false)
   assert.equal(page.element('#issues').hidden, true)
   assert.match(page.element('#summary').textContent, /尚未分析/)
-  await page.refresh(); await page.deliver(view())
+  await page.refresh(); await page.deliver(current)
   assert.equal(page.element('#monitor-tab-details').getAttribute('aria-selected'), 'true', 'ordinary monitoring refresh keeps the chosen detail page')
   assert.match(page.html, /#gs-bar\s*\{[^}]*position:sticky[^}]*top:0/)
-  assert.ok(page.html.indexOf('id="gs-bar"') < page.html.indexOf('id="monitor-tab-issues"'))
+  const header = page.html.match(/<header id="gs-bar"[^>]*>[\s\S]*?<\/header>/)[0]
+  assert.match(header, /id="session-light"[\s\S]*id="recent-blocking-status"[\s\S]*id="recent-summary-time"[\s\S]*<p id="recent-blocking-reason"/)
+  assert.match(page.html, /#recent-blocking-reason\{[^}]*grid-column:1\/-1/)
+  assert.doesNotMatch(header, /id="gs-(green|yellow|red|gray)"|>GS</)
+  assert.ok(page.html.indexOf(header) < page.html.indexOf('id="monitor-tab-issues"'))
 })
 
 test('history details never count the selected old execution as the current main chat or hide an identical problem reason', async t => {
@@ -30,10 +43,10 @@ test('history details never count the selected old execution as the current main
   await page.deliver(current)
   assert.match(page.element('#issues').textContent, /修改已偏离当前要求/)
   assert.match(page.element('#issues').textContent, /<literal> current action/)
-  assert.equal(page.element('#gs-red').textContent, '🔴 1')
+  assert.equal(page.element('#session-light').textContent, '🔴')
   await page.refresh()
   await page.deliver({ ...current, execution: { key: 'prior', historical: true, status: 'ended' }, history: { currentKey: 'turn-a', selectedKey: 'prior', currentStatus: 'running', currentSignal: 'red', executions: [{ key: 'turn-a', status: 'running' }, { key: 'prior', status: 'ended' }] }, analysis: { ...current.analysis, issues: [{ checkId: 'request_drift', reason: '历史问题', evidence: [{ text: 'old action', reference: 'old-evidence' }] }] } })
-  assert.equal(page.element('#gs-red').textContent, '🔴 1', 'the retained old execution does not replace the current main chat light')
+  assert.equal(page.element('#session-light').textContent, '🔴', 'the retained old execution does not replace the current main chat light')
   assert.equal(page.element('#issues').textContent, '', 'an old issue is not exposed as a current problem')
   assert.match(page.element('#detail-issues').textContent, /历史问题.*old-evidence/s)
   assert.match(page.element('#summary').textContent, /历史执行/)
@@ -54,17 +67,17 @@ test('host resource teardown cancels the outstanding monitor read and releases e
   assert.equal(page.timers.size, 0)
 })
 
-test('a confirmed yellow observation exposes its short reason while ended and unbound chats do not gain running counts', async t => {
+test('a confirmed yellow observation exposes its short reason while ended and unbound chats have no active light', async t => {
   const page = await panelHarness(t), current = view()
   current.signal = 'yellow'; current.summary = '首次检查尚无可见执行活动'
   await page.deliver(current)
-  assert.equal(page.element('#gs-yellow').textContent, '🟡 1')
+  assert.equal(page.element('#session-light').textContent, '🟡')
   assert.match(page.element('#issues').textContent, /首次检查尚无可见执行活动/)
   assert.equal(page.sent.filter(row => /notification/.test(row.params?.name ?? '')).length, 0)
   await page.refresh(); await page.deliver({ ...current, execution: { key: 'turn-a', status: 'ended', historical: true }, history: { currentStatus: 'idle', currentSignal: 'yellow' } })
-  for (const [name, expected] of [['green', '🟢 0'], ['yellow', '🟡 0'], ['red', '🔴 0'], ['gray', '⚪ 0']]) assert.equal(page.element('#gs-' + name).textContent, expected)
+  assert.equal(page.element('#session-light').hidden, true)
   await page.refresh(); await page.deliver({ ...view(), identity: { threadId: null } })
-  assert.equal(page.element('#gs-gray').textContent, '⚪ 0', 'unknown identity is not an invented main agent')
+  assert.equal(page.element('#session-light').hidden, true, 'unknown identity is not an invented main agent')
   assert.equal(page.element('#issues').textContent, '')
 })
 

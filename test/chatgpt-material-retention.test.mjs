@@ -325,7 +325,7 @@ test('a historical execution retains the grounded problem and its own inline evi
   assert.equal(request.params.arguments.executionKey, prior.key)
   page.reply(request.id, { structuredContent: old }); await selecting
   assert.equal(page.element('#monitor-details').hidden, false)
-  assert.equal(page.element('#gs-red').textContent, '🔴 1')
+  assert.equal(page.element('#session-light').textContent, '🔴')
   assert.equal(page.element('#issues').textContent, '', 'the old problem is available only in its historical detail')
   assert.match(page.element('#detail-issues').textContent, /Read the log only/)
 })

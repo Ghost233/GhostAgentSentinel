@@ -4,12 +4,20 @@
 <title>Sentinel 会话检查</title>
 <style>
 :root{font:13px/1.5 system-ui;color-scheme:light dark}body{margin:0;padding:14px;overflow-wrap:anywhere}h1{font-size:14px;margin:0 0 8px}p{margin:5px 0}#summary{font-weight:600;font-size:14px}#analysis,.muted{color:GrayText;font-size:12px}.issue{padding:10px 0;border-bottom:1px solid color-mix(in srgb,GrayText 22%,transparent)}h2{font-size:13px;margin:0 0 4px}.evidence{white-space:pre-line;font-size:12px;color:GrayText;line-height:1.45;margin-top:5px}#checks,#history,#diagnostics,#last-summary{margin-top:16px}#diagnostics>h2,#history>h2,#last-summary>h2{color:GrayText}.check{padding:8px 0;border-bottom:1px solid color-mix(in srgb,GrayText 15%,transparent)}.check-status{font-size:12px;font-weight:400;margin-left:8px;color:GrayText}#coverage,#technical,#observation,#execution{white-space:pre-line}#error{color:GrayText;font-size:12px}.history-entry{display:block;width:100%;text-align:left;margin:5px 0;padding:6px 8px;font:inherit;border:1px solid GrayText;border-radius:5px;background:transparent;color:inherit;overflow-wrap:anywhere}.history-entry[aria-current=true]{border-width:2px;font-weight:600}
-#gs-bar{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;padding:10px 0;background:var(--color-background-primary,Canvas);border-bottom:1px solid color-mix(in srgb,GrayText 20%,transparent)}#gs-bar strong{font-size:13px;margin-right:auto}#gs-bar span{font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}#monitor-tabs{display:flex;gap:18px;margin:10px 0 14px}#monitor-tabs button{border:0;border-bottom:2px solid transparent;padding:6px 0;background:transparent;color:GrayText;font:inherit;cursor:pointer}#monitor-tabs button[aria-selected=true]{border-bottom-color:currentColor;color:inherit;font-weight:600}
+#gs-bar{position:sticky;top:0;z-index:2;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:baseline;gap:4px 8px;padding:10px 0;background:var(--color-background-primary,Canvas);border-bottom:1px solid color-mix(in srgb,GrayText 20%,transparent)}
+#recent-heading{display:flex;align-items:baseline;gap:8px;min-width:0}
+#session-light{flex:none}
+#recent-blocking{min-width:0;margin:0}
+#recent-blocking-reason{grid-column:1/-1;margin:0;color:GrayText}
+#recent-blocking-details{margin:5px 0;font-size:12px}
+#monitor-controls{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:10px 0 14px}
+#monitor-tabs{display:flex;gap:18px}#monitor-tabs button{border:0;border-bottom:2px solid transparent;padding:6px 0;background:transparent;color:GrayText;font:inherit;cursor:pointer}#monitor-tabs button[aria-selected=true]{border-bottom-color:currentColor;color:inherit;font-weight:600}
 #refresh{padding:3px 7px;border:1px solid color-mix(in srgb,GrayText 35%,transparent);border-radius:5px;background:transparent;color:inherit;font:inherit;font-size:12px;cursor:pointer}
 #recent-model-activity{padding:5px 0 10px;border-bottom:1px solid color-mix(in srgb,GrayText 20%,transparent)}
 .recent-model-row{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:3px 8px;min-height:25px;font-size:12px}
 .recent-model-value{display:flex;align-items:baseline;justify-content:flex-end;flex-wrap:wrap;gap:5px;margin-left:auto}
-.recent-model-value time{font-size:11px;color:GrayText;font-variant-numeric:tabular-nums;white-space:nowrap}
+.recent-model-value time,#recent-summary-time{font-size:11px;color:GrayText;font-variant-numeric:tabular-nums;white-space:nowrap}
+#recent-summary-time{grid-column:2;justify-self:end}
 .recent-model-badge{font-size:10px;padding:1px 5px;border-radius:4px;background:color-mix(in srgb,GrayText 15%,transparent)}
 .recent-model-badge[data-tone=ok]{background:light-dark(#e1efe7,#20372c);color:light-dark(#26543b,#a3d6b4)}
 .recent-model-badge[data-tone=waiting]{background:light-dark(#f9edd8,#382e20);color:light-dark(#674a22,#ecc88e)}
@@ -19,18 +27,26 @@
 .summary-body:not(.muted){font-size:15px;line-height:1.65}.summary-body p{margin:8px 0}.summary-body .summary-row{display:grid;grid-template-columns:6em minmax(0,1fr);column-gap:10px}.summary-row strong{font-weight:650}.summary-row span{white-space:pre-wrap}
 @media(max-width:420px){.summary-body .summary-row{grid-template-columns:1fr;row-gap:2px}}
 .blocking{margin-top:10px}.blocking p{margin:4px 0}.blocking details{font-size:12px}
-.blocking [data-status="blocked"]{color:light-dark(#a32323,#ffabab)}
+.blocking [data-status="blocked"],#recent-blocking-status[data-status="blocked"]{color:light-dark(#a32323,#ffabab)}
 </style>
-<header id="gs-bar" aria-label="GS · 当前主聊天"><strong>GS</strong><span id="gs-green" aria-label="正常">🟢 0</span><span id="gs-yellow" aria-label="观察">🟡 0</span><span id="gs-red" aria-label="告警">🔴 0</span><span id="gs-gray" aria-label="不可判断">⚪ 0</span><button id="refresh" type="button">刷新</button></header>
+<header id="gs-bar" aria-label="当前会话判断">
+  <div id="recent-heading">
+    <span id="session-light" role="img" hidden></span>
+    <p id="recent-blocking" hidden>JEV · <strong id="recent-blocking-status"></strong></p>
+  </div>
+  <time id="recent-summary-time" aria-label="更新时间" hidden></time>
+  <p id="recent-blocking-reason" hidden></p>
+</header>
+<details id="recent-blocking-details" hidden><summary>查看判断依据</summary><div id="recent-blocking-evidence"></div></details>
 <section id="recent-model-activity" aria-label="本聊天最近的预填和总结">
   <div class="recent-model-row"><strong>上次送预填</strong><div class="recent-model-value"><time id="recent-prefill-time" hidden></time><span id="recent-prefill-state" class="recent-model-badge">待核对</span></div></div>
-  <div class="recent-model-row" id="recent-summary-row"><strong>上次总结</strong><div class="recent-model-value"><span id="recent-summary-state" class="recent-model-badge" hidden></span><time id="recent-summary-time" hidden></time></div></div>
-  <div id="recent-summary-text" class="summary-body muted">等待核对当前聊天</div><div id="recent-blocking" class="blocking" hidden><p>JEV 阻塞判断 · <strong id="recent-blocking-status"></strong></p><details id="recent-blocking-details" hidden><summary>查看判断依据</summary><div id="recent-blocking-evidence"></div></details></div><p id="recent-summary-gaps" class="muted" hidden></p>
+  <div class="recent-model-row" id="recent-summary-row"><strong>上次总结</strong><div class="recent-model-value"><span id="recent-summary-state" class="recent-model-badge" hidden></span></div></div>
+  <div id="recent-summary-text" class="summary-body muted">等待核对当前聊天</div><p id="recent-summary-gaps" class="muted" hidden></p>
   <p id="recent-model-status" class="muted" role="status" hidden></p>
 </section>
 <p id="availability" class="muted" role="status" hidden></p>
 <p id="collection-recovery" class="muted" role="status" hidden></p>
-<nav id="monitor-tabs" role="tablist" aria-label="会话检查"><button id="monitor-tab-issues" type="button" role="tab" aria-controls="issues">当前问题</button><button id="monitor-tab-details" type="button" role="tab" aria-controls="monitor-details">详情</button></nav>
+<div id="monitor-controls"><nav id="monitor-tabs" role="tablist" aria-label="会话检查"><button id="monitor-tab-issues" type="button" role="tab" aria-controls="issues">当前问题</button><button id="monitor-tab-details" type="button" role="tab" aria-controls="monitor-details">详情</button></nav><button id="refresh" type="button">刷新</button></div>
 <section id="issues" role="tabpanel" aria-labelledby="monitor-tab-issues" aria-label="需要关注的问题"></section>
 <section id="monitor-details" role="tabpanel" aria-labelledby="monitor-tab-details" hidden>
 <h1>Sentinel · 当前会话</h1>
@@ -53,6 +69,7 @@
 <script>
 const labels={stalled_progress:'活跃但推进不足',request_drift:'偏离当前请求',failure_loop:'同类失败反复返工',validation_cost:'完整验证重复成本',validation_gap:'本地验证证据缺口',long_wait:'长等待或活动中断'};
 const lights={red:'🔴',yellow:'🟡',green:'🟢',gray:'⚪'};
+const lightLabels={red:'告警',yellow:'观察',green:'正常',gray:'不可判断'};
 const states={queued:'检查排队中',analyzing:'正在检查',unavailable:'本地模型未配置或不可用',failed:'本轮分析失败',unknown:'当前分析不可判断',cooldown:'本轮检查已更新',idle:'最近检查结果',paused:'分析已暂停',stale:'检查已过期',interrupted:'本轮检查已取消','not-connected':'六项分析尚未接入'};
 const executions={running:'运行中',idle:'已结束',ended:'已结束',aborted:'已中断',unknown:'结束状态未确认'};
 const element=id=>document.querySelector('#'+id);
@@ -131,15 +148,17 @@ function selectTab(tab){
 }
 for(const tab of ['issues','details'])element('monitor-tab-'+tab).onclick=()=>{selectTab(tab);if(tab==='issues'&&(selectedExecutionKey||historyCursor))return selectExecution(null,null);};
 selectTab('issues');
-function renderGS(view,signal='gray'){
+function renderSessionLight(view,signal='gray'){
   const identity=text(view?.identity?.threadId,128),history=view?.history;
   const historical=view?.execution?.historical===true;
   const status=history?.currentStatus??(historical?'unknown':view?.execution?.status??view?.observation?.status);
   const active=Boolean(identity)&&!['ended','idle','disposed','aborted'].includes(status);
   const light=historical&&Object.hasOwn(lights,history?.currentSignal)?history.currentSignal:historical?'gray':signal;
-  for(const name of ['green','yellow','red','gray'])write('gs-'+name,lights[name]+' '+(active&&light===name?'1':'0'));
+  show('session-light',active);
+  write('session-light',active?lights[light]:'');
+  attribute('session-light','aria-label',active?'当前会话 · '+lightLabels[light]:'');
 }
-renderGS(null);
+renderSessionLight(null);
 function resetDetails(){
   controlState=null;set('pause','disabled',false);
   renderBlocking('model',null);renderBlocking('last',null);
@@ -149,7 +168,7 @@ function resetDetails(){
   write('model-summary-title','模型总结');write('analysis','当前分析不可判断');write('diagnostics-title','观察与覆盖');
 }
 function clearView(message){
-  resetDetails();renderGS(null);
+  resetDetails();renderSessionLight(null);
   scopeThreadId=null;selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;recentActivity=null;
   renderRecentModelActivity(null);
   write('summary','⚪ '+message);attribute('summary','data-signal','gray');
@@ -177,7 +196,7 @@ function selectExecution(key,cursor=historyCursor){
   if(stopped||!ready||!scopeThreadId)return;
   if(key)selectTab('details');
   selectedExecutionKey=key;historyCursor=cursor;generation++;clearTimeout(timer);timer=null;resetDetails();
-  write('summary','⚪ 正在读取检查记录');attribute('summary','data-signal','gray');renderGS({identity:{threadId:scopeThreadId}},'gray');
+  write('summary','⚪ 正在读取检查记录');attribute('summary','data-signal','gray');renderSessionLight({identity:{threadId:scopeThreadId}},'gray');
   return refresh();
 }
 function renderHistory(view){
@@ -205,10 +224,13 @@ const blockingLabels={blocked:'已阻塞',unblocked:'未阻塞',unknown:'待确�
 function renderBlocking(prefix,decision,retained=false){
   const label=Object.hasOwn(blockingLabels,decision?.status)?blockingLabels[decision.status]:null;
   const reason=text(decision?.reason,180),visible=Boolean(label&&reason),historical=retained||decision?.historical===true;
-  const status=visible?(historical?'上次判断 · ':'')+label+' · '+reason:'';
+  const separateReason=prefix==='recent',reasonText=visible?reason:'';
+  const status=visible?(historical?'上次判断 · ':'')+label+(separateReason?'':' · '+reason):'';
   const details=prefix+'-blocking-details';
-  if(element(prefix+'-blocking-status').textContent!==status)set(details,'open',false);
+  if(element(prefix+'-blocking-status').textContent!==status||
+    (separateReason&&element('recent-blocking-reason').textContent!==reasonText))set(details,'open',false);
   show(prefix+'-blocking',visible);write(prefix+'-blocking-status',status);
+  if(separateReason){show('recent-blocking-reason',visible);write('recent-blocking-reason',reasonText);}
   attribute(prefix+'-blocking-status','data-status',visible&&!historical?decision.status:'');
   const rows=visible?summaryEvidence({evidence:list(decision.evidence)}):[];
   show(details,rows.length>0);updateRows(prefix+'-blocking-evidence',rows);
@@ -304,7 +326,7 @@ function render(view){
   write('summary',paused?'⚪ 本聊天分析已暂停':lights[signal]+' '+summary);
   attribute('summary','data-signal',currentSignal);
   write('analysis',paused?'继续采集 · 仅手动恢复分析':(view.execution?.historical?'历史检查 · ':'')+stateLine(analysis));
-  renderGS(view,currentSignal);
+  renderSessionLight(view,currentSignal);
   const issues=list(analysis.issues).slice(0,6);
   if(!view.execution?.historical&&!issues.length&&['yellow','red'].includes(currentSignal))issues.push({reason:summary});
   for(const target of ['issues','detail-issues']){
@@ -394,7 +416,7 @@ async function refresh(){
     render(response.structuredContent);void dismissDisplayed(response.structuredContent,g);
   }catch(error){
     if(!stopped&&g===generation){
-      resetDetails();renderGS(null);recentActivity=renderRecentModelActivity(recentActivity,true);
+      resetDetails();renderSessionLight(null);recentActivity=renderRecentModelActivity(recentActivity,true);
       write('summary','⚪ 本次读取失败，当前状态不可判断');attribute('summary','data-signal','gray');
       write('error','可稍后重试');write('technical',text(error.message));
     }

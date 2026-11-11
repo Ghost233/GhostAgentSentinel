@@ -102,6 +102,7 @@ test('real native material and model HTTP publish before JEV and retain the new 
   assert.equal(page.element('#last-summary-text').textContent, original.generated.text)
   assert.match(page.element('#last-blocking-status').textContent, /上次判断 · 未阻塞/)
   assert.equal(page.element('#recent-summary-text').textContent, original.generated.text)
-  assert.match(page.element('#recent-blocking-status').textContent, /^待确认 · JEV.*失败/)
+  assert.equal(page.element('#recent-blocking-status').textContent, '待确认')
+  assert.match(page.element('#recent-blocking-reason').textContent, /^JEV.*失败/)
   assert.deepEqual(calls.map(call => call.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone', '/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone'])
 })

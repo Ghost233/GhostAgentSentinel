@@ -12,6 +12,7 @@ import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { decodeJevRequest } from './helpers/jev-wire.mjs'
 import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
+import { panelHarness } from './helpers/chatgpt-panel.mjs'
 
 const { Context } = req('@deepseek-ai/cordis')
 const { default: LlmRuntime, LlmAdapter, createUserMessage } = req('@deepseek-ai/dsh-llm')
@@ -201,11 +202,20 @@ test('DSH session summaries keep raw output in the JEV evidence rather than the 
   host.send(id, output)
   await until(async () => (await host.control.snapshot()).tasks.find(task => task.id === id)?.events.some(event => event.text.includes(output)), 'native output captured')
   await host.control.resume()
-  let decision
-  await until(async () => (decision = (await host.adapter.sessionPanel(id, {})).recentModelActivity.summary?.blocking)?.status === 'unblocked', 'DSH publishes the JEV decision')
+  let view
+  await until(async () => (view = await host.adapter.sessionPanel(id, {})).recentModelActivity.summary?.blocking?.status === 'unblocked', 'DSH publishes the JEV decision')
+  const { blocking: decision, completedAt } = view.recentModelActivity.summary
   assert.equal(decision.reason, '会话回复记录了可继续推进的进展')
   assert.match(decision.evidence[0].text, /\/synthetic\/DSH Workflow/)
   assert.equal(host.modelCalls.filter(call => call.path === '/v1/systemone').length, 1)
+  const page = await panelHarness(t, { html: await host.adapter.panelDocument() })
+  await page.deliver(view)
+  assert.equal(page.element('#recent-blocking-status').textContent, '未阻塞')
+  assert.equal(page.element('#recent-blocking-reason').textContent, decision.reason)
+  assert.equal(page.element('#recent-summary-time').dateTime, new Date(completedAt).toISOString())
+  assert.equal(page.element('#recent-blocking-details').hidden, false)
+  assert.equal(page.element('#recent-blocking-details').open, false)
+  assert.match(page.element('#recent-blocking-evidence').textContent, /\/synthetic\/DSH Workflow/)
 })
 
 test('DSH retains partial observations and summarizes each observed execution once after it ends', async t => {
