@@ -445,10 +445,10 @@
     },
     "stalled_progress": {
       "type": "choice",
-      "instructions": "state.requestId 是核心确认的当前已消费请求锚点；若 instruction 存在，以 instruction.inputRef 的原 taskId、lifecycleId、eventId 定位，局部 eventId 可能重名，facts.sourceRef 保留原拥有节点。event.textRef=request 时原文只在 state.request 提供一份，按原输入引用读取。instruction.origin=delegated 时按子代理实际分工比较，ancestor-limit/user-limit 仅为原拥有节点的用户限制；父代理自行承诺、换话题或 relay 不能取消限制，也不能授予用户权限。其他 input 可能是历史补采、已接受入箱或 notice，不能替换当前请求。只判断所提供观察窗口内的证据。正常的记录淘汰、摘录和预算选材不等于本项证据不足；关键请求、操作、结果或来源缺失时才选择 unknown，不用其他项目的缺口替代本项判断。在本轮当前请求范围内，是否已有足够证据显示近期持续活动却没有可核对的推进或新增诊断？正常调查和 TDD 初次红灯不算推进不足。仅无完成声明不足以支持 attention。",
+      "instructions": "state.requestId 是核心确认的当前已消费请求锚点；若 instruction 存在，以 instruction.inputRef 的原 taskId、lifecycleId、eventId 定位，局部 eventId 可能重名，facts.sourceRef 保留原拥有节点。event.textRef=request 时原文只在 state.request 提供一份，按原输入引用读取。instruction.origin=delegated 时按子代理实际分工比较，ancestor-limit/user-limit 仅为原拥有节点的用户限制；父代理自行承诺、换话题或 relay 不能取消限制，也不能授予用户权限。其他 input 可能是历史补采、已接受入箱或 notice，不能替换当前请求。只判断所提供观察窗口内的证据。正常的记录淘汰、摘录和预算选材不等于本项证据不足；关键请求、操作、结果或来源缺失时才选择 unknown，不用其他项目的缺口替代本项判断。在本轮当前请求范围内，是否已有足够证据显示近期持续活动却没有可核对的推进或新增诊断？必须比较至少两轮活动及实际结果，指出重复了什么、期间为何没有新增事实；不能仅凭调用次数、耗时或任务未完成选择 attention。核对依赖或引用关系、排除占用、确定保留范围、清理预检等得到新的可核对事实，都属于推进；不要求已经修改文件或完成清理。必须核对原始观察结果，facts 未选择 progress/diagnosis 不代表没有推进。正常调查和 TDD 初次红灯不算推进不足。",
       "criteria": {
-        "attention": "当前目标和已有材料明确；近期多次活动只重复已有信息，没有新的产物变化、可核对结果或新增诊断。",
-        "clear": "近期活动产生了新的可核对结果或诊断，或实现与定点验证正在收敛。调查获得新根因证据就是推进，不要求先完成最终修复。",
+        "attention": "当前目标明确，至少两轮可比较的活动及实际结果表明只重复已有信息，期间没有新的产物变化、可核对事实或新增诊断。尚未实施最终动作或没有完成声明均不足以支持此结论。",
+        "clear": "近期活动产生了新的可核对事实、结果或诊断，或实现与定点验证正在收敛。依赖核查、排除风险、明确清理范围及预检得到新事实就是推进，不要求先完成最终修复或删除。",
         "unknown": "当前请求、活动或结果的采集范围缺失，无法比较是否有新增证据。任务尚未完成本身不是采集缺口。"
       }
     },

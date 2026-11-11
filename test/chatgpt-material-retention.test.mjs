@@ -243,7 +243,7 @@ async function controlledModels(t, choice = 'clear') {
     requests.push({ path: req.url, body: decoded })
     res.setHeader('content-type', 'application/json')
     if (req.url === '/v1/chat/completions') res.end(JSON.stringify({ model: 'extractor', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(withModelSummary(body, { selectedOptionIds: [], gaps: [] })) } }] }))
-    else res.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(decoded.questions).map(id => [id, { type: 'choice', choice }])) }))
+    else res.end(JSON.stringify({ model: 'judge', answers: Object.fromEntries(Object.keys(decoded.questions).map(id => [id, { type: 'choice', choice: typeof choice === 'function' ? choice(id) : choice }])) }))
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) })
@@ -258,6 +258,46 @@ async function settled(f, ids) {
   }
   assert.fail('controlled analysis did not settle')
 }
+
+test('an unconfirmed old progress alert retains its scope and result evidence until relevant recovery', async t => {
+  let choice = 'attention'
+  const f = await fixture(t, [{ id: 'main', turn: 'cleanup', text: '清理旧构建产物，保留仍在使用的文件', outputs: 2 }])
+  const models = await controlledModels(t, id => id === 'stalled_progress' || id === 'recover_stalled_progress' ? choice : 'unknown')
+  await configureInstallationModels(f.core, 'chatgpt:material-retention', models.config)
+  await f.core.pause(); await f.start(); await f.read('main')
+  const actor = (await f.core.snapshot()).tasks.find(task => task.id === 'main')
+  const evidence = (id, kind, text) => ({ id, kind, text, taskId: actor.id, taskLifecycleId: actor.lifecycleId, capturedAt: f.now(), occurredAt: f.now(), data: { callId: id, exitCode: 0 } })
+  await f.core.ingest(actor.sourceKey, { events: [evidence('references', 'tool-result', '当前构建清单引用了 12 份制品'), evidence('processes', 'tool-result', '没有运行进程引用构建目录')] })
+  await f.core.resume(); await settled(f, [['main', 'cleanup']])
+  let view = await f.read('main'), issue = view.analysis.issues.find(issue => issue.checkId === 'stalled_progress')
+  assert.ok(issue)
+  assert.equal(issue.assessment, 'current')
+  assert.deepEqual(issue.evidence.map(item => item.text), ['当前构建清单引用了 12 份制品', '没有运行进程引用构建目录'])
+  const judgedAt = issue.observedAt, through = issue.evidenceThrough
+
+  choice = 'unknown'; f.advance(60001)
+  await f.core.ingest(actor.sourceKey, { events: [evidence('preflight', 'tool-result', '预检通过：35 个旧 App，保留 12 份制品')] })
+  await settled(f, [['main', 'cleanup']])
+  view = await f.read('main'); issue = view.analysis.issues.find(issue => issue.checkId === 'stalled_progress')
+  assert.equal(view.analysis.checks.find(check => check.id === 'stalled_progress').status, 'unknown')
+  assert.equal(issue.assessment, 'retained', 'unknown does not present the old alert as a new judgment')
+  assert.match(view.summary, /历史告警.*复核/)
+  assert.equal(issue.observedAt, judgedAt)
+  assert.equal(issue.evidenceThrough, through)
+  assert.ok(!issue.evidence.some(item => item.text.includes('预检通过')), 'later evidence cannot be attributed to the old alert')
+  const current = (await f.core.snapshot()).tasks.find(task => task.id === 'main')
+  assert.equal(current.alerts.find(alert => alert.checkId === 'stalled_progress').status, 'attention', 'unknown does not fabricate recovery')
+  const page = await panelHarness(t); await page.deliver(view)
+  assert.match(page.element('#issues').textContent, /待复核.*本轮尚未确认/s)
+  assert.match(page.element('#issues').textContent, /原告警/)
+
+  choice = 'clear'; f.advance(60001)
+  await f.core.ingest(actor.sourceKey, { events: [evidence('cleanup-result', 'tool-result', '已删除旧产物，保留清单核验通过')] })
+  await settled(f, [['main', 'cleanup']])
+  view = await f.read('main')
+  assert.ok(!view.analysis.issues.some(issue => issue.checkId === 'stalled_progress'))
+  assert.equal((await f.core.snapshot()).tasks.find(task => task.id === 'main').alerts.find(alert => alert.checkId === 'stalled_progress').status, 'recovered')
+})
 
 test('a historical execution retains the grounded problem and its own inline evidence after task alerts stop', async t => {
   const f = await fixture(t, [{ id: 'main', turn: 'prior-alert', text: 'Read the log only' }]), models = await controlledModels(t, 'attention')

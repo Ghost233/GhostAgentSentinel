@@ -271,7 +271,12 @@ function render(view){
     const rows=[];
     if(target==='detail-issues'||!view.execution?.historical)for(const issue of issues){
       if(!issue||!text(issue.reason))continue;
-      const article=node('article',null,'issue');article.append(node('h2',labels[issue.checkId]??'需要关注'));
+      const retained=issue.assessment==='retained',article=node('article',null,'issue');article.append(node('h2',(retained?'待复核：':'')+(labels[issue.checkId]??'需要关注')));
+      if(retained){
+        article.append(node('p','原告警保留 · 本轮尚未确认','muted'));
+        if(Number.isFinite(issue.observedAt)){const at=node('time','原告警判断时间：'+new Date(issue.observedAt).toLocaleString(),'muted');at.dateTime=new Date(issue.observedAt).toISOString();article.append(at);}
+        if(text(issue.reviewReason))article.append(node('p',text(issue.reviewReason),'muted'));
+      }
       if(target==='issues'||text(issue.reason)!==summary)article.append(node('p',text(issue.reason)));
       const delivery=({pending:'等待通知',claimed:'通知投递中',submitted:'通知已提交',failed:'通知提交失败',cancelled:'通知已取消',expired:'通知结果未确认'})[issue.notificationStatus];
       if(delivery)article.append(node('small',delivery,'muted'));

@@ -57,6 +57,22 @@ test('details stay directly readable across refresh, transport failure and chat 
 })
 const material = (id = 'main-a', signal = 'red') => ({ ...result(id), signal, summary: '当前修改可能偏离请求', analysis: { connected: true, state: 'cooldown', resultDisposition: 'current', summary: '本轮六项检查已更新', waitMs: 0, lagMs: 2500, coverage: { complete: true, gaps: [] }, checks: ids.map(checkId => ({ id: checkId, status: checkId === 'request_drift' ? 'attention' : 'clear', reason: '已核对现有材料' })), issues: [{ checkId: 'request_drift', reason: '用户只要求改文字，代理却更改了数据层', evidence: [{ text: '<img src=x onerror="alert(1)"> 只改按钮文字', reference: 'record:private-evidence-id' }] }] }, discovery: { complete: false, directoryComplete: true, counts: { main: 3, fork: 1, child: 2, remote: 0, cloud: 0, unknown: 1 }, tracked: 3, connected: 1, currentIncluded: true, gaps: ['fork-coverage-pending'] } })
 
+test('retained alerts identify the original judgment and pending review without claiming recovery', async t => {
+  const page = await harness(t), view = material(), observedAt = Date.now() - 60000
+  view.analysis.issues[0] = { ...view.analysis.issues[0], assessment: 'retained', observedAt, reviewReason: '本轮材料超过判断预算，尚未确认原疑点是否仍存在' }
+  await page.deliver(view)
+  for (const target of ['issues', 'detail-issues']) {
+    const issue = page.element('#' + target).children[0]
+    assert.match(issue.textContent, /待复核/)
+    assert.match(issue.textContent, /原告警.*本轮尚未确认/s)
+    assert.match(issue.textContent, /材料超过判断预算/)
+    assert.ok(issue.children.some(child => child.tagName === 'TIME' && child.dateTime === new Date(observedAt).toISOString()))
+    assert.doesNotMatch(issue.textContent, /已恢复|已解决/)
+  }
+  await page.refresh(); await page.deliver({ ...view, analysis: { ...view.analysis, issues: [{ ...view.analysis.issues[0], assessment: 'current' }] } })
+  assert.doesNotMatch(page.element('#issues').textContent, /待复核|本轮尚未确认/)
+})
+
 test('missing observation data stays visible and refreshes automatically or manually in the same page', async t => {
   const page = await harness(t)
   const waiting = { signal: 'gray', summary: '观察服务尚未就绪，等待数据', observation: { coverage: 'unavailable', gap: 'observer-unavailable' }, analysis: { state: 'unknown', checks: [] } }

@@ -10,7 +10,7 @@ import { startChatGPTAdapter } from '../chatgpt/adapter.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { candidateHostProfile } from '../chatgpt/storage-compatibility.mjs'
 
-for (const missing of ['bounded-summary-generation/1', 'chatgpt-execution-monitoring/1']) test('a private Core missing ' + missing + ' retires naturally and reconnects while the separate DSH Core stays running', async t => {
+for (const missing of ['bounded-summary-generation/1', 'chatgpt-execution-monitoring/1', 'stalled-progress-review/1']) test('a private Core missing ' + missing + ' retires naturally and reconnects while the separate DSH Core stays running', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-core-capability-upgrade-')), dataDir = join(dir, 'codex')
   let old, oldClient, replacement, dsh, dshClient, adapter, retired = false, reads = 0, connections = 0
   const core = createLazyCore({ dataDir, connect: async () => {

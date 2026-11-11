@@ -444,6 +444,22 @@ test('stalled-progress prerequisites do not mechanically alert on insufficient a
   }
 });
 
+test('cleanup investigation sends new safety facts to progress review even without an extracted progress label', async t => {
+  const request = { ...input.events[0], text: '清理 build 文件夹里的旧数据，保留仍在使用的产物' };
+  const observations = [event('audit', 'output', '核对引用与进程占用后再确定清理范围'),
+    event('inspect', 'tool-start', '核对构建清单及进程引用', { callId: 'inspect' }),
+    event('references', 'tool-result', '当前构建清单引用 12 份制品；没有进程引用旧 App', { callId: 'inspect', exitCode: 0 }),
+    event('preflight', 'tool-result', '清理预检通过：35 个旧 App，已确定保留范围', { callId: 'preflight', exitCode: 0 })];
+  const models = await withModels(t, { facts: [{ kind: 'request', eventId: request.id, quote: request.text }], gaps: [] }, { stalled_progress: 'clear' });
+  const result = await models.analyzer().analyze({ ...input, events: [request, ...observations] });
+  const jev = models.requests.find(request => request.path === '/v1/systemone').body;
+  assert.deepEqual(jev.state.events.filter(event => event.kind === 'tool-result').map(event => event.text), observations.filter(event => event.kind === 'tool-result').map(event => event.text));
+  assert.match(jev.questions.stalled_progress.instructions, /至少两轮活动及实际结果/);
+  assert.match(jev.questions.stalled_progress.instructions, /清理预检.*推进/);
+  assert.match(jev.questions.stalled_progress.instructions, /facts 未选择 progress\/diagnosis 不代表没有推进/);
+  assert.equal(result.checks.find(check => check.id === 'stalled_progress').status, 'clear');
+});
+
 test('canonical failures count distinct calls while refinements and interrupted execution do not create failure loops', async t => {
   const actions = [event('act-1', 'output', 'I rerun the failed case'), event('act-2', 'output', 'I rerun after the change')];
   const facts = [{ kind: 'request', eventId: 'request', quote: 'Add a log' }, ...actions.map(item => ({ kind: 'action', eventId: item.id, quote: item.text }))];
