@@ -18,6 +18,7 @@ import { createNativeNotificationStore } from './native-notifications.mjs';
 import { createNativeCaptureProgress } from './native-capture-progress.mjs';
 
 const DAY = 24 * 60 * 60 * 1000;
+const PREFILL_CANCEL_GRACE_MS = 5_000;
 const CLAIM_MS = 60_000;
 const GROUP_MS = 3_000;
 const HIERARCHY_CAPTURE_LIMIT = 10_000;
@@ -128,16 +129,28 @@ export async function createCore({
   try { nativeOrigins = createNativeOriginFences({ db }); } catch (error) { db.close(); throw error; }
   let closed = false;
   const rounds = new Map();
+  const retiredPrefills = new Map();
   const activeRound = taskKey => { const round = rounds.get(taskKey); return round?.cancelled ? null : round; };
-  const cancelledRequests = () => [...rounds.values()].filter(round => round.cancelled).length;
+  const admittedRounds = () => [...rounds.values(), ...retiredPrefills.values()];
+  const cancelledRequests = () => admittedRounds().filter(round => round.cancelled).length;
+  const cancelledPrefill = taskKey => {
+    const round = rounds.get(taskKey);
+    return round?.kind === 'prefill' && Number.isSafeInteger(round.cancelledAt) && Number.isSafeInteger(round.prefillSubmittedAt) ? round : null;
+  };
+  const nextAnalysisAt = task => {
+    const prefill = cancelledPrefill(task.key);
+    const next = task.analysis.nextEligibleAt ?? 0;
+    return prefill ? Math.min(next, prefill.cancelledAt + PREFILL_CANCEL_GRACE_MS) : next;
+  };
   const concurrencyFor = registrationId => installationAnalysisSettings.get(registrationId)?.concurrency ?? 1;
   const inferenceLifetime = new AbortController();
   const analysisAdmission = () => {
     const counts = new Map();
-    for (const round of rounds.values()) counts.set(round.registrationId, (counts.get(round.registrationId) ?? 0) + 1);
+    const admitted = admittedRounds();
+    for (const round of admitted) counts.set(round.registrationId, (counts.get(round.registrationId) ?? 0) + 1);
     const registrations = new Set([...sources.values()].filter(connected).map(source => source.descriptor.registrationId));
     for (const registrationId of counts.keys()) registrations.add(registrationId);
-    return { limit: registrations.size ? [...registrations].reduce((sum, id) => sum + concurrencyFor(id), 0) : 1, unsettledCalls: rounds.size,
+    return { limit: registrations.size ? [...registrations].reduce((sum, id) => sum + concurrencyFor(id), 0) : 1, unsettledCalls: admitted.length,
       blocked: registrations.size > 0 && [...registrations].every(id => (counts.get(id) ?? 0) >= concurrencyFor(id)) };
   };
   let sequence = 0;
@@ -593,11 +606,12 @@ export async function createCore({
 
   function cancelRound(reason, onlyTask, retainTransport = false, persist = true) {
     const error = new Error(reason);
-    for (const round of rounds.values()) {
+    for (const round of admittedRounds()) {
       if (onlyTask && round.taskKey !== onlyTask.key) continue;
       if (!retainTransport) round.transportController.abort(error);
       if (round.cancelled) continue;
       round.cancelled = true;
+      round.cancelledAt ??= now();
       const controller = round.controller;
       // Keep the lane until the provider settles, but release sealed input material now.
       round.input = null;
@@ -1201,6 +1215,8 @@ export async function createCore({
   function completeRound(round, result, error) {
     if (rounds.get(round.taskKey) !== round) return;
     rounds.delete(round.taskKey);
+    const prefill = retiredPrefills.get(round.taskKey);
+    if (prefill) prefill.recoveryState = round.cancelled ? 'interrupted' : 'failed';
     if (round.cancelled) {
       if (!closed) tick();
       return;
@@ -1257,6 +1273,7 @@ export async function createCore({
     }
     const failedCheck = !error && sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1' ? result.checks.find(check => check.judgmentState === 'failed') : null;
     const settledError = error ?? failedCheck?.error ?? (failedCheck ? { code: 'analysis_failed' } : null);
+    if (prefill) prefill.recoveryState = settledError ? 'failed' : 'completed';
     const partial = !settledError && result.summary.partial;
     if (!settledError && (result.summary.generated || partial) && !result.coverage?.dependencies?.length) {
       delete task.analysis.lastUnjudgedSummary;
@@ -1310,6 +1327,11 @@ export async function createCore({
   }
 
   function completePrefill(round, result, error) {
+    if (retiredPrefills.get(round.taskKey) === round) {
+      retiredPrefills.delete(round.taskKey);
+      if (!closed) tick();
+      return;
+    }
     if (rounds.get(round.taskKey) !== round) return;
     rounds.delete(round.taskKey);
     if (round.cancelled) {
@@ -1335,20 +1357,33 @@ export async function createCore({
   function startNext() {
     if (closed || paused) return;
     const counts = new Map();
-    for (const round of rounds.values()) counts.set(round.registrationId, (counts.get(round.registrationId) ?? 0) + 1);
-    const hasRoom = task => !rounds.has(task.key) && (counts.get(sources.get(task.sourceKey).descriptor.registrationId) ?? 0) < concurrencyFor(sources.get(task.sourceKey).descriptor.registrationId);
+    for (const round of admittedRounds()) counts.set(round.registrationId, (counts.get(round.registrationId) ?? 0) + 1);
+    const hasRoom = (task, analysis = false) => {
+      if (retiredPrefills.has(task.key)) return false;
+      if (rounds.has(task.key)) {
+        const prefill = analysis && cancelledPrefill(task.key);
+        if (!prefill || now() < prefill.cancelledAt + PREFILL_CANCEL_GRACE_MS) return false;
+      }
+      const registrationId = sources.get(task.sourceKey).descriptor.registrationId;
+      return (counts.get(registrationId) ?? 0) < concurrencyFor(registrationId);
+    };
     const reserve = round => { rounds.set(round.taskKey, round); counts.set(round.registrationId, (counts.get(round.registrationId) ?? 0) + 1); };
     for (let index = 0; index < queue.length;) {
       const key = queue[index];
       const task = tasks.get(key);
-      if (task && analyzable(task) && !observationOnly(task) && !taskPaused(task) && analyzerFor(task) && now() >= (task.analysis.nextEligibleAt ?? 0) && !hasRoom(task)) { index++; continue; }
+      if (task && analyzable(task) && !observationOnly(task) && !taskPaused(task) && analyzerFor(task) && now() >= nextAnalysisAt(task) && !hasRoom(task, true)) { index++; continue; }
       queue.splice(index, 1);
       queued.delete(key);
       if (!task || !analyzable(task) || observationOnly(task) || taskPaused(task)) continue;
       const currentAnalyzer = analyzerFor(task);
       if (!currentAnalyzer) continue;
-      if (now() < (task.analysis.nextEligibleAt ?? 0)) continue;
+      if (now() < nextAnalysisAt(task)) continue;
+      const prefill = cancelledPrefill(task.key);
       const round = makeRound(task, 'analysis');
+      if (prefill) {
+        if (!prefill.cancelled) cancelRound('Prefill cancellation is still awaiting release', task, true);
+        retiredPrefills.set(task.key, prefill);
+      }
       reserve(round);
       task.analysis.state = 'analyzing';
       task.analysis.startedAt = round.observedAt;
@@ -1373,7 +1408,7 @@ export async function createCore({
         for (const event of [...round.input.events, ...(round.input.instructionContext?.inheritedEvents ?? [])]) expiresAt = Math.min(expiresAt, event.capturedAt + DAY);
         round.summaryRecord = { [field]: summary[field], completedAt, expiresAt, configScope: copy(round.configScope), ...(summary.partial ? { gaps: summaryGaps(coverage) } : {}), ...(round.finalSummary ? { final: true } : {}), judgmentPending };
       };
-      Promise.resolve().then(() => round.cancelled ? null : currentAnalyzer.analyze(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal, lifetimeSignal: inferenceLifetime.signal, onState, onSummary }))
+      Promise.resolve().then(() => round.cancelled ? null : currentAnalyzer.analyze(round.input, { signal: round.controller.signal, transportSignal: round.transportController.signal, lifetimeSignal: inferenceLifetime.signal, onState, onSummary, ...(prefill ? { recoveryCacheId: round.id } : {}) }))
         .then(result => round.cancelled ? null : validateResult(result, round))
         .then(result => completeRound(round, result, null), error => completeRound(round, null, error));
     }
@@ -1390,6 +1425,7 @@ export async function createCore({
       save('tasks', task);
       const onState = state => {
         if (!['prefilling', 'unknown', 'cancel_requested'].includes(state) || closed || round.cancelled || rounds.get(round.taskKey) !== round) return;
+        if (state === 'cancel_requested') round.cancelledAt ??= now();
         const currentTask = tasks.get(round.taskKey);
         if (!currentTask || currentTask.analysis.prefill?.state === state) return;
         currentTask.analysis.prefill = { state, throughRevision: round.revision, updatedAt: now() };
@@ -1462,7 +1498,7 @@ export async function createCore({
         task.analysis.checks = unknownChecks('Inference dependencies are not configured');
         continue;
       }
-      if (current < (task.analysis.nextEligibleAt ?? 0)) continue;
+      if (current < nextAnalysisAt(task)) continue;
       if (task.resultKey === resultKeyFor(task) && task.analysis.summary && !task.analysis.error && task.analysis.completedAt > current - DAY && task.analysis.checks.filter(check => check.status === 'attention').every(check => task.alerts.some(alert => alert.checkId === check.id && alert.requestId === task.requestId && alert.status === 'attention'))) {
         task.analysis.state = 'idle';
         continue;
@@ -1494,7 +1530,7 @@ export async function createCore({
     startNext();
     if (wakeTimer) clearTimeout(wakeTimer);
     wakeTimer = null;
-    const times = Array.from(tasks.values()).filter(task => analyzable(task) && !observationOnly(task) && !taskPaused(task) && task.analysis.nextEligibleAt > current).map(task => task.analysis.nextEligibleAt);
+    const times = Array.from(tasks.values()).filter(task => analyzable(task) && !observationOnly(task) && !taskPaused(task)).map(nextAnalysisAt).filter(at => at > current);
     times.push(...Array.from(notifications.values()).filter(notification => notification.status === 'pending' && notification.readyAt > current).map(notification => notification.readyAt));
     if (times.length > 0) {
       wakeTimer = setTimeout(tick, Math.max(1, Math.min(...times) - current));
@@ -1997,6 +2033,15 @@ export async function createCore({
         value.analysis.resultDisposition = resultDispositionFor(task, instruction, read);
         const summary = availableSummary(task, current, read);
         if (summary) value.analysis.availableSummary = summary;
+        const retired = retiredPrefills.get(task.key);
+        const prefill = retired ?? cancelledPrefill(task.key);
+        if (prefill) {
+          let summaryState = 'waiting';
+          if (retired) summaryState = retired.recoveryState ?? (activeRound(task.key) ? task.analysis.modelState ?? 'generating' : 'interrupted');
+          else if (paused || taskPaused(task)) summaryState = 'paused';
+          else if (current >= prefill.cancelledAt + PREFILL_CANCEL_GRACE_MS && task.analysis.state === 'queued') summaryState = 'queued';
+          value.analysis.prefillRecovery = { summaryState };
+        }
         // Older summaries stored the raw evidence excerpt as the reason.
         for (const record of [value.analysis.summary, value.analysis.lastSuccessfulSummary, value.analysis.lastPartialSummary, value.analysis.lastUnjudgedSummary, summary]) {
           const decision = (record?.generated ?? record?.partial)?.blocking;

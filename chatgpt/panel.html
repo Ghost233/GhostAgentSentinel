@@ -40,6 +40,7 @@
 <details id="recent-blocking-details" hidden><summary>查看判断依据</summary><div id="recent-blocking-evidence"></div></details>
 <section id="recent-model-activity" aria-label="本聊天最近的预填和总结">
   <div class="recent-model-row"><strong>上次送预填</strong><div class="recent-model-value"><time id="recent-prefill-time" hidden></time><span id="recent-prefill-state" class="recent-model-badge">待核对</span></div></div>
+  <p id="recent-prefill-recovery" class="muted" role="status" hidden></p>
   <div class="recent-model-row" id="recent-summary-row"><strong>上次总结</strong><div class="recent-model-value"><span id="recent-summary-state" class="recent-model-badge" hidden></span></div></div>
   <div id="recent-summary-text" class="summary-body muted">等待核对当前聊天</div><p id="recent-summary-gaps" class="muted" hidden></p>
   <p id="recent-model-status" class="muted" role="status" hidden></p>
@@ -106,6 +107,7 @@ const text=(value,max=240)=>typeof value==='string'?value.trim().slice(0,max):''
 const list=value=>Array.isArray(value)?value:[];
 const count=value=>Number.isSafeInteger(value)&&value>=0?String(value):'—';
 const prefillStates={prefilling:['预填中','waiting'],completed:['已完成','ok'],failed:['失败','failed'],unknown:['状态未确认','waiting'],cancel_requested:['取消中','waiting'],cancelled:['已取消',''],unsupported:['当前模型不支持',''],unconfirmed:['预填支持未确认',''],'time-unrecorded':['发送时间未记录','']};
+const recoveryStates={waiting:'新总结等待重试',queued:'新总结等待并发名额',generating:'新总结生成中',judging:'新总结正在判断',unknown:'新总结状态待确认',cancel_requested:'新总结正在取消',completed:'补跑已结束',failed:'补跑失败',interrupted:'补跑已中断',paused:'分析已暂停'};
 const summaryTimeFormat=new Intl.DateTimeFormat(undefined,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
 const gapDescriptions={'Current user request is unverified':'当前请求尚未核实，执行活动继续监控',current_request_evidence_missing:'缺少当前请求证据',current_request_text_missing:'缺少当前请求正文','Older native records were removed at the capture limit':'达到采集留存上限，较旧记录已移出观察窗口','未识别原生响应材料类型：additional_tools':'旧版工具目录提示，已按声明元数据处理',no_applicable_semantic_checks:'本次观察未触发语义检查','tool-result-image-omitted':'图片未纳入文本观察',analysis_evidence_budget:'本轮仅使用预算内的部分记录',judgment_evidence_budget:'JEV 使用预算内的部分记录',event_excerpt_or_capture_gap:'部分记录截断或存在采集缺口','Some observed excerpts are truncated':'部分记录截断','Some observed content was omitted for privacy':'敏感内容已省略',native_file_change_contents_unverified:'文件变更正文未完整核实',capture_coverage_unconfirmed:'采集覆盖未完整确认',analysis_input_budget:'判断材料超过预算',judgment_evidence_insufficient:'判断执行活动的证据不足',extraction_evidence_gap:'模型提取的证据存在缺口'};
 function summaryGaps(gaps){
@@ -126,6 +128,10 @@ function renderRecentModelActivity(activity,retained=false,revalidating=false){
   write('recent-prefill-state',label);
   attribute('recent-prefill-state','data-tone',tone);
   time('recent-prefill-time',prefill?.submittedAt);
+  const recovery=activity?.prefillRecovery;
+  const recoveryLabel=Object.hasOwn(recoveryStates,recovery?.summaryState)?recoveryStates[recovery.summaryState]:'';
+  show('recent-prefill-recovery',Boolean(recoveryLabel));
+  write('recent-prefill-recovery',recoveryLabel?'旧预填待释放 · '+recoveryLabel:'');
   const valid=recent(summary?.completedAt)&&summary.expiresAt>now&&Boolean(text(summary.text,Infinity));
   show('recent-summary-state',valid);write('recent-summary-state',valid?(summary.final?'已收尾':'已总结'):'');
   attribute('recent-summary-state','data-tone','ok');
@@ -138,7 +144,7 @@ function renderRecentModelActivity(activity,retained=false,revalidating=false){
   show('recent-summary-gaps',missing.length>0);write('recent-summary-gaps',missing.length?'观察范围与说明 · '+missing.join('、'):'');
   const showRetained=retained&&Boolean(valid||validPrefill);
   show('recent-model-status',showRetained);write('recent-model-status',showRetained?'本次未能更新 · 显示上次读取':'');
-  return activity?{prefill:validPrefill?prefill:null,summary:valid?summary:null}:null;
+  return activity?{prefill:validPrefill?prefill:null,summary:valid?summary:null,prefillRecovery:recovery}:null;
 }
 let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false,controlState=null,scopeThreadId=null,selectedExecutionKey=null,historyCursor=null,nextHistoryCursor=null,recentActivity=null;
 const pending=new Map();

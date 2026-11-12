@@ -52,6 +52,17 @@ test('history details never count the selected old execution as the current main
   assert.match(page.element('#summary').textContent, /历史执行/)
 })
 
+test('the panel separates pending prefill release from its replacement summary and clears the status after release', async t => {
+  const page = await panelHarness(t), current = view()
+  current.recentModelActivity = { prefill: { state: 'cancelled' }, prefillRecovery: { summaryState: 'generating' } }
+  await page.deliver(current)
+  assert.equal(page.element('#recent-prefill-recovery').textContent, '旧预填待释放 · 新总结生成中')
+  assert.equal(page.element('#recent-prefill-recovery').hidden, false)
+  delete current.recentModelActivity.prefillRecovery
+  await page.refresh(); await page.deliver(current)
+  assert.equal(page.element('#recent-prefill-recovery').hidden, true)
+})
+
 test('host resource teardown cancels the outstanding monitor read and releases every refresh handle', async t => {
   const page = await panelHarness(t), activeRead = page.sent.findLast(row => row.params?.name === 'sentinel_current_chat')
   const receive = page.handlers.get('message')

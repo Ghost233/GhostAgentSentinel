@@ -80,7 +80,7 @@ export function createAnalyzer(config = {}) {
     if (prefill) return { state: 'completed', receipt: operation.snapshot() };
     return { payload: response, receipt: operation.snapshot() };
   }
-  async function runAnalysis(input, { signal, transportSignal, lifetimeSignal, onState, onSubmitted, onSummary } = {}, prewarming = false) {
+  async function runAnalysis(input, { signal, transportSignal, lifetimeSignal, onState, onSubmitted, onSummary, recoveryCacheId } = {}, prewarming = false) {
       if (lifetimeSignal) {
         signal = signal ? AbortSignal.any([signal, lifetimeSignal]) : lifetimeSignal;
         if (transportSignal) transportSignal = AbortSignal.any([transportSignal, lifetimeSignal]);
@@ -158,8 +158,10 @@ export function createAnalyzer(config = {}) {
       }
       const options = { signal, transportSignal, lifetimeSignal, onState, onSubmitted };
       const llmCapability = await modelCapability('llm', options);
+      if (recoveryCacheId && !llmCapability.supported) throw new AnalysisError('prefill_recovery_unavailable', 'llm', '无法确认推理服务支持独立缓存，暂不能补跑');
       const generation = llmCapability.supported ? { thinking_token_budget: 0 } : {};
       const managed = llmCapability.supported ? { ...generation, cache_salt: modelCacheSalt('llm', input, generation) } : {};
+      if (recoveryCacheId) managed.cache_salt = 'sentinel:' + digest(JSON.stringify(['cancelled-prefill-recovery/1', managed.cache_salt, recoveryCacheId]));
       const required = new Set([...inherited, ...(latestInput ? [latestInput] : [])].map(event => referenceKey(eventRef(event))));
       let analysisEvents = evidenceWindow(events, required, SUMMARY_EVIDENCE_LIMIT);
       if (analysisEvents.length < events.length) {
@@ -206,7 +208,7 @@ export function createAnalyzer(config = {}) {
         return prewarming ? { state: 'skipped' } : result;
       }
       if (prewarming) return modelRequest('llm', input, llmRequest, options, true, llmCapability);
-      const summaryCache = {}, sections = [], selections = new Set(), extractionGaps = new Set(), usage = {};
+      const summaryCache = recoveryCacheId ? { salt: managed.cache_salt } : {}, sections = [], selections = new Set(), extractionGaps = new Set(), usage = {};
       let llmReceipt;
       for (const [index, question] of summaryQuestions.entries()) {
         signal?.throwIfAborted();

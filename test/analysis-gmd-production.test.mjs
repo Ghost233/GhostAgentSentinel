@@ -134,9 +134,24 @@ test('managed summary prefill and generation bound thinking before publishing a 
   assert.ok(result.usage.gmd.llm.lease_released);
 });
 
+test('a cancelled-prefill replacement uses one independent cache for all three summary requests', async t => {
+  const f = await fixture(t);
+  await f.analyzer.prefill(observation, f.options);
+  const result = await f.analyzer.analyze(observation, { ...f.options, recoveryCacheId: 'isolated-round' });
+  assert.ok(result.summary.generated);
+  const [prefill, ...generations] = f.requests.filter(request => request.body.model === 'summary');
+  assert.equal(generations.length, 3);
+  const salts = generations.map(request => request.body.cache_salt);
+  assert.equal(new Set(salts).size, 1);
+  assert.notEqual(salts[0], prefill.body.cache_salt);
+  assert.equal(f.requests.filter(request => request.path === '/v1/systemone').length, 1);
+});
+
 test('an undeclared prefill provider retains the existing two-model analysis without zero-budget calls', async t => {
   const f = await fixture(t, { supported: false });
   assert.equal((await f.analyzer.prefill(observation, f.options)).state, 'unsupported');
+  assert.equal(f.requests.length, 0);
+  await assert.rejects(f.analyzer.analyze(observation, { ...f.options, recoveryCacheId: 'isolated-round' }), { code: 'prefill_recovery_unavailable' });
   assert.equal(f.requests.length, 0);
   const result = await f.analyzer.analyze(observation, f.options);
   assert.ok(result.summary.generated);

@@ -16,10 +16,11 @@ async function fixture(t) {
   let clock = 2_000_000;
   const calls = [];
   const pending = [];
+  let analysisGate;
   const result = input => ({ summary: { currentTask: input.task.currentRequest, currentState: 'Observed', recentProgress: '', attention: '' }, checks: checks.map(id => ({ id, status: 'unknown', reason: 'Test evidence', evidenceIds: [] })), coverage: input.coverage });
   const analyzer = {
     timeConditions() { return []; },
-    async analyze(input) { calls.push({ kind: 'analysis', input }); return result(input); },
+    async analyze(input, options) { calls.push({ kind: 'analysis', input, recoveryCacheId: options.recoveryCacheId }); if (analysisGate) await analysisGate; return result(input); },
     prefill(input, options) {
       calls.push({ kind: 'prefill', input, signal: options.signal, onState: options.onState, onSubmitted: options.onSubmitted });
       return new Promise((resolve, reject) => pending.push({ resolve: () => resolve({ state: 'completed' }), reject }));
@@ -34,7 +35,11 @@ async function fixture(t) {
     await until(() => calls.filter(call => call.kind === 'analysis').length === ids.length);
     await until(async () => (await core.diagnostics()).runtime.activeAnalyses === 0);
   };
-  return { core, calls, pending, start, observe, advance(ms) { clock += ms; }, get clock() { return clock; } };
+  return { core, calls, pending, start, observe, holdAnalysis() {
+    const { promise, resolve } = Promise.withResolvers();
+    analysisGate = promise;
+    return () => { analysisGate = undefined; resolve(); };
+  }, advance(ms) { clock += ms; }, get clock() { return clock; } };
 }
 
 test('ready complete analyses precede queued prefill without interrupting an active prefill', async t => {
@@ -94,6 +99,47 @@ test('pause cancels its prefill but retains admission until the controlled call 
   assert.equal(f.calls[2].kind, 'prefill');
 });
 
+test('an unresolved submitted prefill keeps its slot and permits one isolated summary after five seconds', async t => {
+  const f = await fixture(t);
+  await f.start(['a']);
+  await f.observe('a', 'first activity');
+  await until(() => f.pending.length === 1);
+  f.calls[1].onSubmitted();
+  await f.core.pause();
+  await f.observe('a', 'latest activity');
+  await f.core.resume();
+  await f.core.configureInstallationScheduling('desktop', { concurrency: 2 });
+  f.advance(4998);
+  await f.core.snapshot();
+  assert.equal(f.calls.length, 2);
+  await f.core.configureInstallationScheduling('desktop', { concurrency: 1 });
+  f.advance(1);
+  await f.core.snapshot();
+  assert.equal(f.calls.length, 2, 'the old operation still occupies the only slot');
+  const release = f.holdAnalysis();
+  t.after(release);
+  await f.core.configureInstallationScheduling('desktop', { concurrency: 2 });
+  await until(() => f.calls.length === 3);
+  const during = (await f.core.diagnostics()).runtime;
+  assert.equal(during.unsettledAnalysisCalls, 2);
+  assert.equal(during.analysisAdmissionBlocked, true);
+  assert.equal(f.calls[2].kind, 'analysis');
+  assert.ok(f.calls[2].recoveryCacheId);
+  assert.equal(f.calls[2].input.events.at(-1).id, 'latest activity');
+  assert.equal((await f.core.diagnostics()).runtime.cancelledUnsettledRequests, 1);
+  assert.equal((await f.core.snapshot()).tasks[0].analysis.prefillRecovery.summaryState, 'generating');
+  release();
+  await until(async () => (await f.core.snapshot()).tasks[0].analysis.prefillRecovery?.summaryState === 'completed');
+  await f.observe('a', 'another update');
+  f.advance(60_000);
+  await f.core.snapshot();
+  assert.equal(f.calls.length, 3, 'the unresolved prefill permits only one isolated summary');
+  f.pending.shift().resolve();
+  await until(() => f.calls.length === 4);
+  assert.equal(f.calls[3].recoveryCacheId, undefined);
+  assert.equal((await f.core.snapshot()).tasks[0].analysis.prefillRecovery, undefined);
+});
+
 test('settled prefill failure backs off without changing the successful analysis or spinning on new material', async t => {
   const f = await fixture(t);
   await f.start(['a']);
@@ -109,6 +155,24 @@ test('settled prefill failure backs off without changing the successful analysis
   assert.deepEqual(after.summary, before.summary);
   assert.equal(after.nextEligibleAt, before.nextEligibleAt);
   assert.equal(after.prefill.state, 'failed');
+});
+
+test('provider-initiated prefill cancellation also permits one isolated summary after the grace period', async t => {
+  const f = await fixture(t);
+  await f.core.configureInstallationScheduling('desktop', { concurrency: 2 });
+  await f.start(['a']);
+  await f.observe('a', 'latest activity');
+  await until(() => f.pending.length === 1);
+  const old = f.calls[1];
+  old.onSubmitted();
+  old.onState('cancel_requested');
+  old.onState('unknown');
+  f.advance(5000);
+  await f.core.snapshot();
+  await until(() => f.calls.length === 3);
+  assert.ok(f.calls[2].recoveryCacheId);
+  assert.equal(old.signal.aborted, true);
+  assert.equal((await f.core.diagnostics()).runtime.cancelledUnsettledRequests, 1);
 });
 
 test('closing releases pending prefill versions and seals a late in-flight completion', async t => {

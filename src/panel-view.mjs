@@ -93,6 +93,7 @@ export function recentModelActivity(chatTasks, currentTask, registrationId, read
     if (attempt.state === 'unsupported') prefill = { state: attempt.reason === 'not-supported' ? 'unsupported' : 'unconfirmed' }
     if (attempt.state === 'completed') prefill = { state: 'time-unrecorded' }
   }
-  return { prefill, summary }
+  const prefillRecovery = currentTask?.analysis.prefillRecovery
+  return { prefill, summary, ...(prefillRecovery ? { prefillRecovery } : {}) }
 }
 
