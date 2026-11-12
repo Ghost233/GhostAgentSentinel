@@ -94,7 +94,7 @@ test('GitHub normal and test panels have separate names through the public MCP r
     assert.equal(monitor.title, displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查')
     const resource = await page.rpc('resources/read', { uri: monitor._meta.ui.resourceUri })
     assert.ok(resource.contents[0].text.includes('<title>' + (displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查') + '</title>'))
-    assert.ok(resource.contents[0].text.includes('<h1>' + displayName + ' · 当前会话</h1>'))
+    assert.ok(resource.contents[0].text.includes('<h1>Sentinel · 当前会话</h1>'))
   }
 })
 

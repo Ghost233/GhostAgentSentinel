@@ -103,6 +103,43 @@ export function recentModelActivity(chatTasks, currentTask, registrationId, read
 
 const SESSION_HISTORY_MS = 86_400_000
 
+export function projectPanelOverview(sources, tasks, hierarchy, offset = 0) {
+  const counts = { green: 0, yellow: 0, red: 0, gray: 0 }
+  const tasksByKey = new Map(tasks.map(task => [task.key, task]))
+  const sourceByKey = new Map(sources.map(source => [source.key, source]))
+  const grouped = new Set()
+  const rows = []
+  const rank = value => value.red ? 0 : value.yellow ? 1 : value.gray ? 2 : value.green ? 3 : 4
+  function addRow(items, main, tally, complete) {
+    for (const color of Object.keys(counts)) counts[color] += tally[color] ?? 0
+    const source = sourceByKey.get(main.sourceKey)
+    const attention = items.find(task => task.gs.light === 'red') ?? items.find(task => task.gs.light === 'yellow') ?? main
+    rows.push({ title: main.title?.slice(0, 240) || '未命名会话', source: source.descriptor.name.slice(0, 160), connected: source.status === 'connected',
+      status: main.status, counts: tally, complete, reason: attention.gs.reason?.slice(0, 240), updatedAt: main.lastActivity ?? main.updatedAt })
+  }
+  for (const group of hierarchy.groups) {
+    const items = group.nodes.map(node => tasksByKey.get(node.taskKey)).filter(Boolean)
+    if (!items.length) continue
+    for (const task of items) grouped.add(task.key)
+    const main = items.find(task => task.sessionId === group.rootSessionId) ?? items[0]
+    addRow(items, main, group.counts, group.coverage.complete)
+  }
+  const remaining = new Map()
+  for (const task of tasks) {
+    if (grouped.has(task.key)) continue
+    const key = JSON.stringify([task.sourceKey, task.sessionId ?? task.id])
+    const previous = remaining.get(key)
+    if (!previous || (task.gs.active && !previous.gs.active) || task.gs.active === previous.gs.active && task.updatedAt > previous.updatedAt) remaining.set(key, task)
+  }
+  for (const task of remaining.values()) {
+    const color = task.gs.active ? task.gs.light : null
+    addRow([task], task, Object.hasOwn(counts, color) ? { [color]: 1 } : {}, task.gs.coverage.complete)
+  }
+  rows.sort((a, b) => rank(a.counts) - rank(b.counts) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || a.title.localeCompare(b.title))
+  const page = rows.slice(offset, offset + 30)
+  return { counts, total: rows.length, rows: page, offset, nextOffset: offset + page.length < rows.length ? offset + page.length : null }
+}
+
 export function projectDSHSessionPanel(snapshot, sourceKey, sessionId, selection = {}, readEvidence) {
   if ((selection.executionKey || selection.historyCursor) && selection.expectedThreadId !== sessionId) throw new Error('历史检查的会话身份已变化')
   const source = snapshot.sources.find(value => value.key === sourceKey)

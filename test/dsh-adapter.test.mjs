@@ -2,9 +2,10 @@ import { req } from './dsh-native-runtime.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createAdapter } from '../dsh/host.mjs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createServer } from 'node:http'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 
@@ -228,6 +229,50 @@ test('transport reconnect preserves captured time and Host identity; reloading t
   assert.equal(current.lifecycleId, firstTask.lifecycleId)
   assert.equal(f.records.sources[2].hostRunId, firstSource.hostRunId)
   assert.ok(current.gaps.some(reason => reason.includes('断档')))
+})
+
+test('an upgraded DSH adapter lets an incompatible Core exit and resumes observation on the replacement', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-upgrade-'))
+  const old = await startServer({ dataDir })
+  let registrations = 0
+  const legacy = createServer((req, res) => {
+    if (req.url === '/v1/health') res.end(JSON.stringify({ protocol: 1, instanceId: old.instanceId, features: [] }))
+    else { if (req.url === '/v1/source/register') registrations++; res.end(JSON.stringify({ error: 'legacy Core must not receive new requests' })) }
+  })
+  await new Promise(resolve => legacy.listen(0, '127.0.0.1', resolve))
+  const runtimePath = join(dataDir, 'runtime.json')
+  const current = await readFile(runtimePath, 'utf8')
+  await writeFile(runtimePath, JSON.stringify({ ...JSON.parse(current), url: `http://127.0.0.1:${legacy.address().port}` }))
+  const attempts = []
+  let replacement
+  const f = await fixture(t, { dataDir, waitForConnection: false, connect: async options => {
+    try { const client = await connectCore(options); attempts.push('connected'); return client }
+    catch (error) { attempts.push(error.code); throw error }
+  } })
+  t.after(async () => {
+    await f.remove()
+    await old.close()
+    await replacement?.close()
+    await new Promise(resolve => legacy.close(resolve))
+    await rm(dataDir, { recursive: true, force: true })
+  })
+  await f.install()
+  await until(() => attempts.length > 0)
+  assert.deepEqual(attempts, ['dsh_core_upgrade_pending'])
+  assert.equal(registrations, 0)
+  assert.match((await f.service.snapshot()).adapter.error, /等待旧 Core/)
+  await old.close()
+  replacement = await startServer({ dataDir })
+  assert.notEqual(replacement.instanceId, old.instanceId)
+  await until(() => f.service.connected)
+  await f.create('upgraded-session')
+  let observed
+  for (let attempt = 0; attempt < 100 && !observed; attempt++) {
+    const view = await f.service.sessionPanel('upgraded-session', {})
+    observed = view.history.executions.length > 0
+    if (!observed) await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  assert.equal(observed, true)
 })
 
 test('independent native Hosts with identical local Agent IDs remain separate sources and lifecycles', async t => {

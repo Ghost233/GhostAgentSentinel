@@ -13,7 +13,7 @@ import { materialView, recentModelActivity } from '../src/panel-view.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
-import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_EXECUTION_MONITORING_FEATURE, STALLED_PROGRESS_REVIEW_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, EXECUTION_SUMMARY_LEVELS_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, EXECUTION_BLOCKING_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE } from '../src/protocol.mjs'
+import { CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_EXECUTION_MONITORING_FEATURE, STALLED_PROGRESS_REVIEW_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, EXECUTION_SUMMARY_LEVELS_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, EXECUTION_BLOCKING_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE, PANEL_OVERVIEW_FEATURE } from '../src/protocol.mjs'
 import { FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, FORK_COMPRESSION_FEATURE } from '../src/fork-proof.mjs'
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -124,7 +124,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
   }
   const capability = async () => {
     const health = await core.health(), features = health.features
-    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_EXECUTION_MONITORING_FEATURE, STALLED_PROGRESS_REVIEW_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, EXECUTION_SUMMARY_LEVELS_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, EXECUTION_BLOCKING_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
+    const required = collectMaterials ? [...(nativeOriginVersion === 2 ? [FORK_COMPRESSION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_EXECUTION_MONITORING_FEATURE, STALLED_PROGRESS_REVIEW_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, EXECUTION_SUMMARY_LEVELS_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, EXECUTION_BLOCKING_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE, PANEL_OVERVIEW_FEATURE] : []), 'source-observation/1', 'chatgpt-main/1', 'chatgpt-fork-context/1', FORK_STORAGE_FEATURE, FORK_LINEAGE_FEATURE, FORK_LEGACY_FEATURE, 'hierarchy-context/1', 'conversation-monitoring/1', 'monitoring-failures/1'] : ['source-observation/1']
     required.push(CHATGPT_INSTALLATION_PURGE_FEATURE, CHATGPT_RETENTION_MAINTENANCE_FEATURE)
     if (delivery || initialEnrollmentBaseline) required.push('monitoring-initial-enrollment-rollup/1')
     if (delivery) required.push('monitoring-notifications/1', RECOVERY_ROLLUP_FEATURE)
@@ -538,7 +538,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       failureStage = 'core-connection'
       const supported = await capability()
       if (closed || epoch !== sourceEpoch) return
-      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_EXECUTION_MONITORING_FEATURE, STALLED_PROGRESS_REVIEW_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, EXECUTION_SUMMARY_LEVELS_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, EXECUTION_BLOCKING_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
+      if (!supported.available) { await stopSource(supported.missingFeatures.every(feature => [RECOVERY_ROLLUP_FEATURE, PARTIAL_SUMMARY_FEATURE, BOUNDED_SUMMARY_GENERATION_FEATURE, NATIVE_CAPTURE_LIVE_BUDGET_FEATURE, NATIVE_CAPTURE_PRIORITY_FEATURE, NATIVE_CAPTURE_CHAT_LIMIT_FEATURE, CHECK_EVIDENCE_FEATURE, CHATGPT_EXECUTION_MONITORING_FEATURE, STALLED_PROGRESS_REVIEW_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, CHATGPT_RECENT_MODEL_ACTIVITY_FEATURE, CHINESE_SUMMARY_PROMPT_FEATURE, EXECUTION_SUMMARY_LEVELS_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, EXECUTION_BLOCKING_FEATURE, GMD_SUMMARY_CACHE_RECOVERY_FEATURE, PANEL_OVERVIEW_FEATURE].includes(feature)) ? 'core-update-required' : 'core-capability-unavailable'); return }
       if (typeof core.installationAnalysisConfig === 'function') applyScheduling(await core.installationAnalysisConfig('chatgpt:' + installationId))
       if (coreInstanceId && supported.instanceId && coreInstanceId !== supported.instanceId) {
         try { await stopSource('core-generation-changed') } catch (error) { if (error.status !== 400) throw error }
@@ -677,7 +677,15 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     }
     return { ...view, history, recentModelActivity: recent, execution: { ...selected.item, request: selected.task.currentRequest.slice(0, 240), historical } }
   }
-  async function read(meta, selection = {}) {
+  async function read(meta, selection = {}, signal) {
+    if (selection.scope === 'overview') {
+      const owner = source, epoch = sourceEpoch
+      const { host, gap } = await qualification()
+      if (closed || gap || !owner || host?.hostRunId !== owner.hostRunId || owner !== source || epoch !== sourceEpoch) return { summary: '观察来源尚未就绪', overview: null }
+      const overview = await core.panelOverview(owner.key, selection.offset ?? 0, signal)
+      if (closed || owner !== source || epoch !== sourceEpoch) return { summary: '观察来源已变化', overview: null }
+      return { summary: '会话总览', overview }
+    }
     const id = requestIdentity(meta)
     if (!id) return decorate(gapView('request-identity-unverified'))
     if ((selection.executionKey || selection.historyCursor) && selection.expectedThreadId !== id) return decorate(gapView('history-scope-unverified'))

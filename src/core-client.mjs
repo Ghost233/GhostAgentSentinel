@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
-import { PROTOCOL, DSH_SESSION_PANEL_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, NOTIFICATION_REVOCATION_FEATURE, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
+import packageManifest from '../package.json' with { type: 'json' }
+import { PROTOCOL, DSH_SESSION_PANEL_FEATURE, PANEL_OVERVIEW_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, NOTIFICATION_REVOCATION_FEATURE, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
 
 export const defaultDataDir = join(homedir(), '.ghost-agent-sentinel')
 
@@ -47,13 +48,21 @@ async function liveRuntime(dataDir, signal) {
     if (runtime.protocol !== PROTOCOL || !/^http:\/\/127\.0\.0\.1:\d+$/.test(runtime.url) || !/^[a-f0-9]{64}$/.test(runtime.token)) return null
     const health = await request(runtime, '/v1/health', undefined, signal)
     if (health.instanceId !== runtime.instanceId || health.protocol !== PROTOCOL) return null
-    return { ...runtime, features: Array.isArray(health.features) ? health.features : [] }
+    return { ...runtime, version: health.version, features: Array.isArray(health.features) ? health.features : [] }
   } catch (error) { signal?.throwIfAborted(); return null }
 }
 
-async function ensureRuntime(dataDir, signal) {
+function compatibleRuntime(runtime, requireDSHCore) {
+  if (!runtime || !requireDSHCore) return runtime
+  if ([DSH_SESSION_PANEL_FEATURE, PANEL_OVERVIEW_FEATURE].every(feature => runtime.features.includes(feature)) && /^\d+\.\d+\.\d+$/.test(runtime.version ?? '') &&
+    runtime.version.localeCompare(packageManifest.version, 'en', { numeric: true }) >= 0) return runtime
+  throw Object.assign(new Error('正在等待旧 Core 退出，Sentinel 将自动连接新版'), { code: 'dsh_core_upgrade_pending' })
+}
+
+async function ensureRuntime(dataDir, signal, requireDSHCore) {
   signal?.throwIfAborted()
-  const existing = await liveRuntime(dataDir, signal)
+  const read = async () => compatibleRuntime(await liveRuntime(dataDir, signal), requireDSHCore)
+  const existing = await read()
   if (existing) return existing
   await mkdir(dataDir, { recursive: true, mode: 0o700 })
   const lock = join(dataDir, 'startup.lock')
@@ -66,7 +75,7 @@ async function ensureRuntime(dataDir, signal) {
     if (owner) {
       try {
         await writeFile(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid }), { mode: 0o600 })
-        const ready = await liveRuntime(dataDir, signal)
+        const ready = await read()
         if (ready) return ready
         const child = spawn(process.execPath, [fileURLToPath(new URL('./daemon.mjs', import.meta.url)), '--serve', '--data-dir', dataDir], { detached: true, stdio: 'ignore', env: process.env })
         let spawnError
@@ -75,7 +84,7 @@ async function ensureRuntime(dataDir, signal) {
         while (Date.now() < deadline) {
           signal?.throwIfAborted()
           if (spawnError) throw spawnError
-          const runtime = await liveRuntime(dataDir, signal)
+          const runtime = await read()
           if (runtime) return runtime
           if (child.exitCode !== null) throw new Error(`core exited during startup (${child.exitCode})`)
           await delay(50, undefined, { signal })
@@ -83,7 +92,7 @@ async function ensureRuntime(dataDir, signal) {
         throw new Error('core startup timed out; run ghost-agent-sentinel --serve for diagnostics')
       } finally { await rm(lock, { recursive: true, force: true }) }
     }
-    const ready = await liveRuntime(dataDir, signal)
+    const ready = await read()
     if (ready) return ready
     try {
       const { pid } = JSON.parse(await readFile(join(lock, 'owner.json'), 'utf8'))
@@ -98,10 +107,10 @@ async function ensureRuntime(dataDir, signal) {
   throw new Error('core startup is busy; reconnect later')
 }
 
-export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
+export async function connectCore({ dataDir = defaultDataDir, signal, requireDSHCore = false } = {}) {
   signal?.throwIfAborted()
   dataDir = resolve(dataDir)
-  const runtime = await ensureRuntime(dataDir, signal)
+  const runtime = await ensureRuntime(dataDir, signal, requireDSHCore)
   let closed = false
   const active = new Map(), tracking = { deadlineTimers: 0 }
   const call = (path, body, requestSignal) => {
@@ -138,6 +147,7 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
     unregisterSource: (sourceKey, reason, requestSignal) => call('/v1/source/unregister', { sourceKey, reason }, requestSignal),
     purgeChatGPTInstallation: (scope, requestSignal) => call('/v1/chatgpt/installation/purge', scope, requestSignal),
     snapshot: requestSignal => call('/v1/snapshot', undefined, requestSignal),
+    panelOverview: (sourceKey, offset, requestSignal) => call('/v1/panel-overview?' + new URLSearchParams({ sourceKey, offset }), undefined, requestSignal),
     ...(runtime.features.includes(DSH_SESSION_PANEL_FEATURE) ? {
       dshSessionPanel: (sourceKey, sessionId, selection, requestSignal) => call('/v1/dsh/session-panel?' + new URLSearchParams({ ...selection, sourceKey, sessionId }), undefined, requestSignal),
     } : {}),

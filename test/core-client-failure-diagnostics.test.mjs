@@ -5,10 +5,11 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
+import packageManifest from '../package.json' with { type: 'json' }
 import { req } from './dsh-native-runtime.mjs'
 import { createAdapter } from '../dsh/host.mjs'
 import { connectCore } from '../src/core-client.mjs'
-import { INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE } from '../src/protocol.mjs'
+import { DSH_SESSION_PANEL_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, NOTIFICATION_REVOCATION_FEATURE, PANEL_OVERVIEW_FEATURE } from '../src/protocol.mjs'
 import { startPanelServer } from '../chatgpt/panel-server.mjs'
 
 const { Context } = req('@deepseek-ai/cordis')
@@ -20,6 +21,7 @@ async function fixture(t, features = []) {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-failure-diagnostics-'))
   const token = randomBytes(32).toString('hex'), instanceId = randomUUID(), ctx = new Context()
   const faults = new Map(), hits = new Map(), held = new Set(), sockets = new Set(), clients = []
+  const panelFeatures = [DSH_SESSION_PANEL_FEATURE, PANEL_OVERVIEW_FEATURE]
   const server = createServer(async (request, response) => {
     for await (const _chunk of request) {}
     assert.equal(request.headers.authorization, `Bearer ${token}`)
@@ -29,7 +31,7 @@ async function fixture(t, features = []) {
     if (fault === 'held') { held.add(response); response.once('close', () => held.delete(response)); return }
     response.setHeader('content-type', 'application/json')
     if (fault) { response.writeHead(fault.status ?? 503); response.end(fault.raw ?? JSON.stringify(fault.body)); return }
-    if (request.url === '/v1/health') response.end(JSON.stringify({ protocol: 1, instanceId, features }))
+    if (request.url === '/v1/health') response.end(JSON.stringify({ protocol: 1, instanceId, version: packageManifest.version, features: [...panelFeatures, ...features] }))
     else if (request.url === '/v1/source/register') response.end(JSON.stringify('owned-source'))
     else if (request.url === '/v1/snapshot') response.end(JSON.stringify({ protocol: 1, generatedAt: Date.now(), monitoring: 'active', sources: [], tasks: [] }))
     else response.end(JSON.stringify({ accepted: 0 }))

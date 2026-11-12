@@ -10,7 +10,7 @@ import { normalizeEnrollment } from '../enrollment-config.mjs';
 import { validateHierarchy, projectHierarchy } from '../hierarchy.mjs';
 import { createInstructionLookup, instructionContext, eventRef, referenceKey } from '../instruction-context.mjs';
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
-import { projectDSHSessionPanel } from '../panel-view.mjs';
+import { projectDSHSessionPanel, projectPanelOverview } from '../panel-view.mjs';
 import { analysisTimeConditions, executionBlockingReason, JEV_EVIDENCE_LIMIT } from '../analysis/index.mjs';
 import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
 import { normalizeAnalysisConfig, normalizeAnalysisScheduling, CHECK_EVIDENCE_FEATURE, DSH_EXECUTION_SUMMARIES_FEATURE, EXECUTION_BLOCKING_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
@@ -1594,6 +1594,15 @@ export async function createCore({
       task.lastActivity = task.gs.silence.since;
     }
   }
+  function projectGSTask(task, read) {
+    const context = contextFor(task, read);
+    return { key: task.key, sourceKey: task.sourceKey, id: task.id, lifecycleId: task.lifecycleId, sessionId: task.sessionId,
+      title: task.title, updatedAt: task.updatedAt, status: task.status, lastKnownStatus: task.lastKnownStatus,
+      currentRequest: task.currentRequest, requestStartedAt: task.requestStartedAt, events: taskEvents(task, read),
+      alerts: task.alerts, analysis: { completedAt: task.analysis.completedAt, inputEventIds: task.analysis.inputEventIds, checks: task.analysis.checks,
+        coverage: task.analysis.coverage, error: task.analysis.error, resultDisposition: resultDispositionFor(task, context, read) },
+      coverage: coverageFor(task, read), instructionContext: context ? { binding: context.binding, gaps: context.gaps } : null };
+  }
   const getSource = sourceKey => {
     const source = sources.get(sourceKey);
     initializeHierarchyCaptures(source);
@@ -2087,6 +2096,23 @@ export async function createCore({
       applyGSProjection(publicTasks, current, waitTasks);
       const view = { generatedAt: current, sources: source ? [source] : [], tasks: publicTasks, monitoring: { paused } };
       return projectDSHSessionPanel(view, sourceKey, sessionId, selection, ref => events.get(identity(sourceKey, ref.taskId, ref.lifecycleId, ref.eventId)));
+    },
+    async panelOverview(sourceKey, offset) {
+      ensureOpen();
+      const owner = sources.get(sourceKey), current = now();
+      if (!connected(owner)) throw new Error('当前观察来源尚未连接');
+      const codex = owner.descriptor.policy === 'chatgpt-main/1';
+      const visibleSources = [...sources.values()].filter(source => codex
+        ? source.descriptor.policy === 'chatgpt-main/1' && source.descriptor.registrationId === owner.descriptor.registrationId
+        : source.descriptor.policy !== 'chatgpt-main/1');
+      const visibleTasks = visibleSources.flatMap(source => {
+        const read = projectionRead(source.key);
+        return (read.bySource.get(source.key)?.tasks ?? []).map(task => projectGSTask(task, read));
+      });
+      applyGSProjection(visibleTasks, current);
+      const overview = projectPanelOverview(visibleSources, visibleTasks, projectHierarchy(visibleSources, visibleTasks), offset);
+      if (!codex && owner.descriptor.enroll) overview.monitoring = installationMonitoringState(owner.descriptor.registrationId);
+      return overview;
     },
     async gsSummary({ sourceKey, sessionId }) {
       ensureOpen();

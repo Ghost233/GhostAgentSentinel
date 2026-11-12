@@ -18,7 +18,7 @@ const currentChatAddresses = {
 export async function createPanelMCPServer({ read, control, modelSettings, installationNotifications, requestNotifications, dismissNotifications, notificationRecords, forwardTool, resources, displayName = 'Sentinel' }) {
   if (typeof displayName !== 'string' || !Object.hasOwn(currentChatAddresses, displayName)) throw new Error('invalid panel display name')
   const title = displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查'
-  const html = (resources?.html ?? await readFile(new URL('./panel.html', import.meta.url), 'utf8')).replace('<title>Sentinel 会话检查</title>', '<title>' + title + '</title>').replace('<h1>Sentinel · 当前会话</h1>', '<h1>' + displayName + ' · 当前会话</h1>')
+  const html = (resources?.html ?? await readFile(new URL('./panel.html', import.meta.url), 'utf8')).replace('<title>Sentinel 会话检查</title>', '<title>' + title + '</title>')
   const settingsTitle = displayName === 'GhostSentinel test' ? 'GhostSentinel 安装设置 test' : displayName + ' 安装设置'
   const settingsHtml = modelSettings || forwardTool ? (resources?.settingsHtml ?? await readFile(new URL('./settings.html', import.meta.url), 'utf8')).replace('<title>Sentinel 安装设置</title>', '<title>' + settingsTitle + '</title>').replace('<h1>Sentinel · 安装设置</h1>', '<h1>' + settingsTitle + '</h1>') : null
   const mcp = new McpServer({ name: 'ghost-sentinel-chatgpt', version: '0.1.0-dev.1' })
@@ -34,11 +34,11 @@ export async function createPanelMCPServer({ read, control, modelSettings, insta
   })
   registerTool(mcp, 'sentinel_current_chat', {
     title, description: '只读查看当前本机主会话及24小时内已监控执行的检查结果。',
-    inputSchema: { executionKey: z.string().min(1).max(256).optional(), historyCursor: z.string().min(1).max(256).optional(), expectedThreadId: z.string().min(1).max(128).optional() },
+    inputSchema: { executionKey: z.string().min(1).max(256).optional(), historyCursor: z.string().min(1).max(256).optional(), expectedThreadId: z.string().min(1).max(128).optional(), scope: z.literal('overview').optional(), offset: z.number().int().min(0).max(999999).optional() },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
     _meta: { ui: { resourceUri: uri, visibility: ['app'] }, 'openai/ui': { entrypoints: [{ type: 'thread' }] } },
   }, async (selection, extra) => {
-    const view = await read(extra._meta, selection)
+    const view = await read(extra._meta, selection, extra.signal)
     return { content: [{ type: 'text', text: view.summary }], structuredContent: view }
   })
   if (modelSettings || forwardTool) {

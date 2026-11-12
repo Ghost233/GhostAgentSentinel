@@ -4,6 +4,30 @@ import { panelHarness } from './helpers/chatgpt-panel.mjs'
 
 const view = () => ({ identity: { threadId: 'main-a' }, signal: 'gray', summary: '尚未分析', observation: { status: 'running' }, execution: { key: 'turn-a', status: 'running', historical: false }, analysis: { state: 'unknown', issues: [] } })
 
+test('the shared monitor switches to its paged overview and returns to session details', async t => {
+  const page = await panelHarness(t)
+  await page.deliver(view())
+  page.element('#monitor-tab-overview').onclick()
+  const selection = () => JSON.parse(JSON.stringify(page.sent.findLast(row => row.method === 'tools/call').params.arguments))
+  assert.deepEqual(selection(), { scope: 'overview', offset: 0 })
+  const first = { total: 31, counts: { yellow: 1 }, rows: [{ title: '会话一', connected: true, status: 'running', counts: { yellow: 1 }, reason: '等待响应' }], offset: 0, nextOffset: 30 }
+  await page.deliver({ overview: first })
+  assert.equal(page.element('#overview').hidden, false)
+  assert.equal(page.element('#current-context').hidden, true)
+  assert.match(page.element('#overview-list').textContent, /会话一.*等待响应/s)
+  page.element('#overview-next').onclick()
+  assert.deepEqual(selection(), { scope: 'overview', offset: 30 })
+  await page.deliver({ overview: { ...first, offset: 30, nextOffset: null, rows: [{ title: '会话三十一' }] } })
+  assert.equal(page.element('#overview-next').disabled, true)
+  assert.match(page.element('#overview-list').textContent, /会话三十一/)
+  page.element('#monitor-tab-details').onclick()
+  assert.deepEqual(selection(), {})
+  await page.deliver(view())
+  assert.equal(page.element('#monitor-details').hidden, false)
+  assert.equal(page.element('#overview').hidden, true)
+  assert.equal(page.element('#current-context').hidden, false)
+})
+
 test('the monitor puts the current light and JEV judgment beside the update time above the tabs', async t => {
   const page = await panelHarness(t)
   const completedAt = Date.now() - 1000

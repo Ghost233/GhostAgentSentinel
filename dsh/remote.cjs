@@ -50,6 +50,10 @@ function parameterCodec(name) {
       return value
     }
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('观察操作参数必须是对象')
+    if (name === 'overviewSelection') {
+      if (Object.keys(value).some(key => key !== 'offset') || value.offset !== undefined && (!Number.isSafeInteger(value.offset) || value.offset < 0 || value.offset > 999999)) throw new Error('总览页码无效')
+      return value
+    }
     if (name === 'panelSelection') {
       if (Object.keys(value).some(key => !['executionKey', 'historyCursor', 'expectedThreadId'].includes(key) || typeof value[key] !== 'string' || !value[key] || value[key].length > 2000)) throw new Error('会话面板选择无效')
       return value
@@ -70,7 +74,7 @@ function parameterCodec(name) {
 
 module.exports = function descriptors() {
   const methods = {
-    snapshot: [], gsSummary: ['sessionId'], panelDocument: [], sessionPanel: ['sessionId', 'panelSelection'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'],
+    snapshot: [], gsSummary: ['sessionId'], panelDocument: [], panelOverview: ['overviewSelection'], sessionPanel: ['sessionId', 'panelSelection'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'],
     configureAnalysisIfCurrent: ['config', 'revision'], configureAnalysisScheduling: ['scheduling'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'],
     installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'],
     installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'],

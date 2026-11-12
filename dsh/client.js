@@ -49,6 +49,10 @@
             return value
           }
           if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('观察操作参数必须是对象')
+          if (name === 'overviewSelection') {
+            if (Object.keys(value).some(key => key !== 'offset') || value.offset !== undefined && (!Number.isSafeInteger(value.offset) || value.offset < 0 || value.offset > 999999)) throw new Error('总览页码无效')
+            return value
+          }
           if (name === 'panelSelection') {
             if (Object.keys(value).some(key => !['executionKey', 'historyCursor', 'expectedThreadId'].includes(key) || typeof value[key] !== 'string' || !value[key] || value[key].length > 2000)) throw new Error('会话面板选择无效')
             return value
@@ -74,7 +78,7 @@
           return value
         } }) }
       }
-      const methods = { snapshot: [], gsSummary: ['sessionId'], panelDocument: [], sessionPanel: ['sessionId', 'panelSelection'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], configureAnalysisScheduling: ['scheduling'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'], installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'] }
+      const methods = { snapshot: [], gsSummary: ['sessionId'], panelDocument: [], panelOverview: ['overviewSelection'], sessionPanel: ['sessionId', 'panelSelection'], diagnostics: [], installationDiagnostics: [], sourcePlan: [], pause: [], resume: [], analysisConfig: [], analysisConfigState: [], claimNotifications: ['notificationClaimSelection'], configureSources: ['entries'], configureAnalysisIfCurrent: ['config', 'revision'], configureAnalysisScheduling: ['scheduling'], modelDirectory: ['directorySelection'], ackNotification: ['id', 'result'], installationNotificationPreferences: [], setInstallationNotificationPreference: ['kind', 'enabled'], beginNotificationSubmission: ['id', 'attemptToken'], installationNotificationRecords: ['notificationRecordsSelection'], waitNotificationSubmissionRevocation: ['id', 'attemptToken'] }
       const descriptors = Object.entries(methods).map(([method, parameters]) => ({
         id: `${id}#sentinel/${method}`, service: 'sentinel', namespace: 'sentinel', method,
         invocation: { kind: 'direct' }, cancellation: { parameter: 'signal' }, parameters: parameters.map(name => ({ name, wire: name, source: 'json', codec: parameterCodec(name) })), result: { mode: 'src-json' },
@@ -118,7 +122,7 @@
       }
       async function scopedCall(scope, method, args = [], signal) {
         if (!scope || !scope.active) throw new Error('观察连接不可用')
-        if (['snapshot', 'gsSummary'].includes(method) && [...unfinishedCalls].filter(call => call.method === method).length >= 2) throw new Error('先前读取尚未收尾；暂不开始新的读取')
+        if (['snapshot', 'gsSummary', 'sessionPanel', 'panelOverview'].includes(method) && [...unfinishedCalls].filter(call => call.method === method).length >= 2) throw new Error('先前读取尚未收尾；暂不开始新的读取')
         const abort = new AbortController(), lifetime = scope.abort.signal
         const cancel = () => abort.abort(new Error('观察请求已取消'))
         lifetime.addEventListener('abort', cancel, { once: true }); signal?.addEventListener('abort', cancel, { once: true })
@@ -693,10 +697,32 @@
           h('div', { role: 'tabpanel', id: `${id}-notifications-panel`, 'aria-labelledby': `${id}-notifications-tab`, hidden: tab !== 'notifications' },
             h(InstallationNotificationRecords, { registrationId: config?.registrationId || preferenceIdentity.current, visible: tab === 'notifications', signal: lifetime.current.signal })),
           h('div', { role: 'tabpanel', id: `${id}-diagnostics-panel`, 'aria-labelledby': `${id}-diagnostics-tab`, hidden: tab !== 'diagnostics' },
-            h(InstallationDiagnostics, { key: config?.registrationId || 'loading', config, visible: tab === 'diagnostics', signal: lifetime.current.signal, checks: modelChecks })))
+            h(InstallationDiagnostics, { key: config?.registrationId || 'loading', config, visible: tab === 'diagnostics', signal: lifetime.current.signal, checks: modelChecks }),
+            h(SourcePlanSettings, { visible: tab === 'diagnostics', signal: lifetime.current.signal })))
       }
       const enrollmentStatus = { pending: '等待首次连接', connecting: '已连接，等待基线', connected: '已连接', disconnected: '已断开', disabled: '清单项已停用' }
-      function SourcePlan({ plan, sources }) {
+      function SourcePlanSettings({ visible, signal }) {
+        const [plan, setPlan] = useState(null), [error, setError] = useState('')
+        useEffect(() => {
+          if (!visible || signal.aborted) return
+          const controller = new AbortController()
+          const connect = scope => {
+            if (!scope?.active) { setPlan(null); return }
+            scopedCall(scope, 'sourcePlan', [], controller.signal).then(value => {
+              if (!controller.signal.aborted && scope === connectionScope) { setPlan(value); setError('') }
+            }, failure => { if (!controller.signal.aborted && scope === connectionScope) setError(errorText(failure)) })
+          }
+          settingsBindings.add(connect); connect(connectionScope)
+          return () => { settingsBindings.delete(connect); controller.abort() }
+        }, [visible, signal])
+        if (!visible) return null
+        if (!plan) return h('p', { role: 'status' }, error || '正在读取预期后台清单')
+        return h(SourcePlan, { plan, onSave: async entries => {
+          const saved = await scopedCall(connectionScope, 'configureSources', [entries], signal)
+          setPlan(saved)
+        } })
+      }
+      function SourcePlan({ plan, sources, onSave }) {
         const entries = plan?.entries || []
         const initial = entries.map(({ registrationId, name, profile, enabled }) => ({ registrationId, name, ...(profile ? { profile } : {}), enabled }))
         const serialized = JSON.stringify(initial, null, 2)
@@ -710,15 +736,18 @@
           event.preventDefault(); setResult('正在保存')
           try {
             const entries = parameterCodec('entries').create().parse(JSON.parse(draft))
-            const saved = await call('configureSources', entries)
-            notifyState({ sourcePlan: saved }); setResult('已保存；清单不会自动安装或停用后台插件')
-            await pollSnapshot()
+            if (onSave) await onSave(entries)
+            else {
+              const saved = await call('configureSources', entries)
+              notifyState({ sourcePlan: saved }); await pollSnapshot()
+            }
+            setResult('已保存；清单不会自动安装或停用后台插件')
           } catch (error) { setResult(errorText(error)) }
         }
         return h('details', null, h('summary', null, '预期后台清单'),
           h('p', null, '逐后台启用一次适配器后自动连接。清单记录预期配置，未列出的后台仍可能存在；不代表整机发现完整。'),
           h('p', null, '启用配置 ', plan?.configured ?? entries.filter(entry => entry.enabled).length, ' · 已连接配置 ', plan?.connected ?? '未知',
-            ' · 已连接 Host ', sources.filter(source => source.status === 'connected').length),
+            sources && ' · 已连接 Host ' + sources.filter(source => source.status === 'connected').length),
           entries.map(entry => h('p', { key: entry.registrationId }, entry.name, ' · ', enrollmentStatus[entry.status] || '状态未知',
             ' · Host ', entry.connectedSources ?? 0, ' · 标识 ', entry.registrationId, entry.profile ? ` · 配置 ${entry.profile}` : '')),
           (plan?.unlisted || []).length > 0 && h('p', null, '有已接入 Host 不在预期清单中。'),
@@ -955,10 +984,12 @@
       }
       function GSView({ sessionId, placement = 'above', visible = true, signal, useTabInfo }) {
         const [open, setOpen] = useState(false), [selected, select] = useState(null), [wholeTree, setWholeTree] = useState(false), [hideNormal, setHideNormal] = useState(false), [monitorTab, setMonitorTab] = useState('issues')
+        const [legacy, setLegacy] = useState(false), [delegationTree, setDelegationTree] = useState(false)
+        const treeOpen = legacy || delegationTree
         const [intersects, setIntersects] = useState(!document.defaultView?.IntersectionObserver)
         const tab = useTabInfo ? useTabInfo().tab : { visible, signal }, tabSignal = signal || tab.signal, entryVisible = Boolean(visible && tab.visible && intersects && !tabSignal?.aborted)
-        const current = useMonitor(open && entryVisible, tabSignal), snapshot = current.snapshot
-        const summary = useGSSummary(sessionId, entryVisible && (!open || Boolean(current.error)), tabSignal)
+        const current = useMonitor(treeOpen && open && entryVisible, tabSignal), snapshot = current.snapshot
+        const summary = useGSSummary(sessionId, entryVisible && (!open || !treeOpen || Boolean(current.error)), tabSignal)
         const anchor = useRef(null), openedVersion = useRef(0)
         const scope = snapshot?.hierarchyContext?.scopes?.find(item => item.sessionId === sessionId && item.sourceKey === snapshot.adapter?.sourceKey)
         const group = snapshot?.hierarchyContext?.groups?.find(item => item.key === scope?.groupKey)
@@ -982,7 +1013,7 @@
           return () => { observer.disconnect(); entryObservers--; setIntersects(false) }
         }, [visible, tab.visible])
         useEffect(() => { if (!entryVisible || tabSignal?.aborted) setOpen(false) }, [entryVisible, tabSignal])
-        useEffect(() => { if (open && entryVisible && !snapshotRequest) void pollSnapshot() }, [open, entryVisible])
+        useEffect(() => { if (treeOpen && open && entryVisible && !snapshotRequest) void pollSnapshot() }, [treeOpen, open, entryVisible])
         useLayoutEffect(() => {
           if (!open) return
           anchor.current?.querySelector('[role=dialog] button')?.focus()
@@ -1001,11 +1032,17 @@
           const hidden = () => { if (document.visibilityState === 'hidden') setOpen(false) }
           document.addEventListener('pointerdown', outside); document.addEventListener('keydown', escape); document.addEventListener('visibilitychange', hidden); viewport.addEventListener('resize', place); viewListeners += 4
           return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', escape); document.removeEventListener('visibilitychange', hidden); viewport.removeEventListener('resize', place); viewListeners -= 4 }
-        }, [open])
+        }, [open, treeOpen])
         return h('span', { className: 'sentinel-gs', ref: anchor },
           h('button', { type: 'button', 'data-gs-entry': sessionId, 'aria-label': `GS 当前会话检查${entryContext ? `；${entryContext}，当前无法确认` : ''}`, 'aria-expanded': open,
-            onClick: () => { if (!open) openedVersion.current = state.snapshotVersion; setOpen(value => !value); select(null); setWholeTree(false) } }, 'GS ', entryContext && h('span', { 'data-gs-count-context': true }, '· ', entryContext, ' '), h(GSCounts, { counts: entryCounts })),
-          open && h('section', { className: `sentinel-gs-popup sentinel-gs-${placement}`, role: 'dialog', 'aria-label': 'GS 当前会话检查', 'data-gs-scope': wholeTree ? scope?.rootSessionId : sessionId },
+            onClick: () => { if (!open) { openedVersion.current = state.snapshotVersion; setLegacy(false); setDelegationTree(false) }; setOpen(value => !value); select(null); setWholeTree(false) } }, 'GS ', entryContext && h('span', { 'data-gs-count-context': true }, '· ', entryContext, ' '), h(GSCounts, { counts: entryCounts })),
+          open && !treeOpen && h('section', { className: `sentinel-gs-popup sentinel-gs-${placement} sentinel-gs-shared`, role: 'dialog', 'aria-label': 'GS 当前会话检查', 'data-gs-scope': sessionId },
+            h('div', { className: 'sentinel-controls' },
+              h('button', { type: 'button', 'aria-label': '关闭 GS', onClick: close }, '关闭'),
+              h('button', { type: 'button', onClick: () => { openedVersion.current = state.snapshotVersion; setMonitorTab('details'); setDelegationTree(true) } }, '委派树')),
+            h(SessionPanel, { sessionId, visible: entryVisible, signal: tabSignal, onUnavailable: setLegacy })),
+          open && treeOpen && h('section', { className: `sentinel-gs-popup sentinel-gs-${placement}`, role: 'dialog', 'aria-label': delegationTree ? 'GS 委派树' : 'GS 当前会话检查', 'data-gs-scope': wholeTree ? scope?.rootSessionId : sessionId },
+            delegationTree && h('button', { type: 'button', onClick: () => { setDelegationTree(false); setWholeTree(false); select(null) } }, '返回会话检查'),
             h(MonitorHeader, { scope: wholeTree ? '主会话整棵树' : '当前会话及委派后代', tab: monitorTab, change: setMonitorTab,
               counts: wholeTree ? group?.counts : scope?.counts, close },
               cached && scope && h('small', { 'data-gs-count-context': true }, '上次读取计数 · 当前无法确认')),
@@ -1061,14 +1098,16 @@
         useEffect(() => { const changed = () => update(value => value + 1); footerListeners.add(changed); return () => footerListeners.delete(changed) }, [])
         return sessionId && !visibleFooters.has(sessionId) ? h(GSView, { key: sessionId, sessionId, placement: 'below', visible, signal, useTabInfo }) : null
       }
-      function SessionPanel({ sessionId, visible, signal }) {
+      function SessionPanel({ sessionId, visible, signal, useTabInfo, onUnavailable }) {
         const frame = useRef(null), [html, setHTML] = useState(null), [error, setError] = useState('')
+        const legacy = !sessionId && Boolean(error)
         useLayoutEffect(() => {
-          if (!visible || signal?.aborted) return
+          if (!visible || signal?.aborted || legacy) return
           const viewport = document.defaultView, pending = new Map()
           let connection, lifetime
           const disconnect = () => { lifetime?.abort(); for (const request of pending.values()) request.abort(); pending.clear() }
-          const stop = () => { disconnect(); setHTML(null) }
+          const cleanup = () => { disconnect(); viewport.removeEventListener('message', message); subscribers.delete(load); signal?.removeEventListener('abort', stop) }
+          const stop = () => { cleanup(); setHTML(null) }
           const load = () => {
             if (signal?.aborted || connection === connectionScope) return
             disconnect(); connection = connectionScope; setHTML(null); setError('')
@@ -1077,7 +1116,7 @@
             const { signal: requestSignal } = lifetime
             void scopedCall(connection, 'panelDocument', [], requestSignal).then(value => {
               if (!requestSignal.aborted) setHTML(value)
-            }, error => { if (!requestSignal.aborted) setError(errorText(error)) })
+            }, error => { if (!requestSignal.aborted) { setError(errorText(error)); onUnavailable?.(true) } })
           }
           const message = async event => {
             const target = frame.current?.contentWindow, request = event.data
@@ -1085,14 +1124,26 @@
             if (request.method === 'notifications/cancelled') { pending.get(request.params?.requestId)?.abort(); return }
             if (!Number.isSafeInteger(request.id) || pending.has(request.id)) return
             const respond = payload => target.postMessage({ jsonrpc: '2.0', id: request.id, ...payload }, '*')
-            if (request.method === 'ui/initialize') { respond({ result: {} }); return }
-            if (request.method !== 'tools/call' || request.params?.name !== 'sentinel_current_chat' || pending.size >= 4) {
+            if (request.method === 'ui/initialize') { respond({ result: { hostContext: { sentinelOverviewOnly: !sessionId } } }); return }
+            const tool = request.params?.name
+            if (request.method !== 'tools/call' || !['sentinel_current_chat', 'sentinel_set_overview_monitoring'].includes(tool) || pending.size >= 4) {
               respond({ error: { code: -32601, message: 'DSH 当前会话面板不支持此操作' } }); return
             }
             const abort = new AbortController()
             pending.set(request.id, abort)
             try {
-              const view = await scopedCall(connection, 'sessionPanel', [sessionId, request.params.arguments ?? {}], abort.signal)
+              const selection = request.params.arguments ?? {}
+              let view
+              if (tool === 'sentinel_set_overview_monitoring') {
+                if (typeof selection.paused !== 'boolean') throw new Error('暂停状态无效')
+                view = await scopedCall(connection, selection.paused ? 'pause' : 'resume', [], abort.signal)
+              } else if (selection.scope === 'overview') {
+                const overview = await scopedCall(connection, 'panelOverview', [{ offset: selection.offset ?? 0 }], abort.signal)
+                view = { summary: '会话总览', overview }
+              } else {
+                if (!sessionId) throw new Error('尚未选择会话')
+                view = await scopedCall(connection, 'sessionPanel', [sessionId, selection], abort.signal)
+              }
               if (!abort.signal.aborted && frame.current?.contentWindow === target) respond({ result: { structuredContent: view } })
             } catch (error) {
               if (!abort.signal.aborted && frame.current?.contentWindow === target) respond({ error: { code: -32000, message: errorText(error) } })
@@ -1100,22 +1151,17 @@
           }
           viewport.addEventListener('message', message); subscribers.add(load); signal?.addEventListener('abort', stop, { once: true })
           load()
-          return () => { disconnect(); viewport.removeEventListener('message', message); subscribers.delete(load); signal?.removeEventListener('abort', stop) }
-        }, [sessionId, visible, signal])
+          return cleanup
+        }, [sessionId, visible, signal, onUnavailable, legacy])
+        if (legacy) return h(OverviewPanel, { useTabInfo })
         if (!visible || signal?.aborted) return null
         if (!html) return h('p', { role: 'status' }, error || '正在加载会话检查')
         return h('iframe', { ref: frame, srcDoc: html, sandbox: 'allow-scripts', title: 'Sentinel 会话检查', className: 'sentinel-session-panel' })
       }
       function Panel({ sessionId, useTabInfo } = {}) {
-        if (!sessionId) return h(OverviewPanel, { useTabInfo })
-        return h(SessionSidebar, { key: sessionId, sessionId, useTabInfo })
-      }
-      function SessionSidebar({ sessionId, useTabInfo }) {
-        const [overview, showOverview] = useState(false)
         const tab = useTabInfo ? useTabInfo().tab : { visible: false }
         return h('section', { className: 'sentinel-session-sidebar' },
-          h('button', { type: 'button', className: 'sentinel-panel-switch', onClick: () => showOverview(value => !value) }, overview ? '返回当前会话' : '全部会话'),
-          overview ? h(OverviewPanel, { useTabInfo }) : h(SessionPanel, { sessionId, visible: tab.visible, signal: tab.signal }))
+          h(SessionPanel, { key: sessionId, sessionId, visible: tab.visible, signal: tab.signal, useTabInfo }))
       }
       function OverviewPanel({ useTabInfo } = {}) {
         const tab = useTabInfo ? useTabInfo().tab : { visible: false }
@@ -1222,7 +1268,7 @@
         style.textContent += '.sentinel-tree,.sentinel-tree-node,[data-gs-row]{min-width:0;max-width:100%;box-sizing:border-box}.sentinel-tree button{width:100%;min-width:0;text-align:left;overflow-wrap:anywhere;box-sizing:border-box}.sentinel-node-name{font-size:13px;line-height:1.5}.sentinel-overview .sentinel-node-basis,.sentinel-gs-popup .sentinel-node-basis{font-size:12px;line-height:1.5;opacity:1;color:var(--dsw-alias-label-primary)}.sentinel-gs-counts{flex-wrap:wrap}.sentinel-hide-normal{display:flex;align-items:center;gap:6px;font-size:12px;margin:8px 0}.sentinel-overview .sentinel-hide-normal input{width:auto}.sentinel-tree details{margin:4px 0}.sentinel-tree summary{font-size:12px;cursor:pointer}.sentinel-tree article{font-size:12px;overflow-wrap:anywhere}.sentinel-gs-popup button:focus-visible,.sentinel-overview button:focus-visible{outline:2px solid currentColor;outline-offset:2px}.sentinel-gs-popup header>*{min-width:0}'
         style.textContent += '.sentinel-monitor-header{position:sticky;top:0;z-index:2;background:var(--dsw-alias-bg-layer-2);padding:8px 0;margin:0 0 12px;min-width:0}.sentinel-monitor-title,.sentinel-monitor-lamps{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sentinel-monitor-title{justify-content:space-between}.sentinel-monitor-header .sentinel-monitor-tabs{display:flex;flex-direction:row;gap:6px;margin:8px 0 0}.sentinel-monitor-tabs button{flex:1;text-align:center}.sentinel-monitor-tabs [aria-selected=true]{font-weight:600;border-color:currentColor}.sentinel-gs-popup .sentinel-monitor-header{display:block}.sentinel-issue-evidence small{font-size:11px;line-height:1.45;margin:3px 0;overflow-wrap:anywhere}.sentinel-issue-evidence [data-sentinel-citation]{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.sentinel-focus-summary{border-left:3px solid var(--dsw-alias-border-l2);padding-left:10px}.sentinel-focus-summary>strong{font-size:15px}.sentinel-monitor-header .sentinel-gs-counts{flex-wrap:nowrap}.sentinel-gs-popup [role=tabpanel],.sentinel-overview [role=tabpanel]{min-width:0}[data-gs-issues]:empty{min-height:40px}'
         style.textContent += '[data-sentinel-summary-text]{font-size:15px;line-height:1.65}[data-sentinel-summary-text] .sentinel-summary-row{display:flex;flex-wrap:wrap;gap:2px 10px;margin:8px 0}.sentinel-summary-row strong{font-weight:650;flex:0 0 6em}.sentinel-summary-row span{flex:1 1 17em;min-width:0;white-space:pre-wrap}[data-sentinel-blocking]{margin-top:10px}'
-        style.textContent += '.sentinel-session-sidebar{display:flex;flex-direction:column;height:100%;min-height:0}.sentinel-panel-switch{align-self:flex-end;margin:6px 12px 0;font:inherit}.sentinel-session-panel{flex:1 1 auto;width:100%;min-height:0;border:0}'
+        style.textContent += '.sentinel-session-sidebar{display:flex;flex-direction:column;height:100%;min-height:0}.sentinel-session-panel{flex:1 1 auto;width:100%;min-height:0;border:0}.sentinel-gs-shared{display:flex;flex-direction:column;height:min(65vh,560px)}.sentinel-gs-shared>button{align-self:flex-end}'
         document.head.appendChild(style)
         ctx.effect(() => () => { style.remove() })
         ctx.inject(['remote', 'typert'], child => {

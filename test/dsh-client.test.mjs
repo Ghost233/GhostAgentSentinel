@@ -39,7 +39,20 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     globalThis.IS_REACT_ACT_ENVIRONMENT = true
     try { await act(action) } finally { globalThis.IS_REACT_ACT_ENVIRONMENT = previous }
   }
+  const panelCall = async (name, selection) => {
+    const shared = dom.window.document.querySelector('iframe.sentinel-session-panel').contentWindow
+    let reply
+    shared.postMessage = data => { reply = data }
+    dom.window.dispatchEvent(new dom.window.MessageEvent('message', { source: shared, data: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: selection } } }))
+    await waitUntil(() => reply, 'Actual scoped panel call did not finish')
+    assert.equal(reply.error, undefined, reply.error?.message)
+    return reply.result.structuredContent
+  }
   const dataReady = async () => {
+    if (dom.window.document.querySelector('iframe.sentinel-session-panel')) {
+      assert.ok((await panelCall('sentinel_current_chat', { scope: 'overview' })).overview)
+      return
+    }
     await waitUntil(() => plugin.diagnostics().pendingSnapshot === 0 && plugin.diagnostics().pendingNotification === 0
       && dom.window.document.querySelector('[data-gs-snapshot-time]'), 'Actual overview snapshot did not finish rendering')
     await commit(async () => {})
@@ -48,13 +61,18 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     visible = nextVisible
     if (!viewRoot) viewRoot = createRoot(document.getElementById('view'))
     await commit(async () => { viewRoot.render(h('div', null, ...Array.from({ length: count }, (_, index) => h(Panel, { useTabInfo, key: index })))) })
-    await waitUntil(() => plugin.diagnostics().viewInstances === count
+    await waitUntil(() => document.querySelectorAll('iframe.sentinel-session-panel').length === count || plugin.diagnostics().viewInstances === count
       && plugin.diagnostics().visibleViewers === (nextVisible && document.visibilityState !== 'hidden' ? count : 0), 'Actual sidebar viewer effects did not commit')
     await commit(async () => { for (const tab of document.querySelectorAll('[data-gs-tab=details]')) tab.click(); await settle(); for (const tree of document.querySelectorAll('[data-gs-scope-tree]:not([open])')) tree.querySelector('summary').click(); await settle() })
   }
   const mountSession = async sessionId => {
     if (!viewRoot) viewRoot = createRoot(document.getElementById('view'))
     await commit(async () => { viewRoot.render(h(Panel, { useTabInfo, sessionId })); await settle() })
+  }
+  const mountGS = async sessionId => {
+    if (!viewRoot) viewRoot = createRoot(document.getElementById('view'))
+    const entry = ctx.slots.entries('conversation.session.header.utilities')[0]
+    await commit(async () => { viewRoot.render(h(entry.component, { sessionId, useTabInfo })); await settle() })
   }
   const unmount = async () => {
     await commit(async () => { viewRoot?.unmount(); viewRoot = undefined })
@@ -173,7 +191,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   await waitUntil(() => plugin.diagnostics().backgroundTimer === 1, 'Actual Remote connection did not start background monitoring')
   if (mountPane) { await mount(); await dataReady() }
   else if (!overrides.claimNotifications) await waitUntil(() => plugin.diagnostics().pendingNotification === 0, 'Initial notification claim did not finish')
-  return { ctx, Panel, mounted, registered, delivered, acknowledged, invoked, Notification, plugin, intervals, dom, mount, mountSession, unmount, mountSettings, unmountSettings, settle, waitUntil, dataReady, interact: commit,
+  return { ctx, Panel, mounted, registered, delivered, acknowledged, invoked, Notification, plugin, intervals, dom, mount, mountSession, mountGS, unmount, mountSettings, unmountSettings, settle, waitUntil, dataReady, panelCall, interact: commit,
     async tick() { await commit(async () => { for (const callback of [...intervals.values()]) callback(); await settle() }) },
     async visibility(value) { await commit(async () => { Object.defineProperty(dom.window.document, 'visibilityState', { value, configurable: true }); dom.window.document.dispatchEvent(new dom.window.Event('visibilitychange')); await settle() }) },
     async abortView() { await commit(async () => { tabController.abort(); await settle() }) },
@@ -183,11 +201,12 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   }
 }
 
-test('DSH session sidebar uses the Codex panel document and binds reads to the owning session', async t => {
-  const html = await readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8'), reads = []
+test('DSH uses the shared panel for the session and overview and binds session reads to its owner', async t => {
+  const html = await readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8'), reads = [], overviews = []
   const f = await client(t, null, 'denied', null, true, false, { $nativeSlots: true,
     async panelDocument() { return { ok: true, value: html } },
     async sessionPanel(id, selection) { reads.push({ id, selection }); return { ok: true, value: { identity: { threadId: id } } } },
+    async panelOverview(selection) { overviews.push(selection.offset); return { ok: true, value: { total: 1, rows: [{ title: '共享总览' }] } } },
   })
   await f.mountSession('dsh-owned-session')
   const document = f.dom.window.document
@@ -204,13 +223,26 @@ test('DSH session sidebar uses the Codex panel document and binds reads to the o
   await f.waitUntil(() => replies.length === 1, 'shared panel did not receive its session response')
   assert.deepEqual(reads, [{ id: 'dsh-owned-session', selection: {} }])
   assert.equal(replies[0].result.structuredContent.identity.threadId, 'dsh-owned-session')
+  message(target, { ...request, id: 2, params: { ...request.params, arguments: { scope: 'overview', offset: 30 } } })
+  await f.waitUntil(() => replies.length === 2, 'shared panel did not receive its overview')
+  assert.deepEqual(overviews, [30])
+  assert.equal(replies[1].result.structuredContent.overview.rows[0].title, '共享总览')
+  assert.equal(document.querySelector('iframe'), frame, 'overview uses the same document')
   await f.mountSession('dsh-next-session')
-  message(target, { ...request, id: 2 })
+  message(target, { ...request, id: 3 })
   await f.settle()
   assert.equal(reads.length, 1, 'retired iframe cannot request another session')
-  await f.interact(async () => { document.querySelector('.sentinel-panel-switch').click(); await f.settle() })
-  assert.equal(document.querySelector('iframe'), null)
-  assert.ok(document.querySelector('[aria-label="Sentinel 执行监控总览"]'))
+  await f.mountSession(undefined)
+  await f.waitUntil(() => document.querySelector('iframe'), 'global sidebar did not load the shared panel')
+  const globalFrame = document.querySelector('iframe').contentWindow
+  globalFrame.postMessage = data => replies.push(data)
+  message(globalFrame, { id: 4, method: 'ui/initialize' })
+  assert.equal(replies[2].result.hostContext.sentinelOverviewOnly, true)
+  await f.mountGS('dsh-next-session')
+  await f.interact(async () => { document.querySelector('[data-gs-entry]').click(); await f.settle() })
+  await f.waitUntil(() => document.querySelector('[role=dialog] iframe'), 'GS popup did not load the shared panel')
+  assert.equal(document.querySelector('[role=dialog] iframe').getAttribute('srcdoc'), html)
+  assert.equal(f.plugin.diagnostics().snapshotTimer, 0)
   await f.unmount()
 })
 
@@ -1060,7 +1092,7 @@ test('the actual DSH settings form autosaves groups through Native Remote and dr
   assert.deepEqual((await core.installationNotificationRecords('chatgpt:other-records', {})).records, [])
   await f.tick(); assert.equal(f.delivered.length, 1, 'opening and refreshing a history view does not resubmit a notification')
   await f.tick()
-  await f.interact(async () => { Simulate.click([...f.dom.window.document.querySelectorAll('button')].find(button => button.textContent === '暂停分析')); await f.settle() })
+  await f.panelCall('sentinel_set_overview_monitoring', { paused: true })
   assert.equal((await core.installationMonitoring('dsh:stable')).paused, true)
   assert.equal((await core.snapshot()).monitoring.state, 'active', 'the DSH pause leaves shared monitoring active')
   const peers = new Map()

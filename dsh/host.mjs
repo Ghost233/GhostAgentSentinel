@@ -131,13 +131,13 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
     for (const gap of sentGaps) if (!currentGaps.has(gap)) sentGaps.delete(gap)
   }
   async function disconnect(reason) {
-    const previousClient = client
-    client = undefined; sourceKey = undefined
+    const previous = new Set([client, connectingClient].filter(Boolean))
+    client = undefined; connectingClient = undefined; sourceKey = undefined
     if (!closed) {
       error = String(reason?.message || reason).slice(0, 200)
-      collector.recordGap('共享核心连接曾中断；当前保留缓冲的覆盖边界需核对')
+      if (previous.size || reason?.code !== 'dsh_core_upgrade_pending') collector.recordGap('共享核心连接曾中断；当前保留缓冲的覆盖边界需核对')
     }
-    await previousClient?.close().catch(() => {})
+    await Promise.allSettled([...previous].map(target => track(target.close())))
   }
   async function runTick() {
     let communicationConfirmed = false, confirmedFailure
@@ -145,7 +145,7 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       await retiring
       if (closed) return
       if (!client) {
-        const connected = await track(connect({ dataDir, signal: lifetime.signal }))
+        const connected = await track(connect({ dataDir, signal: lifetime.signal, requireDSHCore: true }))
         if (closed) { await track(connected.close()); return }
         connectingClient = connected
         const key = await call(connected, 'registerSource', descriptor, lifetime.signal)
@@ -268,12 +268,26 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       return invoke('gsSummary', sourceKey, sessionId, signal)
     },
     panelDocument() { return readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8') },
+    async panelOverview({ offset = 0 }, signal) {
+      const owner = sourceKey, target = client
+      const overview = await invoke('panelOverview', owner, offset, signal)
+      if (closed || owner !== sourceKey || target !== client) throw new Error('正在重连 Sentinel Core，会自动重试')
+      return overview
+    },
     async sessionPanel(sessionId, selection, signal) {
-      const owner = sourceKey
-      const view = typeof client?.dshSessionPanel === 'function'
-        ? await invoke('dshSessionPanel', owner, sessionId, selection, signal)
-        : projectDSHSessionPanel(await invoke('snapshot', signal), owner, sessionId, selection)
-      if (closed || owner !== sourceKey) throw new Error('会话观察来源已变化')
+      const owner = sourceKey, target = client
+      const changed = () => closed || owner !== sourceKey || target !== client
+      const reconnecting = () => new Error('正在重连 Sentinel Core，会自动重试')
+      let view
+      try {
+        view = typeof target?.dshSessionPanel === 'function'
+          ? await invoke('dshSessionPanel', owner, sessionId, selection, signal)
+          : projectDSHSessionPanel(await invoke('snapshot', signal), owner, sessionId, selection)
+      } catch (error) {
+        if (changed() && !signal?.aborted) throw reconnecting()
+        throw error
+      }
+      if (changed()) throw reconnecting()
       return view
     },
     pause(signal) { return setInstallationPaused(true, signal) }, resume(signal) { return setInstallationPaused(false, signal) },

@@ -10,7 +10,7 @@ import { prepareInstallation, startFromInstallation } from '../chatgpt/runtime.m
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { setTimeout as delay } from 'node:timers/promises'
 
-for (const missing of ['monitoring-recovery-rollup/1', 'native-capture-live-budget/1', 'native-capture-priority/1', 'native-capture-chat-limit/3', 'per-check-evidence/1', 'chatgpt-execution-monitoring/1', 'stalled-progress-review/1', 'installation-analysis-scheduling/1', 'partial-observation-summary/1', 'bounded-summary-generation/1', 'chatgpt-recent-model-activity/1', 'chinese-summary-prompt/1', 'gmd-summary-cache-recovery/1']) test('an older Core without ' + missing + ' is reported before collection or notification starts', async t => {
+for (const missing of ['monitoring-recovery-rollup/1', 'native-capture-live-budget/1', 'native-capture-priority/1', 'native-capture-chat-limit/3', 'per-check-evidence/1', 'chatgpt-execution-monitoring/1', 'stalled-progress-review/1', 'installation-analysis-scheduling/1', 'partial-observation-summary/1', 'bounded-summary-generation/1', 'chatgpt-recent-model-activity/1', 'chinese-summary-prompt/1', 'gmd-summary-cache-recovery/1', 'panel-overview/1']) test('an older Core without ' + missing + ' is reported before collection or notification starts', async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'sentinel-old-recovery-core-')), clock = Date.now()
   let server, core, adapter, compatible = false, lists = 0
   t.after(async () => { await adapter?.close(); await core?.close(); await server?.close(); await fs.rm(dir, { recursive: true, force: true }) })
@@ -30,6 +30,12 @@ for (const missing of ['monitoring-recovery-rollup/1', 'native-capture-live-budg
   assert.equal((await core.snapshot()).sources.length, 0)
   compatible = true; await adapter.refresh()
   assert.ok(lists > 0, 'a compatible Core resumes collection without changing the App or installation')
+  if (missing === 'panel-overview/1') {
+    const reads = (await core.diagnostics()).http.snapshotReads
+    const result = await adapter.read({ thread_id: thread.id }, { scope: 'overview', offset: 0 })
+    assert.equal(result.overview.total, 0)
+    assert.equal((await core.diagnostics()).http.snapshotReads, reads)
+  }
 })
 
 for (const [anchored, guard] of [[true, null], [false, null], [false, 'recovered-before-claim'], [false, 'paused'], [false, 'project-disabled'], [false, 'project-unknown'], [true, 'already-ended'], [true, 'ended'], [true, 'next-execution']]) test(`a production collection EIO ${anchored ? 'after' : 'before'} its lifecycle anchor respects ${guard ?? 'eligible health notice scope'}`, async t => {
