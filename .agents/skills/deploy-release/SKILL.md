@@ -7,4 +7,6 @@ description: 发布 GhostAgentSentinel 正式版本或核验发布结果时使�
 
 执行前读取仓库根目录下的 [开发契约](../../../docs/development-contract.md) 和 [发布流程与完成条件](../../../docs/release-status.md#发布流程与完成条件)。按后者执行发布前门禁、发布后远端验收及本地分支与 tag 同步；发布完成条件以该文档为准。
 
+创建 GitHub Release 时，同时上传带版本号的 Sentinel 安装包和固定文件名 `ghost-agent-sentinel.tgz`。两者来自同一份通过哈希校验的制品。固定名供 DSHMarket 通过 `releases/latest/download/ghost-agent-sentinel.tgz` 跟随正式版本。
+
 全部条件满足后，给出 Actions、Release 链接和本地同步结果并结束发布。缺少证据或同步受阻时，明确报告未完成项。

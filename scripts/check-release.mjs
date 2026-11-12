@@ -30,8 +30,11 @@ try {
     assert.equal(sha(await readFile(join(root, path))), hash, `source changed: ${path}`)
     assert.equal(sha(await readFile(join(extracted, 'package', path))), hash, `packed content changed: ${path}`)
   }
-  await writeFile(join(destination, 'SHA256SUMS'), `${expected.sha256}  ${pack.filename}\n`)
-  console.log(JSON.stringify({ version: manifest.version, filename: pack.filename, bytes: archive.length, files: pack.files.length, sha256: expected.sha256, status: 'passed' }, null, 2))
+  const stableFilename = `${manifest.name}.tgz`
+  await writeFile(join(destination, stableFilename), archive)
+  await writeFile(join(destination, 'SHA256SUMS'), [pack.filename, stableFilename]
+    .map(filename => `${expected.sha256}  ${filename}\n`).join(''))
+  console.log(JSON.stringify({ version: manifest.version, filename: pack.filename, stableFilename, bytes: archive.length, files: pack.files.length, sha256: expected.sha256, status: 'passed' }, null, 2))
 } finally {
   await rm(temporary, { recursive: true, force: true })
 }
