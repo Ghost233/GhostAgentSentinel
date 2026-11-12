@@ -26,6 +26,7 @@ async function fixture(t, entries) {
   t.mock.method(Date, 'now', () => clock)
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-material-retention-')), coreDir = join(dir, 'core'), adapterDir = join(dir, 'adapter')
   let hostBirth = clock - 10000, hostRunId = 'material-host'
+  let listThreads = async () => ({ data: [], nextCursor: null })
   const threads = new Map()
   for (const entry of entries) {
     const path = join(dir, entry.id + '.jsonl')
@@ -59,6 +60,7 @@ async function fixture(t, entries) {
   const native = {
     async sampleHost() { return { available: true, hostRunId, hostStartedAt: hostBirth, profile } },
     async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
+    listThreads: (...args) => listThreads(...args),
     async readThread(id) { const entry = threads.get(id); return entry ? { thread: { id, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path: entry.path, cwd: dir }, anchorTurnId: entry.anchorTurnId } : null },
     async close() {},
   }
@@ -78,8 +80,33 @@ async function fixture(t, entries) {
     await connect(); await start()
   }
   t.after(async () => { await adapter?.close(); await core?.close(); await server.close(); proxy.closeAllConnections(); await new Promise(resolve => proxy.close(resolve)); await rm(dir, { recursive: true, force: true }) })
-  return { dir, coreDir, adapterDir, threads, batches, deliveries, start, read, restart, get core() { return core }, now: () => clock, advance: ms => { clock += ms }, replaceHost: () => { hostRunId += '-next'; hostBirth = clock }, loseNextResponse: () => { dropNextEvents = true } }
+  return { dir, coreDir, adapterDir, threads, batches, deliveries, start, read, restart, get core() { return core }, now: () => clock, advance: ms => { clock += ms }, replaceHost: () => { hostRunId += '-next'; hostBirth = clock }, loseNextResponse: () => { dropNextEvents = true }, refresh: () => adapter.refresh(), listWith: list => { listThreads = list } }
 }
+
+test('a current-chat read uses confirmed evidence while a background directory read is pending', async t => {
+  const f = await fixture(t, [{ id: 'main', turn: 'active', text: 'Inspect the retained execution' }])
+  await f.start()
+  const before = await f.read('main')
+  assert.equal(before.execution.lifecycleId, 'active')
+  const shared = await f.core.dshSessionPanel(before.execution.sourceKey, 'main', {})
+  assert.deepEqual(shared.history, before.history)
+  assert.deepEqual(shared.execution, before.execution)
+  assert.deepEqual(shared.recentModelActivity, before.recentModelActivity)
+  assert.deepEqual(shared.analysis.checks, before.analysis.checks)
+  const started = Promise.withResolvers(), directory = Promise.withResolvers()
+  f.listWith(() => { started.resolve(); return directory.promise })
+  const background = f.refresh()
+  await started.promise
+  const pending = f.read('main')
+  try {
+    const view = await Promise.race([pending, delay(600)])
+    assert.equal(view?.execution?.key, before.execution.key)
+    assert.equal(view.observation.recordSnapshotLag, true)
+  } finally {
+    directory.resolve({ data: [], nextCursor: null })
+    await Promise.allSettled([background, pending])
+  }
+})
 
 test('material batches beyond sixteen records retain every first capture and use a cursor namespace distinct from metadata observation', async t => {
   const f = await fixture(t, [{ id: 'main', turn: 'turn', text: 'Read the selected log only', outputs: 40 }])

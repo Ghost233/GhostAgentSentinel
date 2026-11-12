@@ -79,6 +79,15 @@ test('five native delegation levels, siblings and a real fork reach GS through t
   assert.equal(frontend.dom.window.document.querySelector('[data-gs-scope]').dataset.gsScope, child.session.id)
   const selected = frontend.dom.window.document.querySelectorAll('[data-gs-node]')[3]
   await frontend.click(selected)
+  const { window } = frontend.dom
+  await frontend.until(() => window.document.querySelector('.sentinel-gs-node-panel iframe'), 'delegation details use the shared panel')
+  const frame = window.document.querySelector('.sentinel-gs-node-panel iframe').contentWindow
+  let initialized
+  frame.postMessage = value => { initialized = value }
+  window.dispatchEvent(new window.MessageEvent('message', { source: frame, data: { jsonrpc: '2.0', id: 1, method: 'ui/initialize' } }))
+  const opened = initialized.result.hostContext.sentinelExecution
+  assert.equal(opened.key, selected.dataset.gsNode)
+  assert.equal(opened.threadId, group.nodes.find(node => node.taskKey === opened.key).sessionId)
   assert.equal(frontend.dom.window.document.querySelector('[data-gs-count="gray"]').textContent, '4')
   await frontend.click(frontend.dom.window.document.querySelector('[data-gs-return-root]'))
   assert.equal(frontend.dom.window.document.querySelectorAll('[data-gs-node]').length, 7)

@@ -9,7 +9,7 @@ import { loadCursor, saveCursor } from './cursor-store.mjs'
 import { archivedThread, classifyThread, createDiscovery, nativeStorageRoot } from './discovery.mjs'
 import { openHealthOutbox } from './health-outbox.mjs'
 import { readModelDirectory } from './model-directory.mjs'
-import { materialView, recentModelActivity } from '../src/panel-view.mjs'
+import { materialView, projectSessionPanel } from '../src/panel-view.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
 import { failureErrorInfo } from '../src/core/failure-receipts.mjs'
 import { createNotificationDelivery } from './notifications.mjs'
@@ -628,7 +628,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (gap) return { gap, scope: 'source' }
     return qualify(entry.id, expected, { host, projects: new Map() })
   }
-  async function observedView(entry, selection) {
+  async function observedView(entry, selection, signal) {
     if (!collectMaterials || !source) return entry.view
     const owner = source, epoch = sourceEpoch, generation = entry.generation
     const retainedOnly = !entry.reader || entry.view.identity.threadId !== entry.id || Boolean(entry.view.observation?.coldReadStage)
@@ -639,7 +639,7 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       if (proof.gap) return fail(entry, proof.gap, proof.scope)
       if (proof.source.hostRunId !== owner.hostRunId) return gapView('source-generation-changed')
     }
-    const snapshot = await core.snapshot()
+    const snapshot = await core.snapshot(signal)
     if (retainedOnly) {
       let after
       try { after = await historyProof(entry, proof.source) }
@@ -647,35 +647,13 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
       if (after.gap) return fail(entry, after.gap, after.scope)
     }
     if (closed || source !== owner || epoch !== sourceEpoch || generation !== entry.generation) return gapView('observation-superseded')
-    const registrationId = 'chatgpt:' + installationId
-    const ownSources = new Set(snapshot.sources.filter(value => value.descriptor.registrationId === registrationId && value.descriptor.policy === 'chatgpt-main/1').map(value => value.key))
-    const chatTasks = snapshot.tasks.filter(task => ownSources.has(task.sourceKey) && task.id === entry.id)
-    const currentTask = chatTasks.find(task => task.sourceKey === owner.key && task.lifecycleId === entry.lifecycleId)
-    const currentObserved = !retainedOnly && !snapshot.monitoring?.paused && !entry.view.observation?.recordRevalidating
-    const recent = recentModelActivity(chatTasks, currentTask, registrationId, snapshot.generatedAt, currentObserved)
-    const records = chatTasks.flatMap(task => {
-      const events = task.events.filter(event => event.taskId === task.id && event.taskLifecycleId === task.lifecycleId && event.data?.runId === task.lifecycleId && event.data?.sourceKind === 'chatgpt-native' && !event.data.history && !event.data.inherited && event.capturedAt > now() - 86400000)
-      if (!events.length) return []
-      const start = events.find(event => event.data.nativeType === 'task_started'), end = events.findLast(event => ['task_complete', 'turn_aborted'].includes(event.data.nativeType))
-      return [{ task, order: start?.occurredAt ?? Math.min(...events.map(event => event.capturedAt)), item: { key: task.key, sourceKey: task.sourceKey, lifecycleId: task.lifecycleId, status: end ? end.data.nativeType === 'turn_aborted' ? 'aborted' : 'ended' : task.status, startedAt: start?.occurredAt ?? null, observedAt: Math.min(...events.map(event => event.capturedAt)), analysisState: task.analysis.state } }]
-    }).sort((a, b) => b.order - a.order || a.task.key.localeCompare(b.task.key))
-    const current = records.find(value => value.task.sourceKey === owner.key && value.task.lifecycleId === entry.lifecycleId) ?? records[0]
-    const selected = selection.executionKey ? records.find(value => value.task.key === selection.executionKey) : current
-    const cursorIndex = selection.historyCursor ? records.findIndex(value => value.task.key === selection.historyCursor) : -1
-    const page = records.slice(cursorIndex + 1, cursorIndex + 21), hasMore = records.length > cursorIndex + 21
-    const currentVerified = Boolean(current && !retainedOnly && !entry.view.observation?.recordRevalidating)
-    const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null,
-      currentStatus: currentVerified ? current.task.status : 'unknown', currentSignal: currentVerified && current.task.analysis.state !== 'paused' && !snapshot.monitoring?.paused ? current.task.gs?.light ?? 'gray' : 'gray',
-      hasMore, cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0), currentGap: retainedOnly ? entry.view.observation?.gap ?? 'current-turn-not-observed' : null, retentionMs: 86400000 }
-    if (!selected) return { ...(entry.view.observation?.coldReadStage || !selection.executionKey && entry.view.observation?.recordRevalidating ? entry.view : gapView(selection.executionKey ? 'history-unavailable' : entry.view.observation?.gap ?? 'current-turn-not-observed', entry.id)), health: entry.health, history, recentModelActivity: recent }
-    const historical = retainedOnly || selected !== current || ['ended', 'aborted'].includes(selected.item.status)
-    const view = materialView({ ...entry.view, ...(historical ? { currentFacts: undefined, inheritance: undefined } : {}), identity: { threadId: entry.id, cursorKey: entry.cursorKey } }, selected.task, { historical, snapshot })
-    if (selected === current) view.health = combineHealth(view.health, entry.health)
-    if (historical) {
-      view.signal = 'gray'; view.summary = entry.view.observation?.gap === 'chat-idle' ? '会话空闲 · 显示上次检查结果，有新活动后自动监控' : retainedOnly ? '当前执行尚未确认 · 显示最近检查记录' : '历史执行 · 仅表示当时的检查记录'
-      view.observation = { phase: selected.item.status === 'ended' ? 'completed' : selected.item.status === 'aborted' ? 'aborted' : 'unknown', status: selected.task.status, coverage: 'retained-history', gap: history.currentGap ?? selected.task.events.find(event => event.kind === 'gap' && !event.data?.history && event.data?.verificationGaps?.length)?.data.verificationGaps[0] ?? (selected.task.currentRequest ? null : 'historical-user-request-unverified'), observedAt: selected.item.observedAt }
-    }
-    return { ...view, history, recentModelActivity: recent, execution: { ...selected.item, request: selected.task.currentRequest.slice(0, 240), historical } }
+    const view = projectSessionPanel(snapshot, {
+      sourceKey: owner.key, sessionId: entry.id, selection,
+      observation: entry.view, lifecycleId: entry.lifecycleId, retainedOnly,
+    })
+    if (!view.execution) view.health = entry.health
+    else if (view.execution.key === view.history.currentKey) view.health = combineHealth(view.health, entry.health)
+    return view
   }
   async function read(meta, selection = {}, signal) {
     if (selection.scope === 'overview') {
@@ -693,23 +671,50 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     const entry = entryFor(id)
     if (!entry) return decorate(gapView('observation-capacity-reached'))
     entry.lastViewedAt = now()
-    if (queuedBatches) {
-      const { gap } = await qualification().catch(() => ({ gap: 'plugin-enablement-unconfirmed' }))
+    const collecting = Boolean(queuedBatches)
+    if (collecting) {
+      const { host, gap } = await qualification().catch(() => ({ gap: 'plugin-enablement-unconfirmed' }))
       if (closed) return decorate(gapView('adapter-closed'))
       if (gap) { await stopSource(gap); return decorate(entry.view) }
+      if (collectMaterials && source?.hostRunId === host.hostRunId && entry.reader && entry.lifecycleId && entry.view.identity.threadId === id) {
+        const owner = source, generation = entry.generation, reader = entry.reader, lifecycleId = entry.lifecycleId
+        const changed = () => closed || source !== owner || entry.reader !== reader || entry.generation !== generation || entry.lifecycleId !== lifecycleId
+        const proof = await qualify(id, reader.source, { host, projects: new Map() }).catch(() => ({ gap: 'main-identity-unverified' }))
+        if (changed()) return decorate(gapView('observation-superseded', id))
+        if (proof.gap) return decorate(gapView(proof.gap, id))
+        if (proof.source.anchorTurnId === lifecycleId && proof.activity !== 'idle') {
+          const view = await observedView(entry, selection, signal)
+          if (changed()) return decorate(gapView('observation-superseded', id))
+          if (selection.executionKey || view.execution?.lifecycleId === lifecycleId) {
+            return decorate({ ...view, observation: { ...view.observation, recordSnapshotLag: true } })
+          }
+        }
+      }
     }
-    const pending = enqueue(async () => {
-      await collect([id])
-      if (closed) return gapView('adapter-closed')
-      const view = await observedView(entry, selection)
-      if (entry.qualifiedHostRunId !== source?.hostRunId) return view
-      const gap = entry.view.observation?.gap
-      const state = ['native_origin_prefix_changed', 'native_origin_header_changed'].includes(gap) ? 'prefix-mismatch' : entry.view.observation?.recordRevalidating ? 'verifying-prefix' : entry.capacityWaiting ? 'active-waiting' : entry.historyDeferred ? 'history-deferred' : null
-      return state ? { ...view, collectionRecovery: { state, ...(state === 'verifying-prefix' && entry.recordVerification ? entry.recordVerification : {}) } } : view
-    })
+    const pending = entry.panelCollection ?? enqueue(() => collect([id]))
     if (!pending) return decorate(gapView(closed ? 'adapter-closed' : 'collection-queue-capacity'))
-    const view = await pending
-    return decorate(closed ? gapView('adapter-closed') : view)
+    if (!entry.panelCollection) {
+      entry.panelCollection = pending
+      const clear = () => { if (entry.panelCollection === pending) entry.panelCollection = null }
+      pending.then(clear, clear)
+    }
+    if (collecting && collectMaterials) {
+      let timer
+      const confirmed = await Promise.race([
+        pending.then(() => true),
+        new Promise(resolve => { timer = setTimeout(resolve, 1000, false) }),
+      ]).finally(() => clearTimeout(timer))
+      if (!confirmed) {
+        const view = gapView('collection-pending', id)
+        return decorate({ ...view, summary: '正在核对当前会话', collectionRecovery: { state: 'active-waiting' } })
+      }
+    } else await pending
+    if (closed) return decorate(gapView('adapter-closed'))
+    const view = await observedView(entry, selection, signal)
+    if (entry.qualifiedHostRunId !== source?.hostRunId) return decorate(view)
+    const gap = entry.view.observation?.gap
+    const state = ['native_origin_prefix_changed', 'native_origin_header_changed'].includes(gap) ? 'prefix-mismatch' : entry.view.observation?.recordRevalidating ? 'verifying-prefix' : entry.capacityWaiting ? 'active-waiting' : entry.historyDeferred ? 'history-deferred' : null
+    return decorate(state ? { ...view, collectionRecovery: { state, ...(state === 'verifying-prefix' && entry.recordVerification ? entry.recordVerification : {}) } } : view)
   }
   async function control(meta, change) {
     const id = requestIdentity(meta)

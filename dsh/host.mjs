@@ -11,7 +11,6 @@ import { DSH_EXECUTION_SUMMARIES_FEATURE, GS_SUMMARY_FEATURE, INSTALLATION_NOTIF
 import { createHierarchyReader } from './hierarchy-reader.mjs'
 import { readModelDirectory } from '../src/model-directory.mjs'
 import { projectInstallationDiagnostics } from '../src/installation-diagnostics.mjs'
-import { projectDSHSessionPanel } from './session-panel.mjs'
 
 export const name = 'ghost-agent-sentinel'
 export const inject = ['agents']
@@ -280,9 +279,7 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
       const reconnecting = () => new Error('正在重连 Sentinel Core，会自动重试')
       let view
       try {
-        view = typeof target?.dshSessionPanel === 'function'
-          ? await invoke('dshSessionPanel', owner, sessionId, selection, signal)
-          : projectDSHSessionPanel(await invoke('snapshot', signal), owner, sessionId, selection)
+        view = await invoke('dshSessionPanel', owner, sessionId, selection, signal)
       } catch (error) {
         if (changed() && !signal?.aborted) throw reconnecting()
         throw error

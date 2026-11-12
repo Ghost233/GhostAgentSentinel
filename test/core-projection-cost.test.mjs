@@ -7,6 +7,30 @@ import { createCore } from '../src/core/index.mjs'
 
 const ref = (taskId, eventId) => ({ taskId, lifecycleId: 'life', eventId })
 
+test('a hierarchy ingest indexes retained event identities once per source read', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'ingest-projection-cost-'))
+  const now = () => 1_000_000
+  const core = await createCore({ dataDir, now })
+  t.after(async () => { await core.close(); await rm(dataDir, { recursive: true, force: true }) })
+  const source = await core.registerSource({ registrationId: 'cost', hostRunId: 'host', name: 'Cost' })
+  const tasks = Array.from({ length: 40 }, (_, index) => ({ id: 'task-' + index, lifecycleId: 'life', sessionId: 'session-' + index, title: 'Task', status: 'idle' }))
+  const events = tasks.map(task => ({ id: 'retained-proof', taskId: task.id, taskLifecycleId: 'life', kind: 'output', text: 'Retained output', capturedAt: now() }))
+  await core.ingest(source, { tasks, events })
+  const stringify = JSON.stringify
+  let references = 0
+  const mock = t.mock.method(JSON, 'stringify', (value, ...args) => {
+    if (Array.isArray(value) && value.length === 3 && value[2] === 'retained-proof') references++
+    return stringify(value, ...args)
+  })
+  try {
+    const accepted = await core.ingest(source, { hierarchyContext: {
+      schemaVersion: 1, revision: 1, sessions: [], activations: [], relations: [], instructionBindings: [], coverage: { complete: true, branchGaps: [] },
+    } })
+    assert.equal(accepted.hierarchyContext.acceptedRevision, 1)
+    assert.ok(references <= events.length * 4, `Indexed ${references} identities for ${events.length} retained events`)
+  } finally { mock.mock.restore() }
+})
+
 test('public projections retain source-owned instructions and read new evidence, requests and expiry afresh', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'projection-read-'))
   let clock = 1_001_000

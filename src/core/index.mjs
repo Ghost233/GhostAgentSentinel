@@ -10,7 +10,7 @@ import { normalizeEnrollment } from '../enrollment-config.mjs';
 import { validateHierarchy, projectHierarchy } from '../hierarchy.mjs';
 import { createInstructionLookup, instructionContext, eventRef, referenceKey } from '../instruction-context.mjs';
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
-import { projectDSHSessionPanel, projectPanelOverview } from '../panel-view.mjs';
+import { projectSessionPanel, projectPanelOverview } from '../panel-view.mjs';
 import { analysisTimeConditions, executionBlockingReason, JEV_EVIDENCE_LIMIT } from '../analysis/index.mjs';
 import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
 import { normalizeAnalysisConfig, normalizeAnalysisScheduling, CHECK_EVIDENCE_FEATURE, DSH_EXECUTION_SUMMARIES_FEATURE, EXECUTION_BLOCKING_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
@@ -1970,8 +1970,9 @@ export async function createCore({
             const task = findTask(sourceKey, binding.taskId, binding.lifecycleId), event = events.get(identity(sourceKey, binding.inputRef.taskId, binding.inputRef.lifecycleId, binding.inputRef.eventId));
             if (task && event && !task.excludedInstructionIds?.includes(event.id)) { admitRequest(task, event); save('tasks', task); }
           }
-          for (const task of tasks.values()) if (task.sourceKey === sourceKey) {
-            const context = contextFor(task), fingerprint = JSON.stringify([context.binding, context.inheritedEvents.map(event => [eventRef(event), event.capturedAt]), context.gaps]);
+          const contextRead = projectionRead(sourceKey);
+          for (const task of contextRead.bySource.get(sourceKey)?.tasks ?? []) {
+            const context = contextFor(task, contextRead), fingerprint = JSON.stringify([context.binding, context.inheritedEvents.map(event => [eventRef(event), event.capturedAt]), context.gaps]);
             if (task.contextFingerprint !== fingerprint) {
               cancelRound('Instruction context changed during analysis', task, true);
               invalidateAlerts(task, 'unknown');
@@ -2095,7 +2096,7 @@ export async function createCore({
         .map(task => ({ ...task, events: taskEvents(task), coverage: coverageFor(task, read) })));
       applyGSProjection(publicTasks, current, waitTasks);
       const view = { generatedAt: current, sources: source ? [source] : [], tasks: publicTasks, monitoring: { paused } };
-      return projectDSHSessionPanel(view, sourceKey, sessionId, selection, ref => events.get(identity(sourceKey, ref.taskId, ref.lifecycleId, ref.eventId)));
+      return projectSessionPanel(view, { sourceKey, sessionId, selection, readEvidence: ref => events.get(identity(sourceKey, ref.taskId, ref.lifecycleId, ref.eventId)) });
     },
     async panelOverview(sourceKey, offset) {
       ensureOpen();

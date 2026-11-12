@@ -10,6 +10,7 @@ const { createRoot } = clientRequire('react-dom/client')
 const { JSDOM } = clientRequire('jsdom')
 export async function mountGS(t, service, sessionId = 'root', surface) {
   service.analysisConfigState ??= async () => ({ registrationId: 'gs-fixture', config: {}, revision: 'gs-fixture-revision' })
+  service.panelDocument ??= () => readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8')
   const ctx = new Context(), slots = new SlotCore(), intervals = new Map()
   const dom = surface?.dom || new JSDOM('<html><head></head><body><div id="view"></div><input id="draft" value="keep draft"></body></html>', { pretendToBeVisual: true })
   const element = surface?.element || dom.window.document.getElementById('view'), existingStyles = new Set(dom.window.document.head.querySelectorAll('style'))
@@ -75,7 +76,24 @@ export async function mountGS(t, service, sessionId = 'root', surface) {
   }
   t.after(destroy)
   await render()
-  return { dom, element, slots, plugin, render, settle, until, destroy, delivered, rpcActivity, intervals, async renderOverview(nextVisible = true) { const entry = slots.entriesOfSlot('sidebar.right.pane.tab')[0]; await commit(async () => root.render(h(entry.component, { useTabInfo: () => ({ tab: { visible: nextVisible, signal: viewAbort.signal } }) }))); await settle() }, async click(element) { await commit(async () => element.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))); await settle() },
+  const click = async element => { await commit(async () => element.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))); await settle() }
+  return { dom, element, slots, plugin, render, settle, until, destroy, delivered, rpcActivity, intervals, async renderOverview(nextVisible = true) { const entry = slots.entriesOfSlot('sidebar.right.pane.tab')[0]; await commit(async () => root.render(h(entry.component, { useTabInfo: () => ({ tab: { visible: nextVisible, signal: viewAbort.signal } }) }))); await settle() }, click,
+    async openTree() {
+      const open = [...element.querySelectorAll('[role=dialog] button')].find(button => button.textContent === '委派树')
+      if (open) await click(open)
+      const tree = element.querySelector('[data-gs-scope-tree]')
+      if (tree && !tree.open) await click(tree.querySelector('summary'))
+    },
+    async panelCall(method, params, selector = 'iframe.sentinel-session-panel') {
+      await until(() => element.querySelector(selector), 'Shared Sentinel frame is ready')
+      const frame = element.querySelector(selector).contentWindow
+      let reply
+      frame.postMessage = value => { reply = value }
+      dom.window.dispatchEvent(new dom.window.MessageEvent('message', { source: frame, data: { jsonrpc: '2.0', id: 1, method, params } }))
+      await until(() => reply, 'Shared panel request reaches native Remote')
+      if (reply.error) throw new Error(reply.error.message)
+      return reply.result
+    },
     async key(key) { await commit(async () => document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key, bubbles: true }))); await settle() },
     async pointer(element) { await commit(async () => element.dispatchEvent(new dom.window.Event('pointerdown', { bubbles: true }))); await settle() },
     async resize() { await commit(async () => dom.window.dispatchEvent(new dom.window.Event('resize'))); await settle() },

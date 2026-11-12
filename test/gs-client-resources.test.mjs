@@ -14,6 +14,11 @@ const checks = ['stalled_progress', 'request_drift', 'failure_loop', 'validation
 test('twenty actual native clients keep summary, tree, notification and connection resources bounded through one hundred UI lifecycles', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-native-client-pressure-'))
   const dom = new JSDOM('<html><head></head><body><input id="draft" value="keep pressure input"></body></html>', { pretendToBeVisual: true })
+  // JSDOM retains detached iframe realms for the lifetime of the parent DOM.
+  // Keep the panel's React and Remote lifecycles here. Real iframe handshakes
+  // and scoped request cancellation are exercised by the native client tests.
+  const createElement = dom.window.document.createElement.bind(dom.window.document)
+  dom.window.document.createElement = (name, ...options) => createElement(name === 'iframe' ? 'div' : name, ...options)
   const original = { window: globalThis.window, document: globalThis.document, act: globalThis.IS_REACT_ACT_ENVIRONMENT }
   globalThis.window = dom.window; globalThis.document = dom.window.document; globalThis.IS_REACT_ACT_ENVIRONMENT = true
   let clock = Date.now(), analyses = 0
@@ -67,7 +72,7 @@ test('twenty actual native clients keep summary, tree, notification and connecti
   const clickAll = async selector => { await act(async () => { for (const f of clients) f.element.querySelector(selector)?.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); await new Promise(resolve => setTimeout(resolve, 5)) }); await idle() }
   const cycle = async index => {
     await clickAll('[data-gs-entry]')
-    await clickAll('[data-gs-tab=details]')
+    await clickAll('.sentinel-gs-shared .sentinel-controls button:nth-child(2)')
     await clickAll('[data-gs-scope-tree]:not([open]) > summary')
     await clickAll('[data-gs-hide-normal]')
     for (const f of clients) assert.ok(f.element.querySelector('[data-gs-path]'), 'Green ancestors remain display paths after filtering')
@@ -108,7 +113,7 @@ test('twenty actual native clients keep summary, tree, notification and connecti
   for (const f of clients) await f.destroy()
   assert.equal(dom.window.document.head.querySelectorAll('style').length, 0)
   for (const f of clients) { assert.ok(Object.values(f.plugin.diagnostics()).every(value => value === 0)); assert.equal(f.rpcActivity.inFlight, 0) }
-  const report = { runtime: process.version, pid: process.pid, clients: 20, warmupCycles: 10, cycles: 100, gc: Boolean(global.gc), source: 'Actual native SlotCore/Remote/React + production public Core projection; controlled IO and visibility, not installed DSH pixels', samples, final: clients.map(f => ({ client: f.plugin.diagnostics(), nativeRPC: f.rpcActivity })) }
+  const report = { runtime: process.version, pid: process.pid, clients: 20, warmupCycles: 10, cycles: 100, gc: Boolean(global.gc), source: 'Actual native SlotCore/Remote/React + production public Core projection; iframe realms replaced by inert elements for process resource measurement', samples, final: clients.map(f => ({ client: f.plugin.diagnostics(), nativeRPC: f.rpcActivity })) }
   if (process.env.SENTINEL_UI_RESOURCE_REPORT) { await mkdir(join(process.env.SENTINEL_UI_RESOURCE_REPORT, '..'), { recursive: true }); await writeFile(process.env.SENTINEL_UI_RESOURCE_REPORT, JSON.stringify(report, null, 2)) }
   t.diagnostic(JSON.stringify({ nativeClientPressure: { clients: 20, cycles: 100, analyses, notifications: deliveredBaseline, finalTemporaryZero: true, memoryAssessment: 'Continuous warm-process RSS/heap/macOS physical footprint samples recorded; no invented absolute memory budget' } }))
 })

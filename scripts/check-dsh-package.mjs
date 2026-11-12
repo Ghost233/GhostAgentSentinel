@@ -14,7 +14,7 @@ const paths = bundlePatchPaths(root, manifest.dsh.bundle)
 assert.equal(paths.length, 1)
 const entries = composeEntries([paths.flatMap(path => loadOverlayPatches('dsh', path))])
 assert.deepEqual(entries.map(({ id, name, config }) => ({ id, name, config })), [{ id: manifest.name, name: manifest.name, config: {} }])
-const runtimeFiles = ['dsh/host.mjs', 'dsh/remote.cjs', 'dsh/observation.mjs', 'dsh/hierarchy-reader.mjs', 'dsh/verification-evidence.mjs', 'dsh/session-panel.mjs', 'src/panel-view.mjs', 'chatgpt/panel.html',
+const runtimeFiles = ['dsh/host.mjs', 'dsh/remote.cjs', 'dsh/observation.mjs', 'dsh/hierarchy-reader.mjs', 'dsh/verification-evidence.mjs', 'src/panel-view.mjs', 'chatgpt/panel.html',
   'src/hierarchy.mjs', 'src/hierarchy-projection.mjs', 'src/core-client.mjs', 'src/daemon.mjs', 'src/server.mjs', 'src/protocol.mjs', 'src/privacy.mjs', 'src/enrollment-config.mjs',
   'src/core/index.mjs', 'src/analysis/index.mjs', 'src/analysis/http.mjs']
 for (const path of [...runtimeFiles, manifest.main, manifest.exports['.'], manifest.exports['./client'], manifest.dsh.bundle.patch, manifest.bin['ghost-agent-sentinel']]) {

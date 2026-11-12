@@ -7,10 +7,7 @@ import { createCore } from '../src/core/index.mjs'
 import { mountGS } from './gs-session-client-runtime.mjs'
 import { clientRequire } from './dsh-native-runtime.mjs'
 
-const showDetails = async f => {
-  const tab = f.element.querySelector('[data-gs-tab=details]'); if (tab) await f.click(tab)
-  const tree = f.element.querySelector('[data-gs-scope-tree]'); if (tree && !tree.open) await f.click(tree.querySelector('summary'))
-}
+const readOverview = async f => (await f.panelCall('tools/call', { name: 'sentinel_current_chat', arguments: { scope: 'overview' } })).structuredContent.overview
 
 const checks = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait']
 async function observedTree(t, ids = ['root', 'normal', 'normal-child', 'deep', 'red', 'yellow', 'gray', 'history'], ended = new Set(['history'])) {
@@ -46,7 +43,7 @@ async function observedTree(t, ids = ['root', 'normal', 'normal-child', 'deep', 
   }
   assert.ok(snapshot.tasks.filter(task => task.status === 'running').every(task => task.analysis.state === 'cooldown'), 'Controlled production analysis settles')
   let claims = 0
-  const service = { async snapshot() { return { ...await core.snapshot(), adapter: { sourceKey } } }, async gsSummary(sessionId) { return core.gsSummary({ sourceKey, sessionId }) }, analysisConfig: async () => ({}), async claimNotifications() { claims++; return [] } }
+  const service = { panelOverview: ({ offset }) => core.panelOverview(sourceKey, offset), sessionPanel: (id, selection) => core.dshSessionPanel(sourceKey, id, selection), async snapshot() { return { ...await core.snapshot(), adapter: { sourceKey } } }, async gsSummary(sessionId) { return core.gsSummary({ sourceKey, sessionId }) }, analysisConfig: async () => ({}), async claimNotifications() { claims++; return [] } }
   return { core, service, sourceKey, snapshot, claims: () => claims, modelCalls: () => modelCalls, now: () => clock, advance: ms => clock += ms, key: id => snapshot.tasks.find(task => task.id === id).key }
 }
 const shown = node => ![...node.closest('nav').querySelectorAll('details:not([open])')].some(detail => detail.contains(node) && !detail.querySelector('summary')?.contains(node))
@@ -65,7 +62,7 @@ test('visible closed GS uses the real core counts summary while only an open pop
   assert.equal(f.plugin.diagnostics().summaryTimer, 1)
   assert.equal(f.plugin.diagnostics().snapshotTimer, 0)
   const analyzed = data.modelCalls()
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   await f.until(() => document.querySelector(`[data-gs-node="${data.key('red')}"]`), 'Opening GS acquires the real tree once')
   assert.equal(fullReads, 1)
   assert.equal(f.plugin.diagnostics().snapshotTimer, 1)
@@ -97,7 +94,7 @@ test('GS uses native entry visibility and document visibility to release read de
   await f.render('root', true, true)
   await f.until(() => f.plugin.diagnostics().pendingSummary === 0, 'One resumed summary finishes')
   assert.equal(f.rpcActivity.methods.gsSummary, calls + 1)
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   await f.visibility('hidden')
   assert.equal(document.querySelector('[role=dialog]'), null)
   assert.equal(f.plugin.diagnostics().snapshotTimer, 0); assert.equal(f.plugin.diagnostics().summaryTimer, 0)
@@ -146,7 +143,7 @@ test('a core without lightweight summary reports its capability gap without fall
   await f.until(() => f.element.querySelector('[data-gs-entry]').textContent.includes('摘要不支持'), 'Capability gap appears on the closed entry')
   await f.tick()
   assert.equal(full, 0); assert.deepEqual(counts(f.element.querySelector('[data-gs-entry]')), ['0', '0', '0', '0'])
-  await f.click(f.element.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(f.element.querySelector('[data-gs-entry]')); await f.openTree()
   assert.ok(f.element.textContent.includes('共享核心尚不支持轻量 GS 摘要'))
   assert.equal(full, 1)
 })
@@ -168,7 +165,7 @@ test('native intersection visibility owns one entry observer and stops only invi
   const observer = [...observers][0]
   await act(async () => observer.callback([{ isIntersecting: true }]))
   await f.until(() => f.rpcActivity.methods.gsSummary === 1 && f.plugin.diagnostics().pendingSummary === 0, 'Visible entry gets one immediate core summary')
-  await f.click(f.element.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(f.element.querySelector('[data-gs-entry]')); await f.openTree()
   await act(async () => observer.callback([{ isIntersecting: false }]))
   await f.settle()
   assert.equal(f.element.querySelector('[role=dialog]'), null)
@@ -253,8 +250,8 @@ test('native UI pause leaves public event collection active while analysis and n
   const collected = await data.core.snapshot()
   assert.ok(collected.tasks.find(task => task.id === 'red').events.some(event => event.id === 'while-view-paused'))
   assert.equal(collected.monitoring.state, 'paused')
-  await f.renderOverview(); await showDetails(f)
-  await f.click([...f.element.querySelectorAll('button')].find(button => button.textContent === '继续分析'))
+  await f.renderOverview()
+  await f.panelCall('tools/call', { name: 'sentinel_set_overview_monitoring', arguments: { paused: false } })
   await f.until(() => data.modelCalls() > before, 'Public UI resume gives new collected material its real analysis turn')
   await f.render('root')
   data.advance(3000); await f.tick()
@@ -288,59 +285,22 @@ async function addFlatSource(data) {
   return { sourceKey, snapshot }
 }
 
-test('pure flat production actors contribute global activity and red counts without inventing session ownership', async t => {
-  const data = await observedTree(t, [])
-  await addFlatSource(data)
-  const f = await mountGS(t, data.service)
-  await f.renderOverview(); await showDetails(f)
-  const document = f.dom.window.document, header = document.querySelector('[data-gs-overview-counts]')
-  assert.ok(header.textContent.includes('会话 0 · 活动代理 2 · 关注 1'))
-  assert.deepEqual(counts(header), ['1', '0', '1', '0'])
-  assert.ok(document.body.textContent.includes('会话及后代数量不可判断'))
-  assert.equal(document.querySelector('[data-gs-empty]'), null, 'A visible flat red actor is not a no-problem empty state')
-  await f.click(document.querySelector('[data-gs-hide-normal]'))
-  assert.deepEqual(counts(header), ['1', '0', '1', '0'])
-  assert.ok(document.querySelector('nav[aria-label="未分组观察任务"]').textContent.includes('Flat red'))
-  assert.ok(!document.querySelector('nav[aria-label="未分组观察任务"]').textContent.includes('Flat flat-clear'))
-  assert.equal(document.querySelector('[data-gs-empty]'), null)
-})
-
-test('mixed grouped and flat production actors are counted once by observation key and keep scope coverage through filtering', async t => {
+test('the shared overview counts grouped and flat actors once and keeps unknown and ended status distinct', async t => {
   const data = await observedTree(t, ['root', 'deep', 'red'])
   const flat = await addFlatSource(data)
-  assert.equal(flat.snapshot.tasks.filter(task => task.id === 'red').length, 2, 'Same local ID belongs to two distinct public observation keys')
+  assert.equal(flat.snapshot.tasks.filter(task => task.id === 'red').length, 2)
   const f = await mountGS(t, data.service)
-  await f.renderOverview(); await showDetails(f)
-  const document = f.dom.window.document, header = document.querySelector('[data-gs-overview-counts]')
-  assert.ok(header.textContent.includes('会话 1 · 活动代理 5 · 关注 2'))
-  assert.deepEqual(counts(header), ['3', '0', '2', '0'])
-  assert.equal(document.querySelectorAll('[data-sentinel-session-group]').length, 1)
-  assert.ok(document.body.textContent.includes('会话及后代数量不可判断'))
-  await f.click(document.querySelector('[data-gs-hide-normal]'))
-  assert.deepEqual(counts(header), ['3', '0', '2', '0'])
-  assert.ok(document.querySelector(`[data-gs-node="${data.key('red')}"]`), 'The grouped deep red path stays visible')
-  assert.ok(document.querySelector('nav[aria-label="未分组观察任务"]').textContent.includes('Flat red'))
-  assert.ok(document.body.textContent.includes('会话及后代数量不可判断'))
-})
-
-test('known flat running actors remain counted gray when unobservable while ended and directory-only objects stay out of activity totals', async t => {
-  const data = await observedTree(t, [])
-  const flat = await addFlatSource(data)
+  await f.renderOverview()
+  let overview = await readOverview(f)
+  assert.deepEqual(overview.counts, { green: 3, yellow: 0, red: 2, gray: 0 })
+  assert.ok(overview.rows.some(row => row.title === 'Flat red' && row.counts.red === 1))
+  assert.ok(overview.rows.some(row => row.title === 'Name root' && row.counts.red === 1))
   await data.core.ingest(flat.sourceKey, { tasks: ['red', 'flat-clear'].map(id => ({ id, lifecycleId: 'life', title: `Flat ${id}`, status: 'unknown' })) })
-  let snapshot = await data.core.snapshot()
-  assert.deepEqual(snapshot.tasks.filter(task => task.sourceKey === flat.sourceKey && ['red', 'flat-clear'].includes(task.id)).map(task => task.gs.light), ['gray', 'gray'])
-  const f = await mountGS(t, data.service)
-  await f.renderOverview(); await showDetails(f)
-  const document = f.dom.window.document, header = document.querySelector('[data-gs-overview-counts]')
-  assert.ok(header.textContent.includes('会话 0 · 活动代理 2 · 关注 0'))
-  assert.deepEqual(counts(header), ['0', '0', '0', '2'])
+  overview = await readOverview(f)
+  assert.deepEqual(overview.counts, { green: 2, yellow: 0, red: 1, gray: 2 })
   await data.core.ingest(flat.sourceKey, { tasks: ['red', 'flat-clear'].map(id => ({ id, lifecycleId: 'life', title: `Flat ${id}`, status: 'disposed' })) })
-  snapshot = await data.core.snapshot()
-  assert.ok(snapshot.tasks.filter(task => task.sourceKey === flat.sourceKey).every(task => task.gs.light === null))
-  await f.tick()
-  assert.ok(header.textContent.includes('会话 0 · 活动代理 0 · 关注 0'))
-  assert.deepEqual(counts(header), ['0', '0', '0', '0'])
-  assert.ok(document.body.textContent.includes('会话及后代数量不可判断'))
+  overview = await readOverview(f)
+  assert.deepEqual(overview.counts, { green: 2, yellow: 0, red: 1, gray: 0 })
 })
 
 for (const waiting of [false, true]) test(`cached grouped ${waiting ? 'user-wait' : 'normal'} lights and counts are marked as prior observations before details are opened`, async t => {
@@ -356,39 +316,27 @@ for (const waiting of [false, true]) test(`cached grouped ${waiting ? 'user-wait
   data.service.snapshot = async () => { if (refuse) throw new Error('controlled snapshot read refused'); return read() }
   data.service.gsSummary = async sessionId => { if (refuse) throw new Error('controlled summary read refused'); return readSummary(sessionId) }
   const f = await mountGS(t, data.service)
-  await f.renderOverview(); await showDetails(f)
-  const document = f.dom.window.document, header = document.querySelector('[data-gs-overview-counts]')
-  const globalBefore = counts(header)
-  assert.deepEqual(globalBefore, ['2', '0', '1', '1'])
+  const document = f.dom.window.document
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   refuse = true
   await f.tick()
-  assert.ok(header.textContent.includes('上次读取计数 · 当前无法确认'), 'Global first-screen counts identify their cached observation context')
-  assert.deepEqual(counts(header), globalBefore)
-  const root = document.querySelector(`[data-gs-node="${data.key('root')}"]`)
-  assert.ok(root.textContent.includes(`当前无法确认 · 上次观察：${original.label}`))
-  assert.equal(root.querySelector('[data-gs-light]').dataset.gsLight, 'green', 'Cached core lamp is retained as a historical fact')
-  const basis = document.querySelector(`[data-gs-basis="${data.key('gray')}"]`)
-  assert.ok(basis.textContent.startsWith('上次观察依据：'))
-  assert.ok(document.querySelector('[data-gs-focus-summary]').textContent.includes('上次观察依据：'))
-  assert.ok(document.body.textContent.includes('会话及后代数量不可判断'), 'The mixed ungrouped coverage gap remains')
-  assert.deepEqual((await data.core.snapshot()).tasks.find(task => task.key === data.key('root')).gs, original, 'A read failure never rewrites the public core light or reason')
-  await f.render('root')
+  assert.deepEqual((await data.core.snapshot()).tasks.find(task => task.key === data.key('root')).gs, original)
+  await f.key('Escape')
   const entry = document.querySelector('[data-gs-entry]')
   assert.ok(entry.textContent.includes('上次读取'))
   assert.deepEqual(counts(entry), ['1', '0', '0', '1'])
-  await f.click(entry); await showDetails(f)
+  await f.click(entry); await f.openTree()
   const popup = document.querySelector('[role=dialog]')
   assert.ok(popup.querySelector('[data-gs-count-context]').textContent.includes('上次读取计数 · 当前无法确认'))
   assert.ok(popup.querySelector(`[data-gs-node="${data.key('root')}"]`).textContent.includes(`当前无法确认 · 上次观察：${original.label}`))
   assert.ok(popup.querySelector(`[data-gs-basis="${data.key('gray')}"]`).textContent.startsWith('上次观察依据：'))
-  assert.ok(popup.querySelector('[data-gs-focus-summary]').textContent.includes('上次观察依据：'))
   await f.render('not-observed')
   assert.equal(document.querySelector('[role=dialog]'), null)
   assert.deepEqual(counts(document.querySelector('[data-gs-entry]')), ['0', '0', '0', '0'])
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   assert.equal(document.querySelectorAll('[data-gs-node]').length, 0, 'A session switch never presents the previous object as current')
   await f.render('root')
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   refuse = false
   await f.tick()
   const fresh = document.querySelector('[role=dialog]')
@@ -396,9 +344,7 @@ for (const waiting of [false, true]) test(`cached grouped ${waiting ? 'user-wait
   assert.ok(!fresh.querySelector(`[data-gs-node="${data.key('root')}"]`).textContent.includes('上次观察'))
   assert.ok(!fresh.querySelector(`[data-gs-basis="${data.key('gray')}"]`).textContent.includes('上次观察依据'))
   assert.deepEqual(counts(fresh), ['1', '0', '0', '1'])
-  await f.renderOverview(); await showDetails(f)
-  assert.equal(document.querySelector('[data-gs-overview-counts] [data-gs-count-context]'), null)
-  assert.deepEqual(counts(document.querySelector('[data-gs-overview-counts]')), globalBefore)
+
 })
 
 test('cached normal-only filter empty states describe the previous observation while current scope is unconfirmed', async t => {
@@ -408,16 +354,12 @@ test('cached normal-only filter empty states describe the previous observation w
   data.service.snapshot = async () => { if (refuse) throw new Error('controlled normal-only snapshot refused'); return read() }
   const f = await mountGS(t, data.service), document = f.dom.window.document
   await f.until(() => document.querySelector('[data-gs-count=green]')?.textContent === '1', 'Production green scope loaded')
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   refuse = true
   await f.tick()
   await f.click(document.querySelector('[role=dialog] [data-gs-hide-normal]'))
   assert.equal(document.querySelector('[data-gs-empty]').textContent, '上次观察中没有需要关注的节点；当前无法确认。')
   assert.deepEqual(counts(document.querySelector('[role=dialog]')), ['1', '0', '0', '0'])
-  await f.renderOverview(); await showDetails(f)
-  await f.click(document.querySelector('[data-gs-hide-normal]'))
-  assert.equal(document.querySelector('[data-gs-empty]').textContent, '上次观察中没有需要关注的节点；当前无法确认。')
-  assert.deepEqual(counts(document.querySelector('[data-gs-overview-counts]')), ['1', '0', '0', '0'])
   refuse = false
   await f.tick()
   assert.equal(document.querySelector('[data-gs-empty]').textContent, '没有需要关注的节点。')
@@ -429,7 +371,7 @@ test('actual GS hides only normal display paths and keeps core counts and each p
   const f = await mountGS(t, data.service)
   const document = f.dom.window.document
   await f.until(() => document.querySelector('[data-gs-count="red"]')?.textContent === '1', 'Production projection reaches native client')
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   const popup = document.querySelector('[role="dialog"]')
   const filter = popup.querySelector('[data-gs-hide-normal]')
   assert.ok(filter, 'The current GS provides hide normal')
@@ -442,7 +384,7 @@ test('actual GS hides only normal display paths and keeps core counts and each p
   assert.ok(row.querySelector('[data-gs-basis]').textContent.includes('red own basis'))
   assert.ok(!row.querySelector('[data-gs-basis]').textContent.includes('gray own basis'))
   await f.click(red)
-  assert.equal(popup.querySelector('[data-gs-detail]').dataset.gsDetail, data.key('red'), 'Focused details stay bound to their selected owner')
+  assert.equal((await f.panelCall('ui/initialize', {}, '.sentinel-gs-node-panel iframe')).hostContext.sentinelExecution.key, data.key('red'))
   const before = counts(popup)
   const coreBefore = await data.core.snapshot()
   const claimsBefore = data.claims()
@@ -459,31 +401,16 @@ test('actual GS hides only normal display paths and keeps core counts and each p
   assert.equal(document.getElementById('draft').value, 'keep draft')
 })
 
-test('actual global overview groups production sessions, keeps normal summaries closed and locates problems without changing the chat', async t => {
+test('the shared overview ranks the problem group first and preserves the current conversation entry', async t => {
   const data = await observedTree(t, ['normal-root', 'normal-leaf', 'root', 'deep', 'red', 'yellow', 'gray', 'history'])
   const f = await mountGS(t, data.service)
-  await f.renderOverview(); await showDetails(f)
-  const document = f.dom.window.document
-  await f.until(() => document.querySelectorAll('[data-sentinel-session-group]').length === 2, 'Both production groups render')
-  const groups = [...document.querySelectorAll('[data-sentinel-session-group]')]
-  assert.ok(groups[0].querySelector('summary').textContent.includes('Name root'), 'Problem session appears before the normal session')
-  assert.ok(document.querySelector('[data-gs-overview-counts]').textContent.includes('会话 2 · 活动代理 7 · 关注 1'))
-  assert.equal(groups[1].querySelector('[data-gs-group-tree]').open, false, 'Normal session shows only its summary')
-  assert.equal(groups[0].querySelector('[data-gs-history]').open, false)
-  const red = groups[0].querySelector(`[data-gs-node="${data.key('red')}"]`)
-  await f.click(red)
-  assert.equal(document.querySelector('[data-gs-detail]').dataset.gsDetail, data.key('red'))
-  assert.equal(document.getElementById('draft').value, 'keep draft')
-  const allCounts = counts(document.querySelector('.sentinel-overview'))
-  const filter = document.querySelector('[data-gs-hide-normal]')
-  assert.equal(filter.checked, false)
-  await f.click(filter)
-  assert.equal(document.querySelectorAll('[data-sentinel-session-group]').length, 1)
-  assert.deepEqual(counts(document.querySelector('[data-gs-overview-counts]')), allCounts.slice(0, 4))
-  assert.equal(document.querySelector('[data-gs-monitor-diagnostics]').open, false)
-  assert.equal(document.querySelector('[data-gs-diagnostics]').open, false)
+  await f.renderOverview()
+  const overview = await readOverview(f)
+  assert.deepEqual(overview.rows.map(row => row.title), ['Name root', 'Name normal-root'])
+  assert.deepEqual(overview.counts, { green: 4, yellow: 1, red: 1, gray: 1 })
   await f.render('root')
-  assert.equal(document.querySelector('[data-gs-entry]').dataset.gsEntry, 'root', 'Global selection never rebinds the current session')
+  assert.equal(f.element.querySelector('[data-gs-entry]').dataset.gsEntry, 'root')
+  assert.equal(f.dom.window.document.getElementById('draft').value, 'keep draft')
 })
 
 test('normal-only and empty production scopes keep zero counts and show short filter empty states', async t => {
@@ -491,22 +418,16 @@ test('normal-only and empty production scopes keep zero counts and show short fi
   const f = await mountGS(t, data.service)
   const document = f.dom.window.document
   await f.until(() => document.querySelector('[data-gs-count="green"]')?.textContent === '3', 'Normal production scope loaded')
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   let popup = document.querySelector('[role=dialog]')
   assert.deepEqual(counts(popup), ['3', '0', '0', '0'])
   await f.click(popup.querySelector('[data-gs-hide-normal]'))
   assert.equal(popup.querySelectorAll('[data-gs-node]').length, 0)
   assert.equal(popup.querySelector('[data-gs-empty]').textContent, '没有需要关注的节点。')
   assert.deepEqual(counts(popup), ['3', '0', '0', '0'])
-  await f.renderOverview(); await showDetails(f)
-  assert.equal(document.querySelector('[data-gs-hide-normal]').checked, false, 'Each view starts with its own normal filter off')
-  await f.click(document.querySelector('[data-gs-hide-normal]'))
-  assert.equal(document.querySelectorAll('[data-sentinel-session-group]').length, 0)
-  assert.equal(document.querySelector('[data-gs-empty]').textContent, '没有需要关注的节点。')
-  assert.deepEqual(counts(document.querySelector('[data-gs-overview-counts]')), ['3', '0', '0', '0'])
   await f.render('not-observed')
   assert.deepEqual(counts(document.querySelector('[data-gs-entry]')), ['0', '0', '0', '0'])
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   popup = document.querySelector('[role=dialog]')
   assert.ok(popup.textContent.includes('层级材料尚未取得'))
   assert.equal(popup.querySelectorAll('[data-gs-node]').length, 0, 'Unknown scope never flashes a different session tree')
@@ -518,7 +439,7 @@ test('disconnected production nodes share one source summary while history stays
   const document = f.dom.window.document
   await data.core.unregisterSource(data.sourceKey)
   await f.tick()
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   let popup = document.querySelector('[role=dialog]')
   assert.equal(popup.querySelectorAll('[data-gs-disconnected]').length, 1)
   assert.ok([...popup.querySelectorAll('[data-gs-basis]')].every(node => !node.textContent.includes('来源失联')), 'The identical source-loss reason is summarized once')
@@ -528,10 +449,7 @@ test('disconnected production nodes share one source summary while history stays
   await f.click(history.querySelector('summary'))
   assert.equal(history.open, true)
   assert.ok(history.querySelector(`[data-gs-node="${data.key('history')}"]`))
-  await f.renderOverview(); await showDetails(f)
-  assert.equal(document.querySelectorAll('[data-gs-disconnected]').length, 1)
-  assert.deepEqual(counts(document.querySelector('[data-gs-overview-counts]')), ['0', '0', '0', '7'])
-  assert.ok(!document.body.textContent.includes('未知后代 0'), 'Unknown branches are never given an estimated count')
+
 })
 
 test('actual popup keyboard dismissal, text lamp labels and compact styles preserve the composer across session switches', async t => {
@@ -541,7 +459,7 @@ test('actual popup keyboard dismissal, text lamp labels and compact styles prese
   await f.until(() => document.querySelector('[data-gs-count="red"]')?.textContent === '1', 'Mixed production scope loaded')
   const entry = document.querySelector('[data-gs-entry]')
   entry.focus()
-  await f.click(entry); await showDetails(f)
+  await f.click(entry); await f.openTree()
   const popup = document.querySelector('[role=dialog]')
   assert.equal(document.activeElement.getAttribute('aria-label'), '关闭 GS')
   const red = popup.querySelector(`[data-gs-node="${data.key('red')}"]`), row = red.closest('[data-gs-row]')
@@ -560,11 +478,11 @@ test('actual popup keyboard dismissal, text lamp labels and compact styles prese
   await f.key('Escape')
   assert.equal(document.querySelector('[role=dialog]'), null)
   assert.equal(document.activeElement, entry)
-  await f.click(entry); await showDetails(f)
+  await f.click(entry); await f.openTree()
   await f.render('normal-root')
   assert.equal(document.querySelector('[role=dialog]'), null, 'Session switching closes the previous scoped popup')
   assert.deepEqual(counts(document.querySelector('[data-gs-entry]')), ['2', '0', '0', '0'])
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   assert.equal(document.querySelector(`[data-gs-node="${data.key('red')}"]`), null)
   assert.equal(document.getElementById('draft'), draft)
   assert.equal(draft.value, 'keep draft')
@@ -576,12 +494,12 @@ test('an empty production core renders a zero-count global overview and an unkno
   const data = await observedTree(t, [])
   const f = await mountGS(t, data.service)
   const document = f.dom.window.document
-  await f.renderOverview(); await showDetails(f)
-  assert.deepEqual(counts(document.querySelector('[data-gs-overview-counts]')), ['0', '0', '0', '0'])
-  assert.ok(document.querySelector('[data-gs-overview-counts]').textContent.includes('会话 0 · 活动代理 0 · 关注 0'))
-  assert.equal(document.querySelector('[data-gs-empty]').textContent, '目前没有活动会话。')
+  await f.renderOverview()
+  const overview = await readOverview(f)
+  assert.equal(overview.total, 0)
+  assert.deepEqual(overview.counts, { green: 0, yellow: 0, red: 0, gray: 0 })
   await f.render('root')
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   assert.deepEqual(counts(document.querySelector('[role=dialog]')), ['0', '0', '0', '0'])
   assert.equal(document.querySelectorAll('[data-gs-node]').length, 0)
 })
@@ -591,7 +509,7 @@ test('an ended production ancestor remains a path while its own history can be i
   const f = await mountGS(t, data.service, 'deep')
   const document = f.dom.window.document
   await f.until(() => document.querySelector('[data-gs-count="red"]')?.textContent === '1', 'Production child subtree loaded')
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   await f.click(document.querySelector('[data-gs-return-root]'))
   const path = document.querySelector(`[data-gs-path="${data.key('root')}"]`)
   const history = path.querySelector('[data-gs-history]')
@@ -600,108 +518,11 @@ test('an ended production ancestor remains a path while its own history can be i
   assert.equal(shown(historicalNode), false)
   await f.click(history.querySelector('summary'))
   await f.click(historicalNode)
-  assert.ok(document.querySelector('[data-gs-detail]').textContent.includes('已结束'))
+  const initial = await f.panelCall('ui/initialize', {}, '.sentinel-gs-node-panel iframe')
+  const { key, threadId } = initial.hostContext.sentinelExecution
+  const result = await f.panelCall('tools/call', { name: 'sentinel_current_chat', arguments: { executionKey: key, expectedThreadId: threadId } }, '.sentinel-gs-node-panel iframe')
+  assert.equal(result.structuredContent.execution.key, data.key('root'))
+  assert.equal(result.structuredContent.execution.historical, true)
   assert.equal(document.querySelector('[data-gs-entry]').dataset.gsEntry, 'deep')
   assert.deepEqual(counts(document.querySelector('[data-gs-entry]')), ['1', '0', '1', '0'])
-})
-
-
-test('inactive historical groups with gaps start closed while ended roots with active or unknown descendants remain visible', async t => {
-  const group = (key, nodes, runningCount, counts) => ({ key, rootSessionId: nodes[0].sessionId, nodes, runningCount, counts,
-    coverage: { complete: false, branchGaps: [{ sessionId: nodes[0].sessionId, reason: `${key} original coverage gap` }] } })
-  const groups = [
-    group('historical', [{ taskKey: 'old', sessionId: 'old', depth: 0, state: 'ended', light: null }], 0, { green: 0, yellow: 0, red: 0, gray: 0 }),
-    group('active', [{ taskKey: 'ended-root', sessionId: 'ended-root', depth: 0, state: 'ended', light: null }, { taskKey: 'active-child', sessionId: 'active-child', depth: 1, state: 'running', light: 'gray' }], 1, { green: 0, yellow: 0, red: 0, gray: 1 }),
-    group('uncertain', [{ taskKey: 'uncertain', sessionId: 'uncertain', depth: 0, state: 'unknown', light: 'gray' }], 0, { green: 0, yellow: 0, red: 0, gray: 1 }),
-  ]
-  const snapshot = { protocol: 1, generatedAt: Date.now(), adapter: { sourceKey: 'own' }, monitoring: { state: 'active' }, sources: [{ key: 'own', status: 'connected', gaps: ['Original source coverage gap'] }],
-    hierarchyContext: { schemaVersion: 1, groups, scopes: [] }, tasks: groups.flatMap(item => item.nodes).map(node => ({ key: node.taskKey, id: node.sessionId, sourceKey: 'own', title: node.sessionId,
-      status: node.state === 'ended' ? 'idle' : node.state, gs: { light: node.light, label: node.state === 'ended' ? '已结束' : '不可判断' }, analysis: { state: 'unknown', checks: [] } })) }
-  const f = await mountGS(t, { snapshot: async () => snapshot, analysisConfig: async () => ({}), claimNotifications: async () => [] })
-  await f.renderOverview(); await showDetails(f)
-  const document = f.dom.window.document
-  await f.until(() => document.querySelectorAll('[data-sentinel-session-group]').length === 3, 'All original groups stay available')
-  const details = key => document.querySelector(`[data-sentinel-session-group="${key}"] [data-gs-group-tree]`)
-  assert.equal(details('historical').open, false, 'A coverage gap does not automatically expand an inactive historical group')
-  assert.ok(details('historical').querySelector('summary').textContent.includes('层级覆盖不完整'))
-  assert.equal(details('active').open, true, 'An ended root with an active descendant stays in the active view')
-  assert.equal(details('uncertain').open, true, 'Unknown active status is not silently classified as ended')
-  assert.ok(document.querySelector('[data-gs-coverage]').textContent.includes('未知后代数量不估算'))
-  assert.deepEqual(counts(document.querySelector('[data-gs-overview-counts]')), ['0', '0', '0', '2'])
-  await f.click(details('historical').querySelector('summary'))
-  assert.equal(details('historical').open, true)
-  assert.ok(details('historical').textContent.includes('historical original coverage gap'))
-  await f.click(details('historical').querySelector('[data-gs-history] summary'))
-  await f.click(details('historical').querySelector('[data-gs-node="old"]'))
-  await f.tick()
-  assert.equal(details('historical').open, true, 'The selected historical object remains inspectable through refresh')
-  assert.equal(document.querySelector('[data-gs-detail]').dataset.gsDetail, 'old')
-  assert.equal(document.getElementById('draft').value, 'keep draft')
-})
-
-test('monitor issues stay empty for normal and unknown production nodes while sticky lamps and focused details retain their scope', async t => {
-  const data = await observedTree(t, ['root', 'gray'])
-  const f = await mountGS(t, data.service), document = f.dom.window.document
-  await f.click(document.querySelector('[data-gs-entry]'))
-  const popup = document.querySelector('[role=dialog]')
-  assert.deepEqual([...popup.querySelectorAll('[role=tab]')].map(node => node.textContent), ['当前问题', '详情'])
-  const issues = popup.querySelector('[data-gs-issues]')
-  assert.equal(issues.childElementCount, 0, 'No issue or explanatory placeholder appears for green/gray nodes')
-  assert.deepEqual(counts(popup.querySelector('[data-gs-monitor-header]')), ['1', '0', '0', '1'])
-  assert.equal(f.dom.window.getComputedStyle(popup.querySelector('[data-gs-monitor-header]')).position, 'sticky')
-  assert.equal(popup.querySelector('form'), null, 'Model configuration belongs to native system settings')
-  await f.click(popup.querySelector('[data-gs-tab=details]'))
-  await f.click(popup.querySelector('[data-gs-scope-tree] > summary'))
-  await f.click(popup.querySelector(`[data-gs-node="${data.key('gray')}"]`))
-  assert.ok(popup.querySelector('[data-gs-focus-summary]'))
-  assert.ok(popup.querySelector('[data-gs-checks]').textContent.includes('gray own basis'))
-  assert.ok(popup.querySelector('[data-gs-checks]'))
-  await f.tick()
-  assert.equal(popup.querySelector('[data-gs-tab=details]').getAttribute('aria-selected'), 'true')
-  assert.ok(popup.querySelector(`[data-gs-node="${data.key('gray')}"][aria-pressed=true]`))
-  await f.renderOverview()
-  const overview = document.querySelector('.sentinel-overview')
-  assert.equal(overview.querySelector('[data-gs-issues]').childElementCount, 0)
-  assert.deepEqual(counts(overview.querySelector('[data-gs-monitor-header]')), ['1', '0', '0', '1'])
-  assert.equal(overview.querySelector('form'), null)
-})
-
-test('production issue links retain multilevel ownership, short citations and delivery markers then open a focused details summary', async t => {
-  const data = await observedTree(t, ['root', 'deep', 'red', 'gray', 'history'])
-  data.advance(3000)
-  const claims = await data.core.claimNotifications(data.sourceKey)
-  assert.equal(claims.length, 1)
-  await data.core.ackNotification(claims[0].id, { sourceKey: claims[0].sourceKey, attemptToken: claims[0].attemptToken, status: 'submitted' })
-  const f = await mountGS(t, data.service), document = f.dom.window.document
-  await f.click(document.querySelector('[data-gs-entry]'))
-  const popup = document.querySelector('[role=dialog]'), issues = popup.querySelector('[data-gs-issues]')
-  assert.deepEqual([...issues.querySelectorAll('[data-gs-node]')].map(node => node.dataset.gsNode), [data.key('red')])
-  assert.ok(issues.querySelector(`[data-gs-path="${data.key('root')}"]`))
-  assert.ok(issues.querySelector(`[data-gs-path="${data.key('deep')}"]`))
-  assert.equal(issues.querySelector('[data-gs-history]'), null)
-  assert.equal(issues.querySelector('[data-gs-checks]'), null)
-  const row = issues.querySelector(`[data-gs-row="${data.key('red')}"]`)
-  assert.ok(row.textContent.includes('red own basis'))
-  assert.ok(row.querySelector('small[data-sentinel-citation]').textContent.includes('red input'))
-  assert.ok(row.querySelector('[data-gs-notification]').textContent.includes('系统已受理'))
-  await f.click(popup.querySelector('[data-gs-tab=details]'))
-  assert.ok(popup.querySelector('[data-gs-focus-summary]'), 'Details immediately focuses the first current problem')
-  const detailPanel = popup.querySelector('[role=tabpanel][aria-label=详情]')
-  assert.equal(detailPanel.firstElementChild.dataset.gsDetail, data.key('red'), 'The focused summary leads Details before tree and coverage')
-  assert.equal(detailPanel.querySelector('[data-gs-scope-tree]').open, false, 'Agent ownership is available on demand')
-  await f.click(popup.querySelector('[data-gs-tab=issues]'))
-  await f.click(issues.querySelector(`[data-gs-node="${data.key('red')}"]`))
-  assert.equal(popup.querySelector('[data-gs-tab=details]').getAttribute('aria-selected'), 'true')
-  assert.equal(popup.querySelector('[data-gs-detail]').dataset.gsDetail, data.key('red'))
-  popup.querySelector('[data-gs-tab=details]').focus()
-  const focused = document.activeElement
-  await f.tick()
-  assert.equal(document.activeElement, focused, 'Snapshot refresh retains keyboard focus')
-  assert.equal(popup.querySelector('[data-gs-detail]').dataset.gsDetail, data.key('red'))
-  await data.core.unregisterSource(data.sourceKey)
-  await f.tick()
-  await f.click(popup.querySelector('[data-gs-tab=issues]'))
-  assert.equal(issues.childElementCount, 0, 'A disconnected scope has gray lamps and no historical current issue')
-  await f.renderOverview()
-  assert.equal(document.querySelector('[data-gs-issues]').childElementCount, 0)
 })

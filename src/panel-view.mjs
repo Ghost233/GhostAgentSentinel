@@ -16,11 +16,17 @@ function blockingView(decision, readEvidence, readAt, historical) {
 
 export function materialView(view, task, { historical = false, snapshot, readEvidence } = {}) {
   const states = { queued: '检查排队中', analyzing: '正在检查', unavailable: '本地摘取模型或 JEV 未配置', failed: '本轮分析失败', unknown: '当前请求或分析证据不足', cooldown: '本轮六项检查已更新', idle: '最近检查结果' }
+  const readAt = snapshot?.generatedAt ?? Date.now()
+  const ownerTasks = snapshot?.tasks ?? [task]
+  const evidenceFor = readEvidence ?? (reference => summaryEvent(task, reference, ownerTasks))
   const findings = historical ? task.analysis.checks.filter(check => check.status === 'attention').map(check => ({ ...check, checkId: check.id })) : task.alerts.filter(alert => alert.status === 'attention')
   const issues = findings.map(alert => {
     const check = task.analysis.checks.find(check => check.id === alert.checkId)
     const confirmed = ['current', 'reused'].includes(task.analysis.resultDisposition) && !['failed', 'unavailable', 'interrupted', 'stale'].includes(task.analysis.state) && check?.status === 'attention' && !view.observation?.recordRevalidating
-    const evidence = task.events.filter(event => alert.evidenceIds?.includes(event.id))
+    const evidence = (Array.isArray(alert.evidenceRefs)
+      ? alert.evidenceRefs.map(evidenceFor).filter(Boolean)
+      : task.events.filter(event => alert.evidenceIds?.includes(event.id)))
+      .filter(event => event.capturedAt <= readAt && event.capturedAt > readAt - SESSION_HISTORY_MS)
     const results = evidence.filter(event => event.kind === 'tool-result').slice(-2)
     const selected = alert.checkId !== 'stalled_progress' ? evidence.slice(0, 2) : results.length ? [...evidence.filter(event => event.kind !== 'tool-result').slice(-1), ...results].slice(-2) : evidence.slice(-2)
     let reviewReason = '已有新材料或检查尚未完成，等待本轮复核'
@@ -42,9 +48,7 @@ export function materialView(view, task, { historical = false, snapshot, readEvi
   const summaryVisible = (historical || ['current', 'reused'].includes(task.analysis.resultDisposition)) && !['failed', 'unavailable', 'interrupted', 'stale'].includes(task.analysis.state)
   const generated = summaryVisible ? task.analysis.summary?.generated : null
   const partial = summaryVisible && task.analysis.coverage?.complete === false ? task.analysis.summary?.partial : null
-  const prior = task.analysis.lastSuccessfulSummary, readAt = snapshot?.generatedAt ?? Date.now()
-  const ownerTasks = snapshot?.tasks ?? [task]
-  const evidenceFor = readEvidence ?? (reference => summaryEvent(task, reference, ownerTasks))
+  const prior = task.analysis.lastSuccessfulSummary
   const generatedView = (value, historicalDecision = historical || revalidating) => {
     if (!value) return null
     const blocking = blockingView(value.blocking, evidenceFor, readAt, historicalDecision)
@@ -129,10 +133,12 @@ export function projectPanelOverview(sources, tasks, hierarchy, offset = 0) {
     if (grouped.has(task.key)) continue
     const key = JSON.stringify([task.sourceKey, task.sessionId ?? task.id])
     const previous = remaining.get(key)
-    if (!previous || (task.gs.active && !previous.gs.active) || task.gs.active === previous.gs.active && task.updatedAt > previous.updatedAt) remaining.set(key, task)
+    const active = Object.hasOwn(counts, task.gs.light)
+    const previousActive = previous && Object.hasOwn(counts, previous.gs.light)
+    if (!previous || (active && !previousActive) || active === previousActive && task.updatedAt > previous.updatedAt) remaining.set(key, task)
   }
   for (const task of remaining.values()) {
-    const color = task.gs.active ? task.gs.light : null
+    const color = task.gs.light
     addRow([task], task, Object.hasOwn(counts, color) ? { [color]: 1 } : {}, task.gs.coverage.complete)
   }
   rows.sort((a, b) => rank(a.counts) - rank(b.counts) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || a.title.localeCompare(b.title))
@@ -140,31 +146,77 @@ export function projectPanelOverview(sources, tasks, hierarchy, offset = 0) {
   return { counts, total: rows.length, rows: page, offset, nextOffset: offset + page.length < rows.length ? offset + page.length : null }
 }
 
-export function projectDSHSessionPanel(snapshot, sourceKey, sessionId, selection = {}, readEvidence) {
+export function projectSessionPanel(snapshot, {
+  sourceKey, sessionId, selection = {}, readEvidence,
+  observation, lifecycleId, retainedOnly = false,
+}) {
   if ((selection.executionKey || selection.historyCursor) && selection.expectedThreadId !== sessionId) throw new Error('历史检查的会话身份已变化')
   const source = snapshot.sources.find(value => value.key === sourceKey)
-  const ownerTasks = source ? snapshot.tasks.filter(task => task.sourceKey === sourceKey) : []
-  const tasks = ownerTasks.filter(task => task.sessionId === sessionId && task.events.length)
-  const connected = source?.status === 'connected'
+  const registrationId = source?.descriptor.registrationId
+  const native = source?.descriptor.policy === 'chatgpt-main/1'
+  const sourceKeys = new Set(source ? native ? snapshot.sources
+    .filter(value => value.descriptor.policy === 'chatgpt-main/1' && value.descriptor.registrationId === registrationId)
+    .map(value => value.key) : [sourceKey] : [])
+  const ownerTasks = snapshot.tasks.filter(task => sourceKeys.has(task.sourceKey))
   const readAt = snapshot.generatedAt
-  const records = tasks.map(task => ({ task, item: { key: task.key, status: task.status, observedAt: task.lastActivity ?? task.updatedAt, analysisState: task.analysis.state } }))
-    .sort((a, b) => (b.item.observedAt ?? 0) - (a.item.observedAt ?? 0) || a.item.key.localeCompare(b.item.key))
-  const current = records.find(value => value.task.status === 'running') ?? records[0]
+  const records = ownerTasks.flatMap(task => {
+    if ((task.sessionId ?? task.id) !== sessionId) return []
+    const events = native ? task.events.filter(event => event.taskId === task.id && event.taskLifecycleId === task.lifecycleId &&
+      event.data?.runId === task.lifecycleId && event.data?.sourceKind === 'chatgpt-native' && !event.data.history && !event.data.inherited &&
+      event.capturedAt > readAt - SESSION_HISTORY_MS) : task.events
+    if (!events.length) return []
+    const start = native && events.find(event => event.data.nativeType === 'task_started')
+    const end = native && events.findLast(event => ['task_complete', 'turn_aborted'].includes(event.data.nativeType))
+    const observedAt = native ? events.reduce((first, event) => Math.min(first, event.capturedAt), Infinity) : task.lastActivity ?? task.updatedAt
+    const item = { key: task.key, sourceKey: task.sourceKey, lifecycleId: task.lifecycleId,
+      status: end ? end.data.nativeType === 'turn_aborted' ? 'aborted' : 'ended' : task.status,
+      startedAt: start?.occurredAt ?? null, observedAt, analysisState: task.analysis.state }
+    return [{ task, item, order: item.startedAt ?? observedAt }]
+  }).sort((a, b) => (b.order ?? 0) - (a.order ?? 0) || a.item.key.localeCompare(b.item.key))
+  const current = records.find(({ task }) => task.sourceKey === sourceKey &&
+    (lifecycleId ? task.lifecycleId === lifecycleId : task.status === 'running')) ?? records[0]
   const selected = selection.executionKey ? records.find(value => value.task.key === selection.executionKey) : current
   const cursorIndex = selection.historyCursor ? records.findIndex(value => value.task.key === selection.historyCursor) : -1
   const page = records.slice(cursorIndex + 1, cursorIndex + 21), hasMore = records.length > cursorIndex + 21
+  const connected = source?.status === 'connected'
+  const observed = connected && !retainedOnly && !observation?.observation?.recordRevalidating
+  const paused = snapshot.monitoring?.paused
   const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null,
-    currentStatus: connected ? current?.task.status : 'unknown', currentSignal: connected ? current?.task.gs?.light : 'gray',
-    cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0),
-    currentGap: connected ? current?.task.status === 'idle' ? 'chat-idle' : null : 'observer-unavailable', retentionMs: SESSION_HISTORY_MS }
-  const identity = { threadId: sessionId, title: current?.task.title }
-  const recent = recentModelActivity(tasks, current?.task, source?.descriptor.registrationId, readAt, connected && !snapshot.monitoring?.paused, ownerTasks, readEvidence)
-  if (!selected) return { identity, signal: 'gray', summary: selection.executionKey ? '这条历史执行已不可读取' : '暂无本会话的执行记录',
-    observation: { status: 'unknown', gap: connected ? 'current-turn-not-observed' : 'observer-unavailable' },
-    analysis: { state: 'unknown', checks: [] }, history, recentModelActivity: recent }
+    currentStatus: observed ? current?.task.status : 'unknown',
+    currentSignal: observed && !paused && current?.task.analysis.state !== 'paused' ? current?.task.gs?.light ?? 'gray' : 'gray',
+    cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null,
+    historyGap: Boolean(selection.historyCursor && cursorIndex < 0), hasMore, retentionMs: SESSION_HISTORY_MS,
+    currentGap: retainedOnly ? observation?.observation?.gap ?? 'current-turn-not-observed' : !connected ? 'observer-unavailable' :
+      current?.task.status === 'idle' ? 'chat-idle' : null }
+  const identity = { ...observation?.identity, threadId: sessionId, title: observation?.identity?.title ?? current?.task.title }
+  const recentModel = recentModelActivity(records.map(value => value.task), current?.task, registrationId, readAt, observed && !paused, ownerTasks, readEvidence)
+  if (!selected) {
+    const gap = selection.executionKey ? 'history-unavailable' : observation?.observation?.gap ?? (connected ? 'current-turn-not-observed' : 'observer-unavailable')
+    const checking = observation?.observation?.coldReadStage || !selection.executionKey && observation?.observation?.recordRevalidating
+    return { ...(checking ? observation : {
+      signal: 'gray', summary: selection.executionKey ? '这条历史执行已不可读取' : '暂无本会话的执行记录',
+      observation: { phase: 'unknown', status: 'unknown', coverage: 'unavailable', gap },
+      analysis: { state: 'unknown', checks: [] },
+    }), identity, history, recentModelActivity: recentModel }
+  }
   const { task, item } = selected
-  const historical = !connected || selected !== current || task.status !== 'running'
-  const view = materialView({ identity, signal: 'gray', summary: '当前状态不可判断',
-    observation: { status: task.status, coverage: historical ? 'retained-history' : 'caught-up', gap: history.currentGap } }, task, { historical, snapshot: { ...snapshot, tasks: ownerTasks }, readEvidence })
-  return { ...view, history, recentModelActivity: recent, execution: { ...item, request: task.currentRequest ?? '', historical } }
+  const ended = ['ended', 'aborted'].includes(item.status) || !native && ['idle', 'disposed'].includes(item.status)
+  const historical = !connected || retainedOnly || selected !== current || ended
+  const view = materialView({ ...observation, identity, signal: 'gray', summary: '当前状态不可判断',
+    ...(historical ? { currentFacts: undefined, inheritance: undefined } : {}),
+    observation: { ...(historical ? {} : observation?.observation), status: task.status,
+      coverage: historical ? 'retained-history' : observation?.observation?.coverage ?? 'caught-up',
+      gap: historical ? history.currentGap : observation?.observation?.gap ?? history.currentGap },
+  }, task, { historical, snapshot: { ...snapshot, tasks: ownerTasks }, readEvidence })
+  if (historical) {
+    view.signal = 'gray'
+    view.summary = history.currentGap === 'chat-idle' ? '会话空闲 · 显示上次检查结果，有新活动后自动监控' :
+      history.currentGap ? '当前执行尚未确认 · 显示最近检查记录' : '历史执行 · 仅表示当时的检查记录'
+    view.observation.phase = item.status === 'aborted' ? 'aborted' : ended ? 'completed' : 'unknown'
+    if (native && !retainedOnly && connected) {
+      view.observation.gap = task.events.find(event => event.kind === 'gap' && !event.data?.history && event.data?.verificationGaps?.length)?.data.verificationGaps[0]
+        ?? (task.currentRequest ? null : 'historical-user-request-unverified')
+    }
+  }
+  return { ...view, history, recentModelActivity: recentModel, execution: { ...item, request: (task.currentRequest ?? '').slice(0, 240), historical } }
 }

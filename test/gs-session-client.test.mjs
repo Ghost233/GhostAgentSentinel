@@ -2,10 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mountGS } from './gs-session-client-runtime.mjs'
 
-const showDetails = async f => {
-  const tab = f.element.querySelector('[data-gs-tab=details]'); if (tab) await f.click(tab)
-  const tree = f.element.querySelector('[data-gs-scope-tree]'); if (tree && !tree.open) await f.click(tree.querySelector('summary'))
-}
+import { projectSessionPanel } from '../src/panel-view.mjs'
+import { panelHarness } from './helpers/chatgpt-panel.mjs'
 
 const emptySnapshot = () => ({ protocol: 1, generatedAt: Date.now(), sources: [], tasks: [], adapter: { sourceKey: 'own' }, hierarchyContext: { schemaVersion: 1, groups: [], scopes: [] } })
 test('GS appends beside native round steps, falls back to the header only without a footer and keeps all zero counts', async t => {
@@ -60,7 +58,7 @@ test('the actual GS popup uses the core current scope, selects details without r
   const f = await mountGS(t, { snapshot: async () => snapshot, gsSummary: async sessionId => ({ protocol: 1, generatedAt: snapshot.generatedAt, sourceKey: 'own', sessionId, sourceStatus: 'connected', scopeKnown: sessionId === 'child', counts: sessionId === 'child' ? snapshot.hierarchyContext.scopes[0].counts : { green: 0, yellow: 0, red: 0, gray: 0 }, coverage: { complete: false, gaps: [] }, gsStatus: { supported: true } }), analysisConfig: async () => ({}), claimNotifications: async () => [] }, 'child')
   const document = f.dom.window.document
   await f.until(() => document.querySelector('[data-gs-count="gray"]')?.textContent === '2', 'core scope counts rendered')
-  await f.click(document.querySelector('[data-gs-entry]')); await showDetails(f)
+  await f.click(document.querySelector('[data-gs-entry]')); await f.openTree()
   let dialog = document.querySelector('[role="dialog"]')
   assert.ok(dialog, 'GS must open a real mounted popup')
   assert.deepEqual([...dialog.querySelectorAll('[data-gs-node]')].map(node => node.dataset.gsNode), ['child-task', 'deep-task'])
@@ -68,7 +66,8 @@ test('the actual GS popup uses the core current scope, selects details without r
   await f.click(dialog.querySelector('[data-gs-node="deep-task"]'))
   assert.equal(document.querySelector('[data-gs-scope]').dataset.gsScope, 'child')
   assert.equal(document.querySelector('[data-gs-entry] [data-gs-count="gray"]').textContent, '2')
-  assert.ok(document.querySelector('[data-gs-detail]').textContent.includes('task deep'))
+  const initial = await f.panelCall('ui/initialize', {}, '.sentinel-gs-node-panel iframe')
+  assert.deepEqual(JSON.parse(JSON.stringify(initial.hostContext.sentinelExecution)), { threadId: 'deep', key: 'deep-task' })
   await f.click(document.querySelector('[data-gs-return-root]'))
   dialog = document.querySelector('[role="dialog"]')
   assert.deepEqual([...dialog.querySelectorAll('[data-gs-node]')].map(node => node.dataset.gsNode), ['root-task', 'child-task', 'deep-task', 'sibling-task'])
@@ -81,52 +80,32 @@ test('the actual GS popup uses the core current scope, selects details without r
   assert.equal(document.getElementById('draft').value, 'keep draft')
 })
 
-test('child checks and alert history show only source-scoped original ancestor citations and retain missing lifecycle gaps', async t => {
-  const at = Date.now(), ancestorRef = { taskId: 'root-id', lifecycleId: 'root-life', eventId: 'shared-local-id' }
-  const expiredRef = { ...ancestorRef, lifecycleId: 'expired-life' }, expiredTimeRef = { ...ancestorRef, eventId: 'expired-original' }
-  const snapshot = { ...emptySnapshot(), monitoring: { state: 'active' }, sources: [{ key: 'own', status: 'connected', descriptor: { name: 'Own Host' } }, { key: 'other', status: 'connected', descriptor: { name: 'Other Host' } }],
-    tasks: [
-      { key: 'root-key', sourceKey: 'own', id: 'root-id', lifecycleId: 'root-life', title: 'Original ancestor', status: 'running', events: [{ id: 'shared-local-id', taskId: 'root-id', taskLifecycleId: 'root-life', capturedAt: at, text: 'Actual ancestor user restriction' }, { id: 'expired-original', taskId: 'root-id', taskLifecycleId: 'root-life', capturedAt: at - 86400001, text: 'Expired original restriction' }], analysis: { checks: [] } },
-      { key: 'child-key', sourceKey: 'own', id: 'child-id', lifecycleId: 'child-life', title: 'Checked child', status: 'running', hierarchy: { parentSessionId: 'root' },
-        events: [{ id: 'shared-local-id', taskId: 'child-id', taskLifecycleId: 'child-life', capturedAt: at, text: 'Wrong child collision' }],
-        analysis: { state: 'completed', summary: { attention: 'Actual inherited restriction breach', evidenceRefs: [ancestorRef] }, checks: [{ id: 'request_drift', status: 'attention', reason: 'Breach independently judged', evidenceIds: ['shared-local-id'], evidenceRefs: [ancestorRef, expiredRef, expiredTimeRef] }] },
-        alerts: [{ id: 'alert', checkId: 'request_drift', status: 'attention', reason: 'Original alert', firstAt: at, evidenceIds: ['shared-local-id'], evidenceRefs: [ancestorRef], recoveryEvidenceRefs: [expiredRef] }] },
-      { key: 'other-root', sourceKey: 'other', id: 'root-id', lifecycleId: 'root-life', title: 'Other source ancestor', status: 'running', events: [{ id: 'shared-local-id', taskId: 'root-id', taskLifecycleId: 'root-life', capturedAt: at, text: 'Wrong other-source collision' }], analysis: { checks: [] } },
-    ], hierarchyContext: { schemaVersion: 1, groups: [{ key: 'citation-group', nodes: [{ taskKey: 'root-key', sessionId: 'root', depth: 0 }, { taskKey: 'child-key', sessionId: 'child', depth: 1 }], counts: { gray: 2 }, coverage: { complete: true, branchGaps: [] } }], scopes: [{ sessionId: 'child', sourceKey: 'own', groupKey: 'citation-group', rootSessionId: 'root', start: 1, end: 2, path: [{ sessionId: 'root', title: 'Original ancestor' }, { sessionId: 'child', title: 'Checked child' }], counts: { gray: 1 }, coverage: { complete: true, branchGaps: [] } }] } }
-  const f = await mountGS(t, { snapshot: async () => snapshot, analysisConfig: async () => ({}), claimNotifications: async () => [] }, 'child')
-  await f.renderOverview(); await showDetails(f)
-  await f.until(() => f.dom.window.document.body.textContent.includes('Checked child'), 'overview loaded')
-  await f.click([...f.dom.window.document.querySelectorAll('nav button')].find(node => node.textContent.includes('Checked child')))
-  const article = f.dom.window.document.querySelector('article')
-  const citations = [...article.querySelectorAll('[data-sentinel-citation]')]
-  assert.equal(citations.length, 3, 'summary, check and original alert each cite the actual ancestor')
-  assert.ok(citations.every(node => node.textContent.includes('Original ancestor') && node.textContent.includes('Actual ancestor user restriction') && node.dataset.sourceKey === 'own' && node.dataset.taskId === 'root-id' && node.dataset.lifecycleId === 'root-life'))
-  assert.ok(citations.every(node => !node.textContent.includes('Wrong child') && !node.textContent.includes('Wrong other-source')))
-  assert.equal(article.querySelectorAll('[data-sentinel-citation-gap]').length, 3, 'missing lifecycle and expired original event refs must stay gaps')
-  await f.render('child'); await f.click(f.dom.window.document.querySelector('[data-gs-entry]')); await showDetails(f); await f.click(f.dom.window.document.querySelector('[data-gs-node="child-key"]'))
-  const popupDetail = f.dom.window.document.querySelector('[data-gs-detail]')
-  assert.equal(popupDetail.querySelectorAll('[data-sentinel-citation]').length, 3)
-  assert.equal(popupDetail.querySelectorAll('[data-sentinel-citation-gap]').length, 3)
-  assert.ok(popupDetail.textContent.includes('Breach independently judged'))
-})
-
-test('a judged clear child displays its actual result while a missing-context child retains the actual gap', async t => {
-  let snapshot = { ...emptySnapshot(), monitoring: { state: 'active' }, sources: [{ key: 'own', status: 'connected' }], tasks: [{ key: 'child-clear', sourceKey: 'own', id: 'child', lifecycleId: 'life', title: 'Clear child', status: 'running', hierarchy: { parentSessionId: 'parent' }, events: [], instructionContext: { gaps: [] }, analysis: { state: 'completed', checks: [{ id: 'request_drift', status: 'clear', reason: 'Delegation stays in scope', evidenceIds: [] }] } }] }
-  snapshot.hierarchyContext = { schemaVersion: 1, groups: [{ key: 'clear-group', nodes: [{ taskKey: 'child-clear', sessionId: 'child', depth: 1 }], counts: { gray: 1 }, coverage: { complete: true, branchGaps: [] } }], scopes: [{ sessionId: 'child', sourceKey: 'own', groupKey: 'clear-group', rootSessionId: 'parent', start: 0, end: 1, path: [{ sessionId: 'parent', title: 'Parent' }, { sessionId: 'child', title: 'Clear child' }], counts: { gray: 1 }, coverage: { complete: true, branchGaps: [] } }] }
-  const f = await mountGS(t, { snapshot: async () => snapshot, analysisConfig: async () => ({}), claimNotifications: async () => [] }, 'child')
-  await f.renderOverview(); await showDetails(f); await f.until(() => f.dom.window.document.body.textContent.includes('Clear child'), 'actual child result')
-  await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
-  let article = f.dom.window.document.querySelector('article')
-  assert.ok(article.textContent.includes('本轮未发现疑点'))
-  assert.ok(!article.textContent.includes('子代理判断尚未接入'))
-  await f.render('child'); await f.click(f.dom.window.document.querySelector('[data-gs-entry]')); await showDetails(f); await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
-  assert.ok(f.dom.window.document.querySelector('[data-gs-detail]').textContent.includes('本轮未发现疑点'))
-  await f.renderOverview(); await showDetails(f)
-  await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
-  snapshot = { ...snapshot, tasks: [{ ...snapshot.tasks[0], instructionContext: { gaps: ['actual inherited permission provenance missing'] }, analysis: { state: 'unknown', checks: [{ id: 'request_drift', status: 'unknown', reason: 'actual inherited permission provenance missing', evidenceIds: [] }] } }] }
-  await f.tick(); article = f.dom.window.document.querySelector('article')
-  assert.ok(article.textContent.includes('actual inherited permission provenance missing'))
-  assert.ok(article.textContent.includes('当前不可判断'))
-  await f.render('child'); await f.click(f.dom.window.document.querySelector('[data-gs-entry]')); await showDetails(f); await f.click(f.dom.window.document.querySelector('[data-gs-node="child-clear"]'))
-  assert.ok(f.dom.window.document.querySelector('[data-gs-detail]').textContent.includes('actual inherited permission provenance missing'))
+test('the shared check view displays owned ancestor evidence and drops foreign or expired collisions', async t => {
+  const at = Date.now()
+  const ancestorRef = { taskId: 'root', lifecycleId: 'root-life', eventId: 'same-id' }
+  const expiredRef = { ...ancestorRef, eventId: 'expired' }
+  const snapshot = { ...emptySnapshot(), generatedAt: at, sources: [
+    { key: 'own', status: 'connected', descriptor: { registrationId: 'own' } },
+    { key: 'other', status: 'connected', descriptor: { registrationId: 'other' } },
+  ], tasks: [
+    { key: 'original', sourceKey: 'own', id: 'root', lifecycleId: 'root-life', sessionId: 'root', events: [
+      { id: 'same-id', taskId: 'root', taskLifecycleId: 'root-life', capturedAt: at, text: 'Actual ancestor user restriction' },
+      { id: 'expired', taskId: 'root', taskLifecycleId: 'root-life', capturedAt: at - 86_400_001, text: 'Expired restriction' },
+    ] },
+    { key: 'child-key', sourceKey: 'own', id: 'child', lifecycleId: 'child-life', sessionId: 'child', status: 'running', currentRequest: 'Own task',
+      events: [{ id: 'same-id', taskId: 'child', taskLifecycleId: 'child-life', capturedAt: at, text: 'Wrong child collision' }],
+      gs: { light: 'red', reason: 'Breach independently judged' },
+      analysis: { state: 'cooldown', resultDisposition: 'current', checks: [{ id: 'request_drift', status: 'attention', reason: 'Breach independently judged' }] },
+      alerts: [{ id: 'alert', checkId: 'request_drift', status: 'attention', reason: 'Breach independently judged',
+        evidenceIds: ['same-id'], evidenceRefs: [ancestorRef, expiredRef, { ...ancestorRef, lifecycleId: 'foreign-life' }] }] },
+    { key: 'other-root', sourceKey: 'other', id: 'root', lifecycleId: 'foreign-life', sessionId: 'root',
+      events: [{ id: 'same-id', taskId: 'root', taskLifecycleId: 'foreign-life', capturedAt: at, text: 'Wrong other-source collision' }] },
+  ] }
+  const view = projectSessionPanel(snapshot, { sourceKey: 'own', sessionId: 'child' })
+  assert.deepEqual(view.analysis.issues[0].evidence.map(item => item.text), ['Actual ancestor user restriction'])
+  const panel = await panelHarness(t)
+  await panel.deliver(view)
+  assert.match(panel.element('#issues').textContent, /Actual ancestor user restriction/)
+  assert.doesNotMatch(panel.element('#issues').textContent, /Expired restriction|Wrong/)
+  assert.match(panel.element('#check-list').textContent, /Breach independently judged/)
 })
