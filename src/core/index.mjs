@@ -10,6 +10,7 @@ import { normalizeEnrollment } from '../enrollment-config.mjs';
 import { validateHierarchy, projectHierarchy } from '../hierarchy.mjs';
 import { createInstructionLookup, instructionContext, eventRef, referenceKey } from '../instruction-context.mjs';
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
+import { projectDSHSessionPanel } from '../panel-view.mjs';
 import { analysisTimeConditions, executionBlockingReason, JEV_EVIDENCE_LIMIT } from '../analysis/index.mjs';
 import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
 import { normalizeAnalysisConfig, normalizeAnalysisScheduling, CHECK_EVIDENCE_FEATURE, DSH_EXECUTION_SUMMARIES_FEATURE, EXECUTION_BLOCKING_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
@@ -189,13 +190,14 @@ export async function createCore({
     rememberNativeRow(collection, key); if (collection === 'notifications') nativeNotifications?.removed(notifications.get(key)); remove.run(collection, key); collections[collection].delete(key);
     if (event) unindexEvent(event);
   };
-  const taskEvents = (task, read) => read ? read.eventsByTask.get(task.key) ?? [] : indexedEvents(eventsByTask, task.key, true);
-  const projectionRead = () => {
+  const taskEvents = (task, read) => read?.eventsByTask.get(task.key) ?? indexedEvents(eventsByTask, task.key, true);
+  const projectionRead = sourceKey => {
     const bySource = new Map(), eventsByTask = new Map();
     for (const task of tasks.values()) {
+      if (sourceKey !== undefined && task.sourceKey !== sourceKey) continue;
       if (!bySource.has(task.sourceKey)) bySource.set(task.sourceKey, { tasks: [], events: indexedEvents(eventsBySource, task.sourceKey), instruction: null });
       bySource.get(task.sourceKey).tasks.push(task);
-      eventsByTask.set(task.key, taskEvents(task));
+      if (sourceKey === undefined) eventsByTask.set(task.key, taskEvents(task));
     }
     return { bySource, eventsByTask };
   };
@@ -1547,11 +1549,47 @@ export async function createCore({
   interval.unref();
   tick(initialRetirement.evicted);
   const ensureOpen = () => { if (closed) throw new Error('Monitoring core is closed'); };
-  function applyGSProjection(publicTasks, current) {
+  function projectTask(task, current, read) {
+    const { baselineConfirmed, revision, requestId, contextFingerprint, excludedInstructionIds, resultKey, resultScope, notificationBinding, ...value } = copy(task);
+    value.notificationScope = notificationScope(task);
+    const instruction = contextFor(task, read);
+    value.events = publicEvents(task, instruction, read);
+    if (instruction) value.instructionContext = copy({ binding: instruction.binding, ancestorLimitRefs: instruction.inheritedEvents.filter(event => event.contextRole === 'ancestor-limit').map(eventRef), userLimitRefs: instruction.inheritedEvents.filter(event => event.contextRole === 'user-limit').map(eventRef), gaps: instruction.gaps });
+    value.coverage = coverageFor(task, read);
+    value.activity = activityFor(task, value.events, value.coverage, current);
+    value.analysis.lagMs = task.lastActivity === null ? null : Math.max(0, task.lastActivity - (task.analysis.through ?? task.lastActivity));
+    value.analysis.waitMs = task.analysis.queuedAt === null ? 0 : Math.max(0, current - task.analysis.queuedAt);
+    value.analysis.resultDisposition = resultDispositionFor(task, instruction, read);
+    const summary = availableSummary(task, current, read);
+    if (summary) value.analysis.availableSummary = summary;
+    const retired = retiredPrefills.get(task.key);
+    const prefill = retired ?? cancelledPrefill(task.key);
+    if (prefill) {
+      let summaryState = 'waiting';
+      if (retired) summaryState = retired.recoveryState ?? (activeRound(task.key) ? task.analysis.modelState ?? 'generating' : 'interrupted');
+      else if (paused || taskPaused(task)) summaryState = 'paused';
+      else if (current >= prefill.cancelledAt + PREFILL_CANCEL_GRACE_MS && task.analysis.state === 'queued') summaryState = 'queued';
+      value.analysis.prefillRecovery = { summaryState };
+    }
+    // Older summaries stored the raw evidence excerpt as the reason.
+    for (const record of [value.analysis.summary, value.analysis.lastSuccessfulSummary, value.analysis.lastPartialSummary, value.analysis.lastUnjudgedSummary, summary]) {
+      const decision = (record?.generated ?? record?.partial)?.blocking;
+      if (decision?.status !== 'blocked' && decision?.status !== 'unblocked') continue;
+      const ref = decision.evidenceRefs?.[0];
+      const evidence = ref && events.get(identity(task.sourceKey, ref.taskId, ref.lifecycleId, ref.eventId));
+      decision.reason = executionBlockingReason(decision.status, evidence);
+    }
+    if (analyzerFactory) value.analysis.currentConfigScope = configScopeFor(task);
+    const conversation = conversationFor(task);
+    if (conversation) value.conversationMonitoring = conversation;
+    if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1') value.monitoringHealth = failureStore.health({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId }, current);
+    return value;
+  }
+  function applyGSProjection(publicTasks, current, waitTasks = publicTasks) {
     for (const task of publicTasks) {
       const source = sources.get(task.sourceKey);
       const scopedTask = { ...task, events: task.events.filter(event => !historical(event)), requestId: tasks.get(task.key).requestId };
-      task.gs = gsStatus(scopedTask, source, current, childWait(scopedTask, source, publicTasks, current));
+      task.gs = gsStatus(scopedTask, source, current, childWait(scopedTask, source, waitTasks, current));
       if (taskPaused(task) && source.status === 'connected' && task.gs.light !== null) task.gs = { ...task.gs, light: 'gray', label: installationPaused(source.descriptor.registrationId) ? '本安装分析已暂停' : '本聊天分析已暂停', reason: '执行观察继续；手动恢复后按当前材料重新排队' };
       task.lastActivity = task.gs.silence.since;
     }
@@ -2020,42 +2058,7 @@ export async function createCore({
       ensureOpen();
       tick();
       const current = now(), read = projectionRead();
-      const publicTasks = Array.from(tasks.values()).map(task => {
-        const { baselineConfirmed, revision, requestId, contextFingerprint, excludedInstructionIds, resultKey, resultScope, notificationBinding, ...value } = copy(task);
-        value.notificationScope = notificationScope(task);
-        const instruction = contextFor(task, read);
-        value.events = publicEvents(task, instruction, read);
-        if (instruction) value.instructionContext = copy({ binding: instruction.binding, ancestorLimitRefs: instruction.inheritedEvents.filter(event => event.contextRole === 'ancestor-limit').map(eventRef), userLimitRefs: instruction.inheritedEvents.filter(event => event.contextRole === 'user-limit').map(eventRef), gaps: instruction.gaps });
-        value.coverage = coverageFor(task, read);
-        value.activity = activityFor(task, value.events, value.coverage, current);
-        value.analysis.lagMs = task.lastActivity === null ? null : Math.max(0, task.lastActivity - (task.analysis.through ?? task.lastActivity));
-        value.analysis.waitMs = task.analysis.queuedAt === null ? 0 : Math.max(0, current - task.analysis.queuedAt);
-        value.analysis.resultDisposition = resultDispositionFor(task, instruction, read);
-        const summary = availableSummary(task, current, read);
-        if (summary) value.analysis.availableSummary = summary;
-        const retired = retiredPrefills.get(task.key);
-        const prefill = retired ?? cancelledPrefill(task.key);
-        if (prefill) {
-          let summaryState = 'waiting';
-          if (retired) summaryState = retired.recoveryState ?? (activeRound(task.key) ? task.analysis.modelState ?? 'generating' : 'interrupted');
-          else if (paused || taskPaused(task)) summaryState = 'paused';
-          else if (current >= prefill.cancelledAt + PREFILL_CANCEL_GRACE_MS && task.analysis.state === 'queued') summaryState = 'queued';
-          value.analysis.prefillRecovery = { summaryState };
-        }
-        // Older summaries stored the raw evidence excerpt as the reason.
-        for (const record of [value.analysis.summary, value.analysis.lastSuccessfulSummary, value.analysis.lastPartialSummary, value.analysis.lastUnjudgedSummary, summary]) {
-          const decision = (record?.generated ?? record?.partial)?.blocking;
-          if (decision?.status !== 'blocked' && decision?.status !== 'unblocked') continue;
-          const ref = decision.evidenceRefs?.[0];
-          const evidence = ref && events.get(identity(task.sourceKey, ref.taskId, ref.lifecycleId, ref.eventId));
-          decision.reason = executionBlockingReason(decision.status, evidence);
-        }
-        if (analyzerFactory) value.analysis.currentConfigScope = configScopeFor(task);
-        const conversation = conversationFor(task);
-        if (conversation) value.conversationMonitoring = conversation;
-        if (sources.get(task.sourceKey)?.descriptor.policy === 'chatgpt-main/1') value.monitoringHealth = failureStore.health({ sourceKey: task.sourceKey, mainId: task.id, lifecycleId: task.lifecycleId }, current);
-        return value;
-      });
+      const publicTasks = Array.from(tasks.values(), task => projectTask(task, current, read));
       applyGSProjection(publicTasks, current);
       const hierarchyContext = projectHierarchy([...sources.values()], publicTasks);
       const activeTaskKeys = [...rounds.values()].filter(round => !round.cancelled).map(round => round.taskKey);
@@ -2068,12 +2071,29 @@ export async function createCore({
         sources: Array.from(sources.values()).map(source => ({ ...copy(source), ...(source.descriptor.policy === 'chatgpt-main/1' ? { monitoringHealth: failureStore.health({ sourceKey: source.key, mainId: null, lifecycleId: null }, current) } : {}) })), tasks: publicTasks,
       };
     },
+    async dshSessionPanel(sourceKey, sessionId, selection) {
+      ensureOpen();
+      const source = sources.get(sourceKey), current = now();
+      const read = projectionRead(sourceKey);
+      const sourceTasks = read.bySource.get(sourceKey)?.tasks ?? [];
+      const sessionTasks = sourceTasks.filter(task => task.sessionId === sessionId);
+      const publicTasks = sessionTasks.map(task => projectTask(task, current, read));
+      const sessionIdentities = new Set(sessionTasks.map(task => identity(task.id, task.lifecycleId)));
+      const waitChildren = new Set((source?.hierarchyContext?.waitBindings ?? [])
+        .filter(binding => binding.phase === 'started' && sessionIdentities.has(identity(binding.taskId, binding.lifecycleId)))
+        .flatMap(binding => binding.childRefs.map(ref => identity(ref.taskId, ref.lifecycleId))));
+      const waitTasks = publicTasks.concat(sourceTasks.filter(task => task.sessionId !== sessionId && waitChildren.has(identity(task.id, task.lifecycleId)))
+        .map(task => ({ ...task, events: taskEvents(task), coverage: coverageFor(task, read) })));
+      applyGSProjection(publicTasks, current, waitTasks);
+      const view = { generatedAt: current, sources: source ? [source] : [], tasks: publicTasks, monitoring: { paused } };
+      return projectDSHSessionPanel(view, sourceKey, sessionId, selection, ref => events.get(identity(sourceKey, ref.taskId, ref.lifecycleId, ref.eventId)));
+    },
     async gsSummary({ sourceKey, sessionId }) {
       ensureOpen();
       if (![sourceKey, sessionId].every(value => typeof value === 'string' && value.trim() && value.length <= 2000)) throw new Error('Invalid GS summary scope');
       tick();
-      const current = now(), read = projectionRead(), source = sources.get(sourceKey), sourceStatus = source?.status ?? 'unknown';
-      const scopedTasks = Array.from(tasks.values()).filter(task => task.sourceKey === sourceKey).map(task => {
+      const current = now(), read = projectionRead(sourceKey), source = sources.get(sourceKey), sourceStatus = source?.status ?? 'unknown';
+      const scopedTasks = (read.bySource.get(sourceKey)?.tasks ?? []).map(task => {
         const context = contextFor(task, read);
         return { key: task.key, sourceKey, id: task.id, lifecycleId: task.lifecycleId, sessionId: task.sessionId,
           status: task.status, lastKnownStatus: task.lastKnownStatus, currentRequest: task.currentRequest, requestStartedAt: task.requestStartedAt,

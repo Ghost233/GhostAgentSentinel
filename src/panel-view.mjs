@@ -3,18 +3,18 @@ function summaryEvent(task, reference, tasks) {
   return owner?.events.find(event => event.id === reference.eventId && event.taskId === reference.taskId && event.taskLifecycleId === reference.lifecycleId)
 }
 
-function blockingView(decision, task, tasks, readAt, historical) {
+function blockingView(decision, readEvidence, readAt, historical) {
   if (!decision) return null
   const evidence = []
   for (const reference of decision.evidenceRefs) {
-    const event = summaryEvent(task, reference, tasks)
+    const event = readEvidence(reference)
     if (!event || !(event.capturedAt > readAt - 86400000 && event.capturedAt <= readAt)) return null
     evidence.push({ text: event.text.slice(0, 240), reference: event.evidence ?? JSON.stringify(reference) })
   }
   return { status: decision.status, reason: decision.reason, evidence, historical }
 }
 
-export function materialView(view, task, { historical = false, snapshot } = {}) {
+export function materialView(view, task, { historical = false, snapshot, readEvidence } = {}) {
   const states = { queued: '检查排队中', analyzing: '正在检查', unavailable: '本地摘取模型或 JEV 未配置', failed: '本轮分析失败', unknown: '当前请求或分析证据不足', cooldown: '本轮六项检查已更新', idle: '最近检查结果' }
   const findings = historical ? task.analysis.checks.filter(check => check.status === 'attention').map(check => ({ ...check, checkId: check.id })) : task.alerts.filter(alert => alert.status === 'attention')
   const issues = findings.map(alert => {
@@ -44,11 +44,12 @@ export function materialView(view, task, { historical = false, snapshot } = {}) 
   const partial = summaryVisible && task.analysis.coverage?.complete === false ? task.analysis.summary?.partial : null
   const prior = task.analysis.lastSuccessfulSummary, readAt = snapshot?.generatedAt ?? Date.now()
   const ownerTasks = snapshot?.tasks ?? [task]
+  const evidenceFor = readEvidence ?? (reference => summaryEvent(task, reference, ownerTasks))
   const generatedView = (value, historicalDecision = historical || revalidating) => {
     if (!value) return null
-    const blocking = blockingView(value.blocking, task, ownerTasks, readAt, historicalDecision)
+    const blocking = blockingView(value.blocking, evidenceFor, readAt, historicalDecision)
     const evidence = value.evidenceRefs.slice(0, 2).map(reference => {
-      const event = summaryEvent(task, reference, ownerTasks)
+      const event = evidenceFor(reference)
       return { text: event?.text?.slice(0, 240) ?? '引用材料当前不可读取', reference: event?.evidence ?? JSON.stringify(reference) }
     })
     return { text: value.text, ...(value.sections ? { sections: value.sections } : {}), evidence, ...(blocking ? { blocking } : {}) }
@@ -66,10 +67,11 @@ export function materialView(view, task, { historical = false, snapshot } = {}) 
       resultDisposition: task.analysis.resultDisposition, completedAt: task.analysis.completedAt, nextEligibleAt: task.analysis.nextEligibleAt, through: task.analysis.through, waitMs: task.analysis.waitMs, lagMs: task.analysis.lagMs, error: task.analysis.error, coverage: task.analysis.coverage ?? task.coverage } }
 }
 
-export function recentModelActivity(chatTasks, currentTask, registrationId, readAt, currentObserved, ownerTasks = chatTasks) {
+export function recentModelActivity(chatTasks, currentTask, registrationId, readAt, currentObserved, ownerTasks = chatTasks, readEvidence) {
   const cutoff = readAt - 86400000
   let prefill = null, summary = null
   for (const task of chatTasks) {
+    const evidenceFor = readEvidence ?? (reference => summaryEvent(task, reference, ownerTasks))
     const { lastPrefill, lastSuccessfulSummary, lastPartialSummary, lastUnjudgedSummary } = task.analysis
     if (lastPrefill?.submittedAt > cutoff && lastPrefill.submittedAt <= readAt && (!prefill || lastPrefill.submittedAt > prefill.submittedAt)) {
       prefill = { submittedAt: lastPrefill.submittedAt, state: lastPrefill.state }
@@ -79,12 +81,14 @@ export function recentModelActivity(chatTasks, currentTask, registrationId, read
       const result = record?.generated ?? record?.partial
       if (!result?.text || !(record.completedAt > cutoff && record.completedAt <= readAt && record.expiresAt > readAt)
         || summary && record.completedAt <= summary.completedAt || record.configScope && record.configScope.registrationId !== registrationId) continue
-      if (!result.evidenceRefs?.length || !result.evidenceRefs.every(ref => ownerTasks.some(owner => owner.sourceKey === task.sourceKey
-        && owner.id === ref.taskId && owner.lifecycleId === ref.lifecycleId && owner.events.some(event => event.id === ref.eventId && event.capturedAt > cutoff && event.capturedAt <= readAt)))) continue
+      if (!result.evidenceRefs?.length || !result.evidenceRefs.every(ref => {
+        const event = evidenceFor(ref)
+        return event && event.capturedAt > cutoff && event.capturedAt <= readAt
+      })) continue
       const current = record === available || currentObserved && task === currentTask && task.status === 'running' && record.completedAt === task.analysis.completedAt
         && ['current', 'reused'].includes(task.analysis.resultDisposition) && ['cooldown', 'idle'].includes(task.analysis.state)
         && !task.conversationMonitoring?.paused && task.monitoringHealth?.state !== 'failed'
-      const blocking = blockingView(result.blocking, task, ownerTasks, readAt, !current)
+      const blocking = blockingView(result.blocking, evidenceFor, readAt, !current)
       summary = { text: result.text, ...(result.sections ? { sections: result.sections } : {}), completedAt: record.completedAt, expiresAt: record.expiresAt, partial: Boolean(record.partial), gaps: record.gaps ?? [], ...(record.final ? { final: true } : {}), ...(blocking ? { blocking } : {}) }
     }
   }
@@ -97,3 +101,33 @@ export function recentModelActivity(chatTasks, currentTask, registrationId, read
   return { prefill, summary, ...(prefillRecovery ? { prefillRecovery } : {}) }
 }
 
+const SESSION_HISTORY_MS = 86_400_000
+
+export function projectDSHSessionPanel(snapshot, sourceKey, sessionId, selection = {}, readEvidence) {
+  if ((selection.executionKey || selection.historyCursor) && selection.expectedThreadId !== sessionId) throw new Error('历史检查的会话身份已变化')
+  const source = snapshot.sources.find(value => value.key === sourceKey)
+  const ownerTasks = source ? snapshot.tasks.filter(task => task.sourceKey === sourceKey) : []
+  const tasks = ownerTasks.filter(task => task.sessionId === sessionId && task.events.length)
+  const connected = source?.status === 'connected'
+  const readAt = snapshot.generatedAt
+  const records = tasks.map(task => ({ task, item: { key: task.key, status: task.status, observedAt: task.lastActivity ?? task.updatedAt, analysisState: task.analysis.state } }))
+    .sort((a, b) => (b.item.observedAt ?? 0) - (a.item.observedAt ?? 0) || a.item.key.localeCompare(b.item.key))
+  const current = records.find(value => value.task.status === 'running') ?? records[0]
+  const selected = selection.executionKey ? records.find(value => value.task.key === selection.executionKey) : current
+  const cursorIndex = selection.historyCursor ? records.findIndex(value => value.task.key === selection.historyCursor) : -1
+  const page = records.slice(cursorIndex + 1, cursorIndex + 21), hasMore = records.length > cursorIndex + 21
+  const history = { executions: page.map(value => value.item), currentKey: current?.task.key ?? null, selectedKey: selected?.task.key ?? null,
+    currentStatus: connected ? current?.task.status : 'unknown', currentSignal: connected ? current?.task.gs?.light : 'gray',
+    cursor: cursorIndex >= 0 ? selection.historyCursor : null, nextCursor: hasMore ? page.at(-1).task.key : null, historyGap: Boolean(selection.historyCursor && cursorIndex < 0),
+    currentGap: connected ? current?.task.status === 'idle' ? 'chat-idle' : null : 'observer-unavailable', retentionMs: SESSION_HISTORY_MS }
+  const identity = { threadId: sessionId, title: current?.task.title }
+  const recent = recentModelActivity(tasks, current?.task, source?.descriptor.registrationId, readAt, connected && !snapshot.monitoring?.paused, ownerTasks, readEvidence)
+  if (!selected) return { identity, signal: 'gray', summary: selection.executionKey ? '这条历史执行已不可读取' : '暂无本会话的执行记录',
+    observation: { status: 'unknown', gap: connected ? 'current-turn-not-observed' : 'observer-unavailable' },
+    analysis: { state: 'unknown', checks: [] }, history, recentModelActivity: recent }
+  const { task, item } = selected
+  const historical = !connected || selected !== current || task.status !== 'running'
+  const view = materialView({ identity, signal: 'gray', summary: '当前状态不可判断',
+    observation: { status: task.status, coverage: historical ? 'retained-history' : 'caught-up', gap: history.currentGap } }, task, { historical, snapshot: { ...snapshot, tasks: ownerTasks }, readEvidence })
+  return { ...view, history, recentModelActivity: recent, execution: { ...item, request: task.currentRequest ?? '', historical } }
+}

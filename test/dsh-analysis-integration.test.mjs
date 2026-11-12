@@ -202,8 +202,13 @@ test('DSH session summaries keep raw output in the JEV evidence rather than the 
   host.send(id, output)
   await until(async () => (await host.control.snapshot()).tasks.find(task => task.id === id)?.events.some(event => event.text.includes(output)), 'native output captured')
   await host.control.resume()
+  const before = (await host.control.diagnostics()).http.snapshotReads
   let view
   await until(async () => (view = await host.adapter.sessionPanel(id, {})).recentModelActivity.summary?.blocking?.status === 'unblocked', 'DSH publishes the JEV decision')
+  const foreign = await host.control.dshSessionPanel('another-source', id, {})
+  assert.equal(foreign.recentModelActivity.summary, null)
+  assert.deepEqual(foreign.history.executions, [])
+  assert.equal((await host.control.diagnostics()).http.snapshotReads, before, 'the current sidebar never requests the installation-wide snapshot')
   const { blocking: decision, completedAt } = view.recentModelActivity.summary
   assert.equal(decision.reason, '会话回复记录了可继续推进的进展')
   assert.match(decision.evidence[0].text, /\/synthetic\/DSH Workflow/)

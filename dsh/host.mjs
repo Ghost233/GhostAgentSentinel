@@ -270,9 +270,11 @@ export function createAdapter(ctx, config = {}, { connect = connectCore, flushMs
     panelDocument() { return readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8') },
     async sessionPanel(sessionId, selection, signal) {
       const owner = sourceKey
-      const snapshot = await invoke('snapshot', signal)
+      const view = typeof client?.dshSessionPanel === 'function'
+        ? await invoke('dshSessionPanel', owner, sessionId, selection, signal)
+        : projectDSHSessionPanel(await invoke('snapshot', signal), owner, sessionId, selection)
       if (closed || owner !== sourceKey) throw new Error('会话观察来源已变化')
-      return projectDSHSessionPanel(snapshot, owner, sessionId, selection)
+      return view
     },
     pause(signal) { return setInstallationPaused(true, signal) }, resume(signal) { return setInstallationPaused(false, signal) },
     modelDirectory({ baseUrl }, requested) {

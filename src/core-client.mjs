@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
-import { PROTOCOL, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, NOTIFICATION_REVOCATION_FEATURE, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
+import { PROTOCOL, DSH_SESSION_PANEL_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, NOTIFICATION_REVOCATION_FEATURE, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
 
 export const defaultDataDir = join(homedir(), '.ghost-agent-sentinel')
 
@@ -138,6 +138,9 @@ export async function connectCore({ dataDir = defaultDataDir, signal } = {}) {
     unregisterSource: (sourceKey, reason, requestSignal) => call('/v1/source/unregister', { sourceKey, reason }, requestSignal),
     purgeChatGPTInstallation: (scope, requestSignal) => call('/v1/chatgpt/installation/purge', scope, requestSignal),
     snapshot: requestSignal => call('/v1/snapshot', undefined, requestSignal),
+    ...(runtime.features.includes(DSH_SESSION_PANEL_FEATURE) ? {
+      dshSessionPanel: (sourceKey, sessionId, selection, requestSignal) => call('/v1/dsh/session-panel?' + new URLSearchParams({ ...selection, sourceKey, sessionId }), undefined, requestSignal),
+    } : {}),
     gsSummary: (sourceKey, sessionId, requestSignal) => call(`/v1/gs/summary?sourceKey=${encodeURIComponent(sourceKey)}&sessionId=${encodeURIComponent(sessionId)}`, undefined, requestSignal).catch(error => { if (error.status === 404) error.code = 'gs_summary_unsupported'; throw error }),
     diagnostics: requestSignal => call('/v1/diagnostics', undefined, requestSignal),
     sourcePlan: requestSignal => call('/v1/sources', undefined, requestSignal),
