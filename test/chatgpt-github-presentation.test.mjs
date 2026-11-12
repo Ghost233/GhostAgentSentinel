@@ -28,14 +28,12 @@ async function panel(t, options = {}) {
   }
 }
 
-test('an upgraded chat panel bypasses a cached inline summary and shows three rows and its JEV state', async t => {
+test('an upgraded chat panel keeps its address and shows three rows and its JEV state', async t => {
   const currentHtml = await readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8')
-  const oldHtml = currentHtml
-    .replace("writeSummary('recent-summary-text',", "write('recent-summary-text',")
-    .replace("renderBlocking('recent',decision,", "renderBlocking('recent',null,")
-  assert.notEqual(oldHtml, currentHtml)
+  const nextHtml = currentHtml.replace('查看判断依据</summary>', '查看原始判断依据</summary>')
+  assert.notEqual(nextHtml, currentHtml)
   const cache = new Map()
-  async function open(html) {
+  async function connect(html) {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
     const server = await createPanelMCPServer({ resources: { html }, displayName: 'GhostSentinel', read: async () => ({ summary: '只读观察' }) })
     const client = new Client({ name: 'panel-cache-regression', version: '1' })
@@ -45,33 +43,38 @@ test('an upgraded chat panel bypasses a cached inline summary and shows three ro
     const tools = await client.listTools()
     const uri = tools.tools.find(tool => tool.name === 'sentinel_current_chat')._meta.ui.resourceUri
     assert.ok((await client.listResources()).resources.some(resource => resource.uri === uri))
-    if (!cache.has(uri)) {
-      const resource = (await client.readResource({ uri })).contents[0]
-      assert.equal(resource.uri, uri)
-      cache.set(uri, resource.text)
+    return { uri, client }
+  }
+  const tabUri = 'ui://ghost-sentinel/current-chat-e2dde0133a9f3247f746d169729c5afcb8a40110cf52b99a1a4203ae5c97e6c6.html'
+  async function loadTab(connection, pluginRevision) {
+    assert.equal(connection.uri, tabUri, 'the existing 0.4.6 tab still matches the advertised resource address')
+    const key = JSON.stringify([tabUri, pluginRevision])
+    if (!cache.has(key)) {
+      const resource = (await connection.client.readResource({ uri: tabUri })).contents[0]
+      assert.equal(resource.uri, tabUri)
+      cache.set(key, resource.text)
     }
-    return { uri, html: cache.get(uri), client }
+    return cache.get(key)
   }
   const at = Date.now(), lines = ['在做什么：核对本地构建。', '有什么进展：定向验证通过。', '卡在哪里：等待最终校验。']
   const view = { signal: 'gray', summary: '当前记录重验中', identity: { threadId: 'cached-panel' },
     analysis: { state: 'unknown', checks: [] }, observation: { coverage: 'caught-up', recordRevalidating: true },
     recentModelActivity: { summary: { text: lines.join(' '), completedAt: at - 1000, expiresAt: at + 60000,
       blocking: { status: 'unblocked', reason: '定向验证通过', evidence: [{ text: '验证通过', reference: 'native:check' }] } } } }
-  const previous = await open(oldHtml), previousPage = await panelHarness(t, { html: previous.html })
-  await previousPage.deliver(view)
-  assert.equal(previousPage.element('#recent-summary-text').children.length, 0)
-  assert.equal(previousPage.element('#recent-blocking').hidden, true)
+  const previous = await connect(currentHtml)
+  assert.match(await loadTab(previous, '0.4.6'), /查看判断依据<\/summary>/)
 
-  const current = await open(currentHtml), page = await panelHarness(t, { html: current.html })
+  const current = await connect(nextHtml)
+  assert.match(await loadTab(current, '0.4.6'), /查看判断依据<\/summary>/)
+  const updated = await loadTab(current, 'next-release')
+  assert.match(updated, /查看原始判断依据<\/summary>/)
+  const page = await panelHarness(t, { html: updated })
   await page.deliver(view)
   assert.deepEqual(page.element('#recent-summary-text').children.map(row => row.textContent.trim()), lines)
   assert.match(page.element('#recent-blocking-status').textContent, /^上次判断 · 未阻塞/)
   assert.match(page.element('#recent-blocking-evidence').textContent, /验证通过/)
-  assert.notEqual(current.uri, previous.uri)
-  assert.equal((await open(currentHtml)).uri, current.uri, 'unchanged HTML reuses the same resource address')
-
   const [currentResource] = (await current.client.readResource({ uri: current.uri })).contents
-  for (const uri of ['ui://ghost-sentinel/current-chat.html', previous.uri]) {
+  for (const uri of ['ui://ghost-sentinel/current-chat.html', `ui://ghost-sentinel/current-chat-${'a'.repeat(64)}.html`]) {
     const reopened = await current.client.readResource({ uri })
     assert.deepEqual(reopened.contents, [{ ...currentResource, uri }])
   }
@@ -80,10 +83,14 @@ test('an upgraded chat panel bypasses a cached inline summary and shows three ro
 })
 
 test('GitHub normal and test panels have separate names through the public MCP resource and tool list', async t => {
-  for (const displayName of ['GhostSentinel', 'GhostSentinel test']) {
+  for (const [displayName, releasedAddress] of [
+    ['GhostSentinel', 'e2dde0133a9f3247f746d169729c5afcb8a40110cf52b99a1a4203ae5c97e6c6'],
+    ['GhostSentinel test', '5e95d866a9409c1c33aa3e4a6bb47a7b5bbda55aa0cf0634ee73c54e831766f4'],
+  ]) {
     const page = await panel(t, { displayName })
     const tools = await page.rpc('tools/list')
     const monitor = tools.tools.find(tool => tool.name === 'sentinel_current_chat')
+    assert.equal(monitor._meta.ui.resourceUri, `ui://ghost-sentinel/current-chat-${releasedAddress}.html`)
     assert.equal(monitor.title, displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查')
     const resource = await page.rpc('resources/read', { uri: monitor._meta.ui.resourceUri })
     assert.ok(resource.contents[0].text.includes('<title>' + (displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查') + '</title>'))

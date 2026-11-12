@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -7,17 +7,23 @@ import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js'
 import { registerAppResource, registerAppTool, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
 import { z } from 'zod'
 
+// Keep the addresses already saved in 0.4.6 tabs. Codex uses the URI to match
+// an existing tab and keys the resource cache separately by plugin revision.
+const currentChatAddresses = {
+  Sentinel: '2fb78eec7bb2201d3e5dd148e8e5a6032d1bcdb74ccfc7acf9a9976d37147964',
+  GhostSentinel: 'e2dde0133a9f3247f746d169729c5afcb8a40110cf52b99a1a4203ae5c97e6c6',
+  'GhostSentinel test': '5e95d866a9409c1c33aa3e4a6bb47a7b5bbda55aa0cf0634ee73c54e831766f4',
+}
+
 export async function createPanelMCPServer({ read, control, modelSettings, installationNotifications, requestNotifications, dismissNotifications, notificationRecords, forwardTool, resources, displayName = 'Sentinel' }) {
-  if (!['Sentinel', 'GhostSentinel', 'GhostSentinel test'].includes(displayName)) throw new Error('invalid panel display name')
+  if (typeof displayName !== 'string' || !Object.hasOwn(currentChatAddresses, displayName)) throw new Error('invalid panel display name')
   const title = displayName === 'GhostSentinel test' ? 'GhostSentinel 会话检查 test' : displayName + ' 会话检查'
   const html = (resources?.html ?? await readFile(new URL('./panel.html', import.meta.url), 'utf8')).replace('<title>Sentinel 会话检查</title>', '<title>' + title + '</title>').replace('<h1>Sentinel · 当前会话</h1>', '<h1>' + displayName + ' · 当前会话</h1>')
   const settingsTitle = displayName === 'GhostSentinel test' ? 'GhostSentinel 安装设置 test' : displayName + ' 安装设置'
   const settingsHtml = modelSettings || forwardTool ? (resources?.settingsHtml ?? await readFile(new URL('./settings.html', import.meta.url), 'utf8')).replace('<title>Sentinel 安装设置</title>', '<title>' + settingsTitle + '</title>').replace('<h1>Sentinel · 安装设置</h1>', '<h1>' + settingsTitle + '</h1>') : null
   const mcp = new McpServer({ name: 'ghost-sentinel-chatgpt', version: '0.1.0-dev.1' })
   const registerTool = (server, name, options, handler) => registerAppTool(server, name, options, forwardTool ? (selection, extra) => forwardTool(name, selection, extra) : handler)
-  // The host can retain HTML by resource URI across plugin upgrades.
-  const digest = createHash('sha256').update(html).digest('hex')
-  const uri = `ui://ghost-sentinel/current-chat-${digest}.html`
+  const uri = `ui://ghost-sentinel/current-chat-${currentChatAddresses[displayName]}.html`
   const readPanel = async url => ({ contents: [{ uri: url.href, mimeType: RESOURCE_MIME_TYPE, text: html }] })
   registerAppResource(mcp, 'sentinel-current-chat', uri, {}, readPanel)
   // Restored tabs can request a panel address advertised by an older version.
