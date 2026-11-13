@@ -342,7 +342,7 @@ async function previewInventory(paths, config, receipt, transaction) {
       }
     }
   }
-  const exact = new Set(['installation.json', 'runtime.json', 'runtime.lock/owner.json', 'maintenance.json', 'health-outbox.sqlite', 'health-outbox.sqlite-wal', 'health-outbox.sqlite-shm', ...descriptorNames])
+  const exact = new Set(['installation.json', 'runtime.json', 'runtime.lock/owner.json', 'maintenance.json', 'runtime-ownership.sqlite', 'runtime-stopped.json', 'health-outbox.sqlite', 'health-outbox.sqlite-wal', 'health-outbox.sqlite-shm', ...descriptorNames])
   const dirs = new Set(['plugin', 'plugin/.codex-plugin', '.agents', '.agents/plugins', 'cursors', 'runtime.lock'])
   let count = 0, liveOwner
   async function liveCursorWriter() {
@@ -648,7 +648,7 @@ async function removeOwnedFiles(plan, config, transaction, io) {
   if (configIdentity((await record(paths.configPath)).value) !== transaction.configIdentity) fail('installation_configuration_changed')
   const descriptors = await descriptorRecords(paths)
   for (const name of descriptorNames) if (descriptors[name]?.digest !== (receipt?.files?.[name] ?? transaction.writtenFiles?.[name]?.digest)) fail('plugin_descriptor_concurrently_changed')
-  const allowed = new Set(['installation-receipt.json', 'operation.json', '.operation.lock/owner.json', 'state/installation.json', 'state/maintenance.json', ...descriptorNames.map(name => 'state/' + name)])
+  const allowed = new Set(['installation-receipt.json', 'operation.json', '.operation.lock/owner.json', 'state/installation.json', 'state/maintenance.json', 'state/runtime-ownership.sqlite', 'state/runtime-stopped.json', ...descriptorNames.map(name => 'state/' + name)])
   const releases = await releasesFor(plan, io)
   for (const release of releases) for (const name of ['plugin-package.json', ...Object.keys(release.manifest.files)]) allowed.add('releases/' + release.digest + '/' + name)
   for (const name of await readdir(join(paths.installRoot, 'transactions'))) {

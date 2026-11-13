@@ -67,7 +67,7 @@ async function ownedFiles(installation, inspectPackage) {
   const { stateRoot, receipt, config, configPath, channel } = installation
   if (configPath !== join(stateRoot, 'state/installation.json') || config.dataDir !== join(stateRoot, 'state') || config.pluginId !== pluginIds[channel] || receipt.installationId !== config.installationId || receipt.stateRoot !== stateRoot || receipt.channel !== channel || !Array.isArray(receipt.releases) || !receipt.releases.length) throw failure('github-cleanup-ownership-unconfirmed')
   if (config.coreDataDir === dirname(stateRoot) || config.coreDataDir.startsWith(dirname(stateRoot) + sep) || config.sessionsRoot === stateRoot || config.sessionsRoot.startsWith(stateRoot + sep)) throw failure('github-cleanup-shared-path-overlap')
-  const allowed = new Set(['.github-prepare.lock', 'github-installation.json', 'state/installation.json', 'state/plugin/.codex-plugin/plugin.json', 'state/plugin/.mcp.json', 'state/health-outbox.sqlite', 'state/health-outbox.sqlite-wal', 'state/health-outbox.sqlite-shm'])
+  const allowed = new Set(['.github-prepare.lock', 'github-installation.json', 'state/installation.json', 'state/plugin/.codex-plugin/plugin.json', 'state/plugin/.mcp.json', 'state/runtime-ownership.sqlite', 'state/runtime-stopped.json', 'state/health-outbox.sqlite', 'state/health-outbox.sqlite-wal', 'state/health-outbox.sqlite-shm'])
   for (const release of receipt.releases) {
     if (!digest(release.archiveSHA256) || !digest(release.releaseId) || release.releaseRoot !== join(stateRoot, 'payloads', release.archiveSHA256)) throw failure('github-cleanup-release-unconfirmed')
     const inspected = await inspectPackage(release.releaseRoot, { digest: release.releaseId })

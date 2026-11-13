@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
+import { fileURLToPath } from 'node:url'
 import { mkdtemp, writeFile, readFile, rm, chmod } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -9,7 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { prepareInstallation, resolvePluginOwner, startFromInstallation } from '../chatgpt/runtime.mjs'
 import { createStdioMetadataClient } from '../chatgpt/stdio-metadata.mjs'
 import { startServer } from '../src/server.mjs'
-import { startPluginBridge } from '../chatgpt/plugin-bridge.mjs'
+import { startPluginBridge, startResilientPluginBridge } from '../chatgpt/plugin-bridge.mjs'
 import { PassThrough } from 'node:stream'
 import { createServer } from 'node:http'
 import { connectCore } from '../src/core-client.mjs'
@@ -31,7 +32,7 @@ async function setup(t) {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-bridge-')), core = await startServer({ dataDir: join(dir, 'core') })
   const prepared = await prepareInstallation({ dataDir: join(dir, 'adapter'), coreDataDir: join(dir, 'core'), sessionsRoot: dir, metadataSocket: join(dir, 'metadata.sock'), pluginId: 'sentinel@bridge' })
   await writeFile(join(prepared.pluginDir, '.codex-plugin/plugin.json'), JSON.stringify({ name: 'ghost-sentinel', version: '0.1.0-dev.1', mcpServers: './.mcp.json', interface: { displayName: 'Sentinel 会话检查' } }), { mode: 0o600 })
-  await writeFile(join(prepared.pluginDir, '.mcp.json'), JSON.stringify({ mcpServers: { sentinel: { command: process.execPath, args: [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', prepared.configPath], cwd: new URL('../', import.meta.url).pathname } } }), { mode: 0o600 })
+  await writeFile(join(prepared.pluginDir, '.mcp.json'), JSON.stringify({ mcpServers: { sentinel: { command: process.execPath, args: [fileURLToPath(new URL('../chatgpt/plugin-bridge.mjs', import.meta.url)), '--config', prepared.configPath], cwd: fileURLToPath(new URL('../', import.meta.url)) } } }), { mode: 0o600 })
   const statePath = join(dir, 'enabled.json'), callsPath = join(dir, 'calls.txt'), pidsPath = join(dir, 'owner-pids.txt'), faultPath = join(dir, 'fault.json'), auditPath = join(dir, 'audit.jsonl'), children = []
   await writeFile(statePath, 'true'); await writeFile(callsPath, ''); await writeFile(pidsPath, '')
   await writeFile(faultPath, '{}'); await writeFile(auditPath, '')
@@ -42,12 +43,12 @@ async function setup(t) {
   })
   function track(child) { children.push(child); child.ended = once(child, 'close'); child.errors = ''; child.stderr.on('data', bytes => { child.errors += bytes }); return child }
   async function owner(timeoutMs = 5000) {
-    const child = track(spawn(process.execPath, [new URL('./fixtures/chatgpt-plugin-bridge/owner.mjs', import.meta.url).pathname, prepared.configPath, statePath, callsPath], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }))
-    const [identity] = await bounded(once(child, 'message'), 'owner did not start: ' + child.errors, timeoutMs)
+    const child = track(spawn(process.execPath, [fileURLToPath(new URL('./fixtures/chatgpt-plugin-bridge/owner.mjs', import.meta.url)), prepared.configPath, statePath, callsPath], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }))
+    const [identity] = await bounded(Promise.race([once(child, 'message'), child.ended.then(() => assert.fail('owner exited before publishing: ' + child.errors))]), 'owner did not start', timeoutMs)
     return { child, identity }
   }
   function bridge({ launchOwner = false, faults = false } = {}) {
-    const args = faults ? [new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url).pathname, prepared.configPath, faultPath, auditPath] : launchOwner ? [new URL('./fixtures/chatgpt-plugin-bridge/bridge.mjs', import.meta.url).pathname, prepared.configPath, statePath, callsPath, pidsPath] : [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', prepared.configPath]
+    const args = faults ? [fileURLToPath(new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url)), prepared.configPath, faultPath, auditPath] : launchOwner ? [fileURLToPath(new URL('./fixtures/chatgpt-plugin-bridge/bridge.mjs', import.meta.url)), prepared.configPath, statePath, callsPath, pidsPath] : [fileURLToPath(new URL('../chatgpt/plugin-bridge.mjs', import.meta.url)), '--config', prepared.configPath]
     const child = track(spawn(process.execPath, args, { stdio: ['pipe', 'pipe', 'pipe'] }))
     let buffer = '', id = 0
     const pending = new Map(), messages = []
@@ -108,9 +109,68 @@ test('cold observation data does not block the MCP UI and later reads recover wi
   } finally { await rm(startupBarrier, { force: true }); await bridge?.close(); await ownerStarting?.catch(() => {}) }
 })
 
+test('local MCP pages survive an owner timeout and two tabs reconnect to one replacement', async t => {
+  const env = await setup(t)
+  await writeFile(join(env.dir, 'resource-main.jsonl'), resourceMaterial({ at: Date.now(), cwd: env.dir, producerVersion: supportedProfile.cliVersion }))
+  const original = await env.owner(), launches = [], tabs = []
+  let waiting
+  try {
+    for (let index = 0; index < 2; index++) {
+      const input = new PassThrough(), output = new PassThrough()
+      const bridge = await startResilientPluginBridge({ configPath: env.configPath, input, output, startOwner() {
+        const launched = env.owner(); launches.push(launched); launched.catch(() => {}); return Promise.resolve()
+      } })
+      let id = 0
+      tabs.push({ bridge, async request(method, params = {}) {
+        const requestId = ++id
+        let listener
+        const data = new Promise(resolve => {
+          listener = bytes => { const reply = JSON.parse(bytes); if (reply.id === requestId) resolve(reply) }
+          output.on('data', listener)
+        })
+        input.write(JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params }) + '\n')
+        try { return await bounded(data, 'local resource or tool did not respond') }
+        finally { output.off('data', listener) }
+      } })
+    }
+    const read = tab => tab.request('tools/call', { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: 'resource-main' } })
+    const html = async tab => (await tab.request('resources/read', { uri: legacyChatResourceUri })).result.contents[0].text
+    await Promise.all(tabs.map(tab => tab.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'resilient-tab', version: '1' } })))
+    const pages = await Promise.all(tabs.map(html))
+    assert.ok((await Promise.all(tabs.map(read))).every(reply => reply.result.structuredContent.identity.threadId === 'resource-main'))
+    const lock = join(env.dir, 'adapter/runtime.lock')
+    await rm(lock, { recursive: true })
+    assert.ok((await Promise.all(tabs.map(read))).every(reply => reply.result.structuredContent.identity.threadId === 'resource-main'))
+    assert.equal(JSON.parse(await readFile(join(lock, 'owner.json'), 'utf8')).runId, original.identity.runId)
+    assert.equal(launches.length, 0, 'an authenticated live observer is recovered without spawning')
+    original.child.kill('SIGSTOP')
+    waiting = Promise.all(tabs.map(read))
+    assert.deepEqual(await Promise.all(tabs.map(html)), pages)
+    assert.ok((await waiting).every(reply => reply.result.structuredContent.observation.gap === 'observer-unavailable'))
+    original.child.kill('SIGCONT')
+    assert.ok((await Promise.all(tabs.map(read))).every(reply => reply.result.structuredContent.identity.threadId === 'resource-main'))
+    original.child.kill('SIGKILL')
+    await bounded(original.child.ended, 'the fixture observer did not exit')
+    let replacement
+    await bounded((async () => {
+      while (!(replacement = await resolvePluginOwner({ configPath: env.configPath }))) await delay(30)
+    })(), 'neither existing tab recovered the observer')
+    assert.notEqual(replacement.runId, original.identity.runId)
+    assert.equal((await Promise.all(launches)).filter(value => !value.identity.reused).length, 1)
+    assert.deepEqual(await Promise.all(tabs.map(html)), pages)
+    assert.ok((await Promise.all(tabs.map(read))).every(reply => reply.result.structuredContent.identity.threadId === 'resource-main'))
+    await writeFile(env.statePath, 'false')
+    await Promise.all(tabs.map(tab => bounded(tab.bridge.closed, 'disabled observer retained a resilient connection')))
+  } finally {
+    if (original.child.exitCode === null && original.child.signalCode === null) original.child.kill('SIGCONT')
+    await Promise.all(tabs.map(tab => tab.bridge.close()))
+    await waiting?.catch(() => {})
+  }
+})
+
 test('normal metadata stderr cannot close a live MCP panel or its unique observer', async t => {
   const env = await setup(t), metadataChildren = []
-  const metadata = createStdioMetadataClient({ executable: process.execPath, args: [new URL('./fixtures/chatgpt-stdio-metadata.mjs', import.meta.url).pathname, 'stderr-chatter'], spawn(...args) { const child = spawn(...args); metadataChildren.push(child); return child } })
+  const metadata = createStdioMetadataClient({ executable: process.execPath, args: [fileURLToPath(new URL('./fixtures/chatgpt-stdio-metadata.mjs', import.meta.url)), 'stderr-chatter'], spawn(...args) { const child = spawn(...args); metadataChildren.push(child); return child } })
   let noisy = false, runtime
   const native = {
     async sampleHost() { return { available: true, hostRunId: 'metadata-stderr-host', hostStartedAt: 1, profile: supportedProfile } },
@@ -123,7 +183,7 @@ test('normal metadata stderr cannot close a live MCP panel or its unique observe
     async readThread(id) { return { thread: { id, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path: join(env.dir, id + '.jsonl'), cwd: env.dir }, anchorTurnId: 'resource-turn' } },
     async close() { await metadata.close() },
   }
-  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL('../chatgpt/plugin-bridge.mjs', import.meta.url).pathname, '--config', env.configPath], stderr: 'pipe' })
+  const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('../chatgpt/plugin-bridge.mjs', import.meta.url)), '--config', env.configPath], stderr: 'pipe' })
   transport.stderr.on('data', () => {})
   const client = new Client({ name: 'metadata-stderr-panel', version: '1' })
   try {
@@ -174,7 +234,7 @@ for (const kind of ['control', 'health-timeout', 'health-network', 'health-expir
   const env = await setup(t), owner = await env.owner()
   assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
   await writeFile(env.faultPath, JSON.stringify({ startup: kind === 'control' ? null : kind }))
-  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url).pathname, env.configPath, env.faultPath, env.auditPath], stderr: 'pipe' })
+  const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url)), env.configPath, env.faultPath, env.auditPath], stderr: 'pipe' })
   transport.stderr.on('data', () => {})
   const client = new Client({ name: 'initial-handshake-feedback', version: '1' })
   const started = performance.now(), soft = ['control', 'health-timeout', 'health-network'].includes(kind), pendingData = kind === 'health-expired-success'
@@ -207,7 +267,7 @@ for (const fault of [{ kind: 'persistent-health-network' }, { kind: 'persistent-
   const env = await setup(t), owner = await env.owner()
   assert.equal((await resolvePluginOwner({ configPath: env.configPath })).runId, owner.identity.runId)
   await writeFile(env.faultPath, JSON.stringify(fault))
-  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url).pathname, env.configPath, env.faultPath, env.auditPath], stderr: 'pipe' })
+  const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('./fixtures/chatgpt-plugin-bridge/fault-bridge.mjs', import.meta.url)), env.configPath, env.faultPath, env.auditPath], stderr: 'pipe' })
   transport.stderr.on('data', () => {})
   const client = new Client({ name: 'initial-handshake-budget', version: '1' })
   try {

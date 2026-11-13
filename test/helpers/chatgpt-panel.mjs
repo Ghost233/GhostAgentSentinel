@@ -20,7 +20,7 @@ class Element {
   setAttribute(name, value) { this.attributes.set(name, String(value)) }
   getAttribute(name) { return this.attributes.get(name) ?? null }
 }
-export async function panelHarness(t, { html = null, now = Date.now } = {}) {
+export async function panelHarness(t, { html = null, now = Date.now, initialize = true } = {}) {
   html ??= await readFile(new URL('../../chatgpt/panel.html', import.meta.url), 'utf8')
   const handlers = new Map(), elements = new Map(), timers = new Map(), sent = []
   for (const match of html.matchAll(/<([a-z0-9]+)\b[^>]*\bid="([^"]+)"[^>]*>/g)) elements.set('#' + match[2], new Element(match[1]))
@@ -32,7 +32,7 @@ export async function panelHarness(t, { html = null, now = Date.now } = {}) {
   const flush = () => new Promise(resolve => setImmediate(resolve))
   const reply = (id, value) => handlers.get('message')({ source: parent, data: { jsonrpc: '2.0', id, result: value } })
   vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], context)
-  reply(sent[0].id, {}); await flush()
+  if (initialize) { reply(sent[0].id, {}); await flush() }
   const deliver = async value => { reply(sent.findLast(row => row.method === 'tools/call').id, { structuredContent: value }); await flush() }
   const refresh = async () => { const scheduled = [...timers].find(([, value]) => value.delay === 1500); assert.ok(scheduled); timers.delete(scheduled[0]); void scheduled[1].callback(); await flush(); return sent.findLast(row => row.method === 'tools/call').id }
   const destroy = async () => { handlers.get('pagehide')?.(); await flush() }

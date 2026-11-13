@@ -275,6 +275,45 @@ test('an upgraded DSH adapter lets an incompatible Core exit and resumes observa
   assert.equal(observed, true)
 })
 
+test('DSH session and overview recover through their original adapter after a Core deadline', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-dsh-deadline-'))
+  let core = await startServer({ dataDir }), blocked = false
+  const runtimePath = join(dataDir, 'runtime.json'), runtime = JSON.parse(await readFile(runtimePath, 'utf8'))
+  const proxy = createServer(async (req, res) => {
+    if (blocked && !['/v1/health', '/v1/diagnostics'].includes(req.url)) return
+    try {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      const response = await fetch(runtime.url + req.url, { method: req.method, headers: { authorization: req.headers.authorization }, ...(req.method === 'POST' ? { body: Buffer.concat(chunks) } : {}) })
+      res.writeHead(response.status, { 'content-type': 'application/json' }).end(await response.text())
+    } catch { res.writeHead(503).end() }
+  })
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve))
+  await writeFile(runtimePath, JSON.stringify({ ...runtime, url: `http://127.0.0.1:${proxy.address().port}` }))
+  const f = await fixture(t, { dataDir, connect: connectCore })
+  t.after(async () => { await f.remove(); await core.close(); proxy.closeAllConnections(); await new Promise(resolve => proxy.close(resolve)); await rm(dataDir, { recursive: true, force: true }) })
+  await f.install()
+  await f.create('deadline-session')
+  const page = await f.service.panelDocument()
+  assert.equal((await f.service.sessionPanel('deadline-session', {})).identity.threadId, 'deadline-session')
+  blocked = true
+  await assert.rejects(f.service.sessionPanel('deadline-session', {}), /core request deadline exceeded|正在重连/)
+  assert.equal(await f.service.panelDocument(), page)
+  await core.close()
+  core = await startServer({ dataDir })
+  const recovered = await (async () => {
+    const deadline = Date.now() + 8000
+    while (true) {
+      try { return await Promise.all([f.service.sessionPanel('deadline-session', {}), f.service.panelOverview({})]) }
+      catch (error) { if (Date.now() >= deadline) throw error; await new Promise(resolve => setTimeout(resolve, 50)) }
+    }
+  })()
+  const [view, overview] = recovered
+  assert.equal(view.identity.threadId, 'deadline-session')
+  assert.ok(overview.rows.some(row => row.title))
+  assert.equal(await f.service.panelDocument(), page)
+})
+
 test('independent native Hosts with identical local Agent IDs remain separate sources and lifecycles', async t => {
   const a = await fixture(t), b = await fixture(t)
   await a.install(); await b.install(); await a.create('same-id'); await b.create('same-id')

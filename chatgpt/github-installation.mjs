@@ -107,12 +107,17 @@ async function checkedConfig(paths) {
   return config
 }
 const ownerFields = ['protocol', 'installationId', 'version', 'pid', 'runId', 'ownership', 'releaseId']
-async function ownerRecords(paths, releaseId, installationId) {
+async function ownerRecords(paths, releaseId, installationId, repair = false) {
   for (let attempt = 0; ; attempt++) {
     try {
       const lockPath = join(paths.dataDir, 'runtime.lock'), lock = await directory(lockPath), owner = (await record(join(lockPath, 'owner.json')))?.value, published = (await record(join(paths.dataDir, 'runtime.json')))?.value
       if (lock && (await readdir(lockPath)).some(name => name !== 'owner.json')) fail('github_owner_unconfirmed')
       if (owner && (owner.protocol !== HELPER_PROTOCOL || owner.version !== HELPER_VERSION || owner.ownership !== 'plugin' || owner.releaseId !== releaseId || owner.installationId !== installationId || !uuid(owner.runId) || !Number.isSafeInteger(owner.pid) || owner.pid < 1)) fail('github_owner_unconfirmed')
+      if (repair && published && !owner && attempt === 0) {
+        // Recover older installations whose publication survived a lost lock.
+        await resolvePluginOwner({ configPath: paths.configPath })
+        continue
+      }
       if (published && (!owner || ownerFields.some(key => published[key] !== owner[key]))) fail('github_owner_unconfirmed')
       return { lockPath, lock, owner, published }
     } catch (error) { if (error.code !== 'ENOENT' || attempt === 2) throw error }
@@ -130,7 +135,7 @@ async function upgrade(paths, config, receipt, packet, pending, io) {
   let operation = pending
   if (!operation) {
     if (await record(paths.maintenancePath)) fail('github_maintenance_requires_review')
-    const current = await ownerRecords(paths, config.releaseId, config.installationId)
+    const current = await ownerRecords(paths, config.releaseId, config.installationId, true)
     if (current.owner && alive(current.owner.pid) && current.published) {
       const authenticated = await (io.resolveOwner ?? resolvePluginOwner)({ configPath: paths.configPath })
       if (!authenticated || ownerFields.some(key => authenticated[key] !== current.owner[key])) fail('github_owner_unconfirmed')

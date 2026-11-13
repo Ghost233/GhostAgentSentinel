@@ -2,13 +2,15 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, writeFile, readdir, rm, stat, chmod } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { configureInstallationModels } from './helpers/installation-model-settings.mjs'
-import { prepareInstallation, startFromInstallation, resolvePluginOwner } from '../chatgpt/runtime.mjs'
+import { prepareInstallation, startFromInstallation, resolvePluginOwner, HELPER_PROTOCOL, HELPER_VERSION } from '../chatgpt/runtime.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
 import { notificationPrefix } from '../chatgpt/native-notifications.mjs'
 import fs from 'node:fs'
@@ -19,6 +21,44 @@ async function completed(promise) {
   try { return await Promise.race([promise, delay(2000, null, { signal: controller.signal }).then(() => assert.fail('plugin-owned runtime did not finish cleanup'))]) }
   finally { controller.abort() }
 }
+
+test('concurrent stale-owner recovery cannot erase the next published observer', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'sentinel-owner-race-')), dataDir = join(dir, 'adapter'), lock = join(dataDir, 'runtime.lock')
+  const { configPath } = await prepareInstallation({ dataDir, coreDataDir: join(dir, 'core'), sessionsRoot: dir, pluginId: 'sentinel@race' })
+  const config = JSON.parse(await readFile(configPath, 'utf8'))
+  const processThatExited = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  await once(processThatExited, 'exit')
+  await fs.promises.mkdir(lock, { mode: 0o700 })
+  await writeFile(join(lock, 'owner.json'), JSON.stringify({ protocol: HELPER_PROTOCOL, version: HELPER_VERSION, installationId: config.installationId, pid: processThatExited.pid, runId: '11111111-1111-1111-1111-111111111111', ownership: 'plugin' }), { mode: 0o600 })
+  const entered = Promise.withResolvers(), release = Promise.withResolvers(), original = fs.promises.rm
+  let blocked = false
+  fs.promises.rm = async (path, options) => {
+    if (path === lock && options?.recursive && !blocked) { blocked = true; entered.resolve(); await release.promise }
+    return original(path, options)
+  }
+  syncBuiltinESMExports()
+  const native = { async sampleHost() { return { available: true, hostRunId: 'race', hostStartedAt: 1, profile: supportedProfile } }, async readEnablement() { return { user: 'enabled', effective: 'enabled' } }, async listThreads() { return { data: [], nextCursor: null } }, async close() {} }
+  const start = () => startFromInstallation({ configPath, native, ownership: 'plugin', pollMs: 0 })
+  const attempts = [start()]
+  attempts[0].catch(() => {})
+  try {
+    await completed(entered.promise)
+    const second = start()
+    attempts.push(second); second.catch(() => {})
+    // The former race let this second attempt publish while removal was suspended.
+    await Promise.race([second.catch(() => {}), delay(300)])
+    release.resolve()
+    const both = await Promise.all(attempts)
+    assert.equal(both.filter(runtime => !runtime.reused).length, 1)
+    assert.equal(both[0].runId, both[1].runId)
+    assert.equal((await resolvePluginOwner({ configPath })).runId, both[0].runId)
+  } finally {
+    release.resolve(); fs.promises.rm = original; syncBuiltinESMExports()
+    const outcomes = await Promise.allSettled(attempts)
+    await Promise.all(outcomes.map(result => result.value?.close()))
+    await rm(dir, { recursive: true, force: true })
+  }
+})
 
 for (const stage of ['configuration', 'publication']) test(`startup revocation fences ${stage} IO before it can leave a published endpoint`, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sentinel-startup-publication-')), dataDir = join(dir, 'adapter')

@@ -2,7 +2,9 @@ import { withModelSummary } from './helpers/model-summary.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -14,6 +16,36 @@ const missing = async path => { try { await stat(path); return false } catch (er
 async function until(predicate, deadline, label) {
   while (!await predicate()) { assert.ok(Date.now() < deadline, `${label} exceeded its wall-clock deadline`); await delay(20) }
 }
+
+test('concurrent Core reconnects recover stale client and server locks after a daemon exits', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'gs-core-reconnect-')), clients = []
+  let original, replacement
+  t.after(async () => {
+    await Promise.all(clients.map(client => client.close()))
+    const running = JSON.parse(await readFile(join(dataDir, 'runtime.json'), 'utf8').catch(() => 'null'))
+    for (const owner of [original, replacement, running]) {
+      if (!owner || !alive(owner.pid)) continue
+      process.kill(owner.pid, 'SIGTERM')
+      await until(() => !alive(owner.pid), Date.now() + 5000, 'isolated daemon cleanup')
+    }
+    await rm(dataDir, { recursive: true, force: true })
+  })
+  const readRuntime = async () => JSON.parse(await readFile(join(dataDir, 'runtime.json'), 'utf8'))
+  clients.push(await connectCore({ dataDir }))
+  original = await readRuntime()
+  process.kill(original.pid, 'SIGKILL')
+  await until(() => !alive(original.pid), Date.now() + 5000, 'fixture daemon exit')
+  const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  await once(dead, 'exit')
+  await mkdir(join(dataDir, 'startup.lock'))
+  await writeFile(join(dataDir, 'startup.lock/owner.json'), JSON.stringify({ pid: dead.pid }))
+  await Promise.all(Array.from({ length: 8 }, async () => { clients.push(await connectCore({ dataDir })) }))
+  replacement = await readRuntime()
+  assert.notEqual(replacement.instanceId, original.instanceId)
+  assert.deepEqual(new Set(await Promise.all(clients.slice(1).map(async client => (await client.health()).instanceId))), new Set([replacement.instanceId]))
+  assert.equal(JSON.parse(await readFile(join(dataDir, 'core.lock/owner.json'), 'utf8')).instanceId, replacement.instanceId)
+  assert.equal(await missing(join(dataDir, 'startup.lock')), true)
+})
 
 test('ordinary replacements retain one submitted HTTP call, while owner stop releases the transport and the production daemon exits after its default idle grace', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'gs-core-transport-process-'))

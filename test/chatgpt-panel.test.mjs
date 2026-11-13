@@ -88,6 +88,27 @@ test('missing observation data stays visible and refreshes automatically or manu
   assert.match(page.element('#identity').textContent, /main-a/)
 })
 
+test('the bundled page recovers from a host handshake timeout in place', async t => {
+  const page = await harness(t, { initialize: false })
+  const timeout = [...page.timers].find(([, timer]) => timer.delay === 5000)
+  timeout[1].callback()
+  await page.flush()
+  const status = page.element('#connection-status')
+  assert.match(status.textContent, /正在重新连接/)
+  assert.equal(status.hidden, false)
+  const retry = [...page.timers].find(([, timer]) => timer.delay === 1500)
+  retry[1].callback()
+  await page.flush()
+  const initialization = page.sent.filter(row => row.method === 'ui/initialize')
+  assert.equal(initialization.length, 2)
+  page.reply(initialization[1].id, {})
+  await page.flush()
+  await page.deliver(result('main-a'))
+  assert.equal(page.element('#connection-status'), status)
+  assert.equal(status.hidden, true)
+  assert.match(page.element('#identity').textContent, /main-a/)
+})
+
 test('a completed model summary keeps literal evidence and disappears when the next result is pending or failed', async t => {
   const page = await harness(t), view = material('main-a', 'gray')
   view.analysis.generated = { text: '正在核对按钮文案。尚未得到验证结果。', evidence: [{ text: '<button> 已修改', reference: 'native:current-evidence' }] }

@@ -911,28 +911,28 @@
         return sessionId && !visibleFooters.has(sessionId) ? h(GSView, { key: sessionId, sessionId, placement: 'below', visible, signal, useTabInfo }) : null
       }
       function SessionPanel({ sessionId, executionKey, visible, signal }) {
-        const frame = useRef(null), [html, setHTML] = useState(null), [error, setError] = useState('')
-        const [attempt, setAttempt] = useState(0)
+        const frame = useRef(null), documentCache = useRef(null), [html, setHTML] = useState(null)
         useLayoutEffect(() => {
           if (!visible || signal?.aborted) return
           const viewport = document.defaultView, pending = new Map()
-          let connection, lifetime
-          const disconnect = () => { lifetime?.abort(); for (const request of pending.values()) request.abort(); pending.clear() }
-          const cleanup = () => { disconnect(); viewport.removeEventListener('message', message); subscribers.delete(load); signal?.removeEventListener('abort', stop) }
-          const stop = () => { cleanup(); setHTML(null) }
+          const lifetime = new AbortController()
+          let loading = false, timer
           const load = () => {
-            if (signal?.aborted || connection === connectionScope) return
-            disconnect(); connection = connectionScope; setHTML(null); setError('')
-            if (!connection?.active) return
-            lifetime = new AbortController()
-            const { signal: requestSignal } = lifetime
-            void scopedCall(connection, 'panelDocument', [], requestSignal).then(value => {
-              if (!requestSignal.aborted) setHTML(value)
-            }, error => { if (!requestSignal.aborted) setError(errorText(error)) })
+            clearTimeout(timer)
+            if (lifetime.signal.aborted || documentCache.current || loading) return
+            loading = true
+            void scopedCall(connectionScope, 'panelDocument', [], lifetime.signal).then(value => {
+              if (lifetime.signal.aborted || typeof value !== 'string' || !value) return
+              documentCache.current = value
+              setHTML(value)
+            }, () => {}).finally(() => {
+              loading = false
+              if (!lifetime.signal.aborted && !documentCache.current) timer = setTimeout(load, 1500)
+            })
           }
           const message = async event => {
             const target = frame.current?.contentWindow, request = event.data
-            if (!target || event.source !== target || request?.jsonrpc !== '2.0' || !connection?.active || lifetime?.signal.aborted || signal?.aborted) return
+            if (!target || event.source !== target || request?.jsonrpc !== '2.0' || lifetime.signal.aborted) return
             if (request.method === 'notifications/cancelled') { pending.get(request.params?.requestId)?.abort(); return }
             if (!Number.isSafeInteger(request.id) || pending.has(request.id)) return
             const respond = payload => target.postMessage({ jsonrpc: '2.0', id: request.id, ...payload }, '*')
@@ -943,6 +943,7 @@
             }
             const abort = new AbortController()
             pending.set(request.id, abort)
+            const connection = connectionScope
             try {
               const selection = request.params.arguments ?? {}
               let view
@@ -956,18 +957,24 @@
                 if (!sessionId) throw new Error('尚未选择会话')
                 view = await scopedCall(connection, 'sessionPanel', [sessionId, selection], abort.signal)
               }
+              if (connection !== connectionScope) throw new Error('观察连接已变化')
               if (!abort.signal.aborted && frame.current?.contentWindow === target) respond({ result: { structuredContent: view } })
             } catch (error) {
               if (!abort.signal.aborted && frame.current?.contentWindow === target) respond({ error: { code: -32000, message: errorText(error) } })
             } finally { if (pending.get(request.id) === abort) pending.delete(request.id) }
           }
-          viewport.addEventListener('message', message); subscribers.add(load); signal?.addEventListener('abort', stop, { once: true })
+          const cleanup = () => {
+            lifetime.abort(); clearTimeout(timer)
+            for (const request of pending.values()) request.abort()
+            pending.clear()
+            viewport.removeEventListener('message', message); subscribers.delete(load); signal?.removeEventListener('abort', cleanup)
+          }
+          viewport.addEventListener('message', message); subscribers.add(load); signal?.addEventListener('abort', cleanup, { once: true })
           load()
           return cleanup
-        }, [sessionId, executionKey, visible, signal, attempt])
+        }, [sessionId, executionKey, visible, signal])
         if (!visible || signal?.aborted) return null
-        if (error) return h('div', null, h('p', { role: 'alert' }, error), h('button', { type: 'button', onClick: () => setAttempt(value => value + 1) }, '重试'))
-        if (!html) return h('p', { role: 'status' }, '正在加载会话检查')
+        if (!html) return h('section', { className: 'sentinel-overview', 'aria-label': 'Sentinel 会话检查' }, h('strong', null, 'Sentinel 会话检查'), h('p', { role: 'status' }, '正在连接观察服务，恢复后会自动显示会话检查'))
         return h('iframe', { ref: frame, srcDoc: html, sandbox: 'allow-scripts', title: 'Sentinel 会话检查', className: 'sentinel-session-panel' })
       }
       function Panel({ sessionId, useTabInfo } = {}) {

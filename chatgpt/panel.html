@@ -40,6 +40,7 @@
   <time id="recent-summary-time" aria-label="更新时间" hidden></time>
   <p id="recent-blocking-reason" hidden></p>
 </header>
+<p id="connection-status" class="muted" role="status">正在连接观察服务</p>
 <div id="current-context">
 <details id="recent-blocking-details" hidden><summary>查看判断依据</summary><div id="recent-blocking-evidence"></div></details>
 <section id="recent-model-activity" aria-label="本聊天最近的预填和总结">
@@ -228,6 +229,12 @@ function clearView(message){
   scopeThreadId=null;selectedExecutionKey=null;historyCursor=null;nextHistoryCursor=null;recentActivity=null;
   renderRecentModelActivity(null);
   write('summary','⚪ '+message);attribute('summary','data-signal','gray');
+}
+function reconnecting(message){
+  resetDetails();renderSessionLight(null);recentActivity=renderRecentModelActivity(recentActivity,true);
+  write('summary','⚪ 本次读取失败，当前状态不可判断');attribute('summary','data-signal','gray');
+  write('connection-status','观察服务暂不可用，正在重新连接');show('connection-status',true);
+  write('technical',text(message));
 }
 function node(tag,value,className){const child=document.createElement(tag);if(value)child.textContent=value;if(className)child.className=className;return child;}
 function renderHealth(health){
@@ -439,7 +446,7 @@ function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);
 function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
 function completeOperation(){
   busy=false;clearTimeout(timer);timer=null;if(stopped||document.hidden)return;
-  timer=setTimeout(refresh,1500);
+  timer=setTimeout(ready?refresh:initialize,1500);
 }
 const displayContextFields=new Set(['theme','styles','displayMode','availableDisplayModes','containerDimensions','locale','timeZone','platform','deviceCapabilities','safeAreaInsets','userAgent']);
 function onMessage(event){
@@ -469,18 +476,23 @@ async function refresh(){
     const response=await request('tools/call',{name:'sentinel_current_chat',arguments:overview?{scope:'overview',offset:overviewOffset}:readArguments()});
     if(stopped||g!==generation||overview!==(monitorTab==='overview'))return;
     if(response.isError)throw new Error('当前检查读取失败');
+    if(response.structuredContent?.observation?.gap==='observer-unavailable'&&!response.structuredContent.identity){
+      reconnecting(response.structuredContent.summary);
+      write('availability',text(response.structuredContent.summary));show('availability',true);
+      if(overview)renderOverview(null);
+      return;
+    }
+    show('connection-status',false);
     if(overview){renderOverview(response.structuredContent?.overview,response.structuredContent?.summary);return;}
     render(response.structuredContent);void dismissDisplayed(response.structuredContent,g);
   }catch(error){
     if(!stopped&&g===generation&&overview===(monitorTab==='overview')){
-      if(overview){renderOverview(null,error.message);return;}
-      resetDetails();renderSessionLight(null);recentActivity=renderRecentModelActivity(recentActivity,true);
-      write('summary','⚪ 本次读取失败，当前状态不可判断');attribute('summary','data-signal','gray');
-      write('error','可稍后重试');write('technical',text(error.message));
+      reconnecting(error.message);
+      if(overview)renderOverview(null);
     }
   }finally{completeOperation();}
 }
-element('refresh').onclick=()=>refresh();
+element('refresh').onclick=()=>ready?refresh():initialize();
 async function setPaused(){
   if(stopped||busy||!ready||!controlState)return;
   const state=controlState,g=generation;clearTimeout(timer);timer=null;busy=true;element('pause').disabled=true;
@@ -501,9 +513,24 @@ async function setPaused(){
 element('pause').onclick=setPaused;
 element('history-current').onclick=()=>selectExecution(null,null);
 element('history-more').onclick=()=>nextHistoryCursor?selectExecution(selectedExecutionKey,nextHistoryCursor):undefined;
-function visibility(){dismissedGeneration=-1;clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void refresh();}
+function visibility(){dismissedGeneration=-1;clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void (ready?refresh():initialize());}
 function teardown(){stopped=true;generation++;clearTimeout(timer);timer=null;for(const [id,entry]of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
-(async()=>{try{const init=await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});if(stopped)return;const execution=init?.hostContext?.sentinelExecution;if(text(execution?.threadId,2000)&&text(execution?.key,2000)){scopeThreadId=execution.threadId;selectedExecutionKey=execution.key;selectTab('details');}if(init?.hostContext?.sentinelOverviewOnly){show('monitor-tab-issues',false);show('monitor-tab-details',false);selectTab('overview');}ready=true;parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');await refresh();}catch(error){clearView('宿主初始化未完成');element('error').textContent='可稍后重试';element('technical').textContent=text(error.message);}})();
+async function initialize(){
+  if(stopped||document.hidden||busy||ready)return;
+  busy=true;
+  try{
+    const init=await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});
+    if(stopped)return;
+    const execution=init?.hostContext?.sentinelExecution;
+    if(text(execution?.threadId,2000)&&text(execution?.key,2000)){scopeThreadId=execution.threadId;selectedExecutionKey=execution.key;selectTab('details');}
+    if(init?.hostContext?.sentinelOverviewOnly){show('monitor-tab-issues',false);show('monitor-tab-details',false);selectTab('overview');}
+    ready=true;
+    parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}},'*');
+  }catch(error){if(!stopped)reconnecting(error.message);}
+  finally{completeOperation();}
+  if(ready)void refresh();
+}
+void initialize();
 </script>
 </html>

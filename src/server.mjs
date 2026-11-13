@@ -10,6 +10,7 @@ import { PROTOCOL, NOTIFICATION_REVOCATION_FEATURE, GS_SUMMARY_FEATURE, SOURCE_O
 import { normalizeEnrollment } from './enrollment-config.mjs'
 import { HIERARCHY_FEATURE } from './hierarchy.mjs'
 import { GS_FEATURE } from './gs-status.mjs'
+import { withProcessLock } from './process-lock.mjs'
 
 export async function writePrivateJson(path, value) {
   const temporary = `${path}.${randomUUID()}.tmp`
@@ -48,34 +49,38 @@ function identifier(value) {
 
 async function acquireCoreLock(dataDir, instanceId) {
   const path = join(dataDir, 'core.lock')
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try { await mkdir(path, { mode: 0o700 }) }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error
-      let dead = false
-      try {
-        const owner = JSON.parse(await readFile(join(path, 'owner.json'), 'utf8'))
-        if (Number.isInteger(owner.pid) && owner.pid > 0) {
-          try { process.kill(owner.pid, 0) } catch (probe) { dead = probe.code === 'ESRCH' }
+  const serialize = action => withProcessLock(join(dataDir, 'core-ownership.sqlite'), action)
+  await serialize(async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { await mkdir(path, { mode: 0o700 }) }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error
+        let dead = false
+        try {
+          const owner = JSON.parse(await readFile(join(path, 'owner.json'), 'utf8'))
+          if (Number.isInteger(owner.pid) && owner.pid > 0) {
+            try { process.kill(owner.pid, 0) } catch (probe) { dead = probe.code === 'ESRCH' }
+          }
+        } catch {
+          // A crash between mkdir and owner write must not block all future starts.
+          dead = Date.now() - (await stat(path)).mtimeMs > 10_000
         }
-      } catch {
-        // A crash between mkdir and owner write must not block all future starts.
-        dead = Date.now() - (await stat(path)).mtimeMs > 10_000
+        if (!dead) throw new Error('core already running or startup in progress for this data directory')
+        await rm(path, { recursive: true, force: true })
+        continue
       }
-      if (!dead) throw new Error('core already running or startup in progress for this data directory')
-      await rm(path, { recursive: true, force: true })
-      continue
+      try { await writePrivateJson(join(path, 'owner.json'), { pid: process.pid, instanceId }) }
+      catch (error) { await rm(path, { recursive: true, force: true }); throw error }
+      return
     }
-    try { await writePrivateJson(join(path, 'owner.json'), { pid: process.pid, instanceId }) }
-    catch (error) { await rm(path, { recursive: true, force: true }); throw error }
-    return async () => {
-      try {
-        const owner = JSON.parse(await readFile(join(path, 'owner.json'), 'utf8'))
-        if (owner.instanceId === instanceId) await rm(path, { recursive: true, force: true })
-      } catch (error) { if (error.code !== 'ENOENT') throw error }
-    }
-  }
-  throw new Error('core startup lock changed; reconnect later')
+    throw new Error('core startup lock changed; reconnect later')
+  })
+  return () => serialize(async () => {
+    try {
+      const owner = JSON.parse(await readFile(join(path, 'owner.json'), 'utf8'))
+      if (owner.instanceId === instanceId) await rm(path, { recursive: true, force: true })
+    } catch (error) { if (error.code !== 'ENOENT') throw error }
+  })
 }
 
 export async function startServer({ dataDir, onIdle, ...options }) {

@@ -1,5 +1,5 @@
 import { isAbsolute } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -8,21 +8,21 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { loadInstallationConfig, resolvePluginOwner } from './runtime.mjs'
 
 async function startOwner(configPath) {
-  const child = spawn(process.execPath, [new URL('./plugin-main.mjs', import.meta.url).pathname, '--config', configPath], { detached: true, stdio: 'ignore' })
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./plugin-main.mjs', import.meta.url)), '--config', configPath], { detached: true, stdio: 'ignore' })
   await once(child, 'spawn'); child.unref()
 }
 
 // The package can serve its own UI before observation data is available.
 // No user data or writes pass this connection until the owner is verified.
-async function startPendingBridge({ configPath, input, output }) {
+async function startPendingBridge({ configPath, input, output, recovery }) {
   const { createPanelMCPServer } = await import('./panel-server.mjs')
   const config = await loadInstallationConfig(configPath)
   const displayName = config.pluginId === 'ghost-sentinel-test@ghostsentinel' ? 'GhostSentinel test' : config.pluginId === 'ghost-sentinel@ghostsentinel' ? 'GhostSentinel' : 'Sentinel'
-  const lifetime = new AbortController(), operations = new Set()
-  let owner, stopped = false, closing, timer, sequence = 0, finished
+  const lifetime = new AbortController(), operations = new Set(), openedAt = Date.now()
+  let owner, stopped = false, closing, timer, sequence = 0, finished, checking, nextLaunch = 0
   const closed = new Promise(resolve => { finished = resolve })
   const unavailable = name => {
-    const summary = '观察服务尚未就绪，等待数据；可自动或手动刷新'
+    const summary = '观察服务尚未就绪，正在重新连接'
     if (name === 'sentinel_current_chat') return { content: [{ type: 'text', text: summary }], structuredContent: {
       signal: 'gray', summary, observation: { coverage: 'unavailable', gap: 'observer-unavailable' },
       analysis: { state: 'unknown', summary: '尚无可用检查结果', checks: [] },
@@ -31,19 +31,32 @@ async function startPendingBridge({ configPath, input, output }) {
     if (name === 'sentinel_installation_diagnostics') return { content: [{ type: 'text', text: summary }], structuredContent: { state: 'unavailable', reason: 'observer-unavailable' } }
     return { isError: true, content: [{ type: 'text', text: summary }], structuredContent: { saveOutcome: 'unknown' } }
   }
-  async function qualified() {
+  async function check() {
     if (stopped) return null
     try {
-      const current = await resolvePluginOwner({ configPath, includeStarting: true })
+      if (recovery?.check && !await recovery.check()) { void close('installation-ended'); return null }
+      const current = await resolvePluginOwner({ configPath, includeStarting: true, includeStopped: Boolean(recovery) })
       if (stopped) return null
+      if (recovery) {
+        if (current?.stopped && (owner || current.stoppedAt >= openedAt) && !['host-verification-unavailable', 'plugin-enablement-unconfirmed'].includes(current.reason)) {
+          void close('owner-ended'); return null
+        }
+        owner = current?.stopped ? null : current
+        if (!owner && Date.now() >= nextLaunch) {
+          nextLaunch = Date.now() + 3000
+          await recovery.launch(configPath)
+        }
+        return owner
+      }
       if (owner && (current?.runId !== owner.runId || current.pid !== owner.pid || owner.url && current.starting)) { void close('owner-ended'); return null }
       if (current) owner = current
       return current
     } catch (error) {
-      if (error.code !== 'plugin_owner_health_unavailable') void close('owner-unconfirmed')
+      if (!recovery && error.code !== 'plugin_owner_health_unavailable') void close('owner-unconfirmed')
       return null
     }
   }
+  const qualified = () => checking ??= check().finally(() => { checking = null })
   const mcp = await createPanelMCPServer({ displayName, async forwardTool(name, selection, extra) {
     if (stopped || operations.size >= 32 || sequence >= Number.MAX_SAFE_INTEGER) return unavailable(name)
     const operation = new AbortController(); operations.add(operation)
@@ -59,8 +72,10 @@ async function startPendingBridge({ configPath, input, output }) {
       const chunks = []; let bytes = 0
       for await (const chunk of response.body) { bytes += chunk.length; if (bytes > 1024 * 1024) throw new Error('response over limit'); chunks.push(chunk) }
       const message = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      // Recheck after the upstream reply, even if a watch probe is already in flight.
+      await checking
       const after = await qualified()
-      if (!after || after.starting || stopped || !Array.isArray(message.result?.content)) return unavailable(name)
+      if (!after || after.starting || after.runId !== current.runId || after.pid !== current.pid || stopped || !Array.isArray(message.result?.content)) return unavailable(name)
       return message.result
     } catch { return unavailable(name) }
     finally { operations.delete(operation) }
@@ -81,6 +96,10 @@ async function startPendingBridge({ configPath, input, output }) {
   catch (error) { await close('connection-start-failed'); throw error }
   if (input.destroyed || input.readableEnded || output.destroyed) await close('stdio-eof')
   return { get runId() { return owner?.runId ?? null }, get pid() { return owner?.pid ?? null }, closed, close }
+}
+
+export function startResilientPluginBridge({ configPath, input = process.stdin, output = process.stdout, startOwner: launch = startOwner, checkInstallation } = {}) {
+  return startPendingBridge({ configPath, input, output, recovery: { launch, check: checkInstallation } })
 }
 
 // A per-chat protocol connection only; collection belongs to plugin-main.

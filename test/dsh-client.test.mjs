@@ -30,8 +30,8 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
   let visible = true
   const useTabInfo = () => ({ tab: { visible, signal: tabSignal } })
   const settle = async () => { await new Promise(resolve => setTimeout(resolve, 20)) }
-  const waitUntil = async (predicate, message) => {
-    const deadline = Date.now() + 1000
+  const waitUntil = async (predicate, message, ms = 1000) => {
+    const deadline = Date.now() + ms
     while (!predicate()) { assert.ok(Date.now() < deadline, message); await settle() }
   }
   const commit = async action => {
@@ -57,7 +57,7 @@ async function client(t, snapshot, permission = 'granted', constructorError = nu
     if (!viewRoot) viewRoot = createRoot(document.getElementById('view'))
     await commit(async () => { viewRoot.render(h('div', null, ...Array.from({ length: count }, (_, index) => h(Panel, { useTabInfo, key: index })))) })
     await waitUntil(() => document.querySelectorAll('iframe.sentinel-session-panel').length === (nextVisible ? count : 0) ||
-      nextVisible && document.querySelector('#view [role=alert]'), 'Shared sidebar view did not finish loading')
+      nextVisible && document.querySelector('#view [role=status]'), 'Shared sidebar view did not finish loading')
   }
   const mountSession = async sessionId => {
     if (!viewRoot) viewRoot = createRoot(document.getElementById('view'))
@@ -1320,7 +1320,7 @@ test('client registers the right overview and submits notifications even when no
   assert.ok(!f.invoked.includes('followup'))
 })
 
-test('a failed DSH resource load retries the shared page without reading a legacy snapshot', async t => {
+test('DSH shows its local status during a failed resource load and opens the shared page automatically', async t => {
   let reads = 0
   const html = await readFile(new URL('../chatgpt/panel.html', import.meta.url), 'utf8')
   const f = await client(t, null, 'denied', null, true, false, {
@@ -1331,11 +1331,11 @@ test('a failed DSH resource load retries the shared page without reading a legac
   })
   await f.mount()
   const view = f.dom.window.document.getElementById('view')
-  assert.match(view.textContent, /共享面板暂不可用/)
+  assert.match(view.textContent, /恢复后会自动显示会话检查/)
   assert.equal(view.querySelector('iframe'), null)
+  assert.equal(view.querySelector('button'), null)
   assert.ok(!f.invoked.includes('snapshot'))
-  await f.interact(async () => { view.querySelector('button').click(); await f.settle() })
-  await f.dataReady()
+  await f.waitUntil(() => view.querySelector('iframe'), 'shared document did not recover without a click', 4000)
   assert.equal(reads, 2)
   assert.equal(view.querySelector('iframe').getAttribute('srcdoc'), html)
   assert.ok(!f.invoked.includes('snapshot'))

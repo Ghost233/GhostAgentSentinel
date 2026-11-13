@@ -1,9 +1,10 @@
-import { mkdir, open, writeFile, rename, lstat, rm } from 'node:fs/promises'
+import { mkdir, open, writeFile, rename, lstat, rm, rmdir } from 'node:fs/promises'
 import { join, resolve, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import { setTimeout as delay } from 'node:timers/promises'
+import { withProcessLock } from '../src/process-lock.mjs'
 
 async function readPrivateConfig(path) {
   const info = await lstat(path)
@@ -84,6 +85,7 @@ async function record(path) {
 const ownIdentity = (value, config) => value?.protocol === HELPER_PROTOCOL && value.installationId === config.installationId && value.version === HELPER_VERSION && (config.releaseId === undefined || value.releaseId === config.releaseId) && Number.isSafeInteger(value.pid) && value.pid > 0 && typeof value.runId === 'string' && /^[a-f0-9-]{36}$/.test(value.runId)
 const identityMatches = (a, b) => ['protocol', 'installationId', 'version', 'pid', 'runId', 'ownership', 'releaseId'].every(key => a[key] === b[key])
 const portOf = url => { const parsed = new URL(url); if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1' || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash || !parsed.port) throw new Error('untrusted helper endpoint'); return Number(parsed.port) }
+const withOwnerLock = (dataDir, action) => withProcessLock(join(dataDir, 'runtime-ownership.sqlite'), action)
 async function stablePort(config) {
   const connection = await record(join(config.dataDir, 'plugin/.mcp.json'))
   if (!connection) return config.port ?? 0
@@ -93,7 +95,7 @@ async function stablePort(config) {
   if (entry.url !== `http://127.0.0.1:${port}/mcp` || config.port !== undefined && config.port !== port) throw new Error('helper endpoint differs from installation')
   return port
 }
-async function existing(config, owner, port, ownership) {
+async function existing(config, owner, port, ownership, softUnavailable = false) {
   if (!ownIdentity(owner, config)) throw new Error('untrusted helper owner')
   if ((owner.ownership ?? 'helper') !== ownership) throw new Error('existing observation has different process ownership')
   const runtime = await record(join(config.dataDir, 'runtime.json'))
@@ -106,14 +108,15 @@ async function existing(config, owner, port, ownership) {
   if (!runtime) return null
   async function unavailable() {
     const [currentOwner, currentRuntime] = await Promise.all([record(join(config.dataDir, 'runtime.lock/owner.json')), record(join(config.dataDir, 'runtime.json'))])
-    if (!currentOwner || !currentRuntime) return null
-    if (!identityMatches(currentOwner, owner) || !identityMatches(currentRuntime, runtime) || currentRuntime.url !== runtime.url) throw new Error('untrusted helper endpoint')
+    if (!currentRuntime) return null
+    if (currentOwner && !identityMatches(currentOwner, owner) || !identityMatches(currentRuntime, runtime) || currentRuntime.url !== runtime.url) throw new Error('untrusted helper endpoint')
     try { process.kill(owner.pid, 0) } catch (error) { if (error.code === 'ESRCH') return { dead: true }; throw new Error('helper owner cannot be verified') }
     throw Object.assign(new Error('live helper endpoint cannot be verified'), { code: 'plugin_owner_health_unavailable' })
   }
   let response
   try { response = await fetch(runtime.url + '/health', { headers: { authorization: 'Bearer ' + config.token }, redirect: 'error', signal: AbortSignal.timeout(750) }) }
   catch { return unavailable() }
+  if (softUnavailable && response.status === 503) return unavailable()
   if (response.status !== 200) throw new Error('live helper endpoint identity mismatch')
   let body
   try { body = await response.text() }
@@ -122,13 +125,47 @@ async function existing(config, owner, port, ownership) {
   return runtime
 }
 
-export async function resolvePluginOwner({ configPath, includeStarting = false } = {}) {
+async function restoreOwner(config, lock, port) {
+  const ownerPath = join(lock, 'owner.json')
+  const published = await record(join(config.dataDir, 'runtime.json'))
+  if (!published) return null
+  const live = await existing(config, published, port, 'plugin')
+  if (live?.dead) { await rm(join(config.dataDir, 'runtime.json'), { force: true }); return null }
+  if (!live) return null
+  await mkdir(lock, { mode: 0o700 }).catch(error => { if (error.code !== 'EEXIST') throw error })
+  const info = await lstat(lock)
+  if (!info.isDirectory() || info.mode & 0o077 || info.uid !== process.getuid()) throw new Error('untrusted helper owner directory')
+  const current = await record(ownerPath)
+  if (current && !identityMatches(current, live)) throw new Error('untrusted helper owner')
+  if (!current) {
+    const { protocol, installationId, runId, pid, version, ownership, releaseId } = live
+    await writePrivateJson(ownerPath, { protocol, installationId, runId, pid, version, ownership, releaseId })
+  }
+  return live
+}
+
+export async function resolvePluginOwner({ configPath, includeStarting = false, includeStopped = false } = {}) {
   if (typeof configPath !== 'string' || !isAbsolute(configPath)) throw new Error('explicit private configuration path required')
   const config = await readPrivateConfig(configPath), info = await lstat(config.dataDir)
   if (!info.isDirectory() || info.mode & 0o077 || typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('private installation directory required')
-  const owner = await record(join(config.dataDir, 'runtime.lock/owner.json'))
-  if (!owner) return null
-  const runtime = await existing(config, owner, config.port ?? 0, 'plugin')
+  const lock = join(config.dataDir, 'runtime.lock'), ownerPath = join(lock, 'owner.json')
+  let owner = await record(ownerPath)
+  if (!owner && await record(join(config.dataDir, 'runtime.json'))) owner = await withOwnerLock(config.dataDir, async () => {
+    if (await maintenance(config)) return null
+    return await record(ownerPath) ?? await restoreOwner(config, lock, config.port ?? 0)
+  })
+  if (!owner) {
+    if (includeStopped) {
+      const stopped = await record(join(config.dataDir, 'runtime-stopped.json'))
+      if (ownIdentity(stopped, config) && stopped.ownership === 'plugin') return { ...stopped, stopped: true }
+    }
+    return null
+  }
+  const runtime = await existing(config, owner, config.port ?? 0, 'plugin', includeStopped)
+  if (includeStopped && (runtime === null || runtime?.dead)) {
+    const stopped = await record(join(config.dataDir, 'runtime-stopped.json'))
+    if (stopped && identityMatches(stopped, owner)) return { ...stopped, stopped: true }
+  }
   if (runtime === null && includeStarting) return { ...owner, starting: true }
   return runtime && !runtime.dead ? { ...runtime, token: config.token } : null
 }
@@ -142,20 +179,36 @@ export async function startFromInstallation({ configPath, pollMs, native, notifi
   if (!info.isDirectory() || info.mode & 0o077 || typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('private installation directory required')
   const lock = join(config.dataDir, 'runtime.lock'), port = ownership === 'plugin' ? config.port ?? 0 : await stablePort(config), runId = randomUUID()
   const identity = { protocol: HELPER_PROTOCOL, installationId: config.installationId, runId, pid: process.pid, version: HELPER_VERSION, ...(ownership === 'plugin' ? { ownership } : {}), ...(config.releaseId === undefined ? {} : { releaseId: config.releaseId }) }
-  const deadline = Date.now() + 2500
+  const deadline = Date.now() + 2500, ownerPath = join(lock, 'owner.json')
+  const reused = live => ({ ...live, reused: true, pluginDir, refresh: async () => {}, diagnostics: () => ({ reused: true }), close: async () => {} })
   while (true) {
-    try { await mkdir(lock, { mode: 0o700 }); break }
-    catch (error) { if (error.code !== 'EEXIST') throw error }
-    const owner = await record(join(lock, 'owner.json'))
-    if (owner) {
-      const live = await existing(config, owner, port, ownership)
-      if (live?.dead) {
-        const current = await record(join(lock, 'owner.json'))
-        if (current && identityMatches(current, owner)) { await rm(join(config.dataDir, 'runtime.json'), { force: true }); await rm(lock, { recursive: true, force: true }) }
-        continue
+    const acquired = await withOwnerLock(config.dataDir, async () => {
+      const owner = await record(ownerPath)
+      if (owner) {
+        const live = await existing(config, owner, port, ownership)
+        if (!live?.dead) return live
+        await rm(join(config.dataDir, 'runtime.json'), { force: true })
+        await rm(lock, { recursive: true, force: true })
+      } else if (ownership === 'plugin') {
+        const live = await restoreOwner(config, lock, port)
+        if (live) return live
       }
-      if (live) return { ...live, reused: true, pluginDir, refresh: async () => {}, diagnostics: () => ({ reused: true }), close: async () => {} }
-    }
+      try { await mkdir(lock, { mode: 0o700 }) }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error
+        // Older versions could die before writing owner.json. Never remove a nonempty directory here.
+        const info = await lstat(lock)
+        if (!info.isDirectory() || info.mode & 0o077 || info.uid !== process.getuid()) throw new Error('untrusted helper owner directory')
+        if (Date.now() - info.mtimeMs <= 10000) return null
+        await rmdir(lock).catch(error => { if (!['ENOENT', 'ENOTEMPTY'].includes(error.code)) throw error })
+        return null
+      }
+      try { await writePrivateJson(ownerPath, identity) }
+      catch (error) { await rmdir(lock); throw error }
+      return true
+    })
+    if (acquired === true) break
+    if (acquired) return reused(acquired)
     if (Date.now() >= deadline) throw new Error('helper owner startup or endpoint cannot be verified')
     await delay(25)
   }
@@ -200,11 +253,15 @@ export async function startFromInstallation({ configPath, pollMs, native, notifi
   const revokePublication = () => revoking ??= (async () => {
     // Startup retains write errors; withdrawal must still check partial publication.
     await publicationPending?.catch(() => {})
-    const owner = await record(join(lock, 'owner.json'))
-    if (owner && identityMatches(owner, identity)) {
+    await withOwnerLock(config.dataDir, async () => {
+      const owner = await record(ownerPath)
+      if (owner && !identityMatches(owner, identity)) return
       const value = await record(join(config.dataDir, 'runtime.json'))
+      if (ownership === 'plugin' && qualificationRevoked && (owner || value && identityMatches(value, identity))) {
+        await writePrivateJson(join(config.dataDir, 'runtime-stopped.json'), { ...identity, reason: stopReason, stoppedAt: Date.now() })
+      }
       if (value && identityMatches(value, identity)) await rm(join(config.dataDir, 'runtime.json'), { force: true })
-    }
+    })
   })()
   const close = () => closing ??= (async () => {
     stopping = true; clearTimeout(retentionTimer); retentionTimer = null
@@ -216,18 +273,17 @@ export async function startFromInstallation({ configPath, pollMs, native, notifi
     await attempt(() => retentionPending)
     await attempt(() => stopped)
     await attempt(() => core?.close())
-    await attempt(async () => {
+    await attempt(() => withOwnerLock(config.dataDir, async () => {
       const owner = await record(join(lock, 'owner.json'))
       if (owner && identityMatches(owner, identity)) {
         const value = await record(join(config.dataDir, 'runtime.json'))
         if (value && identityMatches(value, identity)) await rm(join(config.dataDir, 'runtime.json'), { force: true })
         await rm(lock, { recursive: true, force: true })
       }
-    })
+    }))
     if (failures.length) throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'Observation cleanup failed')
   })().then(() => { const result = { reason: stopReason }; closedResolve(result); return result }, error => { closedReject(error); throw error })
   try {
-    await writePrivateJson(join(lock, 'owner.json'), identity)
     const [coreIO, { createNativeIO }, { startChatGPTAdapter }, { createNativeNotificationIO }] = await Promise.all([
       import('./lazy-core.mjs'), import('./native-io.mjs'), import('./adapter.mjs'), import('./native-notifications.mjs'),
     ])

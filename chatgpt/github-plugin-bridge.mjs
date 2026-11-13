@@ -4,17 +4,14 @@ import { isAbsolute } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { prepareGitHubInstallation } from './github-installation.mjs'
 import { loadInstallationConfig } from './runtime.mjs'
-import { startPluginBridge } from './plugin-bridge.mjs'
+import { startResilientPluginBridge } from './plugin-bridge.mjs'
 
 export async function startGitHubBridge({ channel, releaseRoot, archiveSHA256, stateRoot, input, output, signal } = {}) {
   const prepared = await prepareGitHubInstallation({ channel, releaseRoot, archiveSHA256, stateRoot })
-  const check = async configPath => {
-    if (signal?.aborted) throw new Error('GitHub connection stopped')
-    if ((await loadInstallationConfig(configPath)).releaseId !== prepared.releaseId) throw new Error('GitHub release superseded')
-  }
-  await check(prepared.configPath)
-  return startPluginBridge({ configPath: prepared.configPath, input, output, async startOwner(configPath) {
-    await check(configPath)
+  const checkInstallation = async () => !signal?.aborted && (await loadInstallationConfig(prepared.configPath)).releaseId === prepared.releaseId
+  if (!await checkInstallation()) throw new Error('GitHub release superseded')
+  return startResilientPluginBridge({ configPath: prepared.configPath, input, output, checkInstallation, async startOwner(configPath) {
+    if (!await checkInstallation()) return
     const child = spawn(prepared.nodePath, [prepared.ownerPath, '--config', configPath, '--channel', channel], { detached: true, stdio: 'ignore' })
     await once(child, 'spawn'); child.unref()
   } })

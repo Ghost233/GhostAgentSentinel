@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import packageManifest from '../package.json' with { type: 'json' }
+import { withProcessLock } from './process-lock.mjs'
 import { PROTOCOL, DSH_SESSION_PANEL_FEATURE, PANEL_OVERVIEW_FEATURE, INSTALLATION_NOTIFICATION_RECORDS_FEATURE, INSTALLATION_ANALYSIS_SCHEDULING_FEATURE, NOTIFICATION_REVOCATION_FEATURE, normalizeFailureScope, normalizeInstallationNotificationRecordsQuery } from './protocol.mjs'
 
 export const defaultDataDir = join(homedir(), '.ghost-agent-sentinel')
@@ -67,44 +68,46 @@ async function ensureRuntime(dataDir, signal, requireDSHCore) {
   await mkdir(dataDir, { recursive: true, mode: 0o700 })
   const lock = join(dataDir, 'startup.lock')
   const deadline = Date.now() + 10_000
-  while (Date.now() < deadline) {
-    signal?.throwIfAborted()
-    let owner = false
-    try { await mkdir(lock); owner = true }
-    catch (error) { if (error.code !== 'EEXIST') throw error }
-    if (owner) {
-      try {
-        await writeFile(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid }), { mode: 0o600 })
-        const ready = await read()
-        if (ready) return ready
-        const child = spawn(process.execPath, [fileURLToPath(new URL('./daemon.mjs', import.meta.url)), '--serve', '--data-dir', dataDir], { detached: true, stdio: 'ignore', env: process.env })
-        let spawnError
-        child.on('error', error => { spawnError = error })
-        child.unref()
-        while (Date.now() < deadline) {
-          signal?.throwIfAborted()
-          if (spawnError) throw spawnError
-          const runtime = await read()
-          if (runtime) return runtime
-          if (child.exitCode !== null) throw new Error(`core exited during startup (${child.exitCode})`)
-          await delay(50, undefined, { signal })
-        }
-        throw new Error('core startup timed out; run ghost-agent-sentinel --serve for diagnostics')
-      } finally { await rm(lock, { recursive: true, force: true }) }
-    }
-    const ready = await read()
-    if (ready) return ready
-    try {
-      const { pid } = JSON.parse(await readFile(join(lock, 'owner.json'), 'utf8'))
-      if (Number.isInteger(pid) && pid > 0) {
-        try { process.kill(pid, 0) } catch (error) { if (error.code === 'ESRCH') await rm(lock, { recursive: true, force: true }) }
+  return withProcessLock(join(dataDir, 'core-startup.sqlite'), async () => {
+    while (Date.now() < deadline) {
+      signal?.throwIfAborted()
+      let owner = false
+      try { await mkdir(lock); owner = true }
+      catch (error) { if (error.code !== 'EEXIST') throw error }
+      if (owner) {
+        try {
+          await writeFile(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid }), { mode: 0o600 })
+          const ready = await read()
+          if (ready) return ready
+          const child = spawn(process.execPath, [fileURLToPath(new URL('./daemon.mjs', import.meta.url)), '--serve', '--data-dir', dataDir], { detached: true, stdio: 'ignore', env: process.env })
+          let spawnError
+          child.on('error', error => { spawnError = error })
+          child.unref()
+          while (Date.now() < deadline) {
+            signal?.throwIfAborted()
+            if (spawnError) throw spawnError
+            const runtime = await read()
+            if (runtime) return runtime
+            if (child.exitCode !== null) throw new Error(`core exited during startup (${child.exitCode})`)
+            await delay(50, undefined, { signal })
+          }
+          throw new Error('core startup timed out; run ghost-agent-sentinel --serve for diagnostics')
+        } finally { await rm(lock, { recursive: true, force: true }) }
       }
-    } catch {
-      try { if (Date.now() - (await stat(lock)).mtimeMs > 10_000) await rm(lock, { recursive: true, force: true }) } catch {}
+      const ready = await read()
+      if (ready) return ready
+      try {
+        const { pid } = JSON.parse(await readFile(join(lock, 'owner.json'), 'utf8'))
+        if (Number.isInteger(pid) && pid > 0) {
+          try { process.kill(pid, 0) } catch (error) { if (error.code === 'ESRCH') await rm(lock, { recursive: true, force: true }) }
+        }
+      } catch {
+        try { if (Date.now() - (await stat(lock)).mtimeMs > 10_000) await rm(lock, { recursive: true, force: true }) } catch {}
+      }
+      await delay(100, undefined, { signal })
     }
-    await delay(100, undefined, { signal })
-  }
-  throw new Error('core startup is busy; reconnect later')
+    throw new Error('core startup is busy; reconnect later')
+  }, { deadline, signal })
 }
 
 export async function connectCore({ dataDir = defaultDataDir, signal, requireDSHCore = false } = {}) {

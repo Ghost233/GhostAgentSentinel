@@ -6,10 +6,13 @@ import { join, dirname } from 'node:path'
 import { createHash } from 'node:crypto'
 import { cleanupGitHubInstallation, parseGitHubCleanupArguments } from '../chatgpt/github-cleanup.mjs'
 
-async function fixture(t) {
+async function fixture(t, cleanup = () => {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'sentinel-github-cleanup-'))), stateRoot = join(root, 'github/test')
   await mkdir(stateRoot, { recursive: true, mode: 0o700 })
-  t.after(() => rm(root, { recursive: true, force: true }))
+  t.after(async () => {
+    try { await cleanup() }
+    finally { await rm(root, { recursive: true, force: true }) }
+  })
   return { stateRoot }
 }
 
@@ -25,8 +28,8 @@ test('a disabled but installed test plugin keeps its data and never reaches noti
   assert.deepEqual(calls, ['plugin/list', 'close'])
 })
 
-async function ownedFixture(t) {
-  const f = await fixture(t), archive = 'a'.repeat(64), releaseRoot = join(f.stateRoot, 'payloads', archive)
+async function ownedFixture(t, cleanup) {
+  const f = await fixture(t, cleanup), archive = 'a'.repeat(64), releaseRoot = join(f.stateRoot, 'payloads', archive)
   await mkdir(join(releaseRoot, 'runtime'), { recursive: true, mode: 0o700 })
   const manifest = { runtimeVersion: '0.1.0-dev.1', notificationPath: null, files: { 'owned.mjs': {}, 'runtime/node': {} } }, manifestBytes = JSON.stringify(manifest)
   const releaseId = createHash('sha256').update(manifestBytes).digest('hex')
@@ -55,9 +58,14 @@ test('cleanup preview requires real uninstall evidence but leaves the channel da
 })
 
 test('explicit cleanup removes one uninstalled channel through the public Core purge while preserving normal and DSH sources', async t => {
-  const f = await ownedFixture(t), { startServer } = await import('../src/server.mjs'), { connectCore } = await import('../src/core-client.mjs')
-  const server = await startServer({ dataDir: f.config.coreDataDir }), core = await connectCore({ dataDir: f.config.coreDataDir })
-  t.after(async () => { await core.close(); await server.close() })
+  let core, server
+  const f = await ownedFixture(t, async () => {
+    try { await core?.close() }
+    finally { await server?.close() }
+  })
+  const { startServer } = await import('../src/server.mjs'), { connectCore } = await import('../src/core-client.mjs')
+  server = await startServer({ dataDir: f.config.coreDataDir })
+  core = await connectCore({ dataDir: f.config.coreDataDir })
   const keys = {}
   for (const [name, installationId, policy] of [['test', f.config.installationId, 'chatgpt-main/1'], ['normal', 'normal-installation', 'chatgpt-main/1'], ['dsh', 'dsh-installation', null]]) {
     keys[name] = await core.registerSource({ registrationId: 'chatgpt:' + installationId, hostRunId: name + '-host', name, ...(policy ? { policy } : {}) })
