@@ -102,7 +102,7 @@ test('a fork beyond the per-chat capture bound retires old inheritance while kee
   for (let index = 0; index < 155; index++) await f.next('bounded-' + index)
   let snapshot = await f.core.snapshot()
   const own = snapshot.tasks.filter(task => task.id === 'f'), events = own.flatMap(task => task.events)
-  assert.equal(new Set(events.map(event => event.data?.nativeRecordId).filter(Boolean)).size, 500)
+  assert.equal(new Set(events.map(event => event.data?.nativeRecordId).filter(Boolean)).size, 200)
   assert.equal(own.find(task => task.lifecycleId === 'bounded-154').currentRequest, 'Read only bounded-154')
   assert.ok(own.some(task => task.gaps.some(gap => gap.includes('capture limit'))))
   const captures = new Map(events.filter(event => event.data?.nativeRecordId).map(event => [event.key, event.capturedAt]))

@@ -8,7 +8,7 @@ import { createCore } from '../src/core/index.mjs';
 import { startServer } from '../src/server.mjs';
 import { connectCore } from '../src/core-client.mjs';
 
-test('the production server reopens a retained event set larger than the JavaScript argument limit', async t => {
+test('the production server opens a legacy event set larger than the JavaScript argument limit and trims the session to 200', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'sentinel-large-startup-'));
   let core, server, client;
   t.after(async () => { await client?.close(); await server?.close(); await core?.close(); await rm(dataDir, { recursive: true, force: true }); });
@@ -33,7 +33,10 @@ test('the production server reopens a retained event set larger than the JavaScr
   } finally { db.close(); }
   server = await startServer({ dataDir }); client = await connectCore({ dataDir });
   const diagnostics = await client.diagnostics();
-  assert.equal(diagnostics.retained.events, 150_000);
+  assert.equal(diagnostics.retained.events, 200);
+  const events = (await client.snapshot()).tasks[0].events;
+  assert.equal(events[0].id, 'event-149800');
+  assert.equal(events.at(-1).id, 'event-149999');
   assert.equal(diagnostics.retained.tasks, 1);
   assert.equal(diagnostics.runtime.connectedSources, 0);
   assert.equal((await client.health()).instanceId, (await client.diagnostics()).instanceId);

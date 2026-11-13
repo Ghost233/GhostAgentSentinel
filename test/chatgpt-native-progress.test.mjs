@@ -84,7 +84,7 @@ test('a genuinely missing first body is refused with its fixed classification an
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.records, 1)
 })
 
-test('each chat retains at most 500 native records across sources without replaying evicted bodies or breaking another chat copy', async t => {
+test('each chat retains at most 200 native records across sources without replaying evicted bodies or breaking another chat copy', async t => {
   const f = await fixture(t), source = await f.register(), next = await f.register('chatgpt:install-one', 'host-two')
   await f.emit(source, 'busy-chat', 'shared-oldest')
   const firstAt = f.now
@@ -95,8 +95,8 @@ test('each chat retains at most 500 native records across sources without replay
   }
   let snapshot = await f.core.snapshot()
   const own = snapshot.tasks.filter(task => task.id === 'busy-chat').flatMap(task => task.events)
-  assert.equal(own.length, 500)
-  assert.deepEqual(new Set(own.map(event => event.id)), new Set(Array.from({ length: 500 }, (_, index) => 'record-' + (index + 5))))
+  assert.equal(own.length, 200)
+  assert.deepEqual(new Set(own.map(event => event.id)), new Set(Array.from({ length: 200 }, (_, index) => 'record-' + (index + 305))))
   assert.equal(snapshot.tasks.find(task => task.id === 'other-chat').events[0].capturedAt, firstAt)
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.bodyGaps, 0)
   await f.restart()
@@ -111,13 +111,13 @@ test('each chat retains at most 500 native records across sources without replay
   const dsh = f.batch('dsh-chat', 'dsh-0')
   for (let index = 1; index < 210; index++) dsh.events.push(...f.batch('dsh-chat', 'dsh-' + index).events)
   await f.core.ingest(independent, dsh)
-  assert.equal((await f.core.snapshot()).tasks.find(task => task.id === 'dsh-chat').events.length, 210)
+  assert.equal((await f.core.snapshot()).tasks.find(task => task.id === 'dsh-chat').events.length, 200)
 })
 
 test('per-chat retirement rolls back both bodies and replay fences when storage rejects a deletion', async t => {
   const f = await fixture(t), source = await f.register()
   const batch = f.batch('chat', 'r0')
-  for (let index = 1; index < 500; index++) batch.events.push(...f.batch('chat', 'r' + index).events)
+  for (let index = 1; index < 200; index++) batch.events.push(...f.batch('chat', 'r' + index).events)
   await f.core.ingest(source, batch)
   const before = (await f.core.diagnostics()).retained.nativeCaptureProgress
   const db = new DatabaseSync(join(f.dir, 'observations.sqlite'))
@@ -125,11 +125,11 @@ test('per-chat retirement rolls back both bodies and replay fences when storage 
     db.exec("CREATE TRIGGER fail_trim BEFORE DELETE ON records WHEN OLD.collection='events' BEGIN SELECT RAISE(FAIL, 'controlled trim failure'); END")
     f.advance()
     await assert.rejects(f.emit(source, 'chat', 'new-record'), /controlled trim failure/)
-    assert.equal((await f.core.snapshot()).tasks[0].events.length, 500)
+    assert.equal((await f.core.snapshot()).tasks[0].events.length, 200)
     assert.deepEqual((await f.core.diagnostics()).retained.nativeCaptureProgress, before)
   } finally { db.exec('DROP TRIGGER IF EXISTS fail_trim'); db.close() }
   await f.emit(source, 'chat', 'new-record')
-  assert.equal((await f.core.snapshot()).tasks[0].events.length, 500)
+  assert.equal((await f.core.snapshot()).tasks[0].events.length, 200)
   assert.ok((await f.core.snapshot()).tasks[0].events.some(event => event.id === 'new-record'))
 })
 
@@ -142,14 +142,21 @@ test('opening material retained by an older core applies the per-chat bound and 
     const db = new DatabaseSync(join(f.dir, 'observations.sqlite'))
     try {
       const row = db.prepare("SELECT key,value FROM records WHERE collection='sources'").get(), owner = JSON.parse(row.value)
+      const task = JSON.parse(db.prepare("SELECT value FROM records WHERE collection='tasks'").get().value)
+      // Build the old, unbounded database even when the fixture ran on a bounded Core.
+      const write = db.prepare("INSERT OR IGNORE INTO records VALUES('events', ?, ?)")
+      for (const [index, event] of batch.events.entries()) {
+        const key = JSON.stringify([source, event.taskId, event.taskLifecycleId, event.id])
+        write.run(key, JSON.stringify({ ...event, key, taskKey: task.key, sequence: index + 1 }))
+      }
       owner.descriptor.policy = 'chatgpt-main/1'
       owner.hierarchyEvidenceCaptures = batch.events.map(event => ({ taskId: event.taskId, lifecycleId: event.taskLifecycleId, eventId: event.id, capturedAt: event.capturedAt, nativeOriginId: event.data.nativeRecordId, nativeHistorical: false }))
       db.prepare("UPDATE records SET value=? WHERE collection='sources' AND key=?").run(JSON.stringify(owner), row.key)
       db.prepare("DELETE FROM records WHERE collection='settings' AND key='native-capture-progress'").run()
     } finally { db.close() }
   })
-  assert.equal((await f.core.snapshot()).tasks[0].events.length, 500)
-  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.expired, 10)
+  assert.equal((await f.core.snapshot()).tasks[0].events.length, 200)
+  assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.expired, 310)
   assert.equal((await f.core.diagnostics()).retained.nativeCaptureProgress.bodyGaps, 0)
   await f.restart()
   const next = await f.register('chatgpt:install-one', 'new-host')
@@ -169,7 +176,7 @@ test('trimming a busy chat preserves its current request and still completes par
   ], hierarchyContext: { schemaVersion: 1, revision: 1, sessions: [{ sessionId: taskId }], relations: [], activations: [{ taskId, lifecycleId, sessionId: taskId, runId: lifecycleId, state: 'running', stateRefs: [ref('start')] }], instructionBindings: [{ taskId, lifecycleId, inputRef: ref('request'), origin: 'user-entry', phase: 'consumed', originRefs: [ref('start'), ref('request')], ancestorLimitRefs: [] }], coverage: { complete: true, branchGaps: [] } } })
   let task
   for (let attempt = 0; attempt < 100; attempt++) { task = (await f.core.snapshot()).tasks[0]; if (task.analysis.completedAt) break; await delay(5) }
-  assert.equal(task.events.length, 500)
+  assert.equal(task.events.length, 200)
   assert.equal(task.currentRequest, 'Read the current log only')
   assert.ok(task.events.some(event => event.id === 'output-509'))
   assert.ok(task.analysis.completedAt, JSON.stringify(task.analysis.error))

@@ -628,28 +628,30 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
     if (gap) return { gap, scope: 'source' }
     return qualify(entry.id, expected, { host, projects: new Map() })
   }
-  async function observedView(entry, selection, signal) {
-    if (!collectMaterials || !source) return entry.view
+  async function observedView(entry, selection, signal, pendingView = null) {
+    if (!collectMaterials || !source) return pendingView ?? entry.view
     const owner = source, epoch = sourceEpoch, generation = entry.generation
-    const retainedOnly = !entry.reader || entry.view.identity.threadId !== entry.id || Boolean(entry.view.observation?.coldReadStage)
+    const retainedOnly = Boolean(pendingView) || !entry.reader || entry.view.identity.threadId !== entry.id || Boolean(entry.view.observation?.coldReadStage)
     let proof
     if (retainedOnly) {
       try { proof = await historyProof(entry) }
-      catch (error) { await collectionOutcome(entry, 'failed', error, randomUUID()); await updateHealth(entry); return entry.view }
-      if (proof.gap) return fail(entry, proof.gap, proof.scope)
+      catch (error) { if (pendingView) return pendingView; await collectionOutcome(entry, 'failed', error, randomUUID()); await updateHealth(entry); return entry.view }
+      if (pendingView && signal.aborted) return pendingView
+      if (proof.gap) return pendingView ? gapView(proof.gap) : fail(entry, proof.gap, proof.scope)
       if (proof.source.hostRunId !== owner.hostRunId) return gapView('source-generation-changed')
     }
     const snapshot = await core.snapshot(signal)
     if (retainedOnly) {
       let after
       try { after = await historyProof(entry, proof.source) }
-      catch (error) { await collectionOutcome(entry, 'failed', error, randomUUID()); await updateHealth(entry); return entry.view }
-      if (after.gap) return fail(entry, after.gap, after.scope)
+      catch (error) { if (pendingView) return pendingView; await collectionOutcome(entry, 'failed', error, randomUUID()); await updateHealth(entry); return entry.view }
+      if (pendingView && signal.aborted) return pendingView
+      if (after.gap) return pendingView ? gapView(after.gap) : fail(entry, after.gap, after.scope)
     }
     if (closed || source !== owner || epoch !== sourceEpoch || generation !== entry.generation) return gapView('observation-superseded')
     const view = projectSessionPanel(snapshot, {
       sourceKey: owner.key, sessionId: entry.id, selection,
-      observation: entry.view, lifecycleId: entry.lifecycleId, retainedOnly,
+      observation: pendingView ?? entry.view, lifecycleId: entry.lifecycleId, retainedOnly,
     })
     if (!view.execution) view.health = entry.health
     else if (view.execution.key === view.history.currentKey) view.health = combineHealth(view.health, entry.health)
@@ -705,8 +707,21 @@ export async function startChatGPTAdapter({ core, native, notificationIO, runtim
         new Promise(resolve => { timer = setTimeout(resolve, 1000, false) }),
       ]).finally(() => clearTimeout(timer))
       if (!confirmed) {
-        const view = gapView('collection-pending', id)
-        return decorate({ ...view, summary: '正在核对当前会话', collectionRecovery: { state: 'active-waiting' } })
+        const pendingView = gapView('collection-pending', id)
+        pendingView.summary = '正在核对当前会话'
+        const waiting = view => decorate(view.identity.threadId === id ? { ...view, collectionRecovery: { state: 'active-waiting' } } : view)
+        // The sidebar has a five-second request deadline. A slow history
+        // qualification must still leave time to display the pending state.
+        const deadline = new AbortController()
+        const historySignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal
+        let historyTimer
+        try {
+          const view = await Promise.race([
+            observedView(entry, selection, historySignal, pendingView).catch(() => pendingView),
+            new Promise(resolve => { historyTimer = setTimeout(() => { deadline.abort(); resolve(pendingView) }, 1200) }),
+          ])
+          return waiting(view)
+        } finally { clearTimeout(historyTimer) }
       }
     } else await pending
     if (closed) return decorate(gapView('adapter-closed'))

@@ -13,7 +13,7 @@ export const CHECK_IDS = Object.freeze([
 ]);
 const SUMMARY_EVIDENCE_LIMIT = 200;
 const SUMMARY_OUTPUT_TOKENS = 256;
-export const JEV_EVIDENCE_LIMIT = 500;
+const JEV_EVIDENCE_LIMIT = 100;
 
 function evidenceWindow(events, required, limit) {
   const optional = events.filter(event => !required.has(referenceKey(eventRef(event))));

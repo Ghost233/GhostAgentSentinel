@@ -5,6 +5,7 @@ import { extractVerificationEvidence } from './verification-evidence.mjs'
 const identityStore = Symbol.for('ghost-agent-sentinel.dsh-host-identities.v1')
 const hostIdentities = globalThis[identityStore] ??= new WeakMap()
 const DAY = 24 * 60 * 60 * 1000
+const STREAM_TEXT_LIMIT = 241
 
 // Only scalar identity/watermarks survive adapter replacement. The Host owns Agents.
 export function hostIdentity(root) {
@@ -33,6 +34,7 @@ export function createObservation({ identity, now = Date.now, maxEvents = 500, c
   const claimedInputs = new Map(), observedSessions = new Map(), externalRows = new Map(), pendingExternalRuns = new Map()
   const catalog = new Map(), states = new Map(), inputs = new Map(), hierarchyEvidence = new Map(), checkedCatalogs = new Map(), nativeRuns = new Map(), hierarchyRows = new Map()
   const waits = new Map(), waitGaps = new Map()
+  const streamBlocks = new Map()
   const waitGap = (row, reason, at = now()) => {
     const previous = waitGaps.get(row.lifecycleId)
     if (previous) previous.reasons = [...new Set([...previous.reasons, reason])].slice(0, 8)
@@ -77,6 +79,7 @@ export function createObservation({ identity, now = Date.now, maxEvents = 500, c
     const row = rows.get(id)
     if (hierarchy && row?.observedAt > now() - DAY) { hierarchyRows.set(id, { ...taskSnapshot(row), observedAt: row.observedAt, acknowledgedMetadata: row.acknowledgedMetadata }); bound(hierarchyRows, '历史执行节点超过采集预算；覆盖不完整') }
     rows.delete(id)
+    for (const [key, block] of streamBlocks) if (block.row.lifecycleId === id) streamBlocks.delete(key)
     for (const [key, value] of toolEvents) if (value.lifecycleId === id) toolEvents.delete(key)
     for (const [key, value] of redactedCalls) if (value.lifecycleId === id) redactedCalls.delete(key)
     for (const [key, value] of toolTokens) if (value.lifecycleId === id) toolTokens.delete(key)
@@ -216,6 +219,52 @@ export function createObservation({ identity, now = Date.now, maxEvents = 500, c
       taskLifecycleId: row.lifecycleId, kind, occurredAt: Number.isFinite(occurredAt) ? occurredAt : null,
       capturedAt, text: excerpt(full), evidence: typeof evidence === 'string' ? evidence : JSON.stringify(evidence).slice(0, 2000), data })
     if (events.length > maxEvents) { events.splice(0, events.length - maxEvents); gap('断连缓冲超过 500 条，旧事件被淘汰；覆盖不完整') }
+    changed()
+  }
+  function flushStream(block) {
+    if (!block.text) return
+    record(block.row, 'output', block.text, block.evidence, { ...(block.truncated ? { truncated: true } : {}), ...(block.redacted ? { redacted: true } : {}) }, block.occurredAt, undefined, block.capturedAt)
+    block.text = ''; block.truncated = false
+  }
+  function observeStream(row, lifecycle, frame, type) {
+    if (!Number.isSafeInteger(frame?.revision) || frame.revision <= lifecycle.revision) return
+    lifecycle.revision = frame.revision
+    if (frame.type === 'end') {
+      for (const [key, block] of streamBlocks) if (block.row.lifecycleId === lifecycle.id && block.evidence.attemptId === frame.attemptId) {
+        flushStream(block); streamBlocks.delete(key)
+      }
+      return
+    }
+    if (frame.type !== 'chunk') return
+    const chunk = frame.chunk, chunkType = chunk?.type
+    const text = chunk?.text ?? chunk?.block?.text
+    const evidence = { type, revision: frame.revision, attemptId: frame.attemptId, chunkType }
+    if (!Number.isSafeInteger(chunk?.index) || !frame.attemptId) {
+      if (typeof text === 'string' && text) record(row, 'output', text, evidence, {}, frame.time)
+      return
+    }
+    const key = JSON.stringify([lifecycle.id, frame.attemptId, chunk.index])
+    const previous = streamBlocks.get(key)
+    if (chunkType === 'block-end') {
+      if (previous) { flushStream(previous); streamBlocks.delete(key) }
+      else if (typeof text === 'string' && text) record(row, 'output', text, evidence, {}, frame.time)
+      return
+    }
+    if (typeof text !== 'string' || !text || chunkType !== 'text-delta' && chunkType !== 'reasoning-delta') return
+    if (!previous && streamBlocks.size >= maxEvents) {
+      const [oldKey, old] = streamBlocks.entries().next().value
+      flushStream(old); streamBlocks.delete(oldKey)
+    }
+    const block = previous ?? { row, text: '', tail: '', redacted: false, truncated: false }
+    const boundary = block.tail + text
+    block.redacted ||= sanitizeObservation(boundary).redacted
+    block.tail = block.redacted ? '' : boundary.slice(-240)
+    block.truncated ||= block.text.length + text.length > STREAM_TEXT_LIMIT
+    block.text += text.slice(0, STREAM_TEXT_LIMIT - block.text.length)
+    block.evidence = evidence
+    block.occurredAt = frame.time
+    block.capturedAt = now()
+    streamBlocks.set(key, block)
     changed()
   }
   function inputFacts(row, message, phase, nativeType, evidence, occurredAt, inherited = false) {
@@ -484,6 +533,9 @@ export function createObservation({ identity, now = Date.now, maxEvents = 500, c
       if (!row) return // Late events from a disposed Agent cannot recreate its lifecycle.
       if (type === 'agent/created') { record(row, 'status', '已发现任务', { type }, { status: row.status, nativeType: type }); if (hierarchy) { states.set(lifecycle.id, { ...states.get(lifecycle.id), stateRef: retain(events.at(-1)) }); finishEvidence() }; sweep(); return }
       if (type === 'agent/status' || type === 'agent/disposed') {
+        if (type === 'agent/disposed' || payload.status !== 'running') for (const [key, block] of streamBlocks) if (block.row.lifecycleId === lifecycle.id) {
+          flushStream(block); streamBlocks.delete(key)
+        }
         row.status = type === 'agent/disposed' ? 'disposed' : statusOf(payload.status)
         if (type === 'agent/disposed') lifecycle.disposed = true
         record(row, 'status', `任务状态：${row.status}`, { type }, { status: row.status, nativeType: type }); if (hierarchy) { states.set(lifecycle.id, { ...states.get(lifecycle.id), stateRef: retain(events.at(-1)) }); finishEvidence() }; return
@@ -499,11 +551,7 @@ export function createObservation({ identity, now = Date.now, maxEvents = 500, c
         return
       }
       if (type === 'agent/assistant-stream') {
-        const frame = payload.frame
-        if (!Number.isSafeInteger(frame?.revision) || frame.revision <= lifecycle.revision) return
-        lifecycle.revision = frame.revision
-        const text = frame.type === 'chunk' ? frame.chunk?.text ?? frame.chunk?.block?.text : ''
-        if (typeof text === 'string' && text) record(row, 'output', text, { type, revision: frame.revision, attemptId: frame.attemptId, chunkType: frame.chunk?.type }, {}, frame.time)
+        observeStream(row, lifecycle, payload.frame, type)
         return
       }
       if (type === 'tools/execute' || type === 'tools/result') {
@@ -548,6 +596,10 @@ export function createObservation({ identity, now = Date.now, maxEvents = 500, c
       finishEvidence()
     },
     batch() {
+      for (const [key, block] of streamBlocks) {
+        if (block.capturedAt <= now() - DAY) streamBlocks.delete(key)
+        else flushStream(block)
+      }
       sweep()
       if (hierarchy) for (const relation of catalog.values()) if (relation.mode === 'external') externalRow(relation)
       const historicalTasks = hierarchy ? [...hierarchyRows.values(), ...externalRows.values()] : []
@@ -626,7 +678,7 @@ export function createObservation({ identity, now = Date.now, maxEvents = 500, c
     },
     diagnostics() { sweep(); return { bufferedEvents: events.length, taskRows: rows.size, toolDedupeEntries: toolEvents.size,
       redactedCalls: redactedCalls.size, pendingTools: toolTokens.size, gaps: gaps.size, closed, ...(hierarchy ? { hierarchyWaits: waits.size, hierarchyWaitGaps: waitGaps.size, hierarchyWaitTargets: [...waits.values()].reduce((count, wait) => count + wait.targets.length, 0), hierarchyRows: hierarchyRows.size, hierarchyEvidence: hierarchyEvidence.size, hierarchyRelations: catalog.size, hierarchyStates: states.size, hierarchyInputs: inputs.size, hierarchyInputBindings: [...inputs.values()].reduce((sum, entries) => sum + entries.length, 0), hierarchyAncestorRefs: [...inputs.values()].reduce((sum, entries) => sum + entries.reduce((count, entry) => count + (entry.ancestorLimitRefs?.length ?? 0), 0), 0), hierarchyExternalRows: externalRows.size, hierarchyPendingExternalRuns: pendingExternalRuns.size, hierarchyCatalogs: checkedCatalogs.size, hierarchyRuns: nativeRuns.size, hierarchyObservedSessions: observedSessions.size, hierarchyHistoryGaps: historyGaps.size } : {}) } },
-    close() { if (closed) return; closed = true; events = []; rows.clear(); toolTokens.clear(); toolEvents.clear(); redactedCalls.clear(); gaps.clear(); claimedInputs.clear(); observedSessions.clear(); historyGaps.clear(); externalRows.clear(); pendingExternalRuns.clear(); catalog.clear(); states.clear(); inputs.clear(); hierarchyEvidence.clear(); checkedCatalogs.clear(); nativeRuns.clear(); hierarchyRows.clear(); waits.clear(); waitGaps.clear(); stamps = new WeakMap(); approvalEvents = new WeakSet(); referenceTimes = new WeakMap(); if (hierarchy) identity.hierarchyContent = null },
+    close() { if (closed) return; closed = true; events = []; rows.clear(); toolTokens.clear(); toolEvents.clear(); redactedCalls.clear(); gaps.clear(); claimedInputs.clear(); observedSessions.clear(); historyGaps.clear(); externalRows.clear(); pendingExternalRuns.clear(); catalog.clear(); states.clear(); inputs.clear(); hierarchyEvidence.clear(); checkedCatalogs.clear(); nativeRuns.clear(); hierarchyRows.clear(); waits.clear(); waitGaps.clear(); streamBlocks.clear(); stamps = new WeakMap(); approvalEvents = new WeakSet(); referenceTimes = new WeakMap(); if (hierarchy) identity.hierarchyContent = null },
   }
   return collector
 }

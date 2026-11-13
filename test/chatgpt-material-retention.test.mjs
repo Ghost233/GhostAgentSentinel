@@ -61,7 +61,7 @@ async function fixture(t, entries) {
     async sampleHost() { return { available: true, hostRunId, hostStartedAt: hostBirth, profile } },
     async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
     listThreads: (...args) => listThreads(...args),
-    async readThread(id) { const entry = threads.get(id); return entry ? { thread: { id, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path: entry.path, cwd: dir }, anchorTurnId: entry.anchorTurnId } : null },
+    async readThread(id) { const entry = threads.get(id); return entry ? { thread: { id, parentThreadId: null, forkedFromId: null, source: 'vscode', originator: 'Codex Desktop', path: entry.path, cwd: dir }, anchorTurnId: entry.anchorTurnId, activity: entry.activity } : null },
     async close() {},
   }
   const start = async (collectMaterials = true) => {
@@ -105,6 +105,35 @@ test('a current-chat read uses confirmed evidence while a background directory r
   } finally {
     directory.resolve({ data: [], nextCursor: null })
     await Promise.allSettled([background, pending])
+  }
+})
+
+test('a parked chat keeps its retained summary while collection waits behind a directory read', async t => {
+  const f = await fixture(t, [{ id: 'main', turn: 'ended', text: 'Inspect the retained execution' }])
+  const models = await controlledModels(t)
+  await configureInstallationModels(f.core, 'chatgpt:material-retention', models.config)
+  await f.start()
+  await f.read('main')
+  await settled(f, [['main', 'ended']])
+  f.advance(1000)
+  await appendFile(f.threads.get('main').path, row('event_msg', { type: 'task_complete', turn_id: 'ended' }, f.now()))
+  f.threads.get('main').activity = 'idle'
+  const before = await f.read('main')
+  assert.equal(before.execution.historical, true)
+  assert.ok(before.recentModelActivity.summary)
+  const started = Promise.withResolvers(), directory = Promise.withResolvers()
+  f.listWith(() => { started.resolve(); return directory.promise })
+  const background = f.refresh()
+  await started.promise
+  try {
+    const pending = await f.read('main')
+    assert.equal(pending.collectionRecovery?.state, 'active-waiting')
+    assert.equal(pending.signal, 'gray')
+    assert.equal(pending.execution?.historical, true)
+    assert.deepEqual(pending.recentModelActivity?.summary, before.recentModelActivity.summary)
+  } finally {
+    directory.resolve({ data: [], nextCursor: null })
+    await background
   }
 })
 

@@ -70,7 +70,7 @@ export function childWait(task, source, tasks, current) {
     const active = binding.childRefs.filter(reference => {
       const child = tasks.find(child => child.sourceKey === task.sourceKey && child.id === reference.taskId && child.lifecycleId === reference.lifecycleId)
       const activation = context.activations.find(item => item.taskId === reference.taskId && item.lifecycleId === reference.lifecycleId)
-      return child?.status === 'running' && child.currentRequest?.trim() && activation?.state === 'running' && child.coverage.complete && currentEvents(child, child.events).some(event => activityKinds.has(event.kind) && !event.data?.refinesEventId && current - event.capturedAt < 60_000)
+      return child?.status === 'running' && child.currentRequest?.trim() && activation?.state === 'running' && !coverageBlockers(child.coverage).length && currentEvents(child, child.events).some(event => activityKinds.has(event.kind) && !event.data?.refinesEventId && current - event.capturedAt < 60_000)
     })
     if (active.length) return { kind: 'children', since: start.capturedAt, durationMs: Math.max(0, current - start.capturedAt), evidenceIds: [start.id], childRefs: active }
   }
@@ -88,7 +88,7 @@ export function gsStatus(task, source, current, descendantWait = null) {
   const requestId = task.requestId ?? task.instructionContext?.binding?.inputRef?.eventId
   const analyzed = requestId != null ? task.analysis.inputEventIds?.includes(requestId) : conservative && scope.some(event => task.analysis.inputEventIds?.includes(event.id))
   const completed = task.analysis.completedAt != null && analyzed && (!task.analysis.resultDisposition || ['current', 'reused'].includes(task.analysis.resultDisposition))
-  const semanticGap = task.analysis.checks.some(check => check.judgmentState === 'failed' || check.id !== 'long_wait' && check.applicability?.state === 'triggered' && check.status === 'unknown') || completed && task.analysis.coverage?.complete === false
+  const semanticGap = task.analysis.checks.some(check => check.judgmentState === 'failed' || check.id !== 'long_wait' && check.applicability?.state === 'triggered' && check.status === 'unknown') || completed && coverageBlockers(task.analysis.coverage).length > 0
   if (waiting) waiting.semanticState = semanticGap ? 'insufficient' : completed ? 'complete' : 'pending'
   const base = { silence: { ...silence, exempt: Boolean(waiting) }, waiting, coverage }
   if (conservative && (!latest || silence.durationMs >= 60_000)) {
@@ -103,7 +103,7 @@ export function gsStatus(task, source, current, descendantWait = null) {
   const activation = source.hierarchyContext?.activations.find(item => item.taskId === task.id && item.lifecycleId === task.lifecycleId)
   if (task.status === 'unknown' || source.hierarchyContext && (!activation || activation.state === 'unknown' || activation.sessionId === null)) return { light: 'gray', label: '不可判断', reason: '已知执行当前不可观察；不能凭缺失内部材料判断静默', ...base }
   if (conservative && base.waiting?.kind === 'unconfirmed') return { light: 'gray', label: '等待原因未确认', reason: base.waiting.durationMs === null ? '尚无可见执行活动；等待原因及观察时长未确认' : `已观察至少 ${Math.floor(base.waiting.durationMs / 1000)} 秒；现有材料无法区分正常执行、等待与停滞`, ...base }
-  if (waiting && task.coverage.complete && !task.instructionContext?.gaps?.length && !semanticGap) return { light: 'green', label: waiting.kind === 'user' ? '等待你' : '等待子代理', reason: (waiting.kind === 'user' ? '已观察到当前执行的用户等待开闭依据' : '已核对父等待审计及仍有活动的委派后代；下级状态独立保留') + (waiting.semanticState === 'pending' ? '；六项语义尚待完成' : ''), ...base }
+  if (waiting && !coverageBlockers(task.coverage).length && !task.instructionContext?.gaps?.length && !semanticGap) return { light: 'green', label: waiting.kind === 'user' ? '等待你' : '等待子代理', reason: (waiting.kind === 'user' ? '已观察到当前执行的用户等待开闭依据' : '已核对父等待审计及仍有活动的委派后代；下级状态独立保留') + (waiting.semanticState === 'pending' ? '；六项语义尚待完成' : ''), ...base }
   if (!waiting && (!latest || silence.durationMs >= 60_000)) return { light: 'yellow', label: '观察', reason: !latest ? '尚无可见执行活动' : `已 ${Math.floor(silence.durationMs / 1000)} 秒无新可见执行活动；是否卡死不可判断`, ...base }
   const scoped = task.analysis.coverage?.checkEvidenceVersion === 1;
   const known = check => check.status === 'clear' || check.applicability?.state === 'not-triggered';

@@ -11,7 +11,7 @@ import { validateHierarchy, projectHierarchy } from '../hierarchy.mjs';
 import { createInstructionLookup, instructionContext, eventRef, referenceKey } from '../instruction-context.mjs';
 import { gsStatus, userWait, childWait, waitExempts } from '../gs-status.mjs';
 import { projectSessionPanel, projectPanelOverview } from '../panel-view.mjs';
-import { analysisTimeConditions, executionBlockingReason, JEV_EVIDENCE_LIMIT } from '../analysis/index.mjs';
+import { analysisTimeConditions, executionBlockingReason } from '../analysis/index.mjs';
 import { inferenceFailureInfo, isGMDCacheBusy } from '../analysis/failure-info.mjs';
 import { normalizeAnalysisConfig, normalizeAnalysisScheduling, CHECK_EVIDENCE_FEATURE, DSH_EXECUTION_SUMMARIES_FEATURE, EXECUTION_BLOCKING_FEATURE, EXECUTION_SUMMARY_QUESTIONS_FEATURE, normalizeConversationMonitoring, normalizeCollectionOutcome, normalizeFailureScope, normalizeNativeNotificationEligibility, normalizeNativeNotificationQuery, normalizeNativeNotificationResult, normalizeChatGPTInstallationPurge, normalizeInstallationNotificationPreference, normalizeInstallationNotificationRecordsQuery } from '../protocol.mjs';
 import { createFailureReceipts, failureErrorInfo } from './failure-receipts.mjs';
@@ -23,7 +23,7 @@ const PREFILL_CANCEL_GRACE_MS = 5_000;
 const CLAIM_MS = 60_000;
 const GROUP_MS = 3_000;
 const HIERARCHY_CAPTURE_LIMIT = 10_000;
-const NATIVE_CAPTURE_CHAT_LIMIT = JEV_EVIDENCE_LIMIT;
+const CAPTURE_CHAT_LIMIT = 200;
 const NATIVE_CAPACITY_GAP = 'Older native records were removed at the capture limit';
 const CONVERSATION_MONITORING_LIMIT = 1_000;
 const SUBMISSION_LIMIT = 1_000;
@@ -33,6 +33,7 @@ const copy = value => structuredClone(value);
 const identity = (...parts) => JSON.stringify(parts);
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const historical = event => event.data?.history === true || event.data?.inherited === true;
+const hierarchyReferences = context => context ? [...context.activations.flatMap(item => item.stateRefs), ...context.relations.flatMap(item => item.evidenceRefs), ...context.instructionBindings.flatMap(item => [item.inputRef, ...item.originRefs, ...item.ancestorLimitRefs]), ...(context.waitBindings ?? []).flatMap(item => item.evidenceRefs)] : [];
 const unknownChecks = (reason, judgmentState = 'insufficient') => CHECK_IDS.map(id => ({ id, status: 'unknown', judgmentState, applicability: { state: 'unknown', reason, evidenceIds: [] }, reason, evidenceIds: [] }));
 
 // This module owns monitoring state only. It never controls a source task or a model process.
@@ -63,6 +64,7 @@ export async function createCore({
   const eventsByTask = new Map(), eventsBySource = new Map();
   let timeConditionInputs = new WeakMap();
   let nextEventExpiryAt = Infinity;
+  let eventExpiryNeedsRefresh = false;
   const indexEvent = event => {
     const task = tasks.get(event.taskKey);
     if (task) timeConditionInputs.delete(task);
@@ -74,7 +76,7 @@ export async function createCore({
     }
     nextEventExpiryAt = Math.min(nextEventExpiryAt, event.capturedAt + DAY);
   };
-  const unindexEvent = event => {
+  const unindexEvent = (event, deferExpiry = false) => {
     if (!event) return;
     const task = tasks.get(event.taskKey);
     if (task) timeConditionInputs.delete(task);
@@ -85,7 +87,10 @@ export async function createCore({
       group.values = null;
       if (!group.rows.size) index.delete(key);
     }
-    if (event.capturedAt + DAY === nextEventExpiryAt) nextEventExpiryAt = 0;
+    if (event.capturedAt + DAY === nextEventExpiryAt) {
+      if (deferExpiry) eventExpiryNeedsRefresh = true;
+      else nextEventExpiryAt = 0;
+    }
   };
   const indexedEvents = (index, key, sorted = false) => {
     const group = index.get(key);
@@ -97,7 +102,7 @@ export async function createCore({
     return group.values;
   };
   const rebuildEventIndex = () => {
-    eventsByTask.clear(); eventsBySource.clear(); nextEventExpiryAt = Infinity;
+    eventsByTask.clear(); eventsBySource.clear(); nextEventExpiryAt = Infinity; eventExpiryNeedsRefresh = false;
     timeConditionInputs = new WeakMap();
     for (const event of events.values()) indexEvent(event);
   };
@@ -184,11 +189,11 @@ export async function createCore({
     if (collection === 'notifications') notifySubmission(value);
     return result;
   };
-  const erase = (collection, key) => {
+  const erase = (collection, key, deferExpiry = false) => {
     if (collection === 'notifications' && unsettledSubmission(notifications.get(key))) return retireNotification(notifications.get(key), now());
     const event = collection === 'events' ? events.get(key) : null;
     rememberNativeRow(collection, key); if (collection === 'notifications') nativeNotifications?.removed(notifications.get(key)); remove.run(collection, key); collections[collection].delete(key);
-    if (event) unindexEvent(event);
+    if (event) unindexEvent(event, deferExpiry);
   };
   const taskEvents = (task, read) => read?.eventsByTask.get(task.key) ?? indexedEvents(eventsByTask, task.key, true);
   const projectionRead = sourceKey => {
@@ -498,8 +503,10 @@ export async function createCore({
   function initializeHierarchyCaptures(source) {
     if (!source?.hierarchyContext || source.hierarchyEvidenceCaptures) return;
     const context = source.hierarchyContext;
-    const references = [...context.activations.flatMap(item => item.stateRefs), ...context.relations.flatMap(item => item.evidenceRefs), ...context.instructionBindings.flatMap(item => [item.inputRef, ...item.originRefs, ...item.ancestorLimitRefs]), ...(context.waitBindings ?? []).flatMap(item => item.evidenceRefs),
-      ...Array.from(events.values()).filter(event => tasks.get(event.taskKey)?.sourceKey === source.key).map(eventRef)];
+    const references = hierarchyReferences(context);
+    if (source.descriptor.policy === 'chatgpt-main/1') {
+      for (const event of indexedEvents(eventsBySource, source.key)) references.push(eventRef(event));
+    }
     const captures = new Map();
     for (const reference of references) {
       if (captures.has(referenceKey(reference))) continue;
@@ -763,7 +770,7 @@ export async function createCore({
     for (const records of chats.values()) {
       const live = [...records.values()].filter(record => record.copies.some(event => !removed.has(event.key)));
       live.sort((a, b) => Number(a.context) - Number(b.context) || a.at - b.at || a.sequence - b.sequence);
-      for (const record of live.slice(0, Math.max(0, live.length - NATIVE_CAPTURE_CHAT_LIMIT))) for (const event of record.copies) removed.add(event.key);
+      for (const record of live.slice(0, Math.max(0, live.length - CAPTURE_CHAT_LIMIT))) for (const event of record.copies) removed.add(event.key);
     }
     const evicted = new Map(), removedRefs = new Map();
     for (const key of removed) {
@@ -806,12 +813,92 @@ export async function createCore({
     return { apply, evicted };
   }
 
+  function retireDshCaptures(evicted, registrationId) {
+    const chats = new Map(), at = now();
+    for (const task of tasks.values()) {
+      const source = sources.get(task.sourceKey), registration = source?.descriptor.registrationId;
+      if (!source || source.descriptor.policy === 'chatgpt-main/1' || registrationId !== undefined && registration !== registrationId) continue;
+      const key = identity(registration, task.sessionId ?? task.id);
+      const group = chats.get(key) ?? { tasks: [], size: 0 };
+      group.tasks.push(task);
+      group.size += eventsByTask.get(task.key)?.rows.size ?? 0;
+      chats.set(key, group);
+    }
+    const full = [...chats.values()].filter(group => group.size > CAPTURE_CHAT_LIMIT);
+    if (!full.length) return;
+    const pinned = new Set();
+    const pin = (sourceKey, ref) => pinned.add(identity(sourceKey, ref.taskId, ref.lifecycleId, ref.eventId));
+    for (const group of chats.values()) for (const task of group.tasks) {
+      if (task.status !== 'running' && !(task.status === 'unknown' && task.lastKnownStatus === 'running') && !task.analysis.finalSummaryPending) continue;
+      const source = sources.get(task.sourceKey);
+      if (task.requestId) pinned.add(identity(task.sourceKey, task.id, task.lifecycleId, task.requestId));
+      if (task.analysis.finalSummaryPending) pinned.add(task.analysis.finalSummaryPending);
+      const context = source.hierarchyContext;
+      const own = item => item.taskId === task.id && item.lifecycleId === task.lifecycleId;
+      for (const ref of context?.activations.find(own)?.stateRefs ?? []) pin(task.sourceKey, ref);
+      const binding = context?.instructionBindings.find(item => own(item) && item.inputRef.eventId === task.requestId);
+      for (const ref of [...(binding?.originRefs ?? []), ...(binding?.ancestorLimitRefs ?? [])]) pin(task.sourceKey, ref);
+      for (const relation of context?.relations ?? []) if (relation.childSessionId === task.sessionId || relation.childActivationRef && own(relation.childActivationRef)) {
+        for (const ref of relation.evidenceRefs) pin(task.sourceKey, ref);
+      }
+      for (const wait of context?.waitBindings ?? []) if (own(wait) && wait.phase === 'started') for (const ref of wait.evidenceRefs) pin(task.sourceKey, ref);
+      // The last observed execution edge also supports DSH's closing summary.
+      const state = taskEvents(task).findLast(event => event.kind === 'status' && !historical(event) &&
+        ['agent/status', 'agent/disposed', 'agent/created', 'native-baseline'].includes(event.data?.nativeType));
+      if (state) pinned.add(state.key);
+    }
+    const retiredProofs = new Map();
+    for (const group of full) {
+      const records = group.tasks.flatMap(task => taskEvents(task));
+      records.sort((a, b) => Number(pinned.has(a.key)) - Number(pinned.has(b.key)) || a.capturedAt - b.capturedAt || a.sequence - b.sequence);
+      for (const event of records.slice(0, records.length - CAPTURE_CHAT_LIMIT)) {
+        const task = tasks.get(event.taskKey);
+        if (!evicted.has(task.key)) evicted.set(task.key, new Set());
+        evicted.get(task.key).add(event.id);
+        const previousEnd = task.gapRecords?.find(gap => gap.reason === NATIVE_CAPACITY_GAP)?.endAt ?? 0;
+        rememberGap(task, { reason: NATIVE_CAPACITY_GAP, at, endAt: Math.max(previousEnd, event.capturedAt) });
+        if (!retiredProofs.has(task.sourceKey)) retiredProofs.set(task.sourceKey, new Set());
+        retiredProofs.get(task.sourceKey).add(referenceKey(eventRef(event)));
+        erase('events', event.key, true);
+      }
+    }
+    for (const [sourceKey, refs] of retiredProofs) {
+      const source = sources.get(sourceKey);
+      let changed = false;
+      for (const capture of source.hierarchyEvidenceCaptures ?? []) if (refs.has(referenceKey(capture)) && !capture.capacityRetired) {
+        capture.capacityRetired = true; changed = true;
+      }
+      if (changed && source.hierarchyContext) {
+        source.dshHierarchyKey ??= fingerprint(source.hierarchyContext);
+        const retained = retireDshHierarchyProofs(source.hierarchyContext, ref => refs.has(referenceKey(ref)));
+        if (retained !== source.hierarchyContext) { source.hierarchyContext = retained; delete source.hierarchyMaterialKey; }
+      }
+      if (changed) save('sources', source);
+    }
+  }
+
+  function retireDshHierarchyProofs(context, retired) {
+    if (!hierarchyReferences(context).some(retired)) return context;
+    const activations = context.activations.map(item => item.stateRefs.some(retired)
+      ? { ...item, state: 'unknown', runId: null, stateRefs: item.stateRefs.filter(ref => !retired(ref)) } : item);
+    const relations = context.relations.filter(item => !item.evidenceRefs.some(retired));
+    const parented = new Set(relations.filter(item => item.kind === 'delegation').map(item => item.childSessionId));
+    const sessions = new Map(activations.map(item => [identity(item.taskId, item.lifecycleId), item.sessionId]));
+    const instructionBindings = context.instructionBindings.filter(item => ![item.inputRef, ...item.originRefs, ...item.ancestorLimitRefs].some(retired)
+      && (item.origin !== 'delegated' || parented.has(sessions.get(identity(item.taskId, item.lifecycleId)))));
+    const waitBindings = context.waitBindings?.filter(item => relations.length === context.relations.length && !item.evidenceRefs.some(retired));
+    const branchGaps = [...context.coverage.branchGaps.filter(gap => gap.reason !== NATIVE_CAPACITY_GAP),
+      { sessionId: context.sessions[0]?.sessionId ?? 'unknown', reason: NATIVE_CAPACITY_GAP }].slice(-100);
+    return { ...context, activations, relations, instructionBindings, ...(waitBindings ? { waitBindings } : {}), coverage: { complete: false, branchGaps } };
+  }
+
   function prune(capacityEvicted = null) {
     const current = now();
     const expiredNativeProgress = nativeProgress.prune(current);
     failureStore.prune(current);
     const cutoff = current - DAY;
     const expiredByTask = new Map(capacityEvicted);
+    let expiredBodies = false;
     if (current >= nextEventExpiryAt) {
       let next = Infinity;
       for (const event of events.values()) {
@@ -819,15 +906,19 @@ export async function createCore({
         if (!expiredByTask.has(event.taskKey)) expiredByTask.set(event.taskKey, new Set());
         expiredByTask.get(event.taskKey).add(event.id);
         erase('events', event.key);
+        expiredBodies = true;
       }
       nextEventExpiryAt = next;
+      eventExpiryNeedsRefresh = false;
     }
     for (const task of tasks.values()) {
       let changed = pendingPrunedTasks.has(task.key);
+      const dsh = sources.get(task.sourceKey)?.descriptor.policy !== 'chatgpt-main/1';
       if (task.analysis.lastSuccessfulSummary?.expiresAt <= current) { delete task.analysis.lastSuccessfulSummary; changed = true; }
       if (task.analysis.lastPartialSummary?.expiresAt <= current) { delete task.analysis.lastPartialSummary; changed = true; }
       if (task.analysis.lastUnjudgedSummary?.expiresAt <= current) { delete task.analysis.lastUnjudgedSummary; changed = true; }
       if (task.analysis.lastPrefill?.submittedAt <= cutoff) { delete task.analysis.lastPrefill; changed = true; }
+      const capacity = capacityEvicted?.get(task.key);
       const expired = new Set(expiredByTask.get(task.key) ?? []);
       const references = [task.requestId, ...(task.analysis.inputEventIds ?? []),
         ...task.analysis.checks.flatMap(check => check.evidenceIds ?? []),
@@ -835,10 +926,11 @@ export async function createCore({
       for (const id of references) if (id && !events.has(identity(task.sourceKey, task.id, task.lifecycleId, id))) expired.add(id);
       if (expired.size > 0) {
         pendingPrunedTasks.add(task.key);
-        const removedForCapacity = capacityEvicted?.has(task.key);
-        cancelRound(removedForCapacity ? NATIVE_CAPACITY_GAP : 'Analysis evidence expired after 24 hours', task);
+        const removedForCapacity = capacity && [...expired].every(id => capacity.has(id));
+        if (!removedForCapacity || !dsh || expired.has(task.requestId)) cancelRound(removedForCapacity ? NATIVE_CAPACITY_GAP : 'Analysis evidence expired after 24 hours', task);
         if (!removedForCapacity) rememberGap(task, { reason: 'Earlier evidence expired after 24 hours', at: now(), endAt: now() - DAY });
         if (expired.has(task.requestId)) { task.currentRequest = ''; task.requestId = null; task.contextFingerprint = null; }
+        if (removedForCapacity && dsh) task.analysis.inputEventIds = task.analysis.inputEventIds?.filter(id => !expired.has(id));
         if (task.analysis.inputEventIds?.some(id => expired.has(id)) || task.analysis.checks?.some(check => check.evidenceIds?.some(id => expired.has(id)))) {
           task.analysis.state = 'stale';
           task.analysis.error = { code: 'evidence_expired', message: 'Evidence supporting this analysis expired' };
@@ -913,7 +1005,7 @@ export async function createCore({
           const event = events.get(identity(source.key, reference.taskId, reference.lifecycleId, reference.eventId));
           return event && event.capturedAt > cutoff;
       };
-      const contextReferences = context ? [...context.activations.flatMap(activation => activation.stateRefs), ...context.relations.flatMap(relation => relation.evidenceRefs), ...context.instructionBindings.flatMap(binding => [binding.inputRef, ...binding.originRefs, ...binding.ancestorLimitRefs]), ...(context.waitBindings ?? []).flatMap(binding => binding.evidenceRefs)] : [];
+      const contextReferences = hierarchyReferences(context);
       if (context && (source.hierarchyMaterialAt <= cutoff || contextReferences.some(reference => !retainedReference(reference)) || source.hierarchyMaterialAt == null && contextReferences.length === 0)) {
         let expiredProof = false;
         const activations = context.activations.filter(activation => findTask(source.key, activation.taskId, activation.lifecycleId)).map(activation => {
@@ -954,7 +1046,7 @@ export async function createCore({
       }
       if (!connected(source) && source.lastSeenAt <= cutoff && !Array.from(tasks.values()).some(task => task.sourceKey === source.key)) { failureStore.clearSource(source.key, current); erase('sources', source.key); }
     }
-    if (expiredByTask.size > 0 || expiredNativeProgress > 0) db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    if (expiredBodies || expiredNativeProgress > 0) db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   }
 
   function notificationScope(task) {
@@ -1264,7 +1356,8 @@ export async function createCore({
       task.analysis.error = null;
       task.analysis.summary = result.summary;
       task.analysis.summaryAt = completedAt;
-      task.analysis.inputEventIds = round.input.events.map(event => event.id);
+      const retainedInputs = round.input.source.policy === 'chatgpt-main/1' ? round.input.events : round.input.events.filter(event => events.has(identity(task.sourceKey, event.taskId, event.taskLifecycleId, event.id)));
+      task.analysis.inputEventIds = retainedInputs.map(event => event.id);
       task.analysis.contextEvidenceRefs = (round.input.instructionContext?.inheritedEvents ?? []).map(eventRef);
       task.analysis.checks = result.checks;
       task.analysis.coverage = result.coverage;
@@ -1543,7 +1636,7 @@ export async function createCore({
   // Apply the same bound to material retained by earlier plugin versions.
   let initialRetirement;
   db.exec('SAVEPOINT native_capture_retention');
-  try { initialRetirement = retireNativeCaptures(); db.exec('RELEASE native_capture_retention'); initialRetirement.apply(); }
+  try { initialRetirement = retireNativeCaptures(); retireDshCaptures(initialRetirement.evicted); db.exec('RELEASE native_capture_retention'); initialRetirement.apply(); }
   catch (error) { db.exec('ROLLBACK TO native_capture_retention'); db.exec('RELEASE native_capture_retention'); db.close(); throw error; }
   const interval = setInterval(tick, Math.max(25, Math.min(1_000, leaseMs / 2)));
   interval.unref();
@@ -1619,9 +1712,9 @@ export async function createCore({
     analysis: { state: 'unknown', through: null, throughRevision: 0, completedAt: null, nextEligibleAt: null, error: null, summary: null, checks: unknownChecks('No completed analysis'), queuedAt: null, startedAt: null }, alerts: [],
   });
   function admitRequest(task, event) {
-    if (historical(event)) return;
+    if (event.kind !== 'input' || historical(event)) return;
     const currentInput = taskEvents(task).find(value => value.id === task.requestId);
-    if (event.kind !== 'input' || (currentInput && (event.capturedAt < currentInput.capturedAt || event.capturedAt === currentInput.capturedAt && !(event.data?.inputPhase === 'consumed' && Number.isSafeInteger(event.data?.inputSequence) && event.data.inputSequence > (currentInput.data?.inputSequence ?? Infinity))))) return;
+    if (currentInput && (event.capturedAt < currentInput.capturedAt || event.capturedAt === currentInput.capturedAt && !(event.data?.inputPhase === 'consumed' && Number.isSafeInteger(event.data?.inputSequence) && event.data.inputSequence > (currentInput.data?.inputSequence ?? Infinity)))) return;
     cancelRound('Current request changed during analysis', task, true);
     invalidateAlerts(task, 'superseded');
     task.currentRequest = event.text; task.requestId = event.id; task.requestStartedAt = event.capturedAt;
@@ -1669,6 +1762,7 @@ export async function createCore({
         if (policyChanged) {
           delete source.hierarchyContext;
           delete source.hierarchyMaterialKey;
+          delete source.dshHierarchyKey;
         }
         if (modeChanged || policyChanged) for (const task of tasks.values()) if (task.sourceKey === source.key) {
           cancelRound('Source observation mode or policy changed', task);
@@ -1754,6 +1848,7 @@ export async function createCore({
       }) };
       let incoming = batch.hierarchyContext;
       const previous = source.hierarchyContext;
+      const dshHierarchyKey = incoming && source.descriptor.policy !== 'chatgpt-main/1' ? fingerprint(incoming) : null;
       let acceptedRuns, acceptedCaptures;
       if (incoming) {
         if (previous && incoming.revision < previous.revision) return { accepted: 0, duplicate: 0, expired: 0, paused, hierarchyContext: { schemaVersion: 1, acceptedRevision: previous.revision } };
@@ -1763,7 +1858,11 @@ export async function createCore({
         }
         const prospectiveTasks = new Map(Array.from(tasks.values()).filter(task => task.sourceKey === sourceKey).map(task => [identity(task.id, task.lifecycleId), task]));
         for (const task of batch.tasks ?? []) prospectiveTasks.set(identity(task.id, task.lifecycleId), task);
-        const prospectiveEvents = new Map(Array.from(events.values()).filter(event => tasks.get(event.taskKey)?.sourceKey === sourceKey).map(event => [identity(event.taskId, event.taskLifecycleId, event.id), event]));
+        if (dshHierarchyKey) {
+          batch = { ...batch, events: (batch.events ?? []).filter(event => !captures.get(referenceKey(eventRef(event)))?.capacityRetired) };
+          incoming = retireDshHierarchyProofs(incoming, reference => captures.get(referenceKey(reference))?.capacityRetired);
+        }
+        const prospectiveEvents = new Map(indexedEvents(eventsBySource, sourceKey).map(event => [identity(event.taskId, event.taskLifecycleId, event.id), event]));
         for (const event of batch.events ?? []) if (!prospectiveEvents.has(identity(event.taskId, event.taskLifecycleId, event.id))) prospectiveEvents.set(identity(event.taskId, event.taskLifecycleId, event.id), event);
         if (nativePlan?.expired.length) {
           // A cursor can replay after its first capture expires. Drop only the
@@ -1785,25 +1884,34 @@ export async function createCore({
           batch = { ...batch, tasks: batch.tasks?.map(task => unconfirmed.has(identity(task.id, task.lifecycleId))
             ? { ...task, status: 'unknown', gaps: [...(task.gaps ?? []), 'Earlier evidence expired after 24 hours'] } : task) };
         }
-        if (previous && incoming.revision === previous.revision && JSON.stringify(incoming) !== JSON.stringify(previous)) throw Object.assign(new Error('hierarchy revision content conflict'), { code: 'hierarchy_context_invalid' });
-        acceptedRuns = validateHierarchy(incoming, { tasks: [...prospectiveTasks.values()], events: [...prospectiveEvents.values()], now: now(), acceptedRuns: source.hierarchyRunBindings ?? [], sourcePolicy: source.descriptor.policy });
-        const references = [...incoming.activations.flatMap(item => item.stateRefs), ...incoming.relations.flatMap(item => item.evidenceRefs), ...incoming.instructionBindings.flatMap(item => [item.inputRef, ...item.originRefs, ...item.ancestorLimitRefs]), ...(incoming.waitBindings ?? []).flatMap(item => item.evidenceRefs)];
-        for (const reference of references) {
-          const capture = captures.get(referenceKey(reference));
-          if (capture && capture.capturedAt <= now() - DAY) throw Object.assign(new Error('Expired hierarchy evidence cannot acquire a new first capture timestamp'), { code: 'hierarchy_context_invalid' });
-          if (!capture) captures.set(referenceKey(reference), { ...reference, capturedAt: prospectiveEvents.get(identity(reference.taskId, reference.lifecycleId, reference.eventId)).capturedAt });
+        if (previous && incoming.revision === previous.revision) {
+          const same = dshHierarchyKey && source.dshHierarchyKey ? dshHierarchyKey === source.dshHierarchyKey : JSON.stringify(incoming) === JSON.stringify(previous);
+          if (!same) throw Object.assign(new Error('hierarchy revision content conflict'), { code: 'hierarchy_context_invalid' });
+          if (dshHierarchyKey && source.dshHierarchyKey) incoming = null;
         }
-        if (captures.size > HIERARCHY_CAPTURE_LIMIT) {
-          source.hierarchyCaptureBudgetExceeded = true;
-          rememberGap(source, { reason: HIERARCHY_CAPTURE_GAP, at: now() });
-          save('sources', source);
-          throw Object.assign(new Error(HIERARCHY_CAPTURE_GAP), { code: 'hierarchy_context_invalid' });
+        if (incoming) {
+          acceptedRuns = validateHierarchy(incoming, { tasks: [...prospectiveTasks.values()], events: [...prospectiveEvents.values()], now: now(), acceptedRuns: source.hierarchyRunBindings ?? [], sourcePolicy: source.descriptor.policy });
+          for (const reference of hierarchyReferences(incoming)) {
+            const capture = captures.get(referenceKey(reference));
+            if (capture && capture.capturedAt <= now() - DAY) throw Object.assign(new Error('Expired hierarchy evidence cannot acquire a new first capture timestamp'), { code: 'hierarchy_context_invalid' });
+            if (!capture) captures.set(referenceKey(reference), { ...reference, capturedAt: prospectiveEvents.get(identity(reference.taskId, reference.lifecycleId, reference.eventId)).capturedAt });
+          }
+          if (captures.size > HIERARCHY_CAPTURE_LIMIT) {
+            source.hierarchyCaptureBudgetExceeded = true;
+            rememberGap(source, { reason: HIERARCHY_CAPTURE_GAP, at: now() });
+            save('sources', source);
+            throw Object.assign(new Error(HIERARCHY_CAPTURE_GAP), { code: 'hierarchy_context_invalid' });
+          }
+          acceptedCaptures = [...captures.values()];
         }
-        acceptedCaptures = [...captures.values()];
       }
       if (!incoming && source.hierarchyEvidenceCaptures) {
         const expiredCaptures = new Set(source.hierarchyEvidenceCaptures.filter(value => value.capturedAt <= now() - DAY).map(referenceKey));
         if ((batch.events ?? []).some(event => expiredCaptures.has(referenceKey(eventRef(event))))) throw Object.assign(new Error('Expired hierarchy evidence cannot acquire a new first capture timestamp'), { code: 'hierarchy_context_invalid' });
+        if (!dshHierarchyKey && source.descriptor.policy !== 'chatgpt-main/1' && batch.events?.length) {
+          const retired = new Set(source.hierarchyEvidenceCaptures.filter(value => value.capacityRetired).map(referenceKey));
+          if (retired.size) batch = { ...batch, events: batch.events.filter(event => !retired.has(referenceKey(eventRef(event)))) };
+        }
       }
       // Only native ChatGPT batches need the new progress dependency. Persist
       // its SQL first, but publish neither its memory nor the batch until both
@@ -1872,6 +1980,7 @@ export async function createCore({
         save('sources', source);
         noteSourceSeen(source);
         const counts = { accepted: 0, duplicate: 0, expired: 0, paused };
+        if (dshHierarchyKey) counts.hierarchyContext = { schemaVersion: 1, acceptedRevision: batch.hierarchyContext.revision };
         for (const descriptor of batch.tasks ?? []) {
           let task = findTask(sourceKey, descriptor.id, descriptor.lifecycleId);
           if (!task) { task = newTask(sourceKey, descriptor); rememberNativeRow('tasks', task.key); tasks.set(task.key, task); }
@@ -1952,6 +2061,7 @@ export async function createCore({
           const materialKey = fingerprint([incoming.sessions, incoming.activations, incoming.relations, incoming.instructionBindings, incoming.waitBindings, incoming.coverage]);
           if (materialKey !== source.hierarchyMaterialKey) { source.hierarchyMaterialKey = materialKey; source.hierarchyMaterialAt = now(); }
           source.hierarchyContext = copy(incoming);
+          if (dshHierarchyKey) source.dshHierarchyKey = dshHierarchyKey;
           source.hierarchyRunBindings = acceptedRuns;
           source.hierarchyEvidenceCaptures = acceptedCaptures;
           for (const activation of incoming.activations) {
@@ -1985,6 +2095,7 @@ export async function createCore({
         }
         const retirement = source.descriptor.policy === 'chatgpt-main/1' ? retireNativeCaptures(evictions, nativeCaptureTime ?? now()) : { apply() {}, evicted: new Map() };
         for (const [key, ids] of retirement.evicted) capacityEvicted.set(key, ids);
+        if (source.descriptor.policy !== 'chatgpt-main/1' && (counts.accepted || batch.tasks?.length)) retireDshCaptures(capacityEvicted, source.descriptor.registrationId);
         if (transaction) { db.exec('RELEASE native_ingest'); nativeJournal = null; transaction = null; applyNativeProgress?.(); retirement.apply(); applyNativeOrigins?.(); }
         if (source.descriptor.policy === 'chatgpt-main/1') for (const descriptor of batch.tasks ?? []) nativeNotifications.markMonitored(source.descriptor.registrationId, descriptor.id);
         if (batch.nativeOrigins) counts.nativeOrigins = batch.nativeOrigins.map(proof => nativeOrigins.read(source.descriptor.registrationId, proof.key));
@@ -2160,6 +2271,11 @@ export async function createCore({
       const deadline = at => { if (Number.isSafeInteger(at) && at >= 0) nextExpiryAt = nextExpiryAt === null ? at : Math.min(nextExpiryAt, at); };
       const captured = at => { if (Number.isSafeInteger(at) && at >= 0) deadline(at + DAY); };
       const gaps = values => { for (const gap of values ?? []) if (!['Core restarted; source baseline is unknown', 'Earlier evidence expired after 24 hours', HIERARCHY_CAPTURE_GAP].includes(gap.reason)) captured(gap.at); };
+      if (eventExpiryNeedsRefresh) {
+        nextEventExpiryAt = Infinity;
+        for (const event of events.values()) nextEventExpiryAt = Math.min(nextEventExpiryAt, event.capturedAt + DAY);
+        eventExpiryNeedsRefresh = false;
+      }
       deadline(nextEventExpiryAt);
       for (const task of tasks.values()) {
         if (task.analysis.summary) captured(task.analysis.summaryAt ?? task.analysis.completedAt);

@@ -52,6 +52,7 @@
 </section>
 <p id="availability" class="muted" role="status" hidden></p>
 <p id="collection-recovery" class="muted" role="status" hidden></p>
+<section id="current-facts" hidden><p id="current-request" class="muted"></p><p id="current-activity" class="muted"></p></section>
 </div>
 <div id="monitor-controls"><nav id="monitor-tabs" role="tablist" aria-label="会话检查"><button id="monitor-tab-issues" type="button" role="tab" aria-controls="issues">当前问题</button><button id="monitor-tab-details" type="button" role="tab" aria-controls="monitor-details">详情</button><button id="monitor-tab-overview" type="button" role="tab" aria-controls="overview">总览</button></nav><button id="refresh" type="button">刷新</button></div>
 <section id="issues" role="tabpanel" aria-labelledby="monitor-tab-issues" aria-label="需要关注的问题"></section>
@@ -64,7 +65,6 @@
 <p id="summary" role="status">⚪ 正在核对当前会话</p>
 <p id="execution" class="muted"></p>
 <p id="record-status" class="muted" role="status"></p>
-<section id="current-facts" hidden><p id="current-request" class="muted"></p><p id="current-activity" class="muted"></p></section>
 <p id="inheritance" class="muted" role="status"></p>
 <p id="analysis">当前分析不可判断</p>
 <p id="model-status" class="muted"></p>
@@ -125,17 +125,22 @@ function summaryGaps(gaps){
   const specific=gaps.some(gap=>text(gap)&&!derived.has(gap));
   return [...new Set(gaps.filter(gap=>text(gap)&&(!specific||!derived.has(gap))).map(gap=>Object.hasOwn(gapDescriptions,gap)?gapDescriptions[gap]:gap.includes('unsupported-item-type:')?'存在未识别的原生事件':text(gap,160)))];
 }
-function summaryRunStatus(analysis){
+function summaryRunStatus(analysis,historical){
   const error=analysis?.error;
-  if(analysis?.state==='failed'&&error?.stage==='llm'){
-    if(error.category==='cache-busy')return '总结模型缓存占用，等待重试';
-    if(error.code==='deadline'||error.status===504||/HTTP 504\b/.test(text(error.message)))return '总结模型超时，等待重试';
-    if(error.code==='incomplete_response')return '总结模型未返回完整结果，等待重试';
-    return '本次总结生成失败，等待重试';
+  if(error?.code==='evidence_expired')return '上次总结的依据已过期';
+  if(error?.code==='analysis_expired')return '上次总结已过期';
+  if(['failed','stale'].includes(analysis?.state)&&['llm','jev'].includes(error?.stage)){
+    const status=Number.isInteger(error.status)&&error.status>=400&&error.status<=599?error.status:Number(text(error.message).match(/\bHTTP ([45][0-9]{2})\b/)?.[1]);
+    const judge=error.stage==='jev',model=judge?'JEV':'总结模型';
+    const reason=error.category==='cache-busy'?model+'缓存占用':
+      error.code==='deadline'||status===504?model+'超时':
+      error.code==='incomplete_response'?model+'未返回完整结果':
+      status?model+'请求失败（HTTP '+status+'）':judge?'JEV 判断失败':'总结生成失败';
+    return historical||analysis.state==='stale'?(judge?'上次分析失败 · ':'上次总结失败 · ')+reason:reason+'，等待重试';
   }
   return {queued:'总结正在排队',analyzing:'正在生成总结',paused:'总结已暂停',unavailable:'总结模型未配置或暂不可用'}[analysis?.state]??'';
 }
-function renderRecentModelActivity(activity,retained=false,revalidating=false,analysis){
+function renderRecentModelActivity(activity,retained=false,revalidating=false,analysis,historical=false){
   const now=Date.now(),prefill=activity?.prefill,summary=activity?.summary;
   const recent=at=>Number.isFinite(at)&&at<=now&&at>now-86400000;
   const time=(id,at)=>{
@@ -156,14 +161,14 @@ function renderRecentModelActivity(activity,retained=false,revalidating=false,an
   show('recent-summary-state',valid);write('recent-summary-state',valid?(summary.final?'已收尾':'已总结'):'');
   attribute('recent-summary-state','data-tone','ok');
   set('recent-summary-text','className',valid?'summary-body':'summary-body muted');
-  const runStatus=summaryRunStatus(analysis);
+  const runStatus=summaryRunStatus(analysis,historical);
   writeSummary('recent-summary-text',valid?text(summary.text,Infinity):runStatus||(activity?'暂无可显示的总结':'等待核对当前聊天'),valid?summary.sections:null);
   const decision=valid?(summary.blocking??{status:'unknown',reason:summary.final?'执行已收尾，未作运行中判断':'这份摘要没有可显示的 JEV 判断'}):null;
   renderBlocking('recent',decision,retained||revalidating);
   time('recent-summary-time',valid?summary.completedAt:null);
   const missing=valid&&summary.partial?summaryGaps(list(summary.gaps)):[];
   show('recent-summary-gaps',missing.length>0);write('recent-summary-gaps',missing.length?'观察范围与说明 · '+missing.join('、'):'');
-  const status=retained&&(valid||validPrefill)?'本次未能更新 · 显示上次读取':valid&&runStatus&&analysis?.state==='failed'?runStatus+' · 显示上次总结':'';
+  const status=retained&&(valid||validPrefill)?'本次未能更新 · 显示上次读取':valid&&runStatus&&['failed','stale'].includes(analysis?.state)&&!['evidence_expired','analysis_expired'].includes(analysis?.error?.code)?runStatus+' · 显示已有总结':'';
   show('recent-model-status',Boolean(status));write('recent-model-status',status);
   return activity?{prefill:validPrefill?prefill:null,summary:valid?summary:null,prefillRecovery:recovery}:null;
 }
@@ -312,10 +317,15 @@ function renderBlocking(prefix,decision,retained=false){
 function render(view){
   if(!view||!Object.hasOwn(lights,view.signal)||!view.analysis||typeof view.analysis.state!=='string')throw new Error('未收到兼容的检查结果');
   const identity=text(view.identity?.threadId,2000);
+  const gap=view.history?.currentGap??view.observation?.gap;
+  const unavailable=view.observation?.failureStage==='core-connection'?'观察核心连接暂不可用':
+    gap==='observer-unavailable'?text(view.summary)||'观察服务尚未就绪，等待数据':
+    gap==='core-update-required'?'正在等待新版观察核心接入':
+    gap==='observation-unavailable'?'当前会话暂时无法采集':
+    gap==='chat-archived'?'此聊天已归档，已退出监控':'';
   if(!identity){
     clearView('当前会话未确认');
-    if(view.observation?.gap==='observer-unavailable'){element('availability').textContent=text(view.summary)||'观察服务尚未就绪，等待数据';element('availability').hidden=false;}
-    if(view.observation?.gap==='chat-archived'){write('availability','此聊天已归档，已退出监控');show('availability',true);}
+    write('availability',unavailable||'当前会话尚未确认');show('availability',true);
     const gaps=[...list(view.discovery?.gaps),view.observation?.gap==='chat-archived'?null:view.observation?.gap,...(view.health?.historyGap?['监控故障回执存在保留缺口']:[]),...(view.health?.orderingGap?['故障恢复排序资料不完整']:[])].filter(value=>text(value));
     for(const gap of [...new Set(gaps)])element('gaps').append(node('p',text(gap,160)));
     if(gaps.length)element('diagnostics-title').textContent='观察与覆盖 · 有缺口';
@@ -335,8 +345,12 @@ function render(view){
   })[recovery?.state]??'';
   write('collection-recovery',recoveryMessage+progress);show('collection-recovery',Boolean(recoveryMessage));
   const activityMissing=view.recentModelActivity===undefined;
-  write('error','');write('availability','');show('availability',false);
-  if(!view.execution?.historical&&view.observation?.activityState==='idle-awaiting-end'){write('availability','会话已静止，正在补读结束记录，随后生成收尾摘要');show('availability',true);}
+  write('error','');
+  const availability=unavailable||(view.observation?.activityState==='idle-awaiting-end'?'会话已静止，正在补读结束记录，随后生成收尾摘要':
+    gap==='chat-idle'?'会话当前空闲，有新活动后自动监控':
+    gap==='historical-execution-unconfirmed'||gap==='current-turn-not-observed'?'当前执行尚未确认，正在核对会话记录':
+    gap==='collection-pending'&&!recoveryMessage?'正在核对当前会话':'');
+  write('availability',availability);show('availability',Boolean(availability));
   const analysis=view.analysis,byId=new Map(list(analysis.checks).filter(check=>check&&Object.hasOwn(labels,check.id)).map(check=>[check.id,check]));
   const inheritanceGap=view.inheritance&&(view.inheritance.state!=='complete'||list(view.inheritance.gaps).length>0);
   const recordRevalidating=!view.execution?.historical&&view.observation?.recordRevalidating===true;
@@ -422,6 +436,7 @@ function render(view){
       }
       rows.push(article);
     }
+    if(target==='issues'&&!rows.length&&currentSignal==='green'&&['current','reused'].includes(analysis.resultDisposition))rows.push(node('p','当前检查未发现需要关注的问题','muted'));
     updateRows(target,rows);
   }
   updateRows('check-list',Object.entries(labels).map(([id,label])=>{
@@ -451,7 +466,7 @@ function render(view){
   if(text(analysis.error?.code,120))technical.push('错误代码：'+text(analysis.error.code,120));
   if(text(analysis.error?.message))technical.push(text(analysis.error.message));
   write('technical',technical.join('\n'));
-  recentActivity=renderRecentModelActivity(activityMissing?recentActivity:view.recentModelActivity,activityMissing,recordRevalidating,analysis);
+  recentActivity=renderRecentModelActivity(activityMissing?recentActivity:view.recentModelActivity,activityMissing,recordRevalidating,analysis,view.execution?.historical);
 }
 function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);if(entry.method==='tools/call')parent.postMessage({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id,reason}},'*');entry.reject(new Error(reason));}
 function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}

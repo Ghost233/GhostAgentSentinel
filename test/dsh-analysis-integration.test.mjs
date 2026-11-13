@@ -232,6 +232,34 @@ test('DSH session summaries keep raw output in the JEV evidence rather than the 
   assert.match(page.element('#recent-blocking-evidence').textContent, /\/synthetic\/DSH Workflow/)
 })
 
+test('a full DSH session window still produces all three summary lines and a JEV decision', async t => {
+  const host = await fixture(t, { blockingChoice: 'unblocked_1' }), id = 'task-full-window'
+  await host.create(id, 'Check the results of the directory inspection')
+  await until(async () => (await host.control.snapshot()).tasks.some(task => task.id === id && task.currentRequest), 'native request captured')
+  const snapshot = await host.control.snapshot(), task = snapshot.tasks.find(task => task.id === id)
+  const capturedAt = Date.now()
+  await host.control.ingest(task.sourceKey, { events: Array.from({ length: 520 }, (_, index) => ({
+    id: 'check-' + index, taskId: task.id, taskLifecycleId: task.lifecycleId, kind: 'output',
+    capturedAt, occurredAt: capturedAt, text: 'Checked the directory listing ' + index,
+  })) })
+  host.send(id, 'Directory inspection finished.')
+  await until(async () => (await host.control.snapshot()).tasks.find(task => task.id === id)?.events.some(event => event.text.includes('inspection finished')), 'latest output captured')
+  const retained = (await host.control.snapshot()).tasks.find(task => task.id === id)
+  assert.equal(retained.events.length, 200)
+  assert.ok(retained.events.some(event => event.id === task.instructionContext.binding.inputRef.eventId))
+  assert.ok(retained.events.every(event => event.id !== 'check-0'))
+  await host.control.resume()
+  let summary
+  await until(async () => (summary = (await host.adapter.sessionPanel(id, {})).recentModelActivity.summary)?.blocking?.status === 'unblocked', 'JEV decision after retention')
+  assert.equal(summary.sections.length, 3)
+  const extracts = host.modelCalls.filter(call => call.path === '/v1/chat/completions').slice(0, 3)
+  assert.equal(extracts.length, 3)
+  assert.ok(extracts.every(call => JSON.parse(call.body.messages[1].content).evidence.length <= 200))
+  const judge = host.modelCalls.find(call => call.path === '/v1/systemone')
+  assert.equal(judge.body.state.events.length, 100)
+  assert.equal(judge.body.state.request, task.currentRequest)
+})
+
 test('DSH retains partial observations and summarizes each observed execution once after it ends', async t => {
   const host = await fixture(t), id = 'task-final'
   const actor = await host.create(id, 'first execution request')

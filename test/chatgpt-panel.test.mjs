@@ -34,6 +34,66 @@ test('the default tab explains a summary timeout and clears it after a fresh res
   assert.match(page.element('#recent-summary-text').textContent, /正在生成总结/)
 })
 
+test('the default tab explains a retained summary failure and then shows the recovered summary', async t => {
+  const now = Date.now(), page = await harness(t, { now: () => now })
+  const history = { currentGap: 'historical-execution-unconfirmed', executions: [] }
+  const prior = { ...result('main-a'), history, execution: { historical: true, status: 'ended' },
+    observation: { coverage: 'retained-history', gap: history.currentGap },
+    recentModelActivity: { prefill: { state: 'unconfirmed' }, summary: null },
+    analysis: { state: 'stale', resultDisposition: 'invalid', error: { stage: 'llm', code: 'http_error', message: '推理服务拒绝或失败（HTTP 503）' } } }
+  await page.deliver(prior)
+  assert.equal(page.element('#monitor-tab-issues').getAttribute('aria-selected'), 'true')
+  assert.match(page.element('#recent-summary-text').textContent, /上次总结失败.*HTTP 503/)
+  assert.doesNotMatch(page.element('#recent-summary-text').textContent, /等待重试/)
+  assert.match(page.element('#availability').textContent, /当前执行尚未确认/)
+  assert.equal(page.element('#availability').hidden, false)
+  assert.equal(page.element('#issues').children.length, 0)
+
+  await page.refresh()
+  const sections = ['在做什么：核对本机状态。', '有什么进展：恢复摘要。', '卡在哪里：未观察到明确阻碍。']
+  await page.deliver({ ...result('main-a'), analysis: { state: 'cooldown' }, recentModelActivity: { summary: { text: sections.join('\n'), sections, completedAt: now - 100, expiresAt: now + 1000 } } })
+  assert.equal(page.element('#recent-summary-text').textContent, sections.join('\n'))
+  assert.equal(page.element('#recent-summary-text').children.length, 3)
+  assert.equal(page.element('#availability').hidden, true)
+})
+
+test('the default tab makes an unconfirmed chat and an empty successful check explicit', async t => {
+  const page = await harness(t)
+  await page.deliver({ ...result(null), observation: { coverage: 'unavailable', gap: 'request-identity-unverified' } })
+  assert.match(page.element('#availability').textContent, /当前会话尚未确认/)
+  assert.equal(page.element('#availability').hidden, false)
+
+  await page.refresh()
+  await page.deliver({ ...result(null), observation: { coverage: 'unavailable', gap: 'observation-unavailable', failureStage: 'core-connection' } })
+  assert.match(page.element('#availability').textContent, /观察核心连接暂不可用/)
+
+  await page.refresh()
+  await page.deliver({ ...material('main-a', 'green'), analysis: { state: 'cooldown', resultDisposition: 'current', connected: true,
+    coverage: { complete: true }, checks: ids.map(id => ({ id, status: 'clear' })), issues: [] } })
+  assert.match(page.element('#issues').textContent, /当前检查未发现需要关注的问题/)
+  assert.equal(page.element('#availability').hidden, true)
+})
+
+test('the default tab explains a retained JEV failure even when no summary is displayable', async t => {
+  const page = await harness(t), view = {
+    ...result('main-a'),
+    history: { currentGap: 'chat-idle', executions: [] },
+    observation: { coverage: 'retained-history', gap: 'chat-idle' },
+    execution: { historical: true, status: 'ended' },
+    recentModelActivity: { prefill: { state: 'unconfirmed' }, summary: null },
+    analysis: { state: 'stale', error: { stage: 'jev', code: 'http_error', message: '推理服务拒绝或失败（HTTP 502）' } },
+  }
+  await page.deliver(view)
+  assert.equal(page.element('#monitor-tab-issues').getAttribute('aria-selected'), 'true')
+  assert.match(page.element('#recent-summary-text').textContent, /上次分析失败.*JEV.*HTTP 502/)
+  assert.doesNotMatch(page.element('#recent-summary-text').textContent, /等待重试/)
+  assert.match(page.element('#availability').textContent, /会话当前空闲/)
+
+  await page.refresh()
+  await page.deliver({ ...view, analysis: { state: 'stale', error: { code: 'evidence_expired' } } })
+  assert.match(page.element('#recent-summary-text').textContent, /上次总结的依据已过期/)
+})
+
 test('parked and archived chats explain their monitoring state in Chinese', async t => {
   const page = await harness(t)
   await page.deliver({ ...result(null), observation: { gap: 'chat-archived' } })
@@ -371,6 +431,7 @@ test('current facts stay visible while inherited requirements remain pending and
   assert.doesNotMatch(page.element('#summary').textContent, /正常/)
   assert.match(page.element('#inheritance').textContent, /继承要求待补齐/)
   assert.equal(page.element('#current-facts').hidden, false)
+  assert.ok(page.html.indexOf('id="current-facts"') < page.html.indexOf('id="monitor-tabs"'), 'current facts also render on the default tab')
   assert.match(page.element('#current-request').textContent, /只改 <button> 的文字/)
   assert.match(page.element('#current-activity').textContent, /文案已更新/)
   assert.equal(page.element('#current-request').children.length, 0, 'current facts remain literal text')

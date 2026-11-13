@@ -87,13 +87,13 @@ test('three LLM requests reuse identical evidence and supply one merged summary 
   assert.equal(result.checks.find(check => check.id === 'request_drift').judgmentState, 'insufficient');
 });
 
-test('JEV can see 500 scoped records independently of the three cached summary requests', async t => {
+test('JEV receives at most 100 records independently of the three cached summary requests', async t => {
   const { analyzer, requests } = await models(t);
   const events = [observation.events[0], ...Array.from({ length: 520 }, (_, i) => ({
     ...observation.events[1], id: `action-${i}`, text: `Observed tool activity ${i}.`, capturedAt: now - 520 + i,
   }))];
   const previews = [];
-  await analyzer.analyze({ ...observation, events }, { onSummary: preview => {
+  const result = await analyzer.analyze({ ...observation, events }, { onSummary: preview => {
     assert.deepEqual(requests.map(request => request.path), llmPaths);
     previews.push(preview);
   } });
@@ -106,9 +106,11 @@ test('JEV can see 500 scoped records independently of the three cached summary r
   const summaryInput = JSON.parse(summaryRequests[0][1].content).evidence;
   assert.ok(summaryInput.length <= 200);
   const judgment = decodeJevRequest(requests.at(-1).body);
-  assert.equal(judgment.state.events.length, 500);
+  assert.equal(judgment.state.events.length, 100);
   assert.equal(judgment.state.events[0].id, 'request');
   assert.equal(judgment.state.events.at(-1).id, 'action-519');
+  assert.ok(result.summary.partial.evidenceIds.every(id => judgment.state.events.some(event => event.id === id)));
+  assert.equal(result.coverage.judgmentOmittedEvents, 421);
   assert.equal(judgment.state.executionSummary.text, summaryText);
 });
 
@@ -233,7 +235,7 @@ test('long observations retain the request and inherited limits under independen
   const judged = decodeJevRequest(requests.at(-1).body);
   assert.ok(judged.state.events.some(event => event.id === events.at(-1).id));
   assert.ok(judged.state.events.some(event => event.id === 'limit'));
-  assert.equal(judged.state.events.length, events.length + 1);
+  assert.equal(judged.state.events.length, 100);
   assert.ok(JSON.stringify(requests[0].body).length <= 24000);
   const payload = JSON.parse(requests[0].body.messages[1].content);
   assert.ok(payload.evidence.some(group => group.isCurrentInput && group.text === observation.events[0].text));
