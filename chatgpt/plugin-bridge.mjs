@@ -14,12 +14,14 @@ async function startOwner(configPath) {
 
 // The package can serve its own UI before observation data is available.
 // No user data or writes pass this connection until the owner is verified.
-async function startPendingBridge({ configPath, input, output, recovery }) {
+async function startPendingBridge({ configPath, displayName, input, output, recovery }) {
   const { createPanelMCPServer } = await import('./panel-server.mjs')
-  const config = await loadInstallationConfig(configPath)
-  const displayName = config.pluginId === 'ghost-sentinel-test@ghostsentinel' ? 'GhostSentinel test' : config.pluginId === 'ghost-sentinel@ghostsentinel' ? 'GhostSentinel' : 'Sentinel'
+  if (!displayName) {
+    const config = await loadInstallationConfig(configPath)
+    displayName = config.pluginId === 'ghost-sentinel-test@ghostsentinel' ? 'GhostSentinel test' : config.pluginId === 'ghost-sentinel@ghostsentinel' ? 'GhostSentinel' : 'Sentinel'
+  }
   const lifetime = new AbortController(), operations = new Set(), openedAt = Date.now()
-  let owner, stopped = false, closing, timer, sequence = 0, finished, checking, nextLaunch = 0
+  let owner, stopped = false, staticOnly = false, closing, timer, sequence = 0, finished, checking, nextLaunch = 0
   const closed = new Promise(resolve => { finished = resolve })
   const unavailable = name => {
     const summary = '观察服务尚未就绪，正在重新连接'
@@ -32,13 +34,19 @@ async function startPendingBridge({ configPath, input, output, recovery }) {
     return { isError: true, content: [{ type: 'text', text: summary }], structuredContent: { saveOutcome: 'unknown' } }
   }
   async function check() {
-    if (stopped) return null
+    if (stopped || staticOnly) return null
     try {
-      if (recovery?.check && !await recovery.check()) { void close('installation-ended'); return null }
-      const current = await resolvePluginOwner({ configPath, includeStarting: true, includeStopped: Boolean(recovery) })
+      const installation = recovery?.installation?.()
+      if (installation === false) { staticOnly = true; return null }
+      configPath ??= installation?.configPath
+      if (!configPath) return null
+      if (recovery?.check && !await recovery.check()) { owner = null; staticOnly = true; return null }
+      if (stopped) return null
+      const current = await resolvePluginOwner({ configPath, includeStarting: true, includeStopped: Boolean(recovery), expectedReleaseId: installation?.releaseId })
       if (stopped) return null
       if (recovery) {
         if (current?.stopped && (owner || current.stoppedAt >= openedAt) && !['host-verification-unavailable', 'plugin-enablement-unconfirmed'].includes(current.reason)) {
+          if (installation && ['installation-maintenance', 'plugin-release-superseded'].includes(current.reason)) { owner = null; return null }
           void close('owner-ended'); return null
         }
         owner = current?.stopped ? null : current
@@ -89,7 +97,7 @@ async function startPendingBridge({ configPath, input, output, recovery }) {
     return closing
   }
   const eof = () => { void close('stdio-eof') }, failed = () => { void close('transport-unavailable') }
-  async function watch() { await qualified(); if (!stopped) timer = setTimeout(watch, owner?.url ? 1000 : 250) }
+  async function watch() { await qualified(); if (!stopped && !staticOnly) timer = setTimeout(watch, owner?.url ? 1000 : 250) }
   input.once('end', eof); input.once('close', eof); output.once('error', failed)
   mcp.server.onclose = eof
   try { await mcp.connect(new StdioServerTransport(input, output, { maxBufferSize: 1024 * 1024 })); void watch() }
@@ -98,8 +106,8 @@ async function startPendingBridge({ configPath, input, output, recovery }) {
   return { get runId() { return owner?.runId ?? null }, get pid() { return owner?.pid ?? null }, closed, close }
 }
 
-export function startResilientPluginBridge({ configPath, input = process.stdin, output = process.stdout, startOwner: launch = startOwner, checkInstallation } = {}) {
-  return startPendingBridge({ configPath, input, output, recovery: { launch, check: checkInstallation } })
+export function startResilientPluginBridge({ configPath, displayName, installation, input = process.stdin, output = process.stdout, startOwner: launch = startOwner, checkInstallation } = {}) {
+  return startPendingBridge({ configPath, displayName, input, output, recovery: { launch, check: checkInstallation, installation } })
 }
 
 // A per-chat protocol connection only; collection belongs to plugin-main.

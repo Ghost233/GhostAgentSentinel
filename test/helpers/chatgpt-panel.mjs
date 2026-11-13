@@ -20,14 +20,14 @@ class Element {
   setAttribute(name, value) { this.attributes.set(name, String(value)) }
   getAttribute(name) { return this.attributes.get(name) ?? null }
 }
-export async function panelHarness(t, { html = null, now = Date.now, initialize = true } = {}) {
+export async function panelHarness(t, { html = null, now = Date.now, initialize = true, hidden = false } = {}) {
   html ??= await readFile(new URL('../../chatgpt/panel.html', import.meta.url), 'utf8')
   const handlers = new Map(), elements = new Map(), timers = new Map(), sent = []
   for (const match of html.matchAll(/<([a-z0-9]+)\b[^>]*\bid="([^"]+)"[^>]*>/g)) elements.set('#' + match[2], new Element(match[1]))
   const element = key => { assert.ok(elements.has(key), 'actual panel markup contains ' + key); return elements.get(key) }
   let timerId = 0
   const parent = { postMessage: value => sent.push(value) }
-  const document = { hidden: false, querySelector: element, createElement: tag => new Element(tag) }
+  const document = { hidden, querySelector: element, createElement: tag => new Element(tag) }
   const context = vm.createContext({ parent, document, URL, Date: class extends Date { static now() { return now() } }, addEventListener: (event, callback) => handlers.set(event, callback), removeEventListener: event => handlers.delete(event), setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id }, clearTimeout: id => timers.delete(id) })
   const flush = () => new Promise(resolve => setImmediate(resolve))
   const reply = (id, value) => handlers.get('message')({ source: parent, data: { jsonrpc: '2.0', id, result: value } })

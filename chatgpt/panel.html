@@ -125,7 +125,17 @@ function summaryGaps(gaps){
   const specific=gaps.some(gap=>text(gap)&&!derived.has(gap));
   return [...new Set(gaps.filter(gap=>text(gap)&&(!specific||!derived.has(gap))).map(gap=>Object.hasOwn(gapDescriptions,gap)?gapDescriptions[gap]:gap.includes('unsupported-item-type:')?'存在未识别的原生事件':text(gap,160)))];
 }
-function renderRecentModelActivity(activity,retained=false,revalidating=false){
+function summaryRunStatus(analysis){
+  const error=analysis?.error;
+  if(analysis?.state==='failed'&&error?.stage==='llm'){
+    if(error.category==='cache-busy')return '总结模型缓存占用，等待重试';
+    if(error.code==='deadline'||error.status===504||/HTTP 504\b/.test(text(error.message)))return '总结模型超时，等待重试';
+    if(error.code==='incomplete_response')return '总结模型未返回完整结果，等待重试';
+    return '本次总结生成失败，等待重试';
+  }
+  return {queued:'总结正在排队',analyzing:'正在生成总结',paused:'总结已暂停',unavailable:'总结模型未配置或暂不可用'}[analysis?.state]??'';
+}
+function renderRecentModelActivity(activity,retained=false,revalidating=false,analysis){
   const now=Date.now(),prefill=activity?.prefill,summary=activity?.summary;
   const recent=at=>Number.isFinite(at)&&at<=now&&at>now-86400000;
   const time=(id,at)=>{
@@ -146,14 +156,15 @@ function renderRecentModelActivity(activity,retained=false,revalidating=false){
   show('recent-summary-state',valid);write('recent-summary-state',valid?(summary.final?'已收尾':'已总结'):'');
   attribute('recent-summary-state','data-tone','ok');
   set('recent-summary-text','className',valid?'summary-body':'summary-body muted');
-  writeSummary('recent-summary-text',valid?text(summary.text,Infinity):activity?'暂无可显示的总结':'等待核对当前聊天',valid?summary.sections:null);
+  const runStatus=summaryRunStatus(analysis);
+  writeSummary('recent-summary-text',valid?text(summary.text,Infinity):runStatus||(activity?'暂无可显示的总结':'等待核对当前聊天'),valid?summary.sections:null);
   const decision=valid?(summary.blocking??{status:'unknown',reason:summary.final?'执行已收尾，未作运行中判断':'这份摘要没有可显示的 JEV 判断'}):null;
   renderBlocking('recent',decision,retained||revalidating);
   time('recent-summary-time',valid?summary.completedAt:null);
   const missing=valid&&summary.partial?summaryGaps(list(summary.gaps)):[];
   show('recent-summary-gaps',missing.length>0);write('recent-summary-gaps',missing.length?'观察范围与说明 · '+missing.join('、'):'');
-  const showRetained=retained&&Boolean(valid||validPrefill);
-  show('recent-model-status',showRetained);write('recent-model-status',showRetained?'本次未能更新 · 显示上次读取':'');
+  const status=retained&&(valid||validPrefill)?'本次未能更新 · 显示上次读取':valid&&runStatus&&analysis?.state==='failed'?runStatus+' · 显示上次总结':'';
+  show('recent-model-status',Boolean(status));write('recent-model-status',status);
   return activity?{prefill:validPrefill?prefill:null,summary:valid?summary:null,prefillRecovery:recovery}:null;
 }
 let id=0,timer=null,busy=false,stopped=false,generation=0,ready=false,controlState=null,scopeThreadId=null,selectedExecutionKey=null,historyCursor=null,nextHistoryCursor=null,recentActivity=null;
@@ -440,12 +451,12 @@ function render(view){
   if(text(analysis.error?.code,120))technical.push('错误代码：'+text(analysis.error.code,120));
   if(text(analysis.error?.message))technical.push(text(analysis.error.message));
   write('technical',technical.join('\n'));
-  recentActivity=renderRecentModelActivity(activityMissing?recentActivity:view.recentModelActivity,activityMissing,recordRevalidating);
+  recentActivity=renderRecentModelActivity(activityMissing?recentActivity:view.recentModelActivity,activityMissing,recordRevalidating,analysis);
 }
 function cancel(id,entry,reason){pending.delete(id);clearTimeout(entry.timeout);if(entry.method==='tools/call')parent.postMessage({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id,reason}},'*');entry.reject(new Error(reason));}
 function request(method,params){return new Promise((resolve,reject)=>{const n=++id,entry={resolve,reject,method,timeout:null};entry.timeout=setTimeout(()=>cancel(n,entry,'宿主响应超时'),5000);pending.set(n,entry);parent.postMessage({jsonrpc:'2.0',id:n,method,params},'*');});}
 function completeOperation(){
-  busy=false;clearTimeout(timer);timer=null;if(stopped||document.hidden)return;
+  busy=false;clearTimeout(timer);timer=null;if(stopped||ready&&document.hidden)return;
   timer=setTimeout(ready?refresh:initialize,1500);
 }
 const displayContextFields=new Set(['theme','styles','displayMode','availableDisplayModes','containerDimensions','locale','timeZone','platform','deviceCapabilities','safeAreaInsets','userAgent']);
@@ -513,11 +524,12 @@ async function setPaused(){
 element('pause').onclick=setPaused;
 element('history-current').onclick=()=>selectExecution(null,null);
 element('history-more').onclick=()=>nextHistoryCursor?selectExecution(selectedExecutionKey,nextHistoryCursor):undefined;
-function visibility(){dismissedGeneration=-1;clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void (ready?refresh():initialize());}
+function visibility(){dismissedGeneration=-1;if(document.hidden&&!ready)return;clearTimeout(timer);timer=null;if(!document.hidden&&!busy)void (ready?refresh():initialize());}
 function teardown(){stopped=true;generation++;clearTimeout(timer);timer=null;for(const [id,entry]of pending)cancel(id,entry,'页面已销毁');removeEventListener('message',onMessage);removeEventListener('visibilitychange',visibility);}
 addEventListener('visibilitychange',visibility);addEventListener('pagehide',teardown,{once:true});
 async function initialize(){
-  if(stopped||document.hidden||busy||ready)return;
+  // Codex can wait for the handshake before revealing a restored sidebar.
+  if(stopped||busy||ready)return;
   busy=true;
   try{
     const init=await request('ui/initialize',{appInfo:{name:'ghost-sentinel-chatgpt',version:'0.1.0-dev.1'},appCapabilities:{},protocolVersion:'2026-01-26'});

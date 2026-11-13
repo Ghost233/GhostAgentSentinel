@@ -5,6 +5,35 @@ import { panelHarness as harness } from './helpers/chatgpt-panel.mjs'
 const ids = ['stalled_progress', 'request_drift', 'failure_loop', 'validation_cost', 'validation_gap', 'long_wait']
 const result = id => ({ signal: 'gray', summary: id ? id + ' 执行开始' : '无法确认当前观察', identity: { threadId: id }, observation: { coverage: 'caught-up', gap: null }, analysis: { state: 'not-connected', summary: '六项分析尚未接入' } })
 
+test('a restored hidden panel initializes before the host reveals it', async t => {
+  const page = await harness(t, { hidden: true, initialize: false })
+  assert.equal(page.sent[0]?.method, 'ui/initialize')
+  const [id, timeout] = [...page.timers][0]
+  page.timers.delete(id); timeout.callback(); await page.flush()
+  const [retryId, retry] = [...page.timers][0]
+  page.handlers.get('visibilitychange')()
+  assert.equal(page.timers.get(retryId), retry)
+  page.timers.delete(retryId); void retry.callback()
+  assert.equal(page.sent.at(-1)?.method, 'ui/initialize')
+  page.reply(page.sent.at(-1).id, {}); await page.flush()
+  assert.equal(page.sent.at(-1)?.method, 'ui/notifications/initialized')
+  assert.ok(!page.sent.some(message => message.method === 'tools/call'))
+  assert.equal(page.timers.size, 0)
+  page.document.hidden = false
+  page.handlers.get('visibilitychange')(); await page.deliver(result('restored-chat'))
+  assert.match(page.element('#summary').textContent, /restored-chat/)
+})
+
+test('the default tab explains a summary timeout and clears it after a fresh result', async t => {
+  const page = await harness(t), view = { ...result('main-a'), recentModelActivity: { summary: null, prefill: null } }
+  await page.deliver({ ...view, analysis: { state: 'failed', error: { stage: 'llm', code: 'http_error', message: '推理服务拒绝或失败（HTTP 504）' } } })
+  assert.equal(page.element('#monitor-tab-issues').getAttribute('aria-selected'), 'true')
+  assert.match(page.element('#recent-summary-text').textContent, /总结模型超时/)
+  await page.refresh()
+  await page.deliver({ ...view, analysis: { state: 'analyzing' } })
+  assert.match(page.element('#recent-summary-text').textContent, /正在生成总结/)
+})
+
 test('parked and archived chats explain their monitoring state in Chinese', async t => {
   const page = await harness(t)
   await page.deliver({ ...result(null), observation: { gap: 'chat-archived' } })

@@ -21,7 +21,7 @@ const observation = {
   ], coverage: { complete: true, gaps: [] },
 };
 
-async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgment = false, holdSummary = false, invalidConsumeReceipt = false, holdJudgment = false, rejectFirstSummary = false, busySummaryCaches = 0, summaryGaps = [], minimumOutputTokens = 0, requiresThinkingControl = false } = {}) {
+async function fixture(t, { supported = true, summaryInDirectory = true, spoofReceipt = false, invalidJudgment = false, holdSummary = false, invalidConsumeReceipt = false, holdJudgment = false, rejectFirstSummary = false, busySummaryCaches = 0, summaryGaps = [], requiresThinkingControl = false } = {}) {
   const requests = [];
   const operations = new Map();
   const busyCaches = new Set();
@@ -34,7 +34,7 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
   const generation = model => `gmd-boot.${model}.native-1`;
   const server = createServer(async (req, res) => {
     const send = value => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(value)); };
-    if (req.url === '/api/v1/models') return send({ source: 'ghost-model-deck', models: ['summary', 'judge'].map(model => ({
+    if (req.url === '/api/v1/models') return send({ source: 'ghost-model-deck', models: (summaryInDirectory ? ['summary', 'judge'] : ['judge']).map(model => ({
       key: model, type: model === 'summary' ? 'llm' : 'decision', source: 'ghost-model-deck', loaded_instances: [{ id: model }],
       capabilities: { prefill: { protocol: 'gmd-prefill/1', supported, mode: model === 'summary' ? 'chat_max_tokens_zero' : 'systemone_state', runtime_generation: generation(model),
         operation_policy: { id_format: 'gmd1', time_basis_ms: now, past_window_ms: 600_000, future_tolerance_ms: 60_000 } } },
@@ -65,7 +65,7 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
       runtime_generation: generation(body.model), cache_salt_sha256: hash(body.cache_salt), state: 'completed', terminal: true, lease_released: true,
       children: [{ native_request_id: ++nativeSequence, runtime_generation: 1, question_id: null, state: prefill ? 'length' : 'stop', prompt_tokens: 24,
         completion_tokens: prefill || body.model === 'judge' ? 0 : 8, matched_prompt_tokens: 8, deduplicated_tokens: 0, lease_released: true }] } : null;
-    if (metadata && body.model === 'summary' && !prefill && (body.max_tokens < minimumOutputTokens || requiresThinkingControl && body.thinking_token_budget !== 0)) {
+    if (metadata && body.model === 'summary' && !prefill && requiresThinkingControl && (body.thinking_token_budget !== 0 || body.reasoning_effort !== 'none')) {
       const failed = { ...metadata, state: 'failed', error: { code: 'invalid_response', stage: 'response' }, children: [{ ...metadata.children[0], state: 'length', completion_tokens: body.max_tokens }] };
       operations.set(metadata.request_id, { metadata: failed });
       res.statusCode = 202;
@@ -88,14 +88,15 @@ async function fixture(t, { supported = true, spoofReceipt = false, invalidJudgm
     releaseJudge, stopLifetime() { lifetime.abort(new Error('Observer lifetime closed')); } };
 }
 
-test('a bounded output allowance above the observed truncation ceiling can publish a cited partial summary in three managed generations', async t => {
-  const f = await fixture(t, { minimumOutputTokens: 4096 });
+test('three 256-token managed answers can publish a cited partial summary', async t => {
+  const f = await fixture(t, { requiresThinkingControl: true });
   const result = await f.analyzer.analyze({ ...observation, coverage: { complete: false, gaps: ['image omitted'] } }, f.options);
   assert.ok(result.summary.partial.evidenceRefs.length);
   assert.equal(result.summary.generated, undefined);
   assert.equal(result.coverage.complete, false);
   assert.equal(f.requests.length, 3, 'one generation per question with no extra replacement');
-  assert.equal(f.requests[0].body.max_tokens, 4096);
+  assert.ok(f.requests.every(({ body }) => body.max_tokens === 256 && body.reasoning_effort === 'none'));
+  assert.match(f.requests[0].body.messages[0].content, /一到两句/);
   assert.ok(result.summary.partial.text.length <= 600);
   assert.ok(result.usage.gmd.llm.terminal && result.usage.gmd.llm.lease_released);
 });
@@ -112,7 +113,7 @@ test('managed summary prefill and generation bound thinking before publishing a 
   assert.ok(result.summary.generated);
   assert.equal(result.checks.length, 6);
   assert.deepEqual(f.requests.map(request => [request.path, request.body.max_tokens ?? null]), [
-    ['/v1/chat/completions', 0], ...Array.from({ length: 3 }, () => ['/v1/chat/completions', 4096]), ['/v1/systemone', null],
+    ['/v1/chat/completions', 0], ...Array.from({ length: 3 }, () => ['/v1/chat/completions', 256]), ['/v1/systemone', null],
   ], 'consume handles the new suffix without an extra zero-budget request');
   const prefillPrompt = f.requests[0].body.messages[0].content;
   assert.match(prefillPrompt, /summary\.text 必须使用简体中文/);
@@ -126,6 +127,7 @@ test('managed summary prefill and generation bound thinking before publishing a 
   assert.ok(JSON.stringify(f.requests[1].body).includes('Found the newer requested log entry.'));
   assert.equal(f.requests[0].body.cache_salt, f.requests[1].body.cache_salt);
   assert.deepEqual(f.requests.map(request => request.body.thinking_token_budget), [0, 0, 0, 0, undefined]);
+  assert.deepEqual(f.requests.map(request => request.body.reasoning_effort), ['none', 'none', 'none', 'none', undefined]);
   const legacySalt = 'sentinel:' + hash(JSON.stringify(['analysis-cache/1', observation.source.registrationId, observation.task.key, observation.task.lifecycleId, observation.task.currentRequestId,
     'llm', f.config.llm.baseUrl + '/', 'summary', hash(f.requests[0].body.messages[0].content)]));
   assert.notEqual(f.requests[0].body.cache_salt, legacySalt, 'new generation policy cannot reuse the unconstrained-thinking prefix');
@@ -157,6 +159,18 @@ test('an undeclared prefill provider retains the existing two-model analysis wit
   assert.ok(result.summary.generated);
   assert.deepEqual(f.requests.map(request => request.path), ['/v1/chat/completions', '/v1/chat/completions', '/v1/chat/completions', '/v1/systemone']);
   assert.ok(f.requests.every(request => request.id === undefined && request.body.cache_salt === undefined && request.body.thinking_token_budget === undefined));
+  assert.ok(f.requests.slice(0, 3).every(({ body }) => body.max_tokens === 256 && body.reasoning_effort === 'none'));
+  assert.equal(f.requests.at(-1).body.reasoning_effort, undefined);
+});
+
+test('a summary alias absent from the prefill directory still gets short non-reasoning requests', async t => {
+  const f = await fixture(t, { summaryInDirectory: false });
+  assert.equal((await f.analyzer.prefill(observation, f.options)).state, 'unsupported');
+  assert.ok((await f.analyzer.analyze(observation, f.options)).summary.generated);
+  const summaries = f.requests.filter(request => request.path === '/v1/chat/completions');
+  assert.equal(summaries.length, 3);
+  assert.ok(summaries.every(({ body, id }) => body.max_tokens === 256 && body.reasoning_effort === 'none' && id === undefined));
+  assert.equal(f.requests.filter(request => request.path === '/v1/systemone').length, 1);
 });
 
 test('verified summary cache contention generates in one isolated cache without replaying the rejected operation', async t => {
@@ -165,7 +179,7 @@ test('verified summary cache contention generates in one isolated cache without 
     const result = await f.analyzer.analyze(observation, f.options);
     assert.ok(result.summary.generated);
     const [rejected, generated, progress, blocker, judgment] = f.requests.slice(round * 5);
-    assert.equal(rejected.body.max_tokens, 4096);
+    assert.equal(rejected.body.max_tokens, 256);
     assert.equal(generated.body.max_tokens, rejected.body.max_tokens);
     assert.deepEqual(generated.body.messages, rejected.body.messages);
     assert.notEqual(generated.body.cache_salt, rejected.body.cache_salt);
@@ -259,7 +273,7 @@ test('a managed-operation fault never starts an untracked replacement generation
   await assert.rejects(f.analyzer.analyze(observation, f.options), error => error.code === 'gmd_binding_mismatch');
   assert.equal(f.requests.length, 1);
   assert.ok(f.requests[0].id);
-  assert.equal(f.requests[0].body.max_tokens, 4096);
+  assert.equal(f.requests[0].body.max_tokens, 256);
 });
 
 test('an explicitly unconfirmed request cannot borrow a historical input to prefill inherited context', async t => {

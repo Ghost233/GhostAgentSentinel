@@ -9,6 +9,7 @@ import { createServer } from 'node:http'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
+import { PassThrough } from 'node:stream'
 import { setTimeout as delay } from 'node:timers/promises'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
@@ -226,6 +227,60 @@ test('a late old bridge cannot turn a known nonactive release into an implicit r
   assert.notEqual(old.releaseId, active.releaseId)
 })
 
+test('old and new Codex tabs can read the panel during a held release handoff', async t => {
+  const f = await githubFixture(t), first = await f.packet('stable', '7'.repeat(64))
+  const { startGitHubBridge } = await import('../chatgpt/github-plugin-bridge.mjs')
+  const { prepareGitHubInstallation } = await import('../chatgpt/github-installation.mjs')
+  const initial = await prepareGitHubInstallation(first, f.io)
+  const next = await f.packet('stable', '8'.repeat(64), 'replacement')
+  const { promise: hold, resolve: resume } = Promise.withResolvers()
+  const { promise: held, resolve: markHeld } = Promise.withResolvers()
+  const { promise: completed, resolve: markComplete } = Promise.withResolvers()
+  const uri = 'ui://ghost-sentinel/current-chat.html'
+  let upgraded, launches = 0
+  f.cleanup(async () => { resume(); await upgraded?.catch(() => {}) })
+  async function tab(options, io = f.io) {
+    const input = new PassThrough(), output = new PassThrough()
+    const bridge = await startGitHubBridge({ ...options, input, output }, { async prepareInstallation(options) {
+      const preparation = prepareGitHubInstallation(options, io)
+      if (options.archiveSHA256 === next.archiveSHA256) {
+        upgraded = preparation
+        void preparation.then(markComplete, () => {})
+      }
+      return preparation
+    }, async launchOwner() { launches++ } })
+    f.cleanup(() => bridge.close())
+    let id = 0
+    async function request(method, params = {}) {
+      const reply = once(output, 'data', { signal: AbortSignal.timeout(1000) })
+      input.write(JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }) + '\n')
+      const message = JSON.parse((await reply)[0])
+      assert.equal(message.id, id)
+      return message.result
+    }
+    await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'restored-tab', version: '1' } })
+    return { request, input, bridge }
+  }
+  const old = await tab(first)
+  const resource = await old.request('resources/read', { uri })
+  const io = { ...f.io, async inspectPackage(...args) { markHeld(); await hold; return f.io.inspectPackage(...args) } }
+  const fresh = await tab(next, io)
+  await held
+  const before = launches
+  assert.deepEqual(await fresh.request('resources/read', { uri }), resource)
+  assert.equal((await fresh.request('tools/call', { name: 'sentinel_current_chat', arguments: {} })).structuredContent.signal, 'gray')
+  assert.equal(launches, before)
+  assert.equal((await runtime.loadInstallationConfig(initial.configPath)).releaseId, initial.releaseId)
+  resume()
+  assert.notEqual((await completed).releaseId, initial.releaseId)
+  assert.equal((await old.request('tools/call', { name: 'sentinel_current_chat', arguments: {} })).structuredContent.signal, 'gray')
+  assert.deepEqual(await old.request('resources/read', { uri }), resource)
+  await fresh.request('tools/call', { name: 'sentinel_current_chat', arguments: {} })
+  assert.ok(launches > before, 'the existing connection can start observation after preparation')
+  old.input.end()
+  assert.deepEqual(await old.bridge.closed, { reason: 'stdio-eof' })
+})
+
 test('runtime refuses an expected release mismatch and stops a late old owner after configuration advances', async t => {
   const f = await githubFixture(t), options = await f.packet('stable', '9'.repeat(64))
   const { prepareGitHubInstallation } = await import('../chatgpt/github-installation.mjs')
@@ -276,6 +331,7 @@ test('owner resolution authenticates release identity in the owner, publication 
   await writeFile(ownerPath, JSON.stringify(identity), { mode: 0o600 })
   await writeFile(publicationPath, JSON.stringify(publication), { mode: 0o600 })
   assert.equal((await runtime.resolvePluginOwner(prepared)).releaseId, firstRelease)
+  assert.equal(await runtime.resolvePluginOwner({ ...prepared, expectedReleaseId: nextRelease }), null)
   health = { ...identity, releaseId: nextRelease }
   await assert.rejects(runtime.resolvePluginOwner(prepared), /identity mismatch/)
   health = identity

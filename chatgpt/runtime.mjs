@@ -144,9 +144,10 @@ async function restoreOwner(config, lock, port) {
   return live
 }
 
-export async function resolvePluginOwner({ configPath, includeStarting = false, includeStopped = false } = {}) {
+export async function resolvePluginOwner({ configPath, includeStarting = false, includeStopped = false, expectedReleaseId } = {}) {
   if (typeof configPath !== 'string' || !isAbsolute(configPath)) throw new Error('explicit private configuration path required')
   const config = await readPrivateConfig(configPath), info = await lstat(config.dataDir)
+  if (expectedReleaseId !== undefined && config.releaseId !== expectedReleaseId) return null
   if (!info.isDirectory() || info.mode & 0o077 || typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('private installation directory required')
   const lock = join(config.dataDir, 'runtime.lock'), ownerPath = join(lock, 'owner.json')
   let owner = await record(ownerPath)

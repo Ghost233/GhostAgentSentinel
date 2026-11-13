@@ -2,18 +2,33 @@ import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { isAbsolute } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { prepareGitHubInstallation } from './github-installation.mjs'
+import { GITHUB_CHANNELS, prepareGitHubInstallation } from './github-installation.mjs'
 import { loadInstallationConfig } from './runtime.mjs'
 import { startResilientPluginBridge } from './plugin-bridge.mjs'
 
-export async function startGitHubBridge({ channel, releaseRoot, archiveSHA256, stateRoot, input, output, signal } = {}) {
-  const prepared = await prepareGitHubInstallation({ channel, releaseRoot, archiveSHA256, stateRoot })
+async function launchGitHubOwner(prepared, channel) {
+  const child = spawn(prepared.nodePath, [prepared.ownerPath, '--config', prepared.configPath, '--channel', channel], { detached: true, stdio: 'ignore' })
+  await once(child, 'spawn'); child.unref()
+}
+
+export async function startGitHubBridge(options = {}, { prepareInstallation = prepareGitHubInstallation, launchOwner = launchGitHubOwner } = {}) {
+  const { channel, input, output, signal } = options
+  if (!Object.hasOwn(GITHUB_CHANNELS, channel)) throw new Error('invalid GitHub bridge channel')
+  let prepared, preparing, nextPrepare = 0
+  // The launcher already verified the HTML and executable. Installation
+  // preparation may wait for an old observer, so keep it off the MCP read path.
+  function installation() {
+    if (prepared === undefined && !preparing && !signal?.aborted && Date.now() >= nextPrepare) {
+      preparing = prepareInstallation(options).then(value => { prepared = value }, error => {
+        if (['github_prepare_busy', 'github_owner_stop_unconfirmed'].includes(error.code)) nextPrepare = Date.now() + 1000
+        else prepared = false
+      }).finally(() => { preparing = null })
+    }
+    return prepared
+  }
   const checkInstallation = async () => !signal?.aborted && (await loadInstallationConfig(prepared.configPath)).releaseId === prepared.releaseId
-  if (!await checkInstallation()) throw new Error('GitHub release superseded')
-  return startResilientPluginBridge({ configPath: prepared.configPath, input, output, checkInstallation, async startOwner(configPath) {
-    if (!await checkInstallation()) return
-    const child = spawn(prepared.nodePath, [prepared.ownerPath, '--config', configPath, '--channel', channel], { detached: true, stdio: 'ignore' })
-    await once(child, 'spawn'); child.unref()
+  return startResilientPluginBridge({ displayName: GITHUB_CHANNELS[channel].displayName, installation, input, output, checkInstallation, async startOwner() {
+    if (await checkInstallation()) await launchOwner(prepared, channel)
   } })
 }
 
