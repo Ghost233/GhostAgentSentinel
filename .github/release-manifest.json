@@ -1,10 +1,10 @@
 {
-  "version": "0.5.4",
+  "version": "0.5.5",
   "build": {
     "node": "v24.21.0",
     "npm": "11.19.1"
   },
-  "sha256": "cbee6ad4eca6773390d52ce471a77cc4aad7368c1aa68630fe016070e7dc198d",
+  "sha256": "dfa2f020d3c166f5e72ca51e33ebc8b7ab5895bf8e057456312fa0d02340f4bc",
   "files": {
     "GLOSSARY.md": "f685cdec5d400bedcddd1c8627ba27087fd32feecbb6424bc01da4d4d600661b",
     "README.md": "286cde426d058d68dee575f2f1063c4f5672a49005a62daf12cdad85ff6112f5",
@@ -12,7 +12,7 @@
     "docs/chatgpt-observation.md": "b9315591b5c85834d37921e49f05f8cb0285bf796a2f93b2a76343b545ad0dab",
     "docs/development-contract.md": "c54e632bb0ad6b7127e3466aec42c954e0ef871046540d7bd5b18c5f5bda6d39",
     "docs/installation.md": "00329ee266b0259b4524eda26365f8a369ced68b4ef6899eba4f88575cd89fce",
-    "docs/release-notes.md": "818f23d8df7a200f6ce4d9de82de82ad109b15b9640c1bbd681ec95bf87be7cc",
+    "docs/release-notes.md": "c0d01e4136611a5b5f1020c63007d55d2a2ac199b2d27e6d4f75c63f4d13c8c1",
     "docs/release-status.md": "aa8c2183773d1aed5662650919860ac74771e0b584bc8b26e64fc44bd181c8b5",
     "dsh/client.js": "135831aacd514469cdddd1a04b641e535c263dbd37e08f596a6a341c0c1e94fc",
     "dsh/cordis.patch.yml": "bd7d0f94c3a0d7ef682214764f5e652c82ab928306542d7a03b365e019b64696",
@@ -21,7 +21,7 @@
     "dsh/observation.mjs": "fc94281db9c5ce9c2dab514e5ad98bc1913a3c15aeba805bb827393f560f836b",
     "dsh/remote.cjs": "93446b79b13a1a087f0cd9842bdfc875ff09cca21d018dab611480a3a334b776",
     "dsh/verification-evidence.mjs": "3fef17769cfcb64eadcfc7d9a067da9e253658b3d4e8317e5c4c434bc79ca107",
-    "package.json": "c378a8bea81ef2cb002fafe8d3e48dc0879e96dcdb64ff3434fd7c04d26f943d",
+    "package.json": "33d25e7d6139a029948233d766998369d8d349a8eaa3b32734390c8c4a7d7ef1",
     "src/analysis/failure-info.mjs": "4e804f49eedb55c8cedc41858235c88f94d04ec4371b6c9e6a8595f9cf505aa8",
     "src/analysis/gmd-prefill-client.mjs": "0d955504882cb0981acb6fc55f534045312b93e601d03d4204321c269a0b7feb",
     "src/analysis/http.mjs": "8b6c0ffe5b1a07ee7f55ce3248197f14cbec058f81191fe6f76d3f3646dffbf1",

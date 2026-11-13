@@ -36,11 +36,11 @@ async function startPendingBridge({ configPath, displayName, input, output, reco
   async function check() {
     if (stopped || staticOnly) return null
     try {
-      const installation = recovery?.installation?.()
+      const installation = await recovery?.installation?.()
       if (installation === false) { staticOnly = true; return null }
+      if (recovery?.installation && !installation) { owner = null; return null }
       configPath ??= installation?.configPath
       if (!configPath) return null
-      if (recovery?.check && !await recovery.check()) { owner = null; staticOnly = true; return null }
       if (stopped) return null
       const current = await resolvePluginOwner({ configPath, includeStarting: true, includeStopped: Boolean(recovery), expectedReleaseId: installation?.releaseId })
       if (stopped) return null
@@ -50,7 +50,7 @@ async function startPendingBridge({ configPath, displayName, input, output, reco
           void close('owner-ended'); return null
         }
         owner = current?.stopped ? null : current
-        if (!owner && Date.now() >= nextLaunch) {
+        if (!owner && installation?.canLaunch !== false && Date.now() >= nextLaunch) {
           nextLaunch = Date.now() + 3000
           await recovery.launch(configPath)
         }
@@ -106,8 +106,8 @@ async function startPendingBridge({ configPath, displayName, input, output, reco
   return { get runId() { return owner?.runId ?? null }, get pid() { return owner?.pid ?? null }, closed, close }
 }
 
-export function startResilientPluginBridge({ configPath, displayName, installation, input = process.stdin, output = process.stdout, startOwner: launch = startOwner, checkInstallation } = {}) {
-  return startPendingBridge({ configPath, displayName, input, output, recovery: { launch, check: checkInstallation, installation } })
+export function startResilientPluginBridge({ configPath, displayName, installation, input = process.stdin, output = process.stdout, startOwner: launch = startOwner } = {}) {
+  return startPendingBridge({ configPath, displayName, input, output, recovery: { launch, installation } })
 }
 
 // A per-chat protocol connection only; collection belongs to plugin-main.

@@ -14,6 +14,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { startServer } from '../src/server.mjs'
 import { connectCore } from '../src/core-client.mjs'
 import { supportedProfile } from '../chatgpt/bounded-reader.mjs'
+import { resourceMaterial } from './fixtures/chatgpt-plugin-lazy/resource-material.mjs'
 import * as runtime from '../chatgpt/runtime.mjs'
 
 const firstRelease = 'a'.repeat(64), nextRelease = 'b'.repeat(64)
@@ -279,6 +280,67 @@ test('old and new Codex tabs can read the panel during a held release handoff', 
   assert.ok(launches > before, 'the existing connection can start observation after preparation')
   old.input.end()
   assert.deepEqual(await old.bridge.closed, { reason: 'stdio-eof' })
+})
+
+test('existing and reopened MCP connections to a superseded package read the active observer without restarting it', async t => {
+  const f = await githubFixture(t), first = await f.packet('stable', '7'.repeat(64))
+  const next = await f.packet('stable', '8'.repeat(64), 'replacement')
+  const { startGitHubBridge } = await import('../chatgpt/github-plugin-bridge.mjs')
+  const { prepareGitHubInstallation } = await import('../chatgpt/github-installation.mjs')
+  await prepareGitHubInstallation(first, f.io)
+  const core = await startServer({ dataDir: first.coreDataDir })
+  f.cleanup(() => core.close())
+  const thread = { id: 'resource-main', originator: 'Codex Desktop', source: 'vscode', parentThreadId: null,
+    path: join(first.sessionsRoot, 'resource-main.jsonl'), cwd: first.sessionsRoot, status: { type: 'active' } }
+  await mkdir(first.sessionsRoot, { mode: 0o700 })
+  await writeFile(thread.path, resourceMaterial({ at: Date.now(), cwd: thread.cwd, producerVersion: supportedProfile.cliVersion }))
+  const native = {
+    async sampleHost() { return { available: true, hostRunId: 'active-observer', hostStartedAt: 1, profile: supportedProfile } },
+    async readEnablement() { return { user: 'enabled', effective: 'enabled' } },
+    async listThreads() { return { data: [thread], nextCursor: null } },
+    async readThread(id) { return id === thread.id ? { thread, anchorTurnId: 'resource-turn' } : null },
+    async close() {},
+  }
+  let launches = 0
+  async function tab() {
+    const input = new PassThrough(), output = new PassThrough()
+    const bridge = await startGitHubBridge({ ...first, input, output }, {
+      prepareInstallation: options => prepareGitHubInstallation(options, f.io),
+      async launchOwner() { launches++ },
+    })
+    f.cleanup(() => bridge.close())
+    let id = 0
+    const request = async (method, params) => {
+      const reply = once(output, 'data', { signal: AbortSignal.timeout(3000) })
+      input.write(JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }) + '\n')
+      const message = JSON.parse((await reply)[0])
+      assert.equal(message.id, id)
+      return message.result?.structuredContent
+    }
+    await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'restored-tab', version: '1' } })
+    return { read: () => request('tools/call', { name: 'sentinel_current_chat', arguments: {}, _meta: { thread_id: thread.id } }), bridge }
+  }
+  const existing = await tab()
+  const deadline = Date.now() + 2000
+  while (!launches && Date.now() < deadline) { await existing.read(); await delay(20) }
+  assert.equal(launches, 1)
+  const active = await prepareGitHubInstallation(next, f.io)
+  const owner = await runtime.startFromInstallation({ ...active, ownership: 'plugin', native, pollMs: 0, expectedReleaseId: active.releaseId })
+  f.cleanup(() => owner.close())
+  const reopened = await tab()
+  for (const connection of [existing, reopened]) {
+    let view
+    const readyBy = Date.now() + 2000
+    do {
+      view = await connection.read()
+      if (view?.identity?.threadId) break
+      await delay(25)
+    } while (Date.now() < readyBy)
+    assert.equal(view?.identity?.threadId, thread.id)
+    assert.equal(connection.bridge.runId, owner.runId)
+  }
+  assert.equal(launches, 1)
+  assert.equal((await runtime.loadInstallationConfig(active.configPath)).releaseId, active.releaseId)
 })
 
 test('runtime refuses an expected release mismatch and stops a late old owner after configuration advances', async t => {

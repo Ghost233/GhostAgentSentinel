@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { isAbsolute } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { GITHUB_CHANNELS, prepareGitHubInstallation } from './github-installation.mjs'
+import { GITHUB_CHANNELS, inspectGitHubInstallation, prepareGitHubInstallation } from './github-installation.mjs'
 import { loadInstallationConfig } from './runtime.mjs'
 import { startResilientPluginBridge } from './plugin-bridge.mjs'
 
@@ -15,20 +15,26 @@ export async function startGitHubBridge(options = {}, { prepareInstallation = pr
   const { channel, input, output, signal } = options
   if (!Object.hasOwn(GITHUB_CHANNELS, channel)) throw new Error('invalid GitHub bridge channel')
   let prepared, preparing, nextPrepare = 0
+  let superseded = false
   // The launcher already verified the HTML and executable. Installation
   // preparation may wait for an old observer, so keep it off the MCP read path.
-  function installation() {
-    if (prepared === undefined && !preparing && !signal?.aborted && Date.now() >= nextPrepare) {
+  async function installation() {
+    if (signal?.aborted) return null
+    if (prepared === undefined && !superseded && !preparing && Date.now() >= nextPrepare) {
       preparing = prepareInstallation(options).then(value => { prepared = value }, error => {
         if (['github_prepare_busy', 'github_owner_stop_unconfirmed'].includes(error.code)) nextPrepare = Date.now() + 1000
+        else if (error.code === 'github_release_superseded') superseded = true
         else prepared = false
       }).finally(() => { preparing = null })
     }
-    return prepared
+    if (!superseded && !prepared) return prepared
+    if (prepared && (await loadInstallationConfig(prepared.configPath)).releaseId === prepared.releaseId) return prepared
+    const active = await inspectGitHubInstallation(options)
+    if (!active?.receipt.releases.some(release => release.archiveSHA256 === options.archiveSHA256)) return null
+    return { configPath: active.configPath, releaseId: active.receipt.activeReleaseId, canLaunch: false }
   }
-  const checkInstallation = async () => !signal?.aborted && (await loadInstallationConfig(prepared.configPath)).releaseId === prepared.releaseId
-  return startResilientPluginBridge({ displayName: GITHUB_CHANNELS[channel].displayName, installation, input, output, checkInstallation, async startOwner() {
-    if (await checkInstallation()) await launchOwner(prepared, channel)
+  return startResilientPluginBridge({ displayName: GITHUB_CHANNELS[channel].displayName, installation, input, output, async startOwner() {
+    if (!signal?.aborted && (await loadInstallationConfig(prepared.configPath)).releaseId === prepared.releaseId) await launchOwner(prepared, channel)
   } })
 }
 
